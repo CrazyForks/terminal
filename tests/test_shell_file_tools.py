@@ -6,7 +6,7 @@ from pathlib import Path
 
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import edit_file, glob_files, grep_files, read_file, write_file
+from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
 from llm_browser.tool.shell import shell
 
 
@@ -42,6 +42,25 @@ class ShellFileToolsTest(unittest.TestCase):
             self.assertEqual(result.data["returncode"], 0)
             self.assertIn(str(ctx.session.cwd), result.text)
             self.assertIn("hello", result.text)
+
+    def test_apply_patch_applies_unified_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "example.txt", "content": "hello\nworld\n"})
+            patch = """\
+--- a/example.txt
++++ b/example.txt
+@@ -1,2 +1,2 @@
+ hello
+-world
++browser
+"""
+
+            result = apply_patch_file(ctx, {"patch": patch})
+            read = read_file(ctx, {"path": "example.txt"})
+
+            self.assertEqual(result.data["returncode"], 0)
+            self.assertIn("browser", read.text)
 
 
 if __name__ == "__main__":

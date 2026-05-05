@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -43,6 +44,27 @@ def edit_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     path.write_text(updated, encoding="utf-8")
     changed = count if replace_all else 1
     return ToolResult(text=f"edited {path}", data={"path": str(path), "replacements": changed})
+
+
+def apply_patch_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    patch = str(arguments["patch"])
+    check = bool(arguments.get("check", False))
+    command = ["git", "apply", "--recount", "--whitespace=nowarn"]
+    if check:
+        command.append("--check")
+    result = subprocess.run(
+        command,
+        cwd=str(ctx.session.cwd),
+        input=patch,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    output = (result.stdout or "") + (("\n" if result.stdout and result.stderr else "") + result.stderr if result.stderr else "")
+    if result.returncode != 0:
+        raise ValueError(f"patch failed with status {result.returncode}: {output.strip()}")
+    text = "patch check passed" if check else "patch applied"
+    return ToolResult(text=text, data={"returncode": result.returncode, "check": check})
 
 
 def glob_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import edit_file, glob_files, grep_files, read_file, write_file
+from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
 from llm_browser.tool.python_browser import PythonBrowserTool
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
@@ -111,6 +111,22 @@ def build_builtin_registry() -> ToolRegistry:
             },
         ),
         edit_file,
+    )
+    registry.register(
+        ToolSpec(
+            name="apply_patch",
+            description="Apply a unified diff patch in the session working directory using git apply.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"},
+                    "check": {"type": "boolean"},
+                },
+                "required": ["patch"],
+                "additionalProperties": False,
+            },
+        ),
+        apply_patch_file,
     )
     registry.register(
         ToolSpec(
