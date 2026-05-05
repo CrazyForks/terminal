@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -25,6 +26,7 @@ class PythonBrowserTool:
         self.runtime_factory = runtime_factory or self._default_runtime_factory
         self._namespaces: Dict[str, Dict[str, Any]] = {}
         self._runtimes: Dict[str, BrowserRuntime] = {}
+        self._exec_lock = threading.RLock()
 
     def __call__(self, ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
         code = str(arguments.get("code", ""))
@@ -40,7 +42,7 @@ class PythonBrowserTool:
         stdout = io.StringIO()
         stderr = io.StringIO()
         try:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self._execution_cwd(ctx.session.cwd), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 value = self._execute(code, namespace)
         except BaseException:
             err = stderr.getvalue()
@@ -135,6 +137,8 @@ class PythonBrowserTool:
                 "browser": runtime,
                 "artifact_dir": ctx.session.artifact_dir,
                 "download_dir": runtime.root_dir / "downloads",
+                "cwd": ctx.session.cwd,
+                "workspace_dir": ctx.session.cwd,
                 "cdp": cdp,
                 "new_tab": new_tab,
                 "navigate": runtime.navigate,
@@ -179,6 +183,17 @@ class PythonBrowserTool:
             return None
         return eval(compiled, namespace, namespace)
 
+    @contextlib.contextmanager
+    def _execution_cwd(self, cwd: Path):
+        with self._exec_lock:
+            previous = Path.cwd()
+            cwd.mkdir(parents=True, exist_ok=True)
+            os.chdir(cwd)
+            try:
+                yield
+            finally:
+                os.chdir(previous)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -218,5 +233,11 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
         from pypdf import PdfReader
 
         namespace["PdfReader"] = PdfReader
+    except Exception:
+        pass
+    try:
+        from PIL import Image
+
+        namespace["Image"] = Image
     except Exception:
         pass
