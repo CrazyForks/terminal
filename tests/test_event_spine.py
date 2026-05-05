@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from llm_browser.events.bus import EventBus
+from llm_browser.events.event import Event
+from llm_browser.events.store import EventStore
+from llm_browser.session.store import SessionStore
+
+
+class EventSpineTest(unittest.TestCase):
+    def test_event_store_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EventStore(Path(tmp))
+            event = Event(type="tool.output", session_id="session-1", payload={"text": "hello"})
+
+            store.append(event)
+
+            events = store.read("session-1")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].type, "tool.output")
+            self.assertEqual(events[0].payload, {"text": "hello"})
+
+    def test_bus_subscriber_receives_published_events(self) -> None:
+        bus = EventBus()
+        event = Event(type="session.created", session_id="session-1")
+
+        with bus.subscribe() as subscriber:
+            bus.publish(event)
+            received = subscriber.get(timeout=1)
+
+        self.assertEqual(received.id, event.id)
+
+    def test_session_store_creates_metadata_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bus = EventBus()
+            store = SessionStore(Path(tmp), bus=bus)
+
+            with bus.subscribe() as subscriber:
+                session = store.create(cwd=Path(tmp))
+                store.emit(session.id, "session.input", {"text": "task"})
+                store.update_status(session.id, "idle")
+
+                first = subscriber.get(timeout=1)
+                second = subscriber.get(timeout=1)
+                third = subscriber.get(timeout=1)
+
+            loaded = store.load(session.id)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.status, "idle")
+            self.assertTrue(loaded.artifact_dir.exists())
+            self.assertEqual(first.type, "session.created")
+            self.assertEqual(second.type, "session.input")
+            self.assertEqual(third.type, "session.idle")
+            self.assertEqual(len(store.events.read(session.id)), 3)
+
+    def test_session_store_list_is_newest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            older = store.create(cwd=Path(tmp))
+            time.sleep(0.002)
+            newer = store.create(cwd=Path(tmp))
+
+            sessions = store.list()
+
+            self.assertEqual([session.id for session in sessions], [newer.id, older.id])
+
+
+if __name__ == "__main__":
+    raise SystemExit(unittest.main())
