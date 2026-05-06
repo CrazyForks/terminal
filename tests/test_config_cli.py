@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from llm_browser import cli
 from llm_browser.cli import build_parser
-from llm_browser.config import load_config, redacted_config, write_default_config
+from llm_browser.config import apply_config_environment, load_config, redacted_config, write_config_value, write_default_config
 
 
 class ConfigCliTest(unittest.TestCase):
@@ -50,6 +52,20 @@ class ConfigCliTest(unittest.TestCase):
         self.assertEqual(override.provider, "fake")
         self.assertEqual(override.browser, "chromium")
 
+    def test_tui_defaults_to_codex_not_fake(self) -> None:
+        parser = build_parser(config={})
+
+        args = parser.parse_args(["tui"])
+
+        self.assertEqual(args.provider, "codex")
+        self.assertEqual(args.model, "gpt-5.5")
+
+    def test_tui_main_prepends_tui_subcommand_and_keeps_global_args(self) -> None:
+        with patch("llm_browser.cli.main", return_value=0) as main:
+            self.assertEqual(cli.tui_main(["--state-dir", "/tmp/state", "--browser", "remote"]), 0)
+
+        main.assert_called_once_with(["--state-dir", "/tmp/state", "tui", "--browser", "remote"])
+
     def test_write_default_config_refuses_overwrite_and_redacts_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -61,6 +77,16 @@ class ConfigCliTest(unittest.TestCase):
         redacted = redacted_config({"auth": {"access_token": "secret"}, "nested": [{"refresh_token": "secret2"}]})
         self.assertEqual(redacted["auth"]["access_token"], "<redacted>")
         self.assertEqual(redacted["nested"][0]["refresh_token"], "<redacted>")
+
+    def test_persisted_browser_use_api_key_redacts_and_hydrates_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            path = Path(tmp) / "config.json"
+            _, config = write_config_value("browser.cloud_api_key", "bu_secret", path=path)
+
+            apply_config_environment(config)
+
+            self.assertEqual(os.environ["BROWSER_USE_API_KEY"], "bu_secret")
+            self.assertEqual(redacted_config(config)["browser"]["cloud_api_key"], "<redacted>")
 
 
 if __name__ == "__main__":

@@ -500,6 +500,49 @@ class AgentLoopTest(unittest.TestCase):
             self.assertEqual(tool_message["content"][0]["type"], "input_text")
             self.assertEqual(tool_message["content"][1]["type"], "input_image")
 
+    def test_resume_reconstructs_parallel_tool_calls_by_call_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.emit(session.id, "session.input", {"text": "parallel"})
+            store.emit(session.id, "tool.started", {"tool_call_id": "call_a", "name": "read", "arguments": {"path": "a.txt"}})
+            store.emit(session.id, "tool.started", {"tool_call_id": "call_b", "name": "read", "arguments": {"path": "b.txt"}})
+            store.emit(
+                session.id,
+                "tool.finished",
+                {"tool_call_id": "call_b", "name": "read", "output": ToolResult(text="b").to_event_payload()},
+            )
+            store.emit(
+                session.id,
+                "tool.finished",
+                {"tool_call_id": "call_a", "name": "read", "output": ToolResult(text="a").to_event_payload()},
+            )
+
+            messages = Agent(store)._messages_from_events(session.id)
+
+            assistant = [message for message in messages if message.get("role") == "assistant"][-1]
+            tool_messages = [message for message in messages if message.get("role") == "tool"]
+            self.assertEqual([call["id"] for call in assistant["tool_calls"]], ["call_a", "call_b"])
+            self.assertEqual({message["tool_call_id"] for message in tool_messages}, {"call_a", "call_b"})
+            self.assertEqual({message["content"] for message in tool_messages}, {"a", "b"})
+
+    def test_resume_synthesizes_output_for_dangling_tool_call_before_followup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.emit(session.id, "session.input", {"text": "first"})
+            store.emit(session.id, "tool.started", {"tool_call_id": "call_missing", "name": "python", "arguments": {"code": "x()"}})
+            store.emit(session.id, "session.input", {"text": "follow up"})
+
+            messages = Agent(store)._messages_from_events(session.id)
+
+            self.assertEqual(messages[1]["role"], "assistant")
+            self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_missing")
+            self.assertEqual(messages[2]["role"], "tool")
+            self.assertEqual(messages[2]["tool_call_id"], "call_missing")
+            self.assertIn("missing tool output", messages[2]["content"])
+            self.assertEqual(messages[3], {"role": "user", "content": "follow up"})
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

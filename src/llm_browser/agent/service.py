@@ -170,40 +170,72 @@ class Agent:
 
     def _messages_from_events(self, session_id: str) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
-        pending_tool_call: Optional[Dict[str, Any]] = None
+        pending_tool_calls: List[Dict[str, Any]] = []
+        unresolved_tool_calls: Dict[str, Dict[str, Any]] = {}
+
+        def flush_pending_tool_calls() -> None:
+            if not pending_tool_calls:
+                return
+            batch = list(pending_tool_calls)
+            messages.append({"role": "assistant", "tool_calls": batch})
+            for call in batch:
+                unresolved_tool_calls[call["id"]] = call
+            pending_tool_calls.clear()
+
+        def synthesize_missing_tool_outputs(reason: str) -> None:
+            flush_pending_tool_calls()
+            for call_id, call in list(unresolved_tool_calls.items()):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": call["name"],
+                        "content": f"[tool error: missing tool output in event history: {reason}]",
+                    }
+                )
+                unresolved_tool_calls.pop(call_id, None)
+
         for event in self.store.events.read(session_id):
             if event.type == "session.input":
+                if messages:
+                    synthesize_missing_tool_outputs("new user input arrived before this tool completed")
                 text = str(event.payload.get("text") or "")
                 if text:
                     messages.append({"role": "user", "content": text})
             elif event.type == "tool.started":
-                pending_tool_call = {
-                    "id": str(event.payload.get("tool_call_id") or ""),
-                    "name": str(event.payload.get("name") or ""),
-                    "arguments": event.payload.get("arguments") or {},
-                }
-                messages.append({"role": "assistant", "tool_calls": [pending_tool_call]})
-            elif event.type == "tool.finished" and pending_tool_call:
+                pending_tool_calls.append(
+                    {
+                        "id": str(event.payload.get("tool_call_id") or ""),
+                        "name": str(event.payload.get("name") or ""),
+                        "arguments": event.payload.get("arguments") or {},
+                    }
+                )
+            elif event.type == "tool.finished":
+                flush_pending_tool_calls()
+                call_id = str(event.payload.get("tool_call_id") or "")
+                tool_call = unresolved_tool_calls.pop(call_id, None)
                 output = event.payload.get("output") or {}
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": pending_tool_call["id"],
-                        "name": pending_tool_call["name"],
+                        "tool_call_id": call_id,
+                        "name": str(event.payload.get("name") or (tool_call or {}).get("name") or "tool"),
                         "content": self._tool_event_provider_content(output),
                     }
                 )
-                pending_tool_call = None
-            elif event.type == "tool.failed" and pending_tool_call:
+            elif event.type == "tool.failed":
+                flush_pending_tool_calls()
+                call_id = str(event.payload.get("tool_call_id") or "")
+                tool_call = unresolved_tool_calls.pop(call_id, None)
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": pending_tool_call["id"],
-                        "name": pending_tool_call["name"],
+                        "tool_call_id": call_id,
+                        "name": str(event.payload.get("name") or (tool_call or {}).get("name") or "tool"),
                         "content": f"[tool error: {event.payload.get('error_type')}: {event.payload.get('error')}]",
                     }
                 )
-                pending_tool_call = None
+        synthesize_missing_tool_outputs("session ended before this tool completed")
         if not messages:
             raise ValueError(f"session has no replayable messages: {session_id}")
         return messages

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
-import os
 import shutil
 import subprocess
 import threading
@@ -14,15 +13,14 @@ from llm_browser.tool.result import ToolResult
 
 
 MAX_READ_CHARS = 20000
+MAX_LINE_LENGTH = 2000
 MAX_DIFF_CHARS = 20000
 MAX_SEARCH_OUTPUT = 30000
-DEFAULT_REPO_MAP_SCAN = 2000
-MAX_REPO_MAP_SCAN = 20000
-DEFAULT_REPO_MAP_LIMIT = 30
-MAX_REPO_MAP_LIMIT = 80
+MAX_GLOB_RESULTS = 5000
+MAX_GREP_RESULTS = 1000
 _FILE_LOCKS: Dict[str, threading.RLock] = {}
 _FILE_LOCKS_LOCK = threading.Lock()
-_REPO_MAP_IGNORED_DIRS = {
+_IGNORED_DIR_NAMES = {
     ".browser-use-terminal",
     ".git",
     ".hg",
@@ -34,65 +32,14 @@ _REPO_MAP_IGNORED_DIRS = {
     ".venv",
     "__pycache__",
     "build",
+    "coverage",
     "dist",
     "node_modules",
     "target",
     "venv",
 }
-_REPO_MAP_MANIFEST_NAMES = {
-    "cargo.toml",
-    "composer.json",
-    "go.mod",
-    "package.json",
-    "pom.xml",
-    "pyproject.toml",
-    "requirements-dev.txt",
-    "requirements.txt",
-    "setup.cfg",
-    "setup.py",
-    "tsconfig.json",
-    "uv.lock",
-}
-_REPO_MAP_DOC_NAMES = {
-    "agents.md",
-    "changelog.md",
-    "contributing.md",
-    "readme.md",
-}
-_REPO_MAP_ENTRYPOINT_NAMES = {
-    "__main__.py",
-    "app.py",
-    "asgi.py",
-    "cli.py",
-    "index.js",
-    "index.jsx",
-    "index.ts",
-    "index.tsx",
-    "lib.rs",
-    "main.go",
-    "main.py",
-    "main.rs",
-    "main.ts",
-    "main.tsx",
-    "manage.py",
-    "mod.rs",
-    "server.py",
-    "wsgi.py",
-}
-_REPO_MAP_SOURCE_ROOT_NAMES = {
-    "app",
-    "cmd",
-    "docs",
-    "examples",
-    "internal",
-    "lib",
-    "pkg",
-    "scripts",
-    "src",
-    "test",
-    "tests",
-}
-_REPO_MAP_WORKSPACE_ROOT_NAMES = {"apps", "crates", "packages", "services"}
+_IGNORED_FILE_NAMES = {".DS_Store"}
+_IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
 def read_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -100,10 +47,24 @@ def read_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     if not path.exists():
         raise FileNotFoundError(_missing_path_message(path))
     if path.is_dir():
-        limit = int(arguments.get("limit", 200))
-        entries = sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))[:limit]
+        limit = _bounded_int(arguments.get("limit"), 200, 1, MAX_GLOB_RESULTS)
+        all_entries = [
+            entry
+            for entry in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+            if not _is_ignored_path(entry, path)
+        ]
+        entries = all_entries[:limit]
         text = "\n".join(("/" if entry.is_dir() else "") + entry.name for entry in entries)
-        return ToolResult(text=text, data={"path": str(path), "kind": "directory", "count": len(entries)})
+        return ToolResult(
+            text=text,
+            data={
+                "path": str(path),
+                "kind": "directory",
+                "count": len(entries),
+                "total_count": len(all_entries),
+                "truncated": len(all_entries) > len(entries),
+            },
+        )
 
     raw = path.read_bytes()
     if _looks_binary(raw):
@@ -115,20 +76,59 @@ def read_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     text, _ = _decode_text(raw)
     line_offset = arguments.get("line_offset")
     line_limit = arguments.get("line_limit")
-    if line_offset is not None or line_limit is not None:
-        start = max(0, int(line_offset or 0))
-        limit = int(line_limit or 200)
-        lines = text.splitlines(keepends=True)
-        chunk = "".join(lines[start : start + limit])
+    char_window_requested = "offset" in arguments or "limit" in arguments
+    line_window_requested = line_offset is not None or line_limit is not None
+    line_limit_value = _optional_int(line_limit, 200)
+    line_offset_value = _optional_int(line_offset, 0)
+    ignore_zero_line_window = (
+        char_window_requested
+        and line_window_requested
+        and line_offset_value <= 0
+        and line_limit is not None
+        and line_limit_value <= 0
+    )
+    if line_window_requested and not ignore_zero_line_window:
+        start = max(0, line_offset_value)
+        limit = max(0, line_limit_value)
+        lines = text.splitlines()
+        if lines and start >= len(lines):
+            raise ValueError("line_offset exceeds file length")
+        window = lines[start : start + limit]
+        formatted, truncated_lines = _numbered_lines(window, start)
+        next_line_offset = start + len(window)
         return ToolResult(
-            text=chunk,
-            data={"path": str(path), "kind": "text", "line_offset": start, "line_count": len(lines), "returned_lines": min(limit, len(lines) - start)},
+            text=formatted,
+            data={
+                "path": str(path),
+                "kind": "text",
+                "line_offset": start,
+                "line_count": len(lines),
+                "returned_lines": len(window),
+                "next_line_offset": next_line_offset if next_line_offset < len(lines) else None,
+                "truncated": next_line_offset < len(lines),
+                "line_truncated_count": truncated_lines,
+            },
         )
 
-    offset = int(arguments.get("offset", 0))
-    limit = int(arguments.get("limit", MAX_READ_CHARS))
+    offset = max(0, _optional_int(arguments.get("offset"), 0))
+    limit = _bounded_int(arguments.get("limit"), MAX_READ_CHARS, 0, MAX_READ_CHARS)
     chunk = text[offset : offset + limit]
-    return ToolResult(text=chunk, data={"path": str(path), "kind": "text", "offset": offset, "total_chars": len(text)})
+    next_offset = offset + len(chunk)
+    truncated = next_offset < len(text)
+    if truncated:
+        chunk += f"\n[... omitted {len(text) - next_offset} chars. Continue with offset={next_offset}.]"
+    return ToolResult(
+        text=chunk,
+        data={
+            "path": str(path),
+            "kind": "text",
+            "offset": offset,
+            "returned_chars": len(text[offset : offset + limit]),
+            "total_chars": len(text),
+            "next_offset": next_offset if truncated else None,
+            "truncated": truncated,
+        },
+    )
 
 
 def write_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -203,26 +203,46 @@ def glob_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     root = _resolve(ctx, str(arguments.get("root", ".")))
     if not root.exists():
         raise FileNotFoundError(_missing_path_message(root))
-    limit = int(arguments.get("limit", 200))
+    limit = _bounded_int(arguments.get("limit"), 200, 1, MAX_GLOB_RESULTS)
     recursive = bool(arguments.get("recursive", True))
+    rg_result = _glob_with_rg(root=root, pattern=pattern, recursive=recursive, limit=limit)
+    if rg_result is not None:
+        return rg_result
+
+    all_matches: List[Path]
     if root.is_file():
         matches = [root] if fnmatch.fnmatch(root.name, pattern) else []
+        all_matches = matches
     else:
         iterator = root.rglob(pattern) if recursive else root.glob(pattern)
-        matches = sorted(
-            [path for path in iterator if path.exists()],
+        all_matches = sorted(
+            [path for path in iterator if path.is_file() and not _is_ignored_path(path, root)],
             key=lambda path: (path.stat().st_mtime if path.exists() else 0),
             reverse=True,
-        )[:limit]
+        )
+        matches = all_matches[:limit]
+    truncated = root.is_dir() and len(all_matches) > len(matches)
     text = "\n".join(str(path) for path in matches)
-    return ToolResult(text=text, data={"root": str(root), "pattern": pattern, "count": len(matches), "recursive": recursive})
+    if truncated:
+        text += f"\n[... omitted {len(all_matches) - len(matches)} matches. Narrow pattern or increase limit.]"
+    return ToolResult(
+        text=text,
+        data={
+            "root": str(root),
+            "pattern": pattern,
+            "count": len(matches),
+            "recursive": recursive,
+            "engine": "python",
+            "truncated": truncated,
+        },
+    )
 
 
 def grep_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     pattern = str(arguments["pattern"])
     root = _resolve(ctx, str(arguments.get("root", ".")))
     include = str(arguments.get("include", "*"))
-    limit = int(arguments.get("limit", 200))
+    limit = _bounded_int(arguments.get("limit"), 200, 1, MAX_GREP_RESULTS)
     if not root.exists():
         raise FileNotFoundError(_missing_path_message(root))
     rg_result = _grep_with_rg(pattern=pattern, root=root, include=include, limit=limit)
@@ -241,62 +261,16 @@ def grep_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             if pattern in line:
-                lines.append(f"{path}:{lineno}:{line}")
+                lines.append(f"{path}:{lineno}:{_truncate_line(line)}")
                 if len(lines) >= limit:
                     break
-    return ToolResult(text="\n".join(lines), data={"root": str(root), "pattern": pattern, "count": len(lines), "engine": "python"})
-
-
-def repo_map(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
-    root = _resolve(ctx, str(arguments.get("root", ".")))
-    if not root.exists():
-        raise FileNotFoundError(_missing_path_message(root))
-    if root.is_file():
-        root = root.parent
-
-    scan_limit = _bounded_int(arguments.get("scan_limit"), DEFAULT_REPO_MAP_SCAN, 1, MAX_REPO_MAP_SCAN)
-    section_limit = _bounded_int(arguments.get("limit"), DEFAULT_REPO_MAP_LIMIT, 1, MAX_REPO_MAP_LIMIT)
-    files, truncated = _repo_file_list(root, scan_limit)
-    git_root = _git_root(root)
-    top_level = _top_level_entries(root, section_limit)
-    manifests = _select_known_files(files, _REPO_MAP_MANIFEST_NAMES, section_limit)
-    docs = _select_known_files(files, _REPO_MAP_DOC_NAMES, section_limit)
-    source_roots = _source_roots(files, section_limit)
-    entrypoints = _entrypoint_files(files, section_limit)
-    tests = _test_files(files, section_limit)
-    suggested_next_reads = _suggested_next_reads(docs, manifests, entrypoints, tests, source_roots, section_limit)
-
-    lines = [
-        f"Repository map for {root}",
-        f"Git root: {git_root or 'not detected'}",
-        f"Scanned files: {len(files)}" + (" (truncated)" if truncated else ""),
-    ]
-    lines.extend(_format_repo_map_section("Top-level entries", top_level))
-    lines.extend(_format_repo_map_section("Docs", docs))
-    lines.extend(_format_repo_map_section("Manifests", manifests))
-    lines.extend(_format_repo_map_section("Source roots", [f"{item['path']} ({item['files']} files)" for item in source_roots]))
-    lines.extend(_format_repo_map_section("Likely entrypoints", entrypoints))
-    lines.extend(_format_repo_map_section("Likely tests", tests))
-    lines.extend(_format_repo_map_section("Suggested next reads", suggested_next_reads))
+    truncated = len(lines) >= limit
+    text = "\n".join(lines)
     if truncated:
-        lines.append("Scan truncated; pass a larger scan_limit or use glob/grep for targeted follow-up.")
-
+        text += "\n[... omitted matches. Narrow pattern or increase limit.]"
     return ToolResult(
-        text="\n".join(lines),
-        data={
-            "root": str(root),
-            "git_root": git_root,
-            "scanned_files": len(files),
-            "scan_limit": scan_limit,
-            "truncated": truncated,
-            "top_level": top_level,
-            "docs": docs,
-            "manifests": manifests,
-            "source_roots": source_roots,
-            "entrypoints": entrypoints,
-            "tests": tests,
-            "suggested_next_reads": suggested_next_reads,
-        },
+        text=text,
+        data={"root": str(root), "pattern": pattern, "count": len(lines), "engine": "python", "truncated": truncated},
     )
 
 
@@ -394,184 +368,138 @@ def _grep_with_rg(pattern: str, root: Path, include: str, limit: int) -> Optiona
         "--line-number",
         "--fixed-strings",
         "--color=never",
+        "--max-columns",
+        str(MAX_LINE_LENGTH),
+        "--max-columns-preview",
         "--glob",
         include,
-        "--",
-        pattern,
-        str(root),
     ]
+    for ignored in _ignored_rg_globs():
+        command.extend(["--glob", ignored])
+    command.extend(
+        [
+            "--",
+            pattern,
+            str(root),
+        ]
+    )
     result = subprocess.run(command, text=True, capture_output=True, timeout=30)
     if result.returncode not in {0, 1}:
         return None
-    lines = result.stdout.splitlines()[:limit]
+    all_lines = result.stdout.splitlines()
+    lines = all_lines[:limit]
+    truncated = len(all_lines) > len(lines)
     text = "\n".join(lines)
     if len(text) > MAX_SEARCH_OUTPUT:
         text = _cap(text, MAX_SEARCH_OUTPUT)
-    return ToolResult(text=text, data={"root": str(root), "pattern": pattern, "count": len(lines), "engine": "rg"})
+        truncated = True
+    if truncated:
+        text += "\n[... omitted matches. Narrow pattern or increase limit.]"
+    return ToolResult(
+        text=text,
+        data={"root": str(root), "pattern": pattern, "count": len(lines), "engine": "rg", "truncated": truncated},
+    )
+
+
+def _glob_with_rg(root: Path, pattern: str, recursive: bool, limit: int) -> Optional[ToolResult]:
+    if shutil.which("rg") is None or root.is_file():
+        return None
+    command = ["rg", "--files", "--color=never", "--glob", pattern]
+    for ignored in _ignored_rg_globs():
+        command.extend(["--glob", ignored])
+    try:
+        result = subprocess.run(command, cwd=str(root), text=True, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode not in {0, 1}:
+        return None
+
+    all_matches: List[Path] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        relative = Path(line)
+        if not recursive and len(relative.parts) > 1:
+            continue
+        path = (root / relative).resolve()
+        if path.is_file() and not _is_ignored_path(path, root):
+            all_matches.append(path)
+    all_matches.sort(key=lambda path: (path.stat().st_mtime if path.exists() else 0), reverse=True)
+    matches = all_matches[:limit]
+    truncated = len(all_matches) > len(matches)
+    text = "\n".join(str(path) for path in matches)
+    if truncated:
+        text += f"\n[... omitted {len(all_matches) - len(matches)} matches. Narrow pattern or increase limit.]"
+    return ToolResult(
+        text=text,
+        data={
+            "root": str(root),
+            "pattern": pattern,
+            "count": len(matches),
+            "recursive": recursive,
+            "engine": "rg",
+            "truncated": truncated,
+        },
+    )
 
 
 def _iter_files(root: Path, include: str) -> Iterable[Path]:
     if root.is_file():
-        yield root
+        if not _is_ignored_path(root, root.parent):
+            yield root
         return
     for path in sorted(root.rglob("*")):
-        if path.is_file() and fnmatch.fnmatch(path.name, include):
+        if path.is_file() and fnmatch.fnmatch(path.name, include) and not _is_ignored_path(path, root):
             yield path
 
 
-def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+def _optional_int(value: Any, default: int) -> int:
     try:
-        number = int(value)
+        return int(value)
     except (TypeError, ValueError):
-        number = default
-    return min(max(number, minimum), maximum)
+        return default
 
 
-def _repo_file_list(root: Path, limit: int) -> Tuple[List[str], bool]:
-    files: List[str] = []
-    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _: None):
-        dirnames[:] = sorted((name for name in dirnames if not _repo_map_ignored_dir(name)), key=str.lower)
-        for filename in sorted(filenames, key=str.lower):
-            if len(files) >= limit:
-                return files, True
-            path = Path(dirpath) / filename
-            try:
-                rel_path = path.relative_to(root).as_posix()
-            except ValueError:
-                continue
-            files.append(rel_path)
-    return files, False
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    return min(max(_optional_int(value, default), minimum), maximum)
 
 
-def _repo_map_ignored_dir(name: str) -> bool:
-    return name in _REPO_MAP_IGNORED_DIRS or name.endswith(".egg-info")
+def _numbered_lines(lines: List[str], start: int) -> Tuple[str, int]:
+    formatted: List[str] = []
+    truncated = 0
+    for index, line in enumerate(lines, start=start + 1):
+        display = _truncate_line(line)
+        if len(display) < len(line):
+            truncated += 1
+        formatted.append(f"L{index}: {display}")
+    return "\n".join(formatted), truncated
 
 
-def _git_root(root: Path) -> Optional[str]:
+def _truncate_line(line: str) -> str:
+    if len(line) <= MAX_LINE_LENGTH:
+        return line
+    return line[:MAX_LINE_LENGTH]
+
+
+def _is_ignored_path(path: Path, root: Path) -> bool:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(root),
-            text=True,
-            capture_output=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+    parts = relative.parts
+    container_parts = parts[:-1] if path.is_file() else parts
+    for part in container_parts:
+        if part in _IGNORED_DIR_NAMES or part.endswith(".egg-info") or part.endswith(".dist-info"):
+            return True
+    return path.name in _IGNORED_FILE_NAMES or path.suffix in _IGNORED_SUFFIXES
 
 
-def _top_level_entries(root: Path, limit: int) -> List[str]:
-    entries: List[str] = []
-    try:
-        children = sorted(root.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
-    except OSError:
-        return entries
-    for child in children:
-        if child.is_dir() and _repo_map_ignored_dir(child.name):
-            continue
-        entries.append(child.name + ("/" if child.is_dir() else ""))
-        if len(entries) >= limit:
-            break
-    return entries
-
-
-def _select_known_files(files: List[str], names: set[str], limit: int) -> List[str]:
-    matches = [path for path in files if _basename(path).lower() in names]
-    return sorted(matches, key=_repo_map_path_sort_key)[:limit]
-
-
-def _source_roots(files: List[str], limit: int) -> List[Dict[str, Any]]:
-    counts: Dict[str, int] = {}
-    for path in files:
-        parts = path.split("/")
-        if not parts:
-            continue
-        first = parts[0]
-        first_lower = first.lower()
-        root_name: Optional[str] = None
-        if first_lower in _REPO_MAP_WORKSPACE_ROOT_NAMES and len(parts) > 1:
-            root_name = f"{first}/{parts[1]}"
-        elif first_lower in _REPO_MAP_SOURCE_ROOT_NAMES:
-            root_name = first
-        if root_name is not None:
-            counts[root_name] = counts.get(root_name, 0) + 1
-    return [
-        {"path": path, "files": counts[path]}
-        for path in sorted(counts, key=lambda item: (-counts[item], item.lower()))[:limit]
-    ]
-
-
-def _entrypoint_files(files: List[str], limit: int) -> List[str]:
-    matches = [path for path in files if _basename(path).lower() in _REPO_MAP_ENTRYPOINT_NAMES]
-    return sorted(matches, key=_entrypoint_sort_key)[:limit]
-
-
-def _test_files(files: List[str], limit: int) -> List[str]:
-    matches = []
-    for path in files:
-        basename = _basename(path).lower()
-        parts = [part.lower() for part in path.split("/")]
-        if (
-            "tests" in parts
-            or "test" in parts
-            or basename.startswith("test_")
-            or basename.endswith("_test.py")
-            or ".spec." in basename
-            or ".test." in basename
-        ):
-            matches.append(path)
-    return sorted(matches, key=_repo_map_path_sort_key)[:limit]
-
-
-def _suggested_next_reads(
-    docs: List[str],
-    manifests: List[str],
-    entrypoints: List[str],
-    tests: List[str],
-    source_roots: List[Dict[str, Any]],
-    limit: int,
-) -> List[str]:
-    candidates: List[str] = []
-    candidates.extend(docs)
-    candidates.extend(manifests)
-    candidates.extend(entrypoints[:8])
-    candidates.extend(item["path"] for item in source_roots[:8])
-    candidates.extend(tests[:5])
-    return _dedupe(candidates)[:limit]
-
-
-def _format_repo_map_section(title: str, values: List[str]) -> List[str]:
-    if not values:
-        return [f"{title}: none"]
-    return [f"{title}:"] + [f"  - {value}" for value in values]
-
-
-def _basename(path: str) -> str:
-    return path.rsplit("/", 1)[-1]
-
-
-def _repo_map_path_sort_key(path: str) -> Tuple[int, str]:
-    return (path.count("/"), path.lower())
-
-
-def _entrypoint_sort_key(path: str) -> Tuple[int, int, str]:
-    basename = _basename(path).lower()
-    priority = 0 if basename in {"main.py", "cli.py", "app.py", "server.py", "index.ts", "index.tsx"} else 1
-    return (priority, path.count("/"), path.lower())
-
-
-def _dedupe(values: Iterable[str]) -> List[str]:
-    result: List[str] = []
-    seen = set()
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
+def _ignored_rg_globs() -> List[str]:
+    globs = [f"!**/{name}/**" for name in sorted(_IGNORED_DIR_NAMES)]
+    globs.extend(f"!**/*{suffix}" for suffix in sorted(_IGNORED_SUFFIXES))
+    globs.extend(f"!**/{name}" for name in sorted(_IGNORED_FILE_NAMES))
+    globs.extend(["!**/*.egg-info/**", "!**/*.dist-info/**"])
+    return globs
 
 
 def _missing_path_message(path: Path) -> str:

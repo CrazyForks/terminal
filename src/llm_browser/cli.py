@@ -12,7 +12,16 @@ from typing import Any, Dict, Optional, Sequence
 
 from llm_browser.agent import Agent
 from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
-from llm_browser.config import config_get, example_config, load_config, redacted_config, write_default_config
+from llm_browser.config import (
+    apply_config_environment,
+    config_get,
+    example_config,
+    load_config,
+    redacted_config,
+    writable_config_path,
+    write_config_value,
+    write_default_config,
+)
 from llm_browser.datasets import (
     build_dataset_prompt,
     dataset_summary,
@@ -28,7 +37,7 @@ from llm_browser.session.store import SessionStore
 
 DATASET_TIMEOUT_DRAIN_S = 10.0
 MAX_INLINE_DATASET_RESULT = 20_000
-BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "daemon"]
+BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "remote", "daemon"]
 
 
 def add_browser_runtime_args(
@@ -264,8 +273,8 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     datasets_report.set_defaults(func=cmd_datasets_report)
 
     tui = sub.add_parser("tui", help="Start the terminal UI.")
-    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "fake"))
-    tui.add_argument("--model", default=_model_default(config, None))
+    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    tui.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     tui.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     add_browser_runtime_args(tui, headless_default=None, config=config)
     tui.set_defaults(func=cmd_tui)
@@ -275,6 +284,11 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
 
     config_show = config_sub.add_parser("show", help="Print merged redacted config.")
     config_show.set_defaults(func=cmd_config_show)
+
+    config_set = config_sub.add_parser("set", help="Persist one config value.")
+    config_set.add_argument("key", help="Dotted config key, e.g. browser.cloud_api_key.")
+    config_set.add_argument("value", help="Value to save.")
+    config_set.set_defaults(func=cmd_config_set)
 
     config_init = config_sub.add_parser("init", help="Write an example JSON config.")
     config_init.add_argument("--path", default=str(Path.home() / ".browser-use-terminal" / "config.json"))
@@ -542,11 +556,26 @@ def cmd_datasets_report(args: argparse.Namespace) -> int:
 def cmd_config_show(args: argparse.Namespace) -> int:
     config = getattr(args, "loaded_config", {})
     payload = {
+        "path": str(getattr(args, "loaded_config_path", writable_config_path())),
         "config": redacted_config(config),
         "example": example_config() if not config else None,
     }
     print(json.dumps(payload, indent=2))
     return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    path, config = write_config_value(args.key, _parse_config_value(args.value), path=getattr(args, "loaded_config_path", None))
+    apply_config_environment(config, override=True)
+    print(json.dumps({"ok": True, "path": str(path), "config": redacted_config(config)}, indent=2))
+    return 0
+
+
+def _parse_config_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
 
 
 def cmd_config_init(args: argparse.Namespace) -> int:
@@ -571,6 +600,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         provider_label=args.provider,
         model_label=args.model,
         config=getattr(args, "loaded_config", {}),
+        config_path=getattr(args, "loaded_config_path", None),
     ).run()
 
 
@@ -837,10 +867,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pre.add_argument("--config", default=None)
     pre_args, _ = pre.parse_known_args(argv)
     config = load_config(pre_args.config)
+    apply_config_environment(config)
     parser = build_parser(config=config)
     args = parser.parse_args(argv)
     args.loaded_config = config
+    args.loaded_config_path = writable_config_path(pre_args.config)
     return int(args.func(args))
+
+
+def tui_main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    global_args: list[str] = []
+    tui_args: list[str] = []
+    index = 0
+    argv = list(argv)
+    while index < len(argv):
+        arg = argv[index]
+        if arg in {"--config", "--state-dir"} and index + 1 < len(argv):
+            global_args.extend([arg, argv[index + 1]])
+            index += 2
+            continue
+        if arg.startswith("--config=") or arg.startswith("--state-dir="):
+            global_args.append(arg)
+            index += 1
+            continue
+        tui_args.append(arg)
+        index += 1
+    return main([*global_args, "tui", *tui_args])
 
 
 if __name__ == "__main__":

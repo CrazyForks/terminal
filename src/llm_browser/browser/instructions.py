@@ -9,7 +9,9 @@ Default workflow:
 - Prefer compositor-level interaction first: click_at_xy(x, y), press_key(...), type_text(...), fill_input(...) for framework inputs. Coordinate clicks work through iframes, shadow DOM, and cross-origin content.
 - Use raw CDP whenever a helper is too narrow: cdp("Page.navigate", url="..."), cdp("Input.dispatchMouseEvent", ...), cdp("Runtime.evaluate", ...).
 - Use js(...) for targeted inspection/extraction. Do not dump the whole DOM by default; extract the smallest text/data/geometry needed.
-- For open-ended repository/codebase questions, call repo_map first, then use targeted read/grep calls. Avoid broad recursive file dumps.
+- For repository/codebase questions, explore automatically before answering: start with bounded shell calls for pwd, git status --short, and rg --files; then read obvious docs/manifests and use targeted rg/read calls.
+- Keep codebase exploration focused. For a broad repo overview, do a shallow pass only: docs/manifests plus a few core files. Go deeper only when the user asks about implementation details, a specific feature, or code changes.
+- Avoid broad glob("*"), find, ls -R, tree, cat on large files, or recursive dumps. Read specific files or line windows, and inspect key implementation paths before summarizing.
 - After navigation or form submits, use wait_for_load() and/or wait_for_network_idle(), then attach a screenshot to verify the actual state.
 - If the current tab is blank/internal/stale, call ensure_real_tab(), list_tabs(), switch_tab(...), or new_tab(...).
 - Native dialogs freeze page JS. Check page_info() or pending_dialog() and handle the dialog before continuing.
@@ -28,4 +30,5 @@ BROWSER_HELP_PLAYBOOK = """Operating playbook:
   4. use raw cdp(...) as the escape hatch instead of waiting for a new tool
   5. use js(...) only for targeted data/geometry; avoid whole-DOM dumps
   6. put reusable routines in agent_helpers.py and reload_agent_helpers()
+  7. for codebase questions, use shell/read with rg --files, docs/manifests, targeted rg, and bounded line-window reads; keep broad overviews shallow
 """

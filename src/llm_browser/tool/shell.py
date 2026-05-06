@@ -68,6 +68,9 @@ class ManagedProcess:
 def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     command = str(arguments["command"])
     timeout_s = float(arguments.get("timeout_s", 60))
+    workdir = _resolve_workdir(ctx, arguments)
+    max_output_chars = _max_output_chars(arguments, MAX_INLINE_OUTPUT)
+    started_at = time.time()
     deadline = time.time() + timeout_s
     output: list[tuple[str, str]] = []
     pending: list[tuple[str, str]] = []
@@ -75,7 +78,7 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     process = subprocess.Popen(
         command,
         shell=True,
-        cwd=str(ctx.session.cwd),
+        cwd=str(workdir),
         text=True,
         bufsize=1,
         stdout=subprocess.PIPE,
@@ -101,23 +104,26 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
             _finish_readers(readers, chunks, output, pending)
             _emit_pending(ctx, pending)
             combined_cancel = _combine_ordered(output)
-            return ToolResult(
-                text=combined_cancel,
-                data={"returncode": process.returncode, "cancelled": True, "truncated": False},
+            return _tool_result_from_output(
+                ctx,
+                combined_cancel,
+                process.returncode,
+                duration_s=time.time() - started_at,
+                max_chars=max_output_chars,
+                extra_data={"cancelled": True},
             )
         if time.time() >= deadline:
             _kill_process_group(process, timeout=2)
             _finish_readers(readers, chunks, output, pending)
             _emit_pending(ctx, pending)
             combined_timeout = _combine_ordered(output)
-            return ToolResult(
-                text=combined_timeout,
-                data={
-                    "returncode": process.returncode,
-                    "timeout_s": timeout_s,
-                    "timed_out": True,
-                    "truncated": False,
-                },
+            return _tool_result_from_output(
+                ctx,
+                f"command timed out after {timeout_s:.1f} seconds\n{combined_timeout}",
+                process.returncode,
+                duration_s=time.time() - started_at,
+                max_chars=max_output_chars,
+                extra_data={"timeout_s": timeout_s, "timed_out": True},
             )
         time.sleep(0.1)
 
@@ -125,13 +131,20 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     _finish_readers(readers, chunks, output, pending)
     _emit_pending(ctx, pending)
     combined = _combine_ordered(output)
-    return _tool_result_from_output(ctx, combined, process.returncode)
+    return _tool_result_from_output(
+        ctx,
+        combined,
+        process.returncode,
+        duration_s=time.time() - started_at,
+        max_chars=max_output_chars,
+    )
 
 
 def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     command = str(arguments["command"])
     timeout_s = float(arguments.get("timeout_s", 0))
     use_pty = bool(arguments.get("pty", False))
+    workdir = _resolve_workdir(ctx, arguments)
     master_fd: int | None = None
     if use_pty:
         master_fd, slave_fd = pty.openpty()
@@ -139,7 +152,7 @@ def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
             process = subprocess.Popen(
                 command,
                 shell=True,
-                cwd=str(ctx.session.cwd),
+                cwd=str(workdir),
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -152,7 +165,7 @@ def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
         process = subprocess.Popen(
             command,
             shell=True,
-            cwd=str(ctx.session.cwd),
+            cwd=str(workdir),
             text=True,
             bufsize=1,
             stdin=subprocess.PIPE,
@@ -182,6 +195,7 @@ def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 def shell_poll(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     process_id = str(arguments["process_id"])
     all_output = bool(arguments.get("all", False))
+    max_output_chars = _max_output_chars(arguments, MAX_POLL_OUTPUT)
     managed = _get_process(ctx, process_id)
     _enforce_managed_timeout(managed)
     text = managed.read(all_output=all_output)
@@ -190,7 +204,7 @@ def shell_poll(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     status = managed.status()
     if not status["running"]:
         _finish_managed(managed)
-    return ToolResult(text=_cap(text, MAX_POLL_OUTPUT), data=status)
+    return ToolResult(text=_cap(text, max_output_chars), data={**status, "truncated": len(text) > max_output_chars})
 
 
 def shell_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -211,13 +225,14 @@ def shell_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 
 def shell_stop(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     process_id = str(arguments["process_id"])
+    max_output_chars = _max_output_chars(arguments, MAX_POLL_OUTPUT)
     managed = _get_process(ctx, process_id)
     _terminate_process_group(managed.process, timeout=2)
     _finish_managed(managed)
     text = managed.read(all_output=True)
     with _PROCESS_LOCK:
         _PROCESSES.pop(process_id, None)
-    return ToolResult(text=_cap(text, MAX_POLL_OUTPUT), data={**managed.status(), "stopped": True})
+    return ToolResult(text=_cap(text, max_output_chars), data={**managed.status(), "stopped": True, "truncated": len(text) > max_output_chars})
 
 
 def close_shell_session(session_id: str) -> None:
@@ -381,20 +396,69 @@ def _combine_ordered(chunks: list[tuple[str, str]]) -> str:
     return "".join(text for _, text in chunks)
 
 
-def _tool_result_from_output(ctx: ToolContext, combined: str, returncode: int) -> ToolResult:
+def _tool_result_from_output(
+    ctx: ToolContext,
+    combined: str,
+    returncode: Optional[int],
+    duration_s: Optional[float] = None,
+    max_chars: int = MAX_INLINE_OUTPUT,
+    extra_data: Optional[Dict[str, Any]] = None,
+) -> ToolResult:
     data: Dict[str, Any] = {"returncode": returncode}
-    if len(combined) > MAX_INLINE_OUTPUT:
+    if duration_s is not None:
+        data["duration_s"] = duration_s
+    if extra_data:
+        data.update(extra_data)
+    if len(combined) > max_chars:
         output_dir = ctx.session.artifact_dir / "tool-output"
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"{ctx.tool_call_id}_{ctx.tool_name}.txt"
         path.write_text(combined, encoding="utf-8")
-        text = combined[:MAX_INLINE_OUTPUT] + f"\n\n[full output saved to {path}]"
+        body = _cap(combined, max_chars) + f"\n\n[full output saved to {path}]"
         data["output_path"] = str(path)
         data["truncated"] = True
     else:
-        text = combined
+        body = combined
         data["truncated"] = False
+    sections = []
+    if duration_s is not None:
+        sections.append(f"Wall time: {duration_s:.4f} seconds")
+    if returncode is not None:
+        sections.append(f"Process exited with code {returncode}")
+    sections.append("Output:")
+    sections.append(body)
+    text = "\n".join(sections)
     return ToolResult(text=text, data=data)
+
+
+def _resolve_workdir(ctx: ToolContext, arguments: Dict[str, Any]) -> str:
+    value = arguments.get("workdir")
+    if value in {None, ""}:
+        return str(ctx.session.cwd)
+    candidate = os.path.expanduser(str(value))
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(str(ctx.session.cwd), candidate)
+    path = os.path.realpath(candidate)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"workdir not found or not a directory: {path}")
+    return path
+
+
+def _max_output_chars(arguments: Dict[str, Any], default: int) -> int:
+    if "max_output_chars" in arguments:
+        value = arguments.get("max_output_chars")
+    elif "max_output_tokens" in arguments:
+        try:
+            value = int(arguments.get("max_output_tokens", 0)) * 4
+        except (TypeError, ValueError):
+            value = default
+    else:
+        value = default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(max(number, 1000), 200000)
 
 
 def _cap(text: str, max_chars: int) -> str:

@@ -7,15 +7,7 @@ from pathlib import Path
 
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import (
-    apply_patch_file,
-    edit_file,
-    glob_files,
-    grep_files,
-    read_file,
-    repo_map,
-    write_file,
-)
+from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
 from llm_browser.tool.shell import shell, shell_poll, shell_start, shell_stdin, shell_stop
 
 
@@ -53,28 +45,65 @@ class ShellFileToolsTest(unittest.TestCase):
             lines = read_file(ctx, {"path": "lines.txt", "line_offset": 1, "line_limit": 1})
             binary = read_file(ctx, {"path": "blob.bin"})
 
-            self.assertEqual(lines.text, "b\n")
+            self.assertEqual(lines.text, "L2: b")
+            self.assertEqual(lines.data["next_line_offset"], 2)
             self.assertTrue(binary.data["binary"])
 
-    def test_repo_map_summarizes_without_reading_file_contents(self) -> None:
+    def test_read_file_prefers_char_window_when_zero_line_window_is_accidental(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self.make_context(tmp)
-            write_file(ctx, {"path": "README.md", "content": "secret implementation detail\n"})
-            write_file(ctx, {"path": "pyproject.toml", "content": "[project]\nname = 'demo'\n"})
-            write_file(ctx, {"path": "src/demo/cli.py", "content": "def main():\n    pass\n"})
-            write_file(ctx, {"path": "tests/test_cli.py", "content": "def test_cli():\n    pass\n"})
-            write_file(ctx, {"path": "node_modules/pkg/index.js", "content": "ignored\n"})
+            write_file(ctx, {"path": "letters.txt", "content": "abcdef\nsecond\n"})
 
-            result = repo_map(ctx, {"root": ".", "scan_limit": 100, "limit": 10})
+            result = read_file(
+                ctx,
+                {"path": "letters.txt", "offset": 0, "limit": 3, "line_offset": 0, "line_limit": 0},
+            )
 
-            self.assertIn("Repository map for", result.text)
-            self.assertIn("README.md", result.text)
-            self.assertIn("pyproject.toml", result.data["manifests"])
-            self.assertIn("src/demo/cli.py", result.data["entrypoints"])
-            self.assertIn("tests/test_cli.py", result.data["tests"])
-            self.assertEqual(result.data["source_roots"][0]["path"], "src")
-            self.assertNotIn("secret implementation detail", result.text)
-            self.assertNotIn("node_modules/pkg/index.js", result.text)
+            self.assertTrue(result.text.startswith("abc"))
+            self.assertEqual(result.data["returned_chars"], 3)
+
+    def test_glob_and_grep_skip_common_generated_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "src/app.py", "content": "needle = True\n"})
+            write_file(ctx, {"path": "node_modules/pkg/skip.py", "content": "needle = False\n"})
+            write_file(ctx, {"path": "__pycache__/skip.py", "content": "needle = False\n"})
+
+            globbed = glob_files(ctx, {"root": ".", "pattern": "*.py"})
+            grepped = grep_files(ctx, {"root": ".", "pattern": "needle", "include": "*.py"})
+            listed = read_file(ctx, {"path": "."})
+
+            self.assertIn("src/app.py", globbed.text)
+            self.assertNotIn("node_modules", globbed.text)
+            self.assertNotIn("__pycache__", globbed.text)
+            self.assertIn("src/app.py", grepped.text)
+            self.assertNotIn("node_modules", grepped.text)
+            self.assertNotIn("__pycache__", grepped.text)
+            self.assertNotIn("node_modules", listed.text)
+            self.assertNotIn("__pycache__", listed.text)
+
+    def test_glob_uses_rg_files_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "src/app.py", "content": "print('ok')\n"})
+            write_file(ctx, {"path": "src/readme.md", "content": "docs\n"})
+
+            result = glob_files(ctx, {"root": ".", "pattern": "*.py"})
+
+            self.assertIn("src/app.py", result.text)
+            self.assertNotIn("src/readme.md", result.text)
+            self.assertIn(result.data["engine"], {"rg", "python"})
+
+    def test_glob_non_recursive_only_returns_top_level_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "top.py", "content": "print('top')\n"})
+            write_file(ctx, {"path": "src/app.py", "content": "print('nested')\n"})
+
+            result = glob_files(ctx, {"root": ".", "pattern": "*.py", "recursive": False})
+
+            self.assertIn("top.py", result.text)
+            self.assertNotIn("src/app.py", result.text)
 
     def test_edit_preserves_utf8_bom_and_crlf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,12 +120,15 @@ class ShellFileToolsTest(unittest.TestCase):
     def test_shell_runs_in_session_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self.make_context(tmp)
+            (ctx.session.cwd / "notes").mkdir()
 
             result = shell(ctx, {"command": "pwd && printf hello", "timeout_s": 5})
+            workdir_result = shell(ctx, {"command": "pwd", "workdir": str(ctx.session.cwd / "notes"), "timeout_s": 5})
 
             self.assertEqual(result.data["returncode"], 0)
             self.assertIn(str(ctx.session.cwd), result.text)
             self.assertIn("hello", result.text)
+            self.assertIn(str(ctx.session.cwd / "notes"), workdir_result.text)
 
     def test_shell_streams_output_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

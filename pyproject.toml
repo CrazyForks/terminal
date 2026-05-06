@@ -23,7 +23,8 @@ dependencies = [
 
 [project.scripts]
 browser-use-terminal = "llm_browser.cli:main"
-but = "llm_browser.cli:main"
+but = "llm_browser.cli:tui_main"
+browser-use-terminal-ui = "llm_browser.cli:tui_main"
 llm-browser = "llm_browser.cli:main"
 
 [tool.setuptools.packages.find]

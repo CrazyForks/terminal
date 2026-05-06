@@ -9,22 +9,23 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from rich.align import Align
 from rich.markup import escape
+from rich.markdown import Markdown
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Input, RichLog, Static
+from textual.widgets import DataTable, Input, RichLog, Static, TextArea
 
 from llm_browser.agent import SessionManager
 from llm_browser.browser import browser_runtime_diagnostics
 from llm_browser.brand import PRODUCT_NAME
-from llm_browser.config import redacted_config
+from llm_browser.config import apply_config_environment, redacted_config, write_config_values
 from llm_browser.datasets import build_dataset_prompt, load_dataset, load_manifest, select_tasks, summarize_manifest
 from llm_browser.events import Event
 from llm_browser.provider.base import Provider
@@ -49,8 +50,61 @@ COMMAND_PALETTE: list[tuple[str, str, str]] = [
     ("Refresh", "refresh", "Reload sessions and artifacts"),
     ("Clear transcript", "clear", "Clear the visible transcript"),
     ("Browser config", "browser", "Show browser runtime details"),
+    ("Browser mode", "browser-mode", "Choose auto, chromium, real, or remote browser"),
     ("Auth status", "auth", "Show provider authentication status"),
     ("Config", "config", "Show redacted app configuration"),
+]
+
+
+SLASH_COMMANDS: list[tuple[str, str, str]] = [
+    ("model", "model", "Select model"),
+    ("provider", "provider", "Connect provider"),
+    ("browser", "browser", "Select browser backend"),
+    ("settings", "settings", "Open settings"),
+    ("help", "help", "Help"),
+    ("sessions", "sessions", "Switch session"),
+    ("new", "new", "Start a new task"),
+    ("resume", "resume", "Continue selected session"),
+    ("cancel", "cancel", "Interrupt selected session"),
+    ("clear", "clear", "Clear transcript"),
+    ("refresh", "refresh", "Reload sessions and artifacts"),
+    ("trace", "trace", "Write trace artifact"),
+    ("eval", "eval", "Start self-evaluation session"),
+    ("report", "report", "Summarize selected dataset run"),
+    ("open", "open", "Open selected artifact"),
+    ("auth", "auth", "Show auth status"),
+    ("config", "config", "Show redacted config"),
+    ("set", "set ", "Persist a setting"),
+    ("dataset", "dataset ", "Run dataset task"),
+    ("run", "run ", "Run a new task"),
+    ("exit", "exit", "Exit the app"),
+]
+
+
+BROWSER_MODE_PALETTE: list[tuple[str, str, str]] = [
+    ("Auto", "browser auto", "Use the configured default browser backend"),
+    ("Chromium", "browser chromium", "Launch a local Chromium instance"),
+    ("Real Chrome", "browser real", "Attach to a running desktop Chrome/Edge/Brave browser"),
+    ("Remote", "browser remote", "Use a Browser Use cloud browser"),
+    ("CDP", "browser cdp", "Attach to a DevTools endpoint from env or CLI config"),
+]
+
+
+PROVIDER_PALETTE: list[tuple[str, str, str]] = [
+    ("Codex", "provider codex", "Use Codex subscription auth"),
+    ("OpenAI", "provider openai", "Use OpenAI API key"),
+    ("Fake", "provider fake", "Use deterministic local fake provider"),
+]
+
+
+MODEL_PALETTE: list[tuple[str, str, str]] = [
+    ("GPT-5.5", "model gpt-5.5", "Frontier model"),
+    ("GPT-5.4", "model gpt-5.4", "Strong everyday model"),
+    ("GPT-5.4 Mini", "model gpt-5.4-mini", "Fast small model"),
+    ("GPT-5.3 Codex", "model gpt-5.3-codex", "Coding-optimized model"),
+    ("GPT-5.3 Codex Spark", "model gpt-5.3-codex-spark", "Fast coding model"),
+    ("GPT-5.2", "model gpt-5.2", "Long-running professional work"),
+    ("Custom", "model ", "Type a custom model id"),
 ]
 
 
@@ -121,6 +175,49 @@ class ModalFilterInput(Input):
         handler()
 
 
+class ComposerInput(TextArea):
+    def on_key(self, event: events.Key) -> None:
+        if not getattr(self.app, "_slash_panel_visible", lambda: False)():
+            if event.key == "q" and not self.text:
+                event.prevent_default()
+                event.stop()
+                self.app.exit()
+            elif event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.app.submit_composer()
+            elif event.key in {"shift+enter", "alt+enter", "ctrl+enter", "cmd+enter", "ctrl+j"}:
+                event.prevent_default()
+                event.stop()
+                self.insert("\n")
+                self.app.resize_composer()
+            return
+        key = event.key
+        action = None
+        if key in {"escape", "ctrl+c"}:
+            action = "hide_slash_panel"
+        elif key in {"up", "ctrl+p"}:
+            action = "slash_cursor_up"
+        elif key in {"down", "ctrl+n"}:
+            action = "slash_cursor_down"
+        elif key == "pageup":
+            action = "slash_page_up"
+        elif key == "pagedown":
+            action = "slash_page_down"
+        elif key in {"shift+enter", "alt+enter", "ctrl+enter", "cmd+enter", "ctrl+j"}:
+            action = "insert_composer_newline"
+        elif key == "enter":
+            action = "select_slash_command"
+        if action is None:
+            return
+        handler = getattr(self.app, action, None)
+        if handler is None:
+            return
+        event.prevent_default()
+        event.stop()
+        handler()
+
+
 class CommandPalette(ModalScreen[Optional[str]]):
     CSS = """
     CommandPalette {
@@ -129,7 +226,7 @@ class CommandPalette(ModalScreen[Optional[str]]):
     }
 
     #palette {
-        width: 78;
+        width: 96;
         max-width: 96%;
         height: 24;
         max-height: 88%;
@@ -180,16 +277,23 @@ class CommandPalette(ModalScreen[Optional[str]]):
         Binding("enter", "select", "Select", show=False, priority=True),
     ]
 
-    def __init__(self, commands: list[tuple[str, str, str]]) -> None:
+    def __init__(
+        self,
+        commands: list[tuple[str, str, str]],
+        title: str = "Commands",
+        placeholder: str = "Search commands",
+    ) -> None:
         super().__init__()
         self.commands = commands
+        self.title_text = title
+        self.placeholder = placeholder
 
     def compose(self) -> ComposeResult:
         with Container(id="palette"):
             with Horizontal(id="palette-head"):
-                yield Static("Commands", id="palette-title")
+                yield Static(self.title_text, id="palette-title")
                 yield Static("esc", id="palette-esc")
-            yield ModalFilterInput(placeholder="Search commands", id="palette-filter", compact=True)
+            yield ModalFilterInput(placeholder=self.placeholder, id="palette-filter", compact=True)
             table = DataTable(
                 id="palette-table",
                 cursor_type="row",
@@ -197,8 +301,8 @@ class CommandPalette(ModalScreen[Optional[str]]):
                 show_row_labels=False,
                 cell_padding=0,
             )
-            table.add_column("name", width=28)
-            table.add_column("description", width=42)
+            table.add_column("name", width=30)
+            table.add_column("description", width=58)
             yield table
 
     def on_mount(self) -> None:
@@ -430,6 +534,7 @@ class BrowserUseTerminalApp(App[None]):
         color: #eeeeee;
         scrollbar-color: #606060;
         scrollbar-background: #0a0a0a;
+        scrollbar-size: 0 0;
     }
 
     #main.home #transcript {
@@ -440,24 +545,39 @@ class BrowserUseTerminalApp(App[None]):
         max-height: 20;
     }
 
+    #slash-panel {
+        height: 10;
+        margin-top: 1;
+        padding: 0 2;
+        background: #1e1e1e;
+        border-left: solid #5c9cf5;
+        color: #eeeeee;
+    }
+
+    #main.home #slash-panel {
+        width: 86;
+        max-width: 92%;
+    }
+
     #composer {
-        height: 5;
+        height: 4;
         margin-top: 1;
         padding: 1 2 0 2;
-        background: #1e1e1e;
-        border-left: tall #5c9cf5;
+        background: #1b1b1b;
+        border-left: solid #5c9cf5;
     }
 
     #main.home #composer {
-        width: 78;
+        width: 86;
         max-width: 92%;
     }
 
     #command {
         height: 1;
         border: none;
-        background: #1e1e1e;
+        background: #222222;
         color: #eeeeee;
+        scrollbar-size: 0 0;
     }
 
     #composer-meta {
@@ -473,22 +593,22 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #main.home #hintbar {
-        width: 78;
+        width: 86;
         max-width: 92%;
     }
 
     #sidebar {
-        width: 42;
-        min-width: 34;
+        width: 46;
+        min-width: 38;
         padding: 2 2 1 2;
-        background: #141414;
+        background: #121212;
     }
 
     #session-detail {
         height: auto;
-        max-height: 18;
+        max-height: 15;
         color: #eeeeee;
-        background: #141414;
+        background: #121212;
     }
 
     #artifacts-title, #preview-title {
@@ -499,24 +619,27 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #artifacts {
-        height: 1fr;
-        background: #141414;
+        height: 8;
+        background: #121212;
         color: #eeeeee;
+        scrollbar-size: 0 0;
     }
 
     #artifact-preview {
-        height: 10;
+        height: 1fr;
+        min-height: 12;
         margin-top: 1;
-        background: #141414;
+        background: #121212;
         color: #808080;
         scrollbar-color: #606060;
-        scrollbar-background: #141414;
+        scrollbar-background: #121212;
+        scrollbar-size: 0 0;
     }
 
     #sidebar-footer {
-        height: 2;
+        display: none;
+        height: 0;
         color: #808080;
-        padding-top: 1;
     }
 
     DataTable {
@@ -526,15 +649,34 @@ class BrowserUseTerminalApp(App[None]):
         scrollbar-background: #141414;
     }
 
+    #slash-panel {
+        background: #1e1e1e;
+        scrollbar-color: #606060;
+        scrollbar-background: #1e1e1e;
+        scrollbar-size: 0 0;
+    }
+
     DataTable > .datatable--cursor {
-        background: #fab283;
-        color: #0a0a0a;
+        background: #303030;
+        color: #eeeeee;
         text-style: bold;
     }
 
     DataTable:focus > .datatable--cursor {
-        background: #fab283;
-        color: #0a0a0a;
+        background: #383838;
+        color: #eeeeee;
+        text-style: bold;
+    }
+
+    #artifacts > .datatable--cursor {
+        background: #2a2a2a;
+        color: #eeeeee;
+        text-style: bold;
+    }
+
+    #artifacts:focus > .datatable--cursor {
+        background: #303030;
+        color: #eeeeee;
         text-style: bold;
     }
 
@@ -567,17 +709,25 @@ class BrowserUseTerminalApp(App[None]):
         provider_label: str = "fake",
         model_label: Optional[str] = None,
         config: Optional[dict] = None,
+        config_path: Optional[Path | str] = None,
     ) -> None:
         super().__init__()
         self.store = store
-        self.manager = SessionManager(store, provider_factory=provider_factory, max_turns=max_turns)
+        self._external_provider_factory = provider_factory
         self.provider_label = provider_label
         self.model_label = model_label
         self.config = config or {}
+        self.config_path = Path(config_path).expanduser() if config_path else None
+        apply_config_environment(self.config)
+        self.manager = SessionManager(store, provider_factory=self._make_provider_for_current_settings, max_turns=max_turns)
         self.selected_session_id: Optional[str] = None
         self.selected_artifact_path: Optional[str] = None
+        self._visible_slash_commands: list[tuple[str, str, str]] = []
         self._preview_key: Optional[tuple[str, float, int]] = None
         self._model_buffers: dict[str, str] = {}
+        self._last_transcript_text: dict[str, str] = {}
+        self._recent_model_text: dict[str, str] = {}
+        self._rendered_event_ids: set[str] = set()
         self._stop = threading.Event()
         self._listener: Optional[threading.Thread] = None
 
@@ -585,11 +735,25 @@ class BrowserUseTerminalApp(App[None]):
         with Horizontal(id="body"):
             with Vertical(id="main"):
                 yield RichLog(id="transcript", wrap=True, highlight=True, markup=True)
+                slash_panel = DataTable(
+                    id="slash-panel",
+                    cursor_type="row",
+                    show_header=False,
+                    show_row_labels=False,
+                    cell_padding=0,
+                )
+                slash_panel.add_column("command", width=22)
+                slash_panel.add_column("description", width=72)
+                yield slash_panel
                 with Vertical(id="composer"):
-                    yield Input(
-                        placeholder='Ask anything... "Find the page and save a screenshot"',
+                    yield ComposerInput(
+                        "",
+                        placeholder=' Ask anything... "Find the page and save a screenshot"',
                         id="command",
                         compact=True,
+                        soft_wrap=True,
+                        show_line_numbers=False,
+                        highlight_cursor_line=False,
                     )
                     yield Static("", id="composer-meta")
                 yield Static("", id="hintbar")
@@ -601,9 +765,11 @@ class BrowserUseTerminalApp(App[None]):
                     cursor_type="row",
                     show_header=False,
                     show_row_labels=False,
-                    cell_padding=1,
+                    cell_padding=0,
                 )
-                artifacts.add_columns("kind", "name", "size")
+                artifacts.add_column("kind", width=8)
+                artifacts.add_column("name", width=26)
+                artifacts.add_column("size", width=8)
                 yield artifacts
                 yield Static("preview", id="preview-title")
                 yield RichLog(id="artifact-preview", wrap=True, highlight=True, markup=True)
@@ -617,13 +783,30 @@ class BrowserUseTerminalApp(App[None]):
         self.refresh_artifacts()
         self._update_statusbar()
         self._update_session_detail()
-        self.query_one("#command", Input).focus()
+        self.query_one("#slash-panel", DataTable).display = False
+        self.query_one("#artifact-preview", RichLog).auto_scroll = False
+        self.query_one("#command", ComposerInput).focus()
         self._listener = threading.Thread(target=self._listen_events, name="browser-use-terminal-events", daemon=True)
         self._listener.start()
         self.set_interval(1.0, self._tick)
 
     def on_unmount(self) -> None:
         self._stop.set()
+
+    def _make_provider_for_current_settings(self) -> Optional[Provider]:
+        if self.provider_label == "openai":
+            from llm_browser.provider.openai_responses import OpenAIResponsesProvider
+
+            return OpenAIResponsesProvider(model=self.model_label)
+        if self.provider_label == "codex":
+            from llm_browser.provider.codex_responses import CodexResponsesProvider
+
+            return CodexResponsesProvider(model=self.model_label)
+        if self.provider_label == "fake":
+            return None
+        if self._external_provider_factory is not None:
+            return self._external_provider_factory()
+        return None
 
     def _listen_events(self) -> None:
         with self.store.bus.subscribe() as events:
@@ -671,23 +854,29 @@ class BrowserUseTerminalApp(App[None]):
 
     def _write_banner(self) -> None:
         log = self.query_one("#transcript", RichLog)
-        log.write("[bold #eeeeee]Commands[/bold #eeeeee]")
-        log.write(
-            "[#808080]Plain text starts a task. Slash commands include "
-            "[#eeeeee]/dataset[/], [#eeeeee]/resume[/], [#eeeeee]/cancel[/], "
-            "[#eeeeee]/trace[/], [#eeeeee]/eval[/], [#eeeeee]/report[/], "
-            "[#eeeeee]/browser[/], and [#eeeeee]/open[/].[/]"
-        )
+        log.write("[bold #eeeeee]Slash commands[/bold #eeeeee]")
+        for name, command, description in SLASH_COMMANDS:
+            command_label = f"/{command}".rstrip()
+            log.write(f"[#eeeeee]{escape(command_label):<18}[/] [#808080]{escape(description)}[/]")
+        log.write("[#808080]Use /settings for model, provider, browser, API keys, viewport, cloud, CDP, and max-turns settings.[/]")
+        log.write("[#808080]Paste keys with /auth browser-use <key> or /auth openai <key>; values are saved redacted in config output.[/]")
 
     def _handle_event(self, event: Event) -> None:
+        should_render = event.session_id == self.selected_session_id and event.id not in self._rendered_event_ids
+        if should_render:
+            self._rendered_event_ids.add(event.id)
+
         if event.type == "model.delta":
-            if event.session_id == self.selected_session_id:
+            if should_render:
                 self._append_model_delta(event)
             return
 
-        if event.session_id == self.selected_session_id:
+        if should_render:
             self._flush_model_delta(event.session_id)
-            self._write_log_line(_format_event_for_transcript(event), event.type)
+            line = _format_event_for_transcript(event)
+            event_type = _transcript_event_type(event)
+            if not self._is_duplicate_terminal_result(event, line):
+                self._write_log_line(line, event_type)
         self.refresh_sessions()
         self.refresh_artifacts()
         self._update_statusbar()
@@ -706,34 +895,48 @@ class BrowserUseTerminalApp(App[None]):
         text = self._model_buffers.pop(session_id, "")
         if not text.strip():
             return
-        collapsed = " ".join(text.strip().split())
-        self._write_log_line(collapsed, "model.delta")
+        self._write_log_line(text.strip(), "model.delta")
 
     def _flush_all_model_deltas(self) -> None:
         for session_id in list(self._model_buffers):
             self._flush_model_delta(session_id)
 
     def _write_log_line(self, line: str, event_type: str) -> None:
+        if not line:
+            return
+        if self.selected_session_id and event_type in {
+            "model.delta",
+            "session.done",
+            "session.cancelled",
+            "session.failed",
+            "tool.finished",
+        }:
+            self._last_transcript_text[self.selected_session_id] = _canonical_transcript_text(line)
+            if event_type == "model.delta":
+                previous = self._recent_model_text.get(self.selected_session_id, "")
+                self._recent_model_text[self.selected_session_id] = _join_transcript_text(previous, line)
         log = self.query_one("#transcript", RichLog)
         escaped = escape(line)
         if event_type == "session.input":
             log.write(f"[bold #5c9cf5]▌[/] [bold #eeeeee]Task[/bold #eeeeee]\n{escaped}")
-        elif event_type == "session.created":
-            log.write(f"[#808080]{escaped}[/]")
+        elif event_type == "session.followup":
+            log.write(f"\n[bold #5c9cf5]▌[/] [bold #eeeeee]Follow-up[/bold #eeeeee]\n{escaped}")
         elif event_type == "tool.started":
-            log.write(f"[#808080]{escaped}[/]")
+            log.write(f"[#606060]{escaped}[/]")
         elif event_type == "tool.failed":
             log.write(f"[#e06c75]{escaped}[/]")
         elif event_type == "tool.image":
             log.write(f"[#5c9cf5]{escaped}[/]")
         elif event_type == "tool.output":
-            log.write(f"[#808080]{escaped}[/]")
+            _write_markdown(log, line, style="#808080")
         elif event_type == "tool.finished":
-            log.write(f"[#808080]{escaped}[/]")
+            log.write(f"[#606060]{escaped}[/]")
         elif event_type == "model.delta":
-            log.write(f"[#eeeeee]{escaped}[/]")
+            _write_markdown(log, line)
         elif event_type in {"session.done", "session.cancelled"}:
-            log.write(f"[#7fd88f]{escaped}[/]")
+            _write_markdown(log, line, style="#7fd88f")
+        elif event_type == "browser.live_url":
+            _write_markdown(log, line)
         elif event_type == "session.failed":
             log.write(f"[bold #e06c75]{escaped}[/bold #e06c75]")
         elif event_type == "session.deadline_warning":
@@ -741,17 +944,134 @@ class BrowserUseTerminalApp(App[None]):
         else:
             log.write(escaped)
 
+    def _is_duplicate_terminal_result(self, event: Event, line: str) -> bool:
+        if event.type != "session.done" or not self.selected_session_id:
+            return False
+        result = str(event.payload.get("result") or "")
+        if not result.strip():
+            return False
+        previous = self._last_transcript_text.get(self.selected_session_id, "")
+        recent_model = self._recent_model_text.get(self.selected_session_id, "")
+        canonical_result = _canonical_transcript_text(result)
+        return (
+            previous == canonical_result
+            or previous == _canonical_transcript_text(line)
+            or _canonical_transcript_text(recent_model) == canonical_result
+            or _canonical_transcript_text(recent_model).endswith(canonical_result)
+        )
+
+    def _slash_panel_visible(self) -> bool:
+        return bool(self.query_one("#slash-panel", DataTable).display)
+
+    def _update_slash_panel(self, value: str) -> None:
+        table = self.query_one("#slash-panel", DataTable)
+        stripped = value.strip()
+        if not stripped.startswith("/") or " " in stripped:
+            self.hide_slash_panel()
+            return
+        needle = stripped[1:].lower()
+        matches = [
+            row
+            for row in SLASH_COMMANDS
+            if not needle or needle in row[0].lower() or needle in row[2].lower()
+        ][:9]
+        table.clear()
+        self._visible_slash_commands = matches
+        if not matches:
+            table.display = False
+            return
+        for name, _command, description in matches:
+            table.add_row(
+                Text(f"/{name}", style="#eeeeee"),
+                Text(description, style="#808080"),
+                key=name,
+            )
+        table.display = True
+        table.move_cursor(row=0, column=0)
+
+    def hide_slash_panel(self) -> None:
+        self.query_one("#slash-panel", DataTable).display = False
+        self._visible_slash_commands = []
+
+    def slash_cursor_up(self) -> None:
+        _move_table_cursor(self.query_one("#slash-panel", DataTable), -1)
+
+    def slash_cursor_down(self) -> None:
+        _move_table_cursor(self.query_one("#slash-panel", DataTable), 1)
+
+    def slash_page_up(self) -> None:
+        _move_table_cursor(self.query_one("#slash-panel", DataTable), -8)
+
+    def slash_page_down(self) -> None:
+        _move_table_cursor(self.query_one("#slash-panel", DataTable), 8)
+
+    def select_slash_command(self) -> None:
+        table = self.query_one("#slash-panel", DataTable)
+        if not self._visible_slash_commands or table.row_count <= 0:
+            self.hide_slash_panel()
+            return
+        name, command, _description = self._visible_slash_commands[table.cursor_row]
+        command_input = self.query_one("#command", ComposerInput)
+        self.hide_slash_panel()
+        if command.endswith(" "):
+            self._set_composer_text(f"/{command}")
+            command_input.focus()
+            return
+        self._set_composer_text("")
+        self._handle_command(f"/{command}")
+        command_input.focus()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         line = event.value.strip()
         event.input.value = ""
+        self.hide_slash_panel()
         if not line:
             return
         self._handle_command(line)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "command":
+            self._update_slash_panel(event.value)
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "command":
+            return
+        self.resize_composer()
+        self._update_slash_panel(event.text_area.text)
+
+    def insert_composer_newline(self) -> None:
+        command_input = self.query_one("#command", ComposerInput)
+        command_input.insert("\n")
+        self.resize_composer()
+
+    def submit_composer(self) -> None:
+        command_input = self.query_one("#command", ComposerInput)
+        line = command_input.text.strip()
+        self._set_composer_text("")
+        self.hide_slash_panel()
+        if not line:
+            return
+        self._handle_command(line)
+
+    def resize_composer(self) -> None:
+        command_input = self.query_one("#command", ComposerInput)
+        visible_lines = _composer_visible_line_count(command_input.text, command_input.size.width)
+        command_input.styles.height = visible_lines
+        self.query_one("#composer").styles.height = visible_lines + 3
+
+    def _set_composer_text(self, text: str) -> None:
+        command_input = self.query_one("#command", ComposerInput)
+        command_input.load_text(text)
+        lines = text.splitlines() or [""]
+        command_input.move_cursor((len(lines) - 1, len(lines[-1])), center=False)
+        self.resize_composer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "artifacts":
             self.selected_artifact_path = str(event.row_key.value)
             self._preview_artifact(self.selected_artifact_path, force=True)
+        elif event.data_table.id == "slash-panel":
+            self.select_slash_command()
 
     def _handle_command(self, line: str) -> None:
         log = self.query_one("#transcript", RichLog)
@@ -778,6 +1098,13 @@ class BrowserUseTerminalApp(App[None]):
             self.exit()
         elif command == "help":
             self._write_banner()
+        elif command == "new":
+            self.selected_session_id = None
+            self.selected_artifact_path = None
+            self._write_home()
+            self.refresh_artifacts()
+            self._update_statusbar()
+            self._update_session_detail()
         elif command == "refresh":
             self.action_refresh()
         elif command == "clear":
@@ -787,24 +1114,74 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "artifacts":
             self.refresh_artifacts()
             log.write("[#7fd88f]artifacts refreshed[/]")
+        elif command == "model":
+            if len(args) >= 2:
+                self._set_model(args[1])
+            else:
+                self.action_show_model_selector()
+        elif command in {"provider", "connect"}:
+            if len(args) >= 2:
+                self._set_provider(args[1])
+            else:
+                self.action_show_provider_selector()
+        elif command == "settings":
+            self.action_show_settings()
         elif command == "browser":
+            if len(args) >= 2 and args[1] in {"config", "detail", "details", "status"}:
+                log.write(escape(_browser_runtime_detail()))
+            elif len(args) >= 2:
+                self._set_browser_mode(args[1])
+            else:
+                self.action_show_browser_modes()
+        elif command in {"browser-mode", "browsermode"}:
+            if len(args) >= 2:
+                self._set_browser_mode(args[1])
+            else:
+                self.action_show_browser_modes()
+        elif command == "browser-config":
             log.write(escape(_browser_runtime_detail()))
+        elif command == "headless":
+            if len(args) < 2:
+                log.write(f"[#808080]headless is {'on' if _browser_headless_default() else 'off'}[/]")
+            else:
+                self._set_bool_env("LLM_BROWSER_HEADLESS", args[1], "headless", "browser.headless")
+        elif command == "viewport":
+            self._set_viewport(args[1:])
+        elif command in {"max-turns", "max_turns"}:
+            if len(args) < 2:
+                log.write(f"[#808080]max turns: {self.manager.max_turns}[/]")
+            else:
+                self._set_max_turns(args[1])
+        elif command == "set":
+            self._set_config_value(args[1:])
         elif command == "config":
-            log.write(escape(json.dumps(redacted_config(self.config), indent=2)))
+            payload = {
+                "path": str(self.config_path) if self.config_path else None,
+                "config": redacted_config(self.config),
+            }
+            log.write(escape(json.dumps(payload, indent=2)))
         elif command == "auth":
-            from llm_browser.auth import auth_status
+            if len(args) >= 3 and args[1] in {"browser-use", "browseruse", "cloud", "remote"}:
+                self._set_config_value(["browser-use-api-key", *args[2:]])
+            elif len(args) >= 3 and args[1] == "openai":
+                self._set_config_value(["openai-api-key", *args[2:]])
+            else:
+                from llm_browser.auth import auth_status
 
-            log.write(
-                escape(
-                    json.dumps(
-                        {
-                            "codex": auth_status(),
-                            "openai_api_key": bool(os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")),
-                        },
-                        indent=2,
+                log.write(
+                    escape(
+                        json.dumps(
+                            {
+                                "codex": auth_status(),
+                                "openai_api_key": bool(
+                                    os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+                                ),
+                                "browser_use_api_key": bool(os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("BU_API_KEY")),
+                            },
+                            indent=2,
+                        )
                     )
                 )
-            )
         elif command == "report":
             run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
             if not run_id:
@@ -821,17 +1198,18 @@ class BrowserUseTerminalApp(App[None]):
             if not session_id:
                 log.write("[#e06c75]no selected session to resume[/]")
                 return
-            parent = self.store.load(session_id)
-            if parent is None:
-                log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
-                return
-            resumed = self.manager.start(instruction, parent_id=parent.id)
-            self.selected_session_id = resumed.id
-            self._load_session_log(resumed.id)
+            self._resume_session(session_id, instruction)
         elif command == "cancel":
             session_id = args[1] if len(args) > 1 else self.selected_session_id
             if not session_id:
                 log.write("[#e06c75]no selected session to cancel[/]")
+                return
+            session = self.store.load(session_id)
+            if session is None:
+                log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
+                return
+            if session.status not in {"created", "running"}:
+                log.write(f"[#808080]session is {escape(session.status)}; nothing to cancel[/]")
                 return
             self.manager.cancel(session_id)
             log.write(f"[#f5a742]cancel requested for {escape(session_id)}[/]")
@@ -872,7 +1250,14 @@ class BrowserUseTerminalApp(App[None]):
             if is_slash_command:
                 log.write(f"[#e06c75]unknown command: {escape(command)}[/]")
             else:
-                self._start_task(line)
+                if self.selected_session_id:
+                    session = self.store.load(self.selected_session_id)
+                    if session is not None and session.status in {"created", "running"}:
+                        log.write("[#f5a742]selected session is still running; press esc to interrupt or wait for it to finish[/]")
+                        return
+                    self._resume_session(self.selected_session_id, line)
+                else:
+                    self._start_task(line)
 
     def _load_session_log(self, session_id: str) -> None:
         self._set_home_mode(False)
@@ -884,7 +1269,12 @@ class BrowserUseTerminalApp(App[None]):
             return
         self.selected_session_id = session.id
         self.selected_artifact_path = None
-        for line, event_type in _format_events_for_transcript(self.store.events.read(session.id)[-400:]):
+        self._model_buffers.pop(session.id, None)
+        events = self.store.events.read(session.id)[-400:]
+        self._rendered_event_ids = {event.id for event in events}
+        self._last_transcript_text[session.id] = ""
+        self._recent_model_text[session.id] = ""
+        for line, event_type in _format_events_for_transcript(events):
             self._write_log_line(line, event_type)
         self._update_session_detail()
 
@@ -912,8 +1302,8 @@ class BrowserUseTerminalApp(App[None]):
                 first_path = str(path)
             stat = path.stat()
             table.add_row(
-                _artifact_kind(path),
-                path.name,
+                Text(_artifact_kind(path), style="#808080"),
+                _artifact_display_name(session, path),
                 _format_bytes(stat.st_size),
                 key=str(path),
             )
@@ -925,8 +1315,12 @@ class BrowserUseTerminalApp(App[None]):
         if isinstance(self.screen, ModalScreen):
             self.screen.dismiss(None)
             return
-        if self.selected_session_id:
-            self.manager.cancel(self.selected_session_id)
+        if not self.selected_session_id:
+            return
+        session = self.store.load(self.selected_session_id)
+        if session is None or session.status not in {"created", "running"}:
+            return
+        self.manager.cancel(self.selected_session_id)
 
     def action_refresh(self) -> None:
         self.refresh_sessions()
@@ -948,11 +1342,11 @@ class BrowserUseTerminalApp(App[None]):
 
         def selected(command: Optional[str]) -> None:
             if command is None:
-                self.query_one("#command", Input).focus()
+                self.query_one("#command", ComposerInput).focus()
                 return
-            command_input = self.query_one("#command", Input)
+            command_input = self.query_one("#command", ComposerInput)
             if command.endswith(" "):
-                command_input.value = command
+                self._set_composer_text(command)
                 command_input.focus()
                 return
             self._handle_command(command)
@@ -960,19 +1354,67 @@ class BrowserUseTerminalApp(App[None]):
 
         self.push_screen(CommandPalette(COMMAND_PALETTE), selected)
 
+    def action_show_browser_modes(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        def selected(command: Optional[str]) -> None:
+            if command:
+                self._handle_command(command)
+            self.query_one("#command", ComposerInput).focus()
+
+        self.push_screen(
+            CommandPalette(
+                BROWSER_MODE_PALETTE,
+                title="Browser modes",
+                placeholder="Choose browser backend",
+            ),
+            selected,
+        )
+
+    def action_show_model_selector(self) -> None:
+        self._open_command_selector("Select model", "Search models", self._model_palette())
+
+    def action_show_provider_selector(self) -> None:
+        self._open_command_selector("Select provider", "Search providers", PROVIDER_PALETTE)
+
+    def action_show_settings(self) -> None:
+        self._open_command_selector("Settings", "Search settings", self._settings_palette())
+
+    def _open_command_selector(
+        self,
+        title: str,
+        placeholder: str,
+        commands: list[tuple[str, str, str]],
+    ) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        def selected(command: Optional[str]) -> None:
+            command_input = self.query_one("#command", ComposerInput)
+            if command:
+                if command.endswith(" "):
+                    self._set_composer_text(f"/{command}")
+                    command_input.focus()
+                    return
+                self._handle_command(f"/{command}")
+            command_input.focus()
+
+        self.push_screen(CommandPalette(commands, title=title, placeholder=placeholder), selected)
+
     def action_show_sessions(self) -> None:
         if isinstance(self.screen, ModalScreen):
             return
 
         def selected(session_id: Optional[str]) -> None:
             if not session_id:
-                self.query_one("#command", Input).focus()
+                self.query_one("#command", ComposerInput).focus()
                 return
             self.selected_session_id = session_id
             self._load_session_log(session_id)
             self.refresh_artifacts()
             self._update_session_detail()
-            self.query_one("#command", Input).focus()
+            self.query_one("#command", ComposerInput).focus()
 
         self.push_screen(SessionPalette(self._session_rows()), selected)
 
@@ -983,6 +1425,281 @@ class BrowserUseTerminalApp(App[None]):
         self._load_session_log(session.id)
         self.refresh_sessions()
         self.refresh_artifacts()
+
+    def _resume_session(self, session_id: str, instruction: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        session = self.store.load(session_id)
+        if session is None:
+            log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
+            return
+        try:
+            resumed = self.manager.resume(session.id, instruction)
+        except Exception as exc:
+            log.write(f"[#e06c75]resume failed: {escape(str(exc))}[/]")
+            return
+        self.selected_session_id = resumed.id
+        self.selected_artifact_path = None
+        self._load_session_log(resumed.id)
+        self.refresh_sessions()
+        self.refresh_artifacts()
+
+    def _persist_config_values(self, values: dict[str, Any]) -> Optional[Path]:
+        for dotted, value in values.items():
+            _assign_config_value(self.config, dotted, value)
+        apply_config_environment(self.config, override=True)
+        if self.config_path is None:
+            return None
+        try:
+            path, _ = write_config_values(values, path=self.config_path)
+        except Exception as exc:
+            self.query_one("#transcript", RichLog).write(f"[#e06c75]config save failed: {escape(str(exc))}[/]")
+            return None
+        return path
+
+    def _saved_suffix(self, path: Optional[Path]) -> str:
+        if path is None:
+            return ""
+        return f" [#808080]saved {escape(str(path))}[/]"
+
+    def _set_browser_mode(self, mode: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        normalized = _normalize_browser_mode(mode)
+        if normalized is None:
+            log.write(f"[#e06c75]unknown browser mode: {escape(mode)}[/]")
+            log.write("[#808080]expected auto, chromium, real, remote, cdp, or daemon[/]")
+            return
+        os.environ["LLM_BROWSER_MODE"] = normalized
+        values: dict[str, Any] = {"browser.mode": normalized}
+        if normalized == "headless-chromium":
+            os.environ["LLM_BROWSER_HEADLESS"] = "1"
+            values["browser.headless"] = True
+        elif normalized == "real":
+            os.environ["LLM_BROWSER_HEADLESS"] = "0"
+            values["browser.headless"] = False
+        path = self._persist_config_values(values)
+        log.write(f"[#7fd88f]browser[/] {escape(_browser_mode_label(normalized))}{self._saved_suffix(path)}")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _set_provider(self, provider: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        normalized = provider.strip().lower()
+        if normalized not in {"fake", "openai", "codex"}:
+            log.write(f"[#e06c75]unknown provider: {escape(provider)}[/]")
+            log.write("[#808080]expected codex, openai, or fake[/]")
+            return
+        self.provider_label = normalized
+        path = self._persist_config_values({"provider": normalized})
+        log.write(f"[#7fd88f]provider[/] {escape(normalized)}{self._saved_suffix(path)}")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _set_model(self, model: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        model = model.strip()
+        if not model:
+            log.write("[#e06c75]model requires a model id[/]")
+            return
+        self.model_label = model
+        os.environ["LLM_BROWSER_MODEL"] = model
+        if self.provider_label == "codex":
+            os.environ["LLM_BROWSER_CODEX_MODEL"] = model
+        path = self._persist_config_values({"model": model})
+        log.write(f"[#7fd88f]model[/] {escape(model)}{self._saved_suffix(path)}")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _set_bool_env(self, env_name: str, value: str, label: str, config_key: Optional[str] = None) -> bool:
+        log = self.query_one("#transcript", RichLog)
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            os.environ[env_name] = "1"
+            path = self._persist_config_values({config_key: True}) if config_key else None
+            log.write(f"[#7fd88f]{escape(label)}[/] on{self._saved_suffix(path)}")
+            self._update_statusbar()
+            self._update_session_detail()
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            os.environ[env_name] = "0"
+            path = self._persist_config_values({config_key: False}) if config_key else None
+            log.write(f"[#7fd88f]{escape(label)}[/] off{self._saved_suffix(path)}")
+            self._update_statusbar()
+            self._update_session_detail()
+            return True
+        log.write(f"[#e06c75]{escape(label)} expects on or off[/]")
+        return False
+
+    def _set_viewport(self, values: list[str]) -> None:
+        log = self.query_one("#transcript", RichLog)
+        if not values:
+            width = os.environ.get("LLM_BROWSER_WIDTH") or "1280"
+            height = os.environ.get("LLM_BROWSER_HEIGHT") or "900"
+            log.write(f"[#808080]viewport: {escape(width)}x{escape(height)}[/]")
+            return
+        if len(values) == 1 and "x" in values[0].lower():
+            width, height = values[0].lower().split("x", 1)
+        elif len(values) >= 2:
+            width, height = values[0], values[1]
+        else:
+            log.write("[#e06c75]viewport expects WIDTH HEIGHT or WIDTHxHEIGHT[/]")
+            return
+        try:
+            width_i = int(width)
+            height_i = int(height)
+        except ValueError:
+            log.write("[#e06c75]viewport width and height must be integers[/]")
+            return
+        if width_i <= 0 or height_i <= 0:
+            log.write("[#e06c75]viewport width and height must be positive[/]")
+            return
+        os.environ["LLM_BROWSER_WIDTH"] = str(width_i)
+        os.environ["LLM_BROWSER_HEIGHT"] = str(height_i)
+        path = self._persist_config_values({"browser.width": width_i, "browser.height": height_i})
+        log.write(f"[#7fd88f]viewport[/] {width_i}x{height_i}{self._saved_suffix(path)}")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _set_max_turns(self, value: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        try:
+            max_turns = int(value)
+        except ValueError:
+            log.write("[#e06c75]max-turns expects an integer[/]")
+            return
+        if max_turns <= 0:
+            log.write("[#e06c75]max-turns must be positive[/]")
+            return
+        self.manager.max_turns = max_turns
+        path = self._persist_config_values({"max_turns": max_turns})
+        log.write(f"[#7fd88f]max turns[/] {max_turns}{self._saved_suffix(path)}")
+        self._update_session_detail()
+
+    def _set_config_value(self, args: list[str]) -> None:
+        log = self.query_one("#transcript", RichLog)
+        if len(args) < 2:
+            log.write("[#e06c75]set expects a setting name and value[/]")
+            return
+        key = args[0].strip().lower().replace("_", "-")
+        value = " ".join(args[1:]).strip()
+        env_map = {
+            "cdp-url": ("LLM_BROWSER_CDP_HTTP_URL", "browser.cdp_url", False),
+            "cdp-ws": ("LLM_BROWSER_CDP_WS_URL", "browser.cdp_ws", False),
+            "chrome-path": ("LLM_BROWSER_CHROME_PATH", "browser.chrome_path", False),
+            "profile-template": ("LLM_BROWSER_PROFILE_TEMPLATE", "browser.profile_template", False),
+            "browser-use-api-key": ("BROWSER_USE_API_KEY", "browser.cloud_api_key", True),
+            "cloud-api-key": ("BROWSER_USE_API_KEY", "browser.cloud_api_key", True),
+            "remote-api-key": ("BROWSER_USE_API_KEY", "browser.cloud_api_key", True),
+            "cloud-api-base": ("LLM_BROWSER_CLOUD_API_BASE", "browser.cloud_api_base", False),
+            "cloud-profile-id": ("LLM_BROWSER_CLOUD_PROFILE_ID", "browser.cloud_profile_id", False),
+            "cloud-profile-name": ("LLM_BROWSER_CLOUD_PROFILE_NAME", "browser.cloud_profile_name", False),
+            "cloud-proxy-country": ("LLM_BROWSER_CLOUD_PROXY_COUNTRY", "browser.cloud_proxy_country", False),
+            "cloud-timeout": ("LLM_BROWSER_CLOUD_TIMEOUT", "browser.cloud_timeout", False),
+            "cloud-custom-proxy-json": ("LLM_BROWSER_CLOUD_CUSTOM_PROXY_JSON", "browser.cloud_custom_proxy_json", True),
+            "openai-api-key": ("LLM_BROWSER_OPENAI_API_KEY", "openai.api_key", True),
+            "openai-base-url": ("LLM_BROWSER_OPENAI_BASE_URL", "openai.base_url", False),
+            "codex-base-url": ("LLM_BROWSER_CODEX_BASE_URL", "codex.base_url", False),
+            "daemon-name": ("LLM_BROWSER_DAEMON_NAME", "browser.daemon_name", False),
+            "daemon-backend": ("LLM_BROWSER_DAEMON_BACKEND", "browser.daemon_backend", False),
+        }
+        bool_env_map = {
+            "headless": ("LLM_BROWSER_HEADLESS", "headless", "browser.headless"),
+            "keep-profile": ("LLM_BROWSER_KEEP_CHROME_PROFILE", "keep profile", "browser.keep_profile"),
+            "cloud-allow-resizing": ("LLM_BROWSER_CLOUD_ALLOW_RESIZING", "cloud resizing", "browser.cloud_allow_resizing"),
+            "cloud-recording": ("LLM_BROWSER_CLOUD_ENABLE_RECORDING", "cloud recording", "browser.cloud_recording"),
+        }
+        if key in {"model"}:
+            self._set_model(value)
+            return
+        if key in {"provider"}:
+            self._set_provider(value)
+            return
+        if key in {"browser", "browser-mode"}:
+            self._set_browser_mode(value)
+            return
+        if key in {"viewport"}:
+            self._set_viewport(value.split())
+            return
+        if key in {"max-turns", "maxturns"}:
+            self._set_max_turns(value)
+            return
+        if key in bool_env_map:
+            env_name, label, config_key = bool_env_map[key]
+            self._set_bool_env(env_name, value, label, config_key)
+            return
+        setting = env_map.get(key)
+        if setting is None:
+            log.write(f"[#e06c75]unknown setting: {escape(key)}[/]")
+            return
+        env_name, config_key, sensitive = setting
+        os.environ[env_name] = value
+        parsed_value: Any = value
+        if key == "cloud-timeout":
+            try:
+                parsed_value = int(value)
+            except ValueError:
+                log.write("[#e06c75]cloud-timeout expects an integer[/]")
+                return
+        elif key == "cloud-custom-proxy-json":
+            try:
+                json.loads(value)
+            except ValueError as exc:
+                log.write(f"[#e06c75]cloud-custom-proxy-json expects a JSON object: {escape(str(exc))}[/]")
+                return
+        path = self._persist_config_values({config_key: parsed_value})
+        shown = "<redacted>" if sensitive and value else value
+        log.write(f"[#7fd88f]{escape(key)}[/] {escape(shown)}{self._saved_suffix(path)}")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _model_palette(self) -> list[tuple[str, str, str]]:
+        current = self.model_label
+        rows = []
+        if current:
+            rows.append(("Current", f"model {current}", f"Current {self.provider_label} model"))
+        seen = {current} if current else set()
+        for title, command, description in MODEL_PALETTE:
+            model = command.removeprefix("model ").strip()
+            if model and model in seen:
+                continue
+            rows.append((title, command, description))
+            if model:
+                seen.add(model)
+        return rows
+
+    def _settings_palette(self) -> list[tuple[str, str, str]]:
+        width = os.environ.get("LLM_BROWSER_WIDTH") or "1280"
+        height = os.environ.get("LLM_BROWSER_HEIGHT") or "900"
+        return [
+            ("Model", "model", f"Current {self.model_label or '-'}"),
+            ("Provider", "provider", f"Current {self.provider_label}"),
+            ("Browser", "browser", f"Current {_browser_runtime_label()}"),
+            ("Browser Use API key", "auth browser-use ", "Paste and save remote browser API key"),
+            ("OpenAI API key", "auth openai ", "Paste and save OpenAI API key"),
+            ("Headless on", "headless on", "Run owned Chromium headless"),
+            ("Headless off", "headless off", "Show owned Chromium window"),
+            ("Viewport", "viewport ", f"Current {width}x{height}"),
+            ("Max turns", "max-turns ", f"Current {self.manager.max_turns}"),
+            ("CDP URL", "set cdp-url ", "Attach to DevTools HTTP endpoint"),
+            ("CDP websocket", "set cdp-ws ", "Attach to raw DevTools websocket"),
+            ("Chrome path", "set chrome-path ", "Custom Chrome/Chromium executable"),
+            ("Profile template", "set profile-template ", "Copy an existing profile template"),
+            ("Keep profile on", "set keep-profile on", "Preserve owned Chromium profile"),
+            ("Keep profile off", "set keep-profile off", "Delete owned Chromium profile on close"),
+            ("Cloud API base", "set cloud-api-base ", "Custom Browser Use API base URL"),
+            ("Cloud profile id", "set cloud-profile-id ", "Browser Use cloud profile UUID"),
+            ("Cloud profile name", "set cloud-profile-name ", "Browser Use cloud profile name"),
+            ("Cloud proxy country", "set cloud-proxy-country ", "Browser Use proxy country"),
+            ("Cloud timeout", "set cloud-timeout ", "Browser Use timeout in minutes"),
+            ("Cloud recording on", "set cloud-recording on", "Enable Browser Use cloud recording"),
+            ("Cloud recording off", "set cloud-recording off", "Disable Browser Use cloud recording"),
+            ("Cloud resizing on", "set cloud-allow-resizing on", "Allow cloud browser resizing"),
+            ("Cloud resizing off", "set cloud-allow-resizing off", "Disable cloud browser resizing"),
+            ("OpenAI base URL", "set openai-base-url ", "Custom OpenAI-compatible API base"),
+            ("Codex base URL", "set codex-base-url ", "Custom Codex backend API base"),
+            ("Daemon name", "set daemon-name ", "Daemon browser name"),
+            ("Daemon backend", "set daemon-backend ", "Daemon backend: chromium, cdp, real, cloud"),
+            ("Config", "config", "Show redacted loaded config"),
+        ]
 
     def _session_rows(self) -> list[tuple[str, str, str, str, str]]:
         rows = []
@@ -1093,6 +1810,7 @@ class BrowserUseTerminalApp(App[None]):
             f"[#5c9cf5]{counts.get('running', 0)} running[/]",
             f"[#7fd88f]{counts.get('done', 0)} done[/]",
             f"[#e06c75]{counts.get('failed', 0)} failed[/]",
+            "[#808080]/ settings[/]",
             "[#808080]ctrl+p commands[/]",
         ]
         self.query_one("#hintbar", Static).update("   ".join(hint_segments))
@@ -1112,14 +1830,10 @@ class BrowserUseTerminalApp(App[None]):
         if not session_id:
             detail.update(
                 "[bold #eeeeee]New task[/bold #eeeeee]\n\n"
-                "[bold #eeeeee]Context[/bold #eeeeee]\n"
-                "[#808080]0 events[/]\n"
-                "[#808080]0 tools[/]\n"
-                "[#808080]0 images[/]\n"
-                "[#808080]0 artifacts[/]\n\n"
-                "[bold #eeeeee]Session[/bold #eeeeee]\n"
                 "[#808080]not started[/]\n"
-                "[#808080]press tab for history[/]"
+                "[#808080]press tab for history[/]\n\n"
+                "[bold #eeeeee]browser[/bold #eeeeee]\n"
+                f"[#808080]{escape(_browser_runtime_label())}[/]"
             )
             return
         session = self.store.load(session_id)
@@ -1127,32 +1841,37 @@ class BrowserUseTerminalApp(App[None]):
             detail.update(f"Missing session: {escape(session_id)}")
             return
         events = self.store.events.read(session.id)
-        images = sum(1 for event in events if event.type == "tool.image")
-        tools = sum(1 for event in events if event.type == "tool.started")
-        artifacts = len(_artifact_paths(session))
         task = self._task_for_session(session)
         current_tool = _current_tool(events)
         final_line = _final_line(events)
-        run_id = _dataset_run_id_from_path(session.cwd)
-        run_line = self._dataset_run_detail(run_id) if run_id else "-"
         latest_image = _latest_image_line(events)
-        title = task[:36] if task else "Browser session"
+        live_url = _latest_browser_live_url(events)
+        title = _compact_inline(task or "Browser session", limit=42)
+        result_lines = []
+        if latest_image != "-":
+            result_lines.append(_sidebar_image_line(latest_image))
+        if final_line != "-" and session.status in {"done", "failed", "cancelled"}:
+            result_lines.extend(_sidebar_result_lines(final_line))
+        if current_tool != "-" and session.status in {"created", "running"}:
+            result_lines.append(f"[#808080]working: {escape(_compact_inline(current_tool, limit=46))}[/]")
+        if not result_lines:
+            waiting = "waiting for browser output" if session.status in {"created", "running"} else "idle"
+            result_lines.append(f"[#808080]{waiting}[/]")
+        result_markup = "\n".join(result_lines[:4])
+        browser_markup = ""
+        if session.status in {"created", "running"} and live_url:
+            browser_markup = (
+                "[bold #eeeeee]browser[/bold #eeeeee]\n"
+                f"{_rich_link('open live preview', live_url)}\n"
+                f"{_rich_link(_compact_inline(live_url, limit=42), live_url)}\n\n"
+            )
         detail.update(
             f"[bold #eeeeee]{escape(title)}[/bold #eeeeee]\n\n"
-            f"[bold #eeeeee]Context[/bold #eeeeee]\n"
-            f"[#808080]{len(events):,} events[/]\n"
-            f"[#808080]{tools} tools[/]\n"
-            f"[#808080]{images} images[/]\n"
-            f"[#808080]{artifacts} artifacts[/]\n\n"
-            f"[bold #eeeeee]Session[/bold #eeeeee]\n"
-            f"{_status_markup(session.status)}  [#808080]{escape(session.id)}[/]\n"
-            f"[#808080]parent {escape(session.parent_id or '-')}[/]\n"
+            f"{_status_markup(session.status)} [#808080]· {escape(session.id)}[/]\n"
             f"[#808080]updated {_format_age(session.updated_ms / 1000)}[/]\n\n"
-            f"[bold #eeeeee]Current[/bold #eeeeee]\n"
-            f"[#808080]{escape(current_tool)}[/]\n"
-            f"[#808080]{escape(latest_image)}[/]\n"
-            f"[#808080]{escape(final_line[:80])}[/]\n"
-            f"[#808080]{escape(run_line[:80])}[/]"
+            f"{browser_markup}"
+            f"[bold #eeeeee]answer[/bold #eeeeee]\n"
+            f"{result_markup}"
         )
 
     def _preview_artifact(self, path: Optional[str], force: bool = False) -> None:
@@ -1175,30 +1894,55 @@ class BrowserUseTerminalApp(App[None]):
         self._preview_key = key
         preview.clear()
         kind = _artifact_kind(artifact)
-        preview.write(f"[bold #eeeeee]{escape(artifact.name)}[/bold #eeeeee]  [#808080]{kind}  {_format_bytes(stat.st_size)}[/]")
-        preview.write(f"[#808080]{escape(str(artifact))}[/]")
+        display_name = artifact.name
+        if self.selected_session_id:
+            session = self.store.load(self.selected_session_id)
+            if session is not None:
+                display_name = _artifact_display_name(session, artifact)
+        preview.write(f"[bold #eeeeee]{escape(display_name)}[/bold #eeeeee]")
+        preview.write(f"[#808080]{kind} · {_format_bytes(stat.st_size)}[/]")
+        preview.write(_rich_link(f"open {kind}", artifact.resolve().as_uri()))
+        preview.write("")
         if kind == "image":
             dims = _image_dimensions(artifact)
             if dims:
-                preview.write(f"dimensions: {dims[0]} x {dims[1]}")
-            preview.write("[#808080]Image artifact. Press `o` or `/open` to view it.[/]")
+                preview.write(f"[#808080]dimensions: {dims[0]} x {dims[1]}[/]")
             meta = artifact.with_suffix(".json")
             if meta.exists():
                 try:
-                    preview.write(escape(meta.read_text(encoding="utf-8")[:1200]))
+                    meta_payload = json.loads(meta.read_text(encoding="utf-8"))
+                    preview.write(_screenshot_meta_summary(meta_payload))
                 except Exception:
                     pass
+            preview.scroll_home(animate=False)
             return
-        if artifact.suffix.lower() in {".txt", ".json", ".jsonl", ".md", ".html", ".csv", ".tsv", ".py"}:
+        if artifact.suffix.lower() == ".md":
             try:
-                preview.write(escape(artifact.read_text(encoding="utf-8", errors="replace")[:4000]))
+                text, mode = _preview_text_for_artifact(artifact)
+                if mode == "markdown":
+                    _write_markdown(preview, text)
+                else:
+                    preview.write(escape(text))
             except Exception as exc:
                 preview.write(f"[#f5a742]preview failed: {escape(str(exc))}[/]")
+            preview.scroll_home(animate=False)
+            return
+        if artifact.suffix.lower() in {".txt", ".json", ".jsonl", ".html", ".csv", ".tsv", ".py"}:
+            try:
+                text, mode = _preview_text_for_artifact(artifact)
+                if mode == "markdown":
+                    _write_markdown(preview, text)
+                else:
+                    preview.write(escape(text))
+            except Exception as exc:
+                preview.write(f"[#f5a742]preview failed: {escape(str(exc))}[/]")
+            preview.scroll_home(animate=False)
             return
         preview.write("[#808080]Binary artifact. Press `o` or `/open` to view it.[/]")
+        preview.scroll_home(animate=False)
 
     def _task_for_session(self, session: SessionMetadata) -> str:
-        for event in self.store.events.read(session.id):
+        for event in reversed(self.store.events.read(session.id)):
             if event.type == "session.input":
                 return _summarize_task_text(str(event.payload.get("text") or ""))
         return ""
@@ -1219,10 +1963,10 @@ class BrowserUseTerminalApp(App[None]):
             summary = summarize_manifest(load_manifest(self.store.state_dir, run_id))
         except Exception:
             return f"[#808080]run[/] {escape(run_id)}"
+        label = _dataset_run_label_from_id(run_id)
         return (
-            f"[#808080]run[/] {escape(run_id)} "
-            f"{_progress_bar(summary['passed'], summary['selected'], width=10)} "
-            f"[#7fd88f]{summary['passed']}[/]/[bold]{summary['selected']}[/bold] "
+            f"[#808080]run[/] [#eeeeee]{escape(label)}[/] "
+            f"[#7fd88f]{summary['passed']}/{summary['selected']} done[/] "
             f"[#f5a742]{summary['pending']} pending[/]"
         )
 
@@ -1248,7 +1992,9 @@ def _artifact_paths(session: SessionMetadata) -> list[Path]:
             if not path.is_file():
                 continue
             parts = path.relative_to(session.artifact_dir).parts
-            if "chrome-profile" in parts or "__pycache__" in parts:
+            if "chrome-profile" in parts or "__pycache__" in parts or "compactions" in parts:
+                continue
+            if _is_sidecar_metadata(path):
                 continue
             artifact_paths.append(path)
     paths.extend(artifact_paths)
@@ -1256,7 +2002,65 @@ def _artifact_paths(session: SessionMetadata) -> list[Path]:
     cwd = session.cwd.resolve()
     if cwd.exists() and cwd != session.artifact_dir.resolve() and state_dir in cwd.parents:
         paths.extend([path for path in cwd.rglob("*") if path.is_file()])
-    return sorted(set(paths), key=lambda path: path.stat().st_mtime, reverse=True)[:200]
+    return sorted(set(paths), key=_artifact_sort_key)[:200]
+
+
+def _is_sidecar_metadata(path: Path) -> bool:
+    if path.suffix.lower() != ".json":
+        return False
+    companion = path.with_suffix(".png")
+    if companion.exists() and "screenshots" in path.parts:
+        return True
+    return False
+
+
+def _artifact_sort_key(path: Path) -> tuple[int, float, str]:
+    priority = {
+        "md": 0,
+        "download": 1,
+        "image": 2,
+        "tool": 4,
+        "workspace": 6,
+        "py": 7,
+        "trace": 5,
+        "json": 8,
+    }.get(_artifact_kind(path), 6)
+    return (priority, -path.stat().st_mtime, str(path))
+
+
+def _artifact_display_name(session: SessionMetadata, path: Path) -> str:
+    try:
+        relative = path.relative_to(session.artifact_dir)
+    except ValueError:
+        try:
+            relative = path.relative_to(session.cwd)
+        except ValueError:
+            relative = Path(path.name)
+    if "tool-output" in relative.parts:
+        tool = path.stem.split("_")[-1] or "tool"
+        return _compact_inline(f"{tool} output", limit=27)
+    if "screenshots" in relative.parts:
+        return _compact_inline(path.name, limit=27)
+    return _compact_inline(str(relative), limit=27)
+
+
+def _screenshot_meta_summary(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    lines: list[str] = []
+    url = str(payload.get("url") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    viewport = payload.get("viewport")
+    if title:
+        lines.append(f"[#808080]title: {escape(_compact_inline(title, limit=36))}[/]")
+    if url:
+        lines.append(_rich_link(_compact_inline(url, limit=42), url))
+    if isinstance(viewport, dict):
+        width = viewport.get("width")
+        height = viewport.get("height")
+        if width and height:
+            lines.append(f"[#808080]viewport: {width} x {height}[/]")
+    return "\n".join(lines)
 
 
 def _browser_headless_default() -> bool:
@@ -1266,9 +2070,49 @@ def _browser_headless_default() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_browser_mode(mode: str) -> Optional[str]:
+    normalized = mode.strip().lower().replace("_", "-")
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "chromium": "chromium",
+        "chrome": "chromium",
+        "local": "chromium",
+        "owned": "chromium",
+        "headless": "headless-chromium",
+        "headless-chromium": "headless-chromium",
+        "real": "real",
+        "real-chrome": "real",
+        "existing": "real",
+        "remote": "cloud",
+        "cloud": "cloud",
+        "browser-use": "cloud",
+        "browser-use-cloud": "cloud",
+        "cdp": "cdp",
+        "attach": "cdp",
+        "daemon": "daemon",
+    }
+    return aliases.get(normalized)
+
+
+def _browser_mode_label(mode: str) -> str:
+    labels = {
+        "auto": "auto",
+        "chromium": "chromium",
+        "headless-chromium": "chromium headless",
+        "real": "real chrome",
+        "cloud": "remote browser-use",
+        "cdp": "cdp",
+        "daemon": "daemon",
+    }
+    return labels.get(mode, mode)
+
+
 def _browser_runtime_label() -> str:
     diagnostics = browser_runtime_diagnostics()
     mode = str(diagnostics.get("mode") or "auto")
+    if mode == "headless-chromium":
+        return "chromium headless"
     if mode == "chromium" and diagnostics.get("headless_env"):
         return "chromium headless"
     if mode == "cloud":
@@ -1304,50 +2148,90 @@ def _browser_runtime_detail() -> str:
 def _format_event_for_transcript(event: Event) -> str:
     payload = event.payload
     if event.type == "session.created":
-        return f"session {event.session_id} created"
+        return ""
     if event.type == "session.input":
         return _summarize_task_text(str(payload.get("text") or ""))
     if event.type == "session.status":
-        return f"status {payload.get('status', '')}"
+        return ""
     if event.type == "session.cancel_requested":
         return f"cancel requested: {payload.get('reason', '')}"
     if event.type == "session.compacted":
-        return f"compacted {payload.get('before_messages')} -> {payload.get('after_messages')} messages"
+        return f"compacted: before={payload.get('before_messages')} after={payload.get('after_messages')}"
     if event.type == "session.deadline_warning":
         return f"deadline warning: {payload.get('remaining_s')}s remaining"
+    if event.type == "browser.live_url":
+        url = str(payload.get("live_url") or payload.get("url") or "").strip()
+        if not url:
+            return "browser live preview"
+        return f"browser live preview:\n\n{url}"
     if event.type == "tool.started":
-        return f"→ {payload.get('name') or 'tool'} {payload.get('tool_call_id') or ''}".strip()
+        name = str(payload.get("name") or "tool")
+        return _format_tool_started_summary(name, payload.get("arguments") or {})
     if event.type == "tool.image":
         image = payload.get("image") or {}
         path = Path(str(image.get("path") or ""))
         label = image.get("label") or "image"
         return f"image: {label} -> {path.name or path}"
     if event.type == "tool.output":
-        text = _compact_inline(payload.get("text", ""))
-        return f"  {payload.get('name') or 'tool'} {payload.get('stream') or ''} {text}".strip()
+        text = str(payload.get("text") or "")
+        header = f"{payload.get('name') or 'tool'} {payload.get('stream') or ''}".strip()
+        return f"{header}\n\n{text}".strip()
     if event.type == "tool.finished":
+        if str(payload.get("name") or "") == "done":
+            return ""
         output = payload.get("output") or {}
-        text = _compact_inline(output.get("text", ""))
-        suffix = f" {text}" if text else ""
-        return f"✓ {payload.get('name') or 'tool'}{suffix}"
+        name = str(payload.get("name") or "tool")
+        text = str(output.get("text") or "")
+        data = {
+            key: value
+            for key, value in output.items()
+            if key not in {"text", "images"} and not _is_empty_tool_value(value)
+        }
+        if not text and _is_success_metadata(data):
+            return ""
+        parts = [f"✓ {name}"]
+        if text:
+            parts.append(_trim_tool_output_for_transcript(text))
+        if _is_success_metadata(data):
+            data = {}
+        if data:
+            parts.append(_fenced_json(data))
+        images = output.get("images") or []
+        if images:
+            parts.append(_fenced_json({"images": images}))
+        return "\n\n".join(parts)
     if event.type == "tool.failed":
-        return f"tool failed: {payload.get('name') or 'tool'} {payload.get('error') or ''}".strip()
+        return f"tool failed: {payload.get('name') or 'tool'} {_compact_error_text(payload.get('error') or '')}".strip()
     if event.type == "session.done":
-        text = _compact_inline(payload.get("result", ""), limit=220)
-        return f"done: {text}" if text else "done"
+        text = str(payload.get("result") or "")
+        return f"done:\n\n{text}" if text else "done"
     if event.type == "session.failed":
-        return f"failed: {payload.get('error') or ''}".strip()
+        return f"failed: {_compact_error_text(payload.get('error') or '')}".strip()
     return f"{event.type}: {payload}"
+
+
+def _transcript_event_type(event: Event) -> str:
+    if event.type == "session.input" and event.payload.get("resumed"):
+        return "session.followup"
+    return event.type
 
 
 def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
     model_buffers: dict[str, str] = {}
+    last_by_session: dict[str, str] = {}
+    recent_model_by_session: dict[str, str] = {}
 
     def flush(session_id: str) -> None:
         text = model_buffers.pop(session_id, "")
         if text.strip():
-            lines.append((" ".join(text.strip().split()), "model.delta"))
+            rendered = text.strip()
+            lines.append((rendered, "model.delta"))
+            last_by_session[session_id] = _canonical_transcript_text(rendered)
+            recent_model_by_session[session_id] = _join_transcript_text(
+                recent_model_by_session.get(session_id, ""),
+                rendered,
+            )
 
     for event in events:
         if event.type == "model.delta":
@@ -1360,7 +2244,22 @@ def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
                 flush(event.session_id)
             continue
         flush(event.session_id)
-        lines.append((_format_event_for_transcript(event), event.type))
+        line = _format_event_for_transcript(event)
+        if line:
+            if event.type == "session.done":
+                result = str(event.payload.get("result") or "")
+                previous = last_by_session.get(event.session_id, "")
+                recent_model = recent_model_by_session.get(event.session_id, "")
+                canonical_result = _canonical_transcript_text(result)
+                if (
+                    previous == canonical_result
+                    or previous == _canonical_transcript_text(line)
+                    or _canonical_transcript_text(recent_model) == canonical_result
+                    or _canonical_transcript_text(recent_model).endswith(canonical_result)
+                ):
+                    continue
+            lines.append((line, _transcript_event_type(event)))
+            last_by_session[event.session_id] = _canonical_transcript_text(line)
 
     for session_id in list(model_buffers):
         flush(session_id)
@@ -1395,6 +2294,361 @@ def _format_events_for_log(events: list[Event]) -> list[tuple[str, str]]:
     return lines
 
 
+def _write_markdown(log: RichLog, text: str, style: str = "none") -> None:
+    if _file_links_for_text(text):
+        log.write(_rich_text_with_file_links(text, style=style))
+        return
+    log.write(
+        Markdown(
+            _linkify_markdown(text),
+            code_theme="monokai",
+            hyperlinks=True,
+            inline_code_theme="monokai",
+            style=style,
+        )
+    )
+
+
+def _fenced_json(value: object) -> str:
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except TypeError:
+        rendered = repr(value)
+    return f"```json\n{rendered}\n```"
+
+
+def _format_tool_started_summary(name: str, arguments: object) -> str:
+    if not isinstance(arguments, dict):
+        return f"→ {name}"
+    if name == "shell":
+        command = str(arguments.get("command") or "").strip()
+        if command:
+            return f"→ shell {_summarize_command(command)}"
+    if name == "python":
+        code = str(arguments.get("code") or "").strip()
+        if code:
+            return f"→ python {_summarize_code(code)}"
+    keys = ", ".join(str(key) for key in list(arguments)[:4])
+    return f"→ {name}" + (f" {keys}" if keys else "")
+
+
+def _summarize_command(command: str) -> str:
+    first_line = next((line.strip() for line in command.splitlines() if line.strip()), "")
+    if "cat >" in first_line and "<<'" in first_line:
+        target = first_line.split("cat >", 1)[1].split("<<", 1)[0].strip()
+        return f"write {target}"
+    if first_line.startswith("zed "):
+        return f"open {first_line.removeprefix('zed ').strip()}"
+    if first_line.startswith("open "):
+        return first_line
+    return _compact_inline(first_line, limit=96)
+
+
+def _summarize_code(code: str) -> str:
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return _compact_inline(stripped, limit=96)
+    return "run code"
+
+
+def _trim_tool_output_for_transcript(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) <= 1200 and len(stripped.splitlines()) <= 18:
+        return stripped
+    lines = stripped.splitlines()[:12]
+    return "\n".join(lines).rstrip() + "\n..."
+
+
+def _format_tool_arguments_for_transcript(name: str, arguments: object) -> str:
+    if not isinstance(arguments, dict):
+        return _fenced_json(arguments)
+    if name == "shell" and "command" in arguments:
+        command = str(arguments.get("command") or "")
+        extras = {key: value for key, value in arguments.items() if key != "command"}
+        parts = [f"```sh\n{_truncate_multiline(command, max_lines=16, max_chars=1400)}\n```"]
+        if extras:
+            parts.append(_fenced_json(extras))
+        return "\n\n".join(parts)
+    if name == "python" and "code" in arguments:
+        code = str(arguments.get("code") or "")
+        extras = {key: value for key, value in arguments.items() if key != "code"}
+        parts = [f"```python\n{_truncate_multiline(code, max_lines=18, max_chars=1600)}\n```"]
+        if extras:
+            parts.append(_fenced_json(extras))
+        return "\n\n".join(parts)
+    rendered = json.dumps(arguments, ensure_ascii=False, indent=2, default=str)
+    if len(rendered) <= 1400:
+        return f"```json\n{rendered}\n```"
+    compact = {
+        key: _compact_tool_argument_value(value)
+        for key, value in arguments.items()
+    }
+    return _fenced_json(compact)
+
+
+def _truncate_multiline(text: str, *, max_lines: int, max_chars: int) -> str:
+    lines = text.splitlines()
+    truncated = False
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        truncated = True
+    rendered = "\n".join(lines)
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars].rstrip()
+        truncated = True
+    if truncated:
+        hidden_lines = max(0, len(text.splitlines()) - len(lines))
+        suffix = f"\n# ... truncated"
+        if hidden_lines:
+            suffix += f" ({hidden_lines} more lines)"
+        rendered += suffix
+    return rendered
+
+
+def _compact_tool_argument_value(value: object) -> object:
+    if isinstance(value, str):
+        return _compact_inline(value, limit=260)
+    if isinstance(value, list):
+        return f"{len(value)} items"
+    if isinstance(value, dict):
+        return {key: _compact_tool_argument_value(item) for key, item in list(value.items())[:12]}
+    return value
+
+
+def _is_success_metadata(data: dict[str, object]) -> bool:
+    if not data:
+        return False
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return False
+    allowed = {"returncode", "truncated", "ok"}
+    if any(key not in allowed for key in payload):
+        return False
+    return payload.get("returncode", 0) == 0 and payload.get("truncated") in {False, None}
+
+
+def _preview_text_for_artifact(path: Path, limit: int = 5000) -> tuple[str, str]:
+    suffix = path.suffix.lower()
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    raw = _strip_tool_output_metadata(raw)
+    if suffix in {".json", ".jsonl"}:
+        parsed = _parse_json_preview(raw, jsonl=suffix == ".jsonl")
+        if parsed is not None:
+            if isinstance(parsed, str):
+                return (_limit_preview_text(parsed, limit), "plain")
+            return (_fenced_json(parsed), "markdown")
+    if "tool-output" in path.parts:
+        parsed = _parse_json_preview(raw, jsonl=False)
+        if parsed is not None:
+            text = _best_text_from_preview_payload(parsed)
+            if text:
+                decoded = _decode_escaped_text(text)
+                mode = "markdown" if _looks_like_markdown(decoded) else "plain"
+                return (_limit_preview_text(decoded, limit), mode)
+            return (_fenced_json(parsed), "markdown")
+    text = _decode_escaped_text(raw)
+    text = _limit_preview_text(text, limit)
+    if suffix == ".md" or _looks_like_markdown(text):
+        return (text, "markdown")
+    return (text, "plain")
+
+
+def _strip_tool_output_metadata(text: str) -> str:
+    for separator in ("\n\ndata=", "\ndata="):
+        if separator in text:
+            return text.split(separator, 1)[0].rstrip()
+    return text.rstrip()
+
+
+def _parse_json_preview(text: str, *, jsonl: bool) -> object | None:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if jsonl:
+        rows = []
+        for line in stripped.splitlines()[:80]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                return None
+        return rows
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        return None
+
+
+def _best_text_from_preview_payload(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        strings = [item for item in value if isinstance(item, str) and item.strip()]
+        if strings:
+            unique = list(dict.fromkeys(strings))
+            return max(unique, key=len)
+    if isinstance(value, dict):
+        for key in ("text", "result", "output"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item
+    return ""
+
+
+def _decode_escaped_text(text: str) -> str:
+    if not any(marker in text for marker in ("\\n", "\\u", "\\t", "\\r")):
+        return text
+    try:
+        return text.encode("utf-8").decode("unicode_escape")
+    except UnicodeError:
+        return text
+
+
+def _looks_like_markdown(text: str) -> bool:
+    stripped = text.lstrip()
+    return (
+        stripped.startswith("#")
+        or "\n#" in text
+        or "**" in text
+        or re.search(r"(?m)^\s*[-*]\s+\S", text) is not None
+        or re.search(r"(?m)^\|.+\|$", text) is not None
+    )
+
+
+def _limit_preview_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n..."
+
+
+def _is_empty_tool_value(value: object) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _linkify_markdown(text: str) -> str:
+    lines = str(text).splitlines()
+    linked: list[str] = []
+    in_fence = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            linked.append(line)
+            continue
+        if in_fence:
+            linked.append(line)
+            continue
+        if "](" in line:
+            linked.append(line)
+            continue
+        linked.append(_linkify_line(line))
+    return "\n".join(linked)
+
+
+_INLINE_ABS_PATH_CODE_RE = re.compile(r"`(/[^`]+)`")
+_BARE_URL_RE = re.compile(r"(?<![<(])(https?://[^\s<>()]+)")
+_ABS_PATH_RE = re.compile(r"(?<![\w`\\])(/(?!/)(?:[^\s`\]\),;]+/?)+)")
+_LINK_CHUNK_SIZE = 74
+
+
+def _linkify_line(line: str) -> str:
+    def url_repl(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        suffix = ""
+        while raw and raw[-1] in ".,;:":
+            suffix = raw[-1] + suffix
+            raw = raw[:-1]
+        if len(raw) > _LINK_CHUNK_SIZE:
+            return _chunked_markdown_link(raw, raw) + suffix
+        return f"<{raw}>{suffix}"
+
+    return _BARE_URL_RE.sub(url_repl, line)
+
+
+def _chunked_markdown_link(label: str, target: str) -> str:
+    chunks = [label[index : index + _LINK_CHUNK_SIZE] for index in range(0, len(label), _LINK_CHUNK_SIZE)]
+    clean_target = _markdown_link_target(target)
+    return "\n".join(f"[{_markdown_link_label(chunk)}](<{clean_target}>)" for chunk in chunks)
+
+
+def _markdown_link_label(label: str) -> str:
+    return label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _markdown_link_target(target: str) -> str:
+    return target.replace("\n", "").replace(">", "%3E")
+
+
+def _file_links_for_text(text: str, limit: int = 3) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for _start, _end, raw, path in _file_link_spans_for_text(text):
+        resolved = path.resolve()
+        if resolved not in seen:
+            paths.append(resolved)
+            seen.add(resolved)
+        if len(paths) >= limit:
+            break
+    return paths[:limit]
+
+
+def _rich_text_with_file_links(text: str, style: str = "none") -> Text:
+    base_style = None if style == "none" else style
+    rendered = Text(style=base_style)
+    cursor = 0
+    for start, end, label, path in _file_link_spans_for_text(text):
+        if start < cursor:
+            continue
+        rendered.append(text[cursor:start])
+        rendered.append(label, style=f"#56d7f7 underline link {path.resolve().as_uri()}")
+        cursor = end
+    rendered.append(text[cursor:])
+    return rendered
+
+
+def _file_link_spans_for_text(text: str) -> list[tuple[int, int, str, Path]]:
+    spans: list[tuple[int, int, str, Path]] = []
+    covered: list[tuple[int, int]] = []
+    for match in _INLINE_ABS_PATH_CODE_RE.finditer(text):
+        raw = match.group(1)
+        path = Path(raw).expanduser()
+        if path.exists():
+            spans.append((match.start(), match.end(), raw, path))
+            covered.append((match.start(), match.end()))
+    for match in _ABS_PATH_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in covered):
+            continue
+        raw = match.group(1)
+        while raw and raw[-1] in ".,;:":
+            raw = raw[:-1]
+        path = Path(raw).expanduser()
+        if path.exists():
+            spans.append((match.start(), match.start() + len(raw), raw, path))
+    return sorted(spans, key=lambda item: item[0])
+
+
+def _canonical_transcript_text(text: str) -> str:
+    stripped = str(text or "").strip()
+    if stripped.startswith("done:\n\n"):
+        stripped = stripped.removeprefix("done:\n\n").strip()
+    return stripped
+
+
+def _join_transcript_text(previous: str, current: str) -> str:
+    previous = _canonical_transcript_text(previous)
+    current = _canonical_transcript_text(current)
+    if not previous:
+        return current
+    if not current:
+        return previous
+    joined = f"{previous}\n\n{current}"
+    return joined[-12000:]
+
+
 def _summarize_task_text(text: str) -> str:
     task = text
     marker = "\nTask:\n"
@@ -1411,6 +2665,65 @@ def _compact_inline(value: object, limit: int = 160) -> str:
     if len(text) > limit:
         return text[: max(0, limit - 3)] + "..."
     return text
+
+
+def _composer_visible_line_count(text: str, width: int, *, max_lines: int = 5) -> int:
+    available = max(20, int(width or 80) - 2)
+    total = 0
+    for line in str(text or "").splitlines() or [""]:
+        total += max(1, (len(line) + available - 1) // available)
+    return max(1, min(max_lines, total))
+
+
+def _compact_result_text(value: object, limit: int = 160) -> str:
+    text = str(value or "")
+    for path in _file_links_for_text(text, limit=8):
+        text = text.replace(str(path), path.name)
+    return _compact_inline(text, limit=limit)
+
+
+def _compact_error_text(value: object, limit: int = 220) -> str:
+    text = " ".join(str(value or "").strip().split())
+    message_match = re.search(r'"message"\s*:\s*"([^"]+)"', text)
+    if message_match:
+        prefix = text.split("{", 1)[0].strip().rstrip(":")
+        message = message_match.group(1)
+        text = f"{prefix}: {message}" if prefix else message
+    return _compact_inline(text, limit=limit)
+
+
+def _sidebar_result_lines(value: object) -> list[str]:
+    text = str(value or "").strip()
+    files = _file_links_for_text(text, limit=1)
+    if files:
+        path = files[0]
+        return [f"[#808080]file[/] {_rich_link(path.name, path.resolve().as_uri())}"]
+    table_rows = _markdown_table_row_count(text)
+    if table_rows:
+        label = "row" if table_rows == 1 else "rows"
+        return [f"[#808080]table: {table_rows} {label}[/]"]
+    if text.startswith("failed:"):
+        text = _compact_error_text(text.removeprefix("failed:").strip(), limit=96)
+    return [f"[#808080]{escape(_compact_result_text(text, limit=64))}[/]"]
+
+
+def _sidebar_image_line(value: str) -> str:
+    text = value
+    if text.startswith("screenshot -> "):
+        text = text.removeprefix("screenshot -> ")
+    return f"[#808080]screenshot: {escape(_compact_inline(text, limit=42))}[/]"
+
+
+def _markdown_table_row_count(text: str) -> int:
+    rows = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            continue
+        if re.fullmatch(r"[\s|:\-]+", stripped):
+            continue
+        rows += 1
+    return max(0, rows - 1)
 
 
 def _compact_path(path: Path, limit: int = 38) -> str:
@@ -1444,13 +2757,18 @@ def _dataset_run_label(path: Path) -> str:
     if not run_id:
         return "-"
     task_id = _dataset_task_id_from_path(path)
+    compact_run = _dataset_run_label_from_id(run_id)
+    label = compact_run[:18]
+    return f"{label}:{task_id}" if task_id else label
+
+
+def _dataset_run_label_from_id(run_id: str) -> str:
     compact_run = run_id
     if compact_run.startswith("real-v8-"):
         compact_run = "v8-" + compact_run.removeprefix("real-v8-")
     if compact_run.startswith("real-v14-"):
         compact_run = "v14-" + compact_run.removeprefix("real-v14-")
-    label = compact_run[:18]
-    return f"{label}:{task_id}" if task_id else label
+    return compact_run
 
 
 def _progress_bar(done: int, total: int, width: int = 12) -> str:
@@ -1473,6 +2791,22 @@ def _latest_image_line(events: list[Event]) -> str:
         name = path.name if str(path) else "-"
         return f"{label} -> {name}"
     return "-"
+
+
+def _latest_browser_live_url(events: list[Event]) -> str:
+    for event in reversed(events):
+        if event.type != "browser.live_url":
+            continue
+        payload = event.payload
+        url = str(payload.get("live_url") or payload.get("url") or "").strip()
+        if url:
+            return url
+    return ""
+
+
+def _rich_link(label: str, url: str) -> str:
+    target = url.replace('"', "%22").replace("]", "%5D").replace("\n", "")
+    return f"[link=\"{target}\"][#5c9cf5]{escape(label)}[/][/link]"
 
 
 def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
@@ -1534,7 +2868,7 @@ def _final_line(events: list[Event]) -> str:
         if event.type == "session.done":
             return str(event.payload.get("result") or "done")
         if event.type == "session.failed":
-            return str(event.payload.get("error") or "failed")
+            return f"failed: {_compact_error_text(event.payload.get('error') or 'failed')}"
         if event.type == "session.cancelled":
             return str(event.payload.get("reason") or "cancelled")
         if event.type == "tool.finished":
@@ -1563,7 +2897,7 @@ def _artifact_kind(path: Path) -> str:
     if "tool-output" in path.parts:
         return "tool"
     if "dataset-runs" in path.parts:
-        return "workspace"
+        return suffix.lstrip(".") or "workspace"
     return suffix.lstrip(".") or "file"
 
 
@@ -1599,6 +2933,20 @@ def _format_age(mtime: float) -> str:
     return f"{age // 86400}d ago"
 
 
+def _assign_config_value(config: dict[str, Any], dotted: str, value: Any) -> None:
+    parts = [part for part in dotted.split(".") if part]
+    if not parts:
+        return
+    target: dict[str, Any] = config
+    for part in parts[:-1]:
+        existing = target.get(part)
+        if not isinstance(existing, dict):
+            existing = {}
+            target[part] = existing
+        target = existing
+    target[parts[-1]] = value
+
+
 class TextualTui:
     def __init__(
         self,
@@ -1608,6 +2956,7 @@ class TextualTui:
         provider_label: str = "fake",
         model_label: Optional[str] = None,
         config: Optional[dict] = None,
+        config_path: Optional[Path | str] = None,
     ) -> None:
         self.app = BrowserUseTerminalApp(
             store,
@@ -1616,6 +2965,7 @@ class TextualTui:
             provider_label=provider_label,
             model_label=model_label,
             config=config,
+            config_path=config_path,
         )
 
     def run(self) -> int:

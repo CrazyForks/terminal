@@ -62,6 +62,32 @@ class SessionManager:
         thread.start()
         return session
 
+    def resume(self, session_id: str, instruction: str = "Continue from the previous session state.") -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+        with self._lock:
+            active = self._active.get(session.id)
+            if active is not None and active.running:
+                raise RuntimeError(f"session already running: {session.id}")
+
+        active_ref: Dict[str, ActiveSession] = {}
+
+        def target() -> None:
+            try:
+                agent = Agent(self.store, provider_factory=self.provider_factory, max_turns=self.max_turns)
+                agent.resume_session(session.id, instruction)
+            except BaseException:
+                active_ref["active"].error = traceback.format_exc()
+
+        thread = threading.Thread(target=target, name=f"browser-use-terminal-{session.id}", daemon=True)
+        resumed = ActiveSession(session_id=session.id, task=instruction, thread=thread)
+        active_ref["active"] = resumed
+        with self._lock:
+            self._active[session.id] = resumed
+        thread.start()
+        return session
+
     def cancel(self, session_id: str, reason: str = "user requested cancellation") -> None:
         self.store.request_cancel(session_id, reason=reason)
 

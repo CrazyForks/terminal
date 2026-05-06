@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from llm_browser.events import Event
 from llm_browser.session.store import SessionStore
 from llm_browser.tui.app import (
     BrowserUseTerminalApp,
+    ComposerInput,
     CommandPalette,
     SessionPalette,
     _artifact_kind,
+    _artifact_paths,
+    _composer_visible_line_count,
     _current_tool,
     _dataset_run_id_from_path,
     _dataset_run_label,
     _dataset_task_id_from_path,
     _final_line,
+    _file_links_for_text,
+    _format_event_for_transcript,
     _format_events_for_log,
+    _format_events_for_transcript,
+    _linkify_markdown,
     _latest_image_line,
+    _latest_browser_live_url,
+    _normalize_browser_mode,
+    _preview_text_for_artifact,
     _progress_bar,
+    _rich_link,
     _short_task_list,
     _summarize_task_text,
 )
@@ -81,6 +95,148 @@ class TuiTest(unittest.TestCase):
         self.assertEqual(lines[0], ("[s1] model: Hello", "model.delta"))
         self.assertIn("tool start: python", lines[1][0])
 
+    def test_format_events_for_transcript_hides_lifecycle_and_marks_followup(self) -> None:
+        events = [
+            Event(type="session.created", session_id="s1", payload={}),
+            Event(type="session.input", session_id="s1", payload={"text": "first task"}),
+            Event(type="session.status", session_id="s1", payload={"status": "running"}),
+            Event(type="session.input", session_id="s1", payload={"text": "second task", "resumed": True}),
+        ]
+
+        self.assertEqual(
+            _format_events_for_transcript(events),
+            [("first task", "session.input"), ("second task", "session.followup")],
+        )
+
+    def test_transcript_tool_events_show_compact_arguments_and_output(self) -> None:
+        long_text = "a" * 400
+        events = [
+            Event(
+                type="tool.started",
+                session_id="s1",
+                payload={
+                    "name": "python",
+                    "tool_call_id": "call_1",
+                    "arguments": {"code": "print('hello')", "headless": True},
+                },
+            ),
+            Event(
+                type="tool.finished",
+                session_id="s1",
+                payload={"name": "python", "output": {"text": long_text, "data": {"ok": True}}},
+            ),
+        ]
+
+        lines = _format_events_for_transcript(events)
+
+        self.assertIn("print('hello')", lines[0][0])
+        self.assertIn(long_text, lines[1][0])
+        self.assertNotIn('"ok": true', lines[1][0])
+
+    def test_done_transcript_preserves_markdown(self) -> None:
+        event = Event(type="session.done", session_id="s1", payload={"result": "**Done**\n- item"})
+
+        self.assertEqual(_format_event_for_transcript(event), "done:\n\n**Done**\n- item")
+
+    def test_failed_transcript_compacts_provider_json_error(self) -> None:
+        event = Event(
+            type="session.failed",
+            session_id="s1",
+            payload={
+                "error": (
+                    'Codex Responses request failed: HTTP 400: { "error": { '
+                    '"message": "No tool call found for function call output.", '
+                    '"type": "invalid_request_error" } }'
+                )
+            },
+        )
+
+        formatted = _format_event_for_transcript(event)
+
+        self.assertEqual(
+            formatted,
+            "failed: Codex Responses request failed: HTTP 400: No tool call found for function call output.",
+        )
+        self.assertNotIn("invalid_request_error", formatted)
+
+    def test_transcript_dedupes_streamed_final_answer(self) -> None:
+        events = [
+            Event(type="model.delta", session_id="s1", payload={"text": "The file is here:\n\n"}),
+            Event(type="model.delta", session_id="s1", payload={"text": "`/tmp/result.md`"}),
+            Event(type="session.status", session_id="s1", payload={"status": "done"}),
+            Event(type="session.done", session_id="s1", payload={"result": "The file is here:\n\n`/tmp/result.md`"}),
+        ]
+
+        lines = _format_events_for_transcript(events)
+
+        self.assertEqual([event_type for _, event_type in lines], ["model.delta", "model.delta"])
+        self.assertNotIn("session.done", [event_type for _, event_type in lines])
+
+    def test_done_tool_result_is_not_rendered_as_extra_final_answer(self) -> None:
+        event = Event(
+            type="tool.finished",
+            session_id="s1",
+            payload={"name": "done", "output": {"text": "same final answer"}},
+        )
+
+        self.assertEqual(_format_event_for_transcript(event), "")
+
+    def test_linkify_markdown_autolinks_urls_and_existing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.md"
+            path.write_text("# Notes\n", encoding="utf-8")
+
+            linked = _linkify_markdown(f"See https://example.com and {path}.")
+
+            self.assertIn("<https://example.com>", linked)
+            self.assertEqual(_file_links_for_text(str(path)), [path.resolve()])
+
+    def test_linkify_markdown_chunks_long_links_and_inline_file_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ("very_" + "long_" * 18 + "notes.md")
+            path.write_text("# Notes\n", encoding="utf-8")
+            url = "https://live.browser-use.com/?wss=" + ("abc123" * 24)
+
+            linked = _linkify_markdown(f"browser live preview:\n{url}\n`{path}`")
+
+            self.assertGreaterEqual(linked.count(f"](<{url}>)"), 2)
+            self.assertNotIn("file://", linked)
+            self.assertEqual(_file_links_for_text(f"`{path}`"), [path.resolve()])
+
+    def test_tool_output_preview_decodes_json_payload_instead_of_storage_format(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool-output" / "call_1_python.txt"
+            path.parent.mkdir()
+            path.write_text(json.dumps(["short", "Zurich\\nSan Francisco\\n$643"]) + "\n\ndata={'ok': True}", encoding="utf-8")
+
+            text, mode = _preview_text_for_artifact(path)
+
+            self.assertEqual(mode, "plain")
+            self.assertIn("Zurich\nSan Francisco", text)
+            self.assertNotIn("data=", text)
+
+    def test_tool_output_preview_detects_markdown_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool-output" / "call_1_python.txt"
+            path.parent.mkdir()
+            path.write_text(json.dumps(["| A | B |\\n|---|---|\\n| 1 | 2 |"]) + "\n\ndata={'ok': True}", encoding="utf-8")
+
+            text, mode = _preview_text_for_artifact(path)
+
+            self.assertEqual(mode, "markdown")
+            self.assertIn("| A | B |", text)
+
+    def test_normalize_browser_mode_accepts_user_facing_aliases(self) -> None:
+        self.assertEqual(_normalize_browser_mode("real"), "real")
+        self.assertEqual(_normalize_browser_mode("remote"), "cloud")
+        self.assertEqual(_normalize_browser_mode("chromium"), "chromium")
+        self.assertIsNone(_normalize_browser_mode("netscape"))
+
+    def test_composer_visible_line_count_wraps_and_caps_at_five(self) -> None:
+        self.assertEqual(_composer_visible_line_count("", 80), 1)
+        self.assertEqual(_composer_visible_line_count("x" * 100, 52), 2)
+        self.assertEqual(_composer_visible_line_count("\n".join(str(i) for i in range(10)), 80), 5)
+
     def test_summarize_task_text_extracts_dataset_task(self) -> None:
         text = (
             "You are running a browser-use-terminal dataset task.\n"
@@ -117,6 +273,26 @@ class TuiTest(unittest.TestCase):
 
         self.assertEqual(_final_line(events), "complete")
 
+    def test_final_line_compacts_failed_session_errors(self) -> None:
+        events = [
+            Event(
+                type="session.failed",
+                session_id="s1",
+                payload={
+                    "error": (
+                        'Codex Responses request failed: HTTP 400: { "error": { '
+                        '"message": "No tool call found for function call output.", '
+                        '"type": "invalid_request_error" } }'
+                    )
+                },
+            )
+        ]
+
+        self.assertEqual(
+            _final_line(events),
+            "failed: Codex Responses request failed: HTTP 400: No tool call found for function call output.",
+        )
+
     def test_short_task_list_limits_long_runs(self) -> None:
         self.assertEqual(_short_task_list([]), "-")
         self.assertEqual(_short_task_list([str(index) for index in range(14)], limit=3), "0, 1, 2 +11")
@@ -146,9 +322,52 @@ class TuiTest(unittest.TestCase):
 
         self.assertEqual(_latest_image_line(events), "final -> final.png")
 
+    def test_live_browser_url_helpers_render_clickable_link(self) -> None:
+        events = [
+            Event(type="browser.live_url", session_id="s1", payload={"live_url": "https://live.example/session"}),
+        ]
+
+        self.assertEqual(_latest_browser_live_url(events), "https://live.example/session")
+        self.assertEqual(
+            _rich_link("open live preview", "https://live.example/session"),
+            "[link=\"https://live.example/session\"][#5c9cf5]open live preview[/][/link]",
+        )
+
     def test_artifact_kind_prioritizes_trace_and_download_dirs(self) -> None:
         self.assertEqual(_artifact_kind(Path("/tmp/session/browser/traces/001_trace.json")), "trace")
         self.assertEqual(_artifact_kind(Path("/tmp/session/browser/downloads/report.csv")), "download")
+
+    def test_artifact_paths_hide_internal_compactions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session = store.create(cwd=workspace)
+            internal = session.artifact_dir / "compactions" / "001.json"
+            internal.parent.mkdir(parents=True)
+            internal.write_text("{}", encoding="utf-8")
+            visible = session.artifact_dir / "result.md"
+            visible.write_text("# Result", encoding="utf-8")
+
+            self.assertEqual(_artifact_paths(session), [visible])
+
+    def test_artifact_paths_prioritize_user_outputs_over_screenshot_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            session = store.create(cwd=workspace)
+            screenshot = session.artifact_dir / "browser" / "screenshots" / "001_screenshot.png"
+            screenshot.parent.mkdir(parents=True)
+            screenshot.write_bytes(b"png")
+            screenshot.with_suffix(".json").write_text("{}", encoding="utf-8")
+            note = workspace / "answer.md"
+            note.write_text("# Answer", encoding="utf-8")
+
+            paths = _artifact_paths(session)
+
+            self.assertEqual(paths[:2], [note.resolve(), screenshot])
+            self.assertNotIn(screenshot.with_suffix(".json"), paths)
 
 
 class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
@@ -238,6 +457,235 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("enter")
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, CommandPalette)
+
+    async def test_browser_mode_palette_sets_browser_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_MODE": "auto"}, clear=False):
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/browser")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, CommandPalette)
+                await pilot.press("j")
+                await pilot.press("enter")
+                await pilot.pause()
+
+            self.assertEqual(os.environ["LLM_BROWSER_MODE"], "chromium")
+
+    async def test_slash_command_panel_opens_settings_from_composer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("/")
+                await pilot.pause()
+                panel = app.query_one("#slash-panel")
+                self.assertTrue(panel.display)
+                await pilot.press("down")
+                await pilot.pause()
+                self.assertEqual(panel.cursor_row, 1)
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, CommandPalette)
+
+    async def test_composer_auto_expands_and_caps_at_five_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                command = app.query_one("#command", ComposerInput)
+                app._set_composer_text("one\ntwo\nthree\nfour\nfive\nsix")
+                await pilot.pause()
+
+                self.assertEqual(command.styles.height.value, 5)
+                self.assertEqual(app.query_one("#composer").styles.height.value, 8)
+
+    async def test_composer_enter_submits_and_clears_text(self) -> None:
+        class FakeManager:
+            def __init__(self, store: SessionStore) -> None:
+                self.store = store
+                self.started: list[str] = []
+
+            def start(self, task: str):
+                self.started.append(task)
+                return self.store.create()
+
+            def reap(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+            fake_manager = FakeManager(store)
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text("first line\nsecond line")
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertEqual(fake_manager.started, ["first line\nsecond line"])
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "")
+
+    async def test_ctrl_b_is_not_bound_to_browser_palette(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, CommandPalette)
+
+    async def test_slash_settings_update_model_and_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/provider codex")
+                app._handle_command("/model gpt-5.4")
+                await pilot.pause()
+
+            self.assertEqual(app.provider_label, "codex")
+            self.assertEqual(app.model_label, "gpt-5.4")
+
+    async def test_running_cloud_session_detail_renders_live_preview_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.emit(session.id, "session.input", {"text": "open a page"})
+            store.update_status(session.id, "running")
+            store.emit(session.id, "browser.live_url", {"live_url": "https://live.example/session"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._update_session_detail()
+                await pilot.pause()
+                detail = app.query_one("#session-detail")
+
+            self.assertIn("open live preview", str(detail.visual))
+            self.assertIn("https://live.example/session", str(detail.visual))
+
+    async def test_done_session_detail_hides_finished_tool_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.emit(session.id, "session.input", {"text": "make a table"})
+            store.emit(session.id, "tool.started", {"name": "python", "tool_call_id": "call_1"})
+            store.emit(session.id, "tool.finished", {"name": "python", "tool_call_id": "call_1", "output": {"text": "intermediate"}})
+            store.update_status(session.id, "done")
+            store.emit(session.id, "session.done", {"result": "| A | B |\n|---|---|\n| 1 | 2 |"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._update_session_detail()
+                await pilot.pause()
+                detail = app.query_one("#session-detail")
+
+            self.assertIn("answer", str(detail.visual))
+            self.assertIn("table: 1 row", str(detail.visual))
+            self.assertNotIn("python done", str(detail.visual))
+
+    async def test_markdown_artifact_preview_renders_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            note = session.artifact_dir / "result.md"
+            note.write_text("**Flight**\n\n- [Google](https://google.com)\n", encoding="utf-8")
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            with patch("llm_browser.tui.app._write_markdown") as write_markdown:
+                async with app.run_test(size=(120, 36)) as pilot:
+                    app.selected_session_id = session.id
+                    app._preview_artifact(str(note), force=True)
+                    await pilot.pause()
+
+            self.assertEqual(write_markdown.call_count, 1)
+            self.assertIn("**Flight**", write_markdown.call_args.args[1])
+
+    async def test_auth_command_persists_browser_use_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            config_path = Path(tmp) / "config.json"
+            app = BrowserUseTerminalApp(
+                SessionStore(Path(tmp) / "state"),
+                provider_label="fake",
+                model_label="fake-model",
+                config_path=config_path,
+            )
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth browser-use bu_test_key")
+                await pilot.pause()
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["browser"]["cloud_api_key"], "bu_test_key")
+            self.assertEqual(os.environ["BROWSER_USE_API_KEY"], "bu_test_key")
+
+    async def test_plain_text_with_selected_done_session_resumes_in_place(self) -> None:
+        class FakeManager:
+            def __init__(self, store: SessionStore) -> None:
+                self.store = store
+                self.resumed: list[tuple[str, str]] = []
+
+            def resume(self, session_id: str, instruction: str):
+                self.resumed.append((session_id, instruction))
+                self.store.emit(session_id, "session.input", {"text": instruction, "resumed": True})
+                return self.store.load(session_id)
+
+            def start(self, task: str):
+                raise AssertionError(f"unexpected new task: {task}")
+
+            def cancel(self, session_id: str) -> None:
+                pass
+
+            def reap(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "first task"})
+            store.update_status(session.id, "done")
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+            fake_manager = FakeManager(store)
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                app._handle_command("second task")
+                await pilot.pause()
+
+            self.assertEqual(fake_manager.resumed, [(session.id, "second task")])
+            self.assertEqual(app.selected_session_id, session.id)
+
+    async def test_cancel_shortcut_ignores_completed_session(self) -> None:
+        class FakeManager:
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+
+            def cancel(self, session_id: str) -> None:
+                self.cancelled.append(session_id)
+
+            def reap(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.update_status(session.id, "done")
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+            fake_manager = FakeManager()
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app.action_cancel_selected()
+                await pilot.pause()
+
+            self.assertEqual(fake_manager.cancelled, [])
+            self.assertFalse((Path(tmp) / "sessions" / session.id / "cancel.json").exists())
 
 
 if __name__ == "__main__":

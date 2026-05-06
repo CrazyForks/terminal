@@ -33,6 +33,8 @@ uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done 
 uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
 uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com
 uv run browser-use-terminal tui --browser chromium
+uv run but
+uv run but --provider fake
 uv run browser-use-terminal sessions list
 uv run browser-use-terminal datasets sample real_v8 --count 1 --seed 21
 uv run browser-use-terminal datasets run real_v8 --provider codex --model gpt-5.5 --count 1 --seed 21
@@ -80,12 +82,17 @@ uv run browser-use-terminal tui --browser cdp --cdp-ws ws://127.0.0.1:9222/devto
 Browser Use cloud provisions a browser, attaches to its CDP websocket, records the live URL in runtime output, and stops the cloud browser on close:
 
 ```bash
-export BROWSER_USE_API_KEY=...
+uv run but
+# inside the TUI: /auth browser-use <api-key>
+# or: /settings -> Browser Use API key
+
+uv run but --browser remote --cloud-profile-id <uuid> --provider codex --model gpt-5.5
 uv run browser-use-terminal browser smoke --browser cloud --cloud-timeout 60 --cloud-proxy-country us
-uv run browser-use-terminal tui --browser cloud --cloud-profile-id <uuid> --provider codex --model gpt-5.5
 ```
 
 Useful shared options: `--browser-width`, `--browser-height`, `--chrome-path`, `--profile-template`, `--keep-profile`, `--cloud-profile-name`, `--cloud-recording`, and `--cloud-custom-proxy-json`.
+
+Settings saved from the TUI are persisted in `~/.browser-use-terminal/config.json`. Secrets such as `browser.cloud_api_key` and `openai.api_key` are redacted by `config show` and `/config`.
 
 Daemon mode runs a local browser owner process behind the same runtime facade. Use it when you want harnesless-style CDP ownership while keeping this harness's sessions, screenshots, and artifacts:
 

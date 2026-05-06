@@ -5,15 +5,7 @@ from typing import Any, Dict
 
 from llm_browser.tool.browser_exports import BROWSER_TOOL_DESCRIPTION
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import (
-    apply_patch_file,
-    edit_file,
-    glob_files,
-    grep_files,
-    read_file,
-    repo_map,
-    write_file,
-)
+from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
 from llm_browser.tool.python_browser import PythonBrowserTool
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
@@ -57,12 +49,18 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="shell",
-            description="Run a shell command in the session working directory. Large output is saved to an artifact file.",
+            description=(
+                "Run a shell command. Prefer rg/rg --files for codebase exploration, set workdir instead of cd, "
+                "and use max_output_tokens for noisy commands. Large output is truncated and saved to an artifact file."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
+                    "workdir": {"type": "string"},
                     "timeout_s": {"type": "number"},
+                    "max_output_tokens": {"type": "integer"},
+                    "max_output_chars": {"type": "integer"},
                 },
                 "required": ["command"],
                 "additionalProperties": False,
@@ -73,11 +71,12 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="shell_start",
-            description="Start a long-running shell process in the session working directory and return a process id for polling/stdin/stop. Pass pty=true for interactive terminal programs.",
+            description="Start a long-running shell process and return a process id for polling/stdin/stop. Pass workdir instead of cd; pass pty=true for interactive terminal programs.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
+                    "workdir": {"type": "string"},
                     "timeout_s": {"type": "number"},
                     "pty": {"type": "boolean"},
                 },
@@ -96,6 +95,8 @@ def build_builtin_registry() -> ToolRegistry:
                 "properties": {
                     "process_id": {"type": "string"},
                     "all": {"type": "boolean"},
+                    "max_output_tokens": {"type": "integer"},
+                    "max_output_chars": {"type": "integer"},
                 },
                 "required": ["process_id"],
                 "additionalProperties": False,
@@ -127,6 +128,8 @@ def build_builtin_registry() -> ToolRegistry:
                 "type": "object",
                 "properties": {
                     "process_id": {"type": "string"},
+                    "max_output_tokens": {"type": "integer"},
+                    "max_output_chars": {"type": "integer"},
                 },
                 "required": ["process_id"],
                 "additionalProperties": False,
@@ -137,7 +140,10 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="read",
-            description="Read a text file or list a directory. Supports char offset/limit or line_offset/line_limit. Refuses binary content clearly.",
+            description=(
+                "Read a text file or list a directory. Supports char offset/limit or zero-based line_offset/line_limit; "
+                "line windows return L<number>: prefixed lines. Refuses binary content clearly."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -206,7 +212,7 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="glob",
-            description="List files matching a glob pattern under a root, newest first.",
+            description="List non-noisy files matching a glob pattern under a root, newest first. Prefer shell with rg --files for broad repo listings.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -224,7 +230,7 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="grep",
-            description="Search text files for a literal pattern using rg when available.",
+            description="Search text files for a literal pattern using rg when available, skipping common generated/cache directories.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -238,25 +244,6 @@ def build_builtin_registry() -> ToolRegistry:
             },
         ),
         grep_files,
-    )
-    registry.register(
-        ToolSpec(
-            name="repo_map",
-            description=(
-                "Summarize repository structure without reading file contents. "
-                "Use before open-ended codebase exploration to choose targeted read/grep calls."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "root": {"type": "string"},
-                    "scan_limit": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                },
-                "additionalProperties": False,
-            },
-        ),
-        repo_map,
     )
     registry.register(
         ToolSpec(
