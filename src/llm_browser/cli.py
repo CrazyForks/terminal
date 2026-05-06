@@ -280,6 +280,12 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
         if task.task_id in completed_task_ids:
             continue
         prompt = build_dataset_prompt(task, headless=args.headless)
+        if args.task_timeout_s and args.task_timeout_s > 0:
+            prompt += (
+                f"\n\nRuntime budget: this task has a hard timeout of {args.task_timeout_s:g} seconds. "
+                "Do not spend the full budget on one unreliable path. If the primary site stalls, switch to raw HTTP, "
+                "CDP, alternate endpoints, mirrors, search, or local scripts, then call done with the best supported answer."
+            )
         workspace = store.state_dir / "dataset-runs" / run_id / f"task-{task.task_id}-workspace"
         workspace.mkdir(parents=True, exist_ok=True)
         result = _run_dataset_task(
@@ -375,7 +381,12 @@ def _run_dataset_task(
 
     def target() -> None:
         try:
-            agent = Agent(store, provider=make_provider(provider_name, model), max_turns=max_turns)
+            agent = Agent(
+                store,
+                provider=make_provider(provider_name, model),
+                max_turns=max_turns,
+                time_budget_s=timeout_s if timeout_s and timeout_s > 0 else None,
+            )
             finished = agent.run_session(session.id, prompt)
             result["session"] = finished.to_dict()
             result["ok"] = finished.status == "done"

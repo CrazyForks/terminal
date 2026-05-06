@@ -134,6 +134,25 @@ class PythonBrowserToolTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_statement_imports_and_display_shim_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "from IPython.display import display\nvalue = {'ok': True}\ndisplay(value)\nresult = value",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"], {"ok": True})
+            self.assertIn('"ok": true', result.text)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

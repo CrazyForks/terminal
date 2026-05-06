@@ -147,6 +147,22 @@ class AgentLoopTest(unittest.TestCase):
 
             self.assertTrue(compacted)
             self.assertTrue(Path(compacted[0].payload["path"]).exists())
+            self.assertLess(compacted[-1].payload["after_messages"], compacted[-1].payload["before_messages"])
+
+    def test_deadline_warning_is_injected_before_timeout(self) -> None:
+        class WarnAwareProvider:
+            def start_turn(self, messages, tools):
+                if any("Runtime note:" in str(message.get("content")) for message in messages):
+                    yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "finished"}))
+                else:
+                    yield ModelEvent.call(ToolCall(id="call_echo", name="echo", arguments={"text": "wait"}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=WarnAwareProvider(), time_budget_s=1).run("deadline", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            self.assertIn("session.deadline_warning", [event.type for event in store.events.read(session.id)])
 
     def test_resume_session_replays_existing_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

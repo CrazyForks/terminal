@@ -181,10 +181,26 @@ class BrowserRuntime:
 
     def page_info(self) -> Dict[str, Any]:
         raw = self.js(
-            "JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,"
-            "sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
+            """
+            (() => {
+              const de = document.documentElement || {};
+              const body = document.body || {};
+              const pageWidth = de.scrollWidth || body.scrollWidth || innerWidth || 0;
+              const pageHeight = de.scrollHeight || body.scrollHeight || innerHeight || 0;
+              return JSON.stringify({
+                url: location.href || '',
+                title: document.title || '',
+                w: innerWidth || 0,
+                h: innerHeight || 0,
+                sx: scrollX || 0,
+                sy: scrollY || 0,
+                pw: pageWidth,
+                ph: pageHeight
+              });
+            })()
+            """
         )
-        return json.loads(raw)
+        return json.loads(raw or "{}")
 
     def visible_text(self, max_chars: int = 8000) -> str:
         text = self.js(
@@ -222,7 +238,7 @@ class BrowserRuntime:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
-        info = self.page_info()
+        info = self._safe_page_info()
         image = ToolImage(
             label=label,
             path=str(path),
@@ -233,6 +249,21 @@ class BrowserRuntime:
         )
         path.with_suffix(".json").write_text(json.dumps(image.to_dict(), indent=2) + "\n", encoding="utf-8")
         return image
+
+    def _safe_page_info(self) -> Dict[str, Any]:
+        try:
+            return self.page_info()
+        except Exception:
+            return {
+                "url": str((self.target or {}).get("url") or ""),
+                "title": str((self.target or {}).get("title") or ""),
+                "w": 0,
+                "h": 0,
+                "sx": 0,
+                "sy": 0,
+                "pw": 0,
+                "ph": 0,
+            }
 
     def click_at(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         base = {"x": x, "y": y, "button": button, "clickCount": clicks}
