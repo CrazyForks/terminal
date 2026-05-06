@@ -211,6 +211,25 @@ def build_parser() -> argparse.ArgumentParser:
     auth_status = auth_sub.add_parser("status", help="Print redacted auth status.")
     auth_status.set_defaults(func=cmd_auth_status)
 
+    auth_codex = auth_sub.add_parser("codex", help="Codex subscription auth commands.")
+    auth_codex_sub = auth_codex.add_subparsers(dest="codex_auth_command", required=True)
+
+    auth_codex_status = auth_codex_sub.add_parser("status", help="Print redacted Codex auth status.")
+    auth_codex_status.set_defaults(func=cmd_auth_status)
+
+    auth_codex_import = auth_codex_sub.add_parser("import", help="Copy current Codex CLI auth into this harness auth store.")
+    auth_codex_import.add_argument("--codex-home", default=None, help="Override Codex CLI home directory.")
+    auth_codex_import.set_defaults(func=cmd_auth_codex_import)
+
+    auth_codex_refresh = auth_codex_sub.add_parser("refresh", help="Refresh harness-owned Codex auth.")
+    auth_codex_refresh.set_defaults(func=cmd_auth_codex_refresh)
+
+    auth_codex_logout = auth_codex_sub.add_parser("logout", help="Remove harness-owned Codex auth.")
+    auth_codex_logout.set_defaults(func=cmd_auth_codex_logout)
+
+    auth_codex_login = auth_codex_sub.add_parser("login", help="Login with OpenAI Codex device code auth.")
+    auth_codex_login.set_defaults(func=cmd_auth_codex_login)
+
     return parser
 
 
@@ -410,18 +429,55 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
 
 def cmd_auth_status(args: argparse.Namespace) -> int:
-    import os
+    from llm_browser.auth import auth_status
 
-    from llm_browser.auth import load_codex_auth
-
-    codex_auth = load_codex_auth()
     payload = {
-        "codex": codex_auth.redacted_summary() if codex_auth else {"available": False},
+        "codex": auth_status(),
         "openai_api_key": {
             "available": bool(os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
         },
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_auth_codex_import(args: argparse.Namespace) -> int:
+    from llm_browser.auth import import_codex_cli_auth
+
+    codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
+    auth = import_codex_cli_auth(codex_home=codex_home)
+    print(json.dumps({"ok": True, "codex": auth.redacted_summary()}, indent=2))
+    return 0
+
+
+def cmd_auth_codex_refresh(args: argparse.Namespace) -> int:
+    from llm_browser.auth import refresh_codex_auth
+
+    auth = refresh_codex_auth()
+    print(json.dumps({"ok": True, "codex": auth.redacted_summary()}, indent=2))
+    return 0
+
+
+def cmd_auth_codex_logout(args: argparse.Namespace) -> int:
+    from llm_browser.auth import logout_codex_auth
+
+    removed = logout_codex_auth()
+    print(json.dumps({"ok": True, "removed": removed}, indent=2))
+    return 0
+
+
+def cmd_auth_codex_login(args: argparse.Namespace) -> int:
+    from llm_browser.auth import complete_device_code_login, request_device_code
+
+    device = request_device_code()
+    print(
+        "Open this URL and enter the code:\n"
+        f"{device.verification_url}\n\n"
+        f"Code: {device.user_code}\n\n"
+        "Waiting for authorization..."
+    )
+    auth = complete_device_code_login(device)
+    print(json.dumps({"ok": True, "codex": auth.redacted_summary()}, indent=2))
     return 0
 
 

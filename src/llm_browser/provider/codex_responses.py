@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
-from llm_browser.auth import CodexAuth, load_codex_auth
+from llm_browser.auth import CodexAuth, CodexAuthError, PermanentCodexAuthError, load_codex_auth, refresh_codex_auth
 from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 
@@ -42,20 +42,16 @@ class CodexResponsesProvider:
             raise RuntimeError("Codex auth missing. Run Codex login first, or use provider=openai with an API key.")
 
         payload = self._build_payload(messages, tools)
-        response = requests.post(
-            _codex_url(self.base_url),
-            headers={
-                "Authorization": f"Bearer {self.auth.access_token}",
-                "chatgpt-account-id": self.auth.account_id,
-                "originator": "llm-browser",
-                "OpenAI-Beta": "responses=experimental",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
-            json=payload,
-            timeout=self.timeout_s,
-            stream=True,
-        )
+        response = self._post_payload(payload)
+        if response.status_code in {401, 403} and self.auth.refresh_token:
+            response.close()
+            try:
+                self.auth = refresh_codex_auth(auth=self.auth)
+            except PermanentCodexAuthError:
+                raise
+            except CodexAuthError as exc:
+                raise RuntimeError(f"Codex auth refresh failed after HTTP {response.status_code}: {exc}") from exc
+            response = self._post_payload(payload)
         if response.status_code >= 400:
             raise RuntimeError(f"Codex Responses request failed: HTTP {response.status_code}: {response.text[:1000]}")
 
@@ -109,6 +105,23 @@ class CodexResponsesProvider:
         if tools:
             payload["tools"] = tools
         return payload
+
+    def _post_payload(self, payload: Dict[str, Any]) -> requests.Response:
+        assert self.auth is not None
+        return requests.post(
+            _codex_url(self.base_url),
+            headers={
+                "Authorization": f"Bearer {self.auth.access_token}",
+                "chatgpt-account-id": self.auth.account_id,
+                "originator": "llm-browser",
+                "OpenAI-Beta": "responses=experimental",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            json=payload,
+            timeout=self.timeout_s,
+            stream=True,
+        )
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []

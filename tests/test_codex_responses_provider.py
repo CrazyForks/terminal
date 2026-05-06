@@ -132,6 +132,29 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][3]["role"], "user")
         self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
 
+    def test_refreshes_auth_once_after_unauthorized_response(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        unauthorized = FakeResponse(401, [], text="expired")
+        ok = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+        refreshed = CodexAuth(
+            access_token="new-access",
+            account_id="acct_123",
+            refresh_token="new-refresh",
+            id_token=None,
+            source_path=Path("/tmp/auth.json"),
+            auth_mode="chatgpt",
+        )
+
+        with patch("llm_browser.provider.codex_responses.requests.post", side_effect=[unauthorized, ok]) as post, patch(
+            "llm_browser.provider.codex_responses.refresh_codex_auth", return_value=refreshed
+        ) as refresh:
+            list(provider.start_turn([{"role": "user", "content": "open site"}], []))
+
+        self.assertTrue(unauthorized.closed)
+        refresh.assert_called_once()
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer new-access")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
