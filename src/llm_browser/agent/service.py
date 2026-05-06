@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,7 @@ class Agent:
         max_turns: int = 80,
         recover_tool_errors: bool = True,
         compact_after_chars: int = DEFAULT_COMPACT_AFTER_CHARS,
+        time_budget_s: Optional[float] = None,
     ) -> None:
         self.store = store
         self.provider = provider or FakeProvider()
@@ -39,6 +41,9 @@ class Agent:
         self.max_turns = max_turns
         self.recover_tool_errors = recover_tool_errors
         self.compact_after_chars = compact_after_chars
+        self.time_budget_s = time_budget_s
+        self.deadline_at = time.monotonic() + time_budget_s if time_budget_s and time_budget_s > 0 else None
+        self._deadline_warning_sent = False
 
     def run(
         self,
@@ -79,6 +84,7 @@ class Agent:
         try:
             for _ in range(self.max_turns):
                 self._check_cancel(session.id)
+                messages = self._maybe_add_deadline_warning(session, messages)
                 messages = self._maybe_compact(session, messages)
                 tool_calls: List[ToolCall] = []
                 text_parts: List[str] = []
@@ -206,6 +212,29 @@ class Agent:
                 },
             )
         return compacted
+
+    def _maybe_add_deadline_warning(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self.deadline_at is None or self._deadline_warning_sent:
+            return messages
+        remaining_s = self.deadline_at - time.monotonic()
+        budget = self.time_budget_s or 0
+        threshold_s = max(60.0, min(180.0, budget * 0.25))
+        if remaining_s > threshold_s:
+            return messages
+
+        remaining_display = max(0, int(remaining_s))
+        text = (
+            f"Runtime note: about {remaining_display} seconds remain for this task. "
+            "If you have enough evidence, stop exploratory work and call done with the best complete answer now. "
+            "If the original site is unreliable, include the fallback evidence and any ambiguity instead of continuing indefinitely."
+        )
+        self._deadline_warning_sent = True
+        self.store.emit(
+            session.id,
+            "session.deadline_warning",
+            {"remaining_s": remaining_display, "text": text},
+        )
+        return [*messages, {"role": "user", "content": text}]
 
     def _execute_tool(self, session_id: str, call: ToolCall) -> ToolResult:
         session = self.store.load(session_id)

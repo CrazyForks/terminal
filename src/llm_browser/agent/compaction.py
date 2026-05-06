@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+
+MAX_SUMMARY_CHARS = 18000
+MAX_KEPT_TEXT_CHARS = 7000
 
 
 def message_chars(messages: List[Dict[str, Any]]) -> int:
@@ -17,7 +23,7 @@ def compact_messages(
     if len(messages) <= keep_last + 1:
         return messages, artifact_dir / "compactions" / "noop.json"
 
-    kept = messages[-keep_last:]
+    kept = [_trim_message(message) for message in messages[-keep_last:]]
     summary = _summary(messages[:-keep_last])
     compaction_dir = artifact_dir / "compactions"
     compaction_dir.mkdir(parents=True, exist_ok=True)
@@ -41,28 +47,39 @@ def compact_messages(
 
 def _summary(messages: List[Dict[str, Any]]) -> str:
     first_user = ""
+    recent_tools = []
     tool_refs = []
     errors = []
+    paths = []
     for message in messages:
         role = message.get("role")
         text = _message_text(message)
         if role == "user" and not first_user:
             first_user = text[:3000]
         if role == "tool":
+            if text:
+                recent_tools.append(_compact_text(text, 2600))
             if "output_path" in text or "artifact" in text or "screenshots" in text:
-                tool_refs.append(text[:1200])
+                tool_refs.append(_compact_text(text, 1600))
             if "tool error" in text or "'ok': False" in text or '"ok": false' in text:
-                errors.append(text[:1200])
+                errors.append(_compact_text(text, 1600))
+        for path in _extract_paths(text):
+            if path not in paths:
+                paths.append(path)
     parts = []
     if first_user:
         parts.append(f"Original user/task goal:\n{first_user}")
+    if recent_tools:
+        parts.append("Recent tool results before compaction:\n" + "\n\n".join(recent_tools[-10:]))
     if tool_refs:
         parts.append("Important tool/artifact references:\n" + "\n\n".join(tool_refs[-8:]))
+    if paths:
+        parts.append("Known artifact/file paths:\n" + "\n".join(paths[-40:]))
     if errors:
         parts.append("Recent recoverable errors:\n" + "\n\n".join(errors[-5:]))
     if not parts:
         parts.append(f"Compacted {len(messages)} older message(s). Continue from recent context.")
-    return "\n\n".join(parts)
+    return _compact_text("\n\n".join(parts), MAX_SUMMARY_CHARS)
 
 
 def _message_text(message: Dict[str, Any]) -> str:
@@ -81,3 +98,35 @@ def _message_text(message: Dict[str, Any]) -> str:
                 parts.append(str(item))
         return "\n".join(parts)
     return str(content)
+
+
+def _trim_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    trimmed = deepcopy(message)
+    content = trimmed.get("content")
+    if isinstance(content, str):
+        trimmed["content"] = _compact_text(content, MAX_KEPT_TEXT_CHARS)
+    elif isinstance(content, list):
+        next_content = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_text":
+                next_item = dict(item)
+                next_item["text"] = _compact_text(str(next_item.get("text") or ""), MAX_KEPT_TEXT_CHARS)
+                next_content.append(next_item)
+            else:
+                next_content.append(item)
+        trimmed["content"] = next_content
+    return trimmed
+
+
+def _compact_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return f"{text[:head]}\n\n[... omitted {omitted} chars during compaction ...]\n\n{text[-tail:]}"
+
+
+def _extract_paths(text: str) -> List[str]:
+    pattern = re.compile(r"(/[^\s\]\)\"']+\.(?:txt|json|jsonl|png|jpg|jpeg|webp|pdf|csv|tsv|xlsx|html|md|docx))")
+    return [match.group(1) for match in pattern.finditer(text)]

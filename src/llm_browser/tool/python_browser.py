@@ -5,9 +5,11 @@ import io
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 import traceback
+import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -80,6 +82,7 @@ class PythonBrowserTool:
                 "os": os,
                 "Path": Path,
                 "time": time,
+                "display": _display,
             }
             _install_optional_imports(namespace)
             self._namespaces[ctx.session.id] = namespace
@@ -186,6 +189,9 @@ class PythonBrowserTool:
         return BrowserRuntime.start(root_dir=root_dir, headless=headless)
 
     def _execute(self, code: str, namespace: Dict[str, Any]) -> Any:
+        if _looks_like_statements(code):
+            exec(compile(code, "<llm-browser-python>", "exec"), namespace, namespace)
+            return None
         try:
             compiled = compile(code, "<llm-browser-python>", "eval")
         except SyntaxError:
@@ -221,6 +227,7 @@ def _is_jsonable(value: Any) -> bool:
 
 
 def _install_optional_imports(namespace: Dict[str, Any]) -> None:
+    _install_display_shim()
     try:
         import requests
 
@@ -251,3 +258,70 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
         namespace["Image"] = Image
     except Exception:
         pass
+
+
+def _looks_like_statements(code: str) -> bool:
+    stripped = code.strip()
+    if "\n" in stripped:
+        return True
+    statement_prefixes = (
+        "import ",
+        "from ",
+        "for ",
+        "while ",
+        "if ",
+        "with ",
+        "try:",
+        "def ",
+        "class ",
+        "return ",
+        "raise ",
+        "assert ",
+        "print(",
+    )
+    return stripped.startswith(statement_prefixes) or "=" in stripped and "==" not in stripped
+
+
+def _display(*values: Any, **_: Any) -> None:
+    for value in values:
+        if hasattr(value, "to_markdown"):
+            try:
+                print(value.to_markdown())
+                continue
+            except Exception:
+                pass
+        if hasattr(value, "to_string"):
+            try:
+                print(value.to_string())
+                continue
+            except Exception:
+                pass
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                print(json.dumps(value, ensure_ascii=False, indent=2))
+                continue
+            except TypeError:
+                pass
+        print(value)
+
+
+def _install_display_shim() -> None:
+    if "IPython.display" in sys.modules:
+        return
+    try:
+        import IPython.display  # noqa: F401
+
+        return
+    except Exception:
+        pass
+
+    ipython_module = sys.modules.get("IPython")
+    if ipython_module is None:
+        ipython_module = types.ModuleType("IPython")
+        sys.modules["IPython"] = ipython_module
+    display_module = types.ModuleType("IPython.display")
+    display_module.display = _display
+    display_module.Markdown = str
+    display_module.HTML = str
+    setattr(ipython_module, "display", display_module)
+    sys.modules["IPython.display"] = display_module
