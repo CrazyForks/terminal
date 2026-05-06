@@ -24,6 +24,7 @@ class ScreenshotRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path) -> None:
         super().__init__(root_dir=root_dir)
         self.target = {"url": "https://fallback.example", "title": "Fallback"}
+        self.last_params: Optional[Dict[str, Any]] = None
 
     def cdp(
         self,
@@ -35,6 +36,7 @@ class ScreenshotRuntime(BrowserRuntime):
     ) -> Dict[str, Any]:
         self.last_timeout_s = timeout_s
         self.last_retry = retry
+        self.last_params = params or {}
         if method == "Page.captureScreenshot":
             return {"data": base64.b64encode(b"png-bytes").decode("ascii")}
         return {}
@@ -118,6 +120,18 @@ class BrowserRuntimeTest(unittest.TestCase):
             self.assertTrue(Path(image.path).with_suffix(".json").exists())
             self.assertEqual(runtime.last_timeout_s, 8.0)
             self.assertFalse(runtime.last_retry)
+
+    def test_screenshot_accepts_page_clip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = ScreenshotRuntime(Path(tmp))
+
+            runtime.screenshot("table", clip={"x": 10, "y": 20, "width": 300, "height": 120})
+
+            self.assertEqual(runtime.last_params["clip"]["x"], 10)
+            self.assertEqual(runtime.last_params["clip"]["y"], 20)
+            self.assertEqual(runtime.last_params["clip"]["width"], 300)
+            self.assertEqual(runtime.last_params["clip"]["height"], 120)
+            self.assertTrue(runtime.last_params["captureBeyondViewport"])
 
     def test_new_tab_explicitly_navigates_when_chrome_returns_blank_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

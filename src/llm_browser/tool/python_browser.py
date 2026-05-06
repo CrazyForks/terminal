@@ -647,6 +647,56 @@ class PythonBrowserTool:
                 ctx.emit_image(image)
             return image
 
+        def screenshot_element(
+            selector: str,
+            label: Optional[str] = None,
+            attach: bool = True,
+            padding: float = 8.0,
+            timeout_s: float = 8.0,
+        ) -> Dict[str, Any]:
+            selector_json = json.dumps(selector)
+            rect = runtime.js(
+                f"""
+                (() => {{
+                  const el = document.querySelector({selector_json});
+                  if (!el) return null;
+                  const r = el.getBoundingClientRect();
+                  return {{
+                    x: r.left + scrollX,
+                    y: r.top + scrollY,
+                    width: r.width,
+                    height: r.height,
+                    viewportX: r.left,
+                    viewportY: r.top,
+                    tag: el.tagName,
+                    text: (el.innerText || el.alt || el.getAttribute('aria-label') || '').trim().slice(0, 300)
+                  }};
+                }})()
+                """,
+                await_promise=False,
+            )
+            if not isinstance(rect, dict):
+                raise ValueError(f"element not found for selector: {selector}")
+            pad = max(0.0, float(padding))
+            clip = {
+                "x": max(0.0, float(rect.get("x") or 0) - pad),
+                "y": max(0.0, float(rect.get("y") or 0) - pad),
+                "width": max(1.0, float(rect.get("width") or 1) + pad * 2),
+                "height": max(1.0, float(rect.get("height") or 1) + pad * 2),
+                "scale": 1.0,
+            }
+            image = runtime.screenshot(
+                label=label or f"element_{selector}",
+                attach=attach,
+                full_page=False,
+                timeout_s=timeout_s,
+                clip=clip,
+            )
+            if attach:
+                images.append(image)
+                ctx.emit_image(image)
+            return {"selector": selector, "rect": rect, "clip": clip, "image": image.to_dict()}
+
         namespace.update(
             {
                 "browser": runtime,
@@ -670,6 +720,7 @@ class PythonBrowserTool:
                 "click_text": click_text,
                 "dismiss_cookie_banners": dismiss_cookie_banners,
                 "screenshot": screenshot,
+                "screenshot_element": screenshot_element,
                 "page_info": runtime.page_info,
                 "visible_text": runtime.visible_text,
                 "links": runtime.links,
@@ -1508,6 +1559,7 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "click_text",
         "dismiss_cookie_banners",
         "screenshot",
+        "screenshot_element",
         "page_info",
         "visible_text",
         "links",
