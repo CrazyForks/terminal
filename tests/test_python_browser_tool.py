@@ -798,6 +798,96 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(cards[0]["title"], "Morrilton")
             self.assertEqual(cards[0]["lines"][:2], ["944 Hwy 287", "Morrilton, AR 72110"])
 
+    def test_search_web_parses_duckduckgo_redirects_and_saves_empty_pages(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            if "bing.com/search" in url:
+                return Response("<html><title>blocked</title></html>", url)
+            if "duckduckgo.com/html" in url:
+                html_page = (
+                    '<div class="result">'
+                    '<a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Falpha">Alpha result</a>'
+                    '<a class="result__snippet">Useful snippet</a>'
+                    "</div>"
+                    '<div class="result">'
+                    '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fbeta">Beta result</a>'
+                    "</div>"
+                )
+                return Response(html_page, url)
+            raise AssertionError(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "result = search_web('alpha beta', max_results=2, include_specialized=False)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            payload = result.data["result"]
+            self.assertEqual([item["url"] for item in payload["results"]], ["https://example.com/alpha", "https://example.org/beta"])
+            self.assertEqual(payload["attempts"][0]["parsed"], 0)
+            self.assertTrue(Path(payload["attempts"][0]["raw_path"]).exists())
+
+    def test_search_web_uses_pubmed_fallback_when_page_search_is_empty(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200, payload: Any = None) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+                self._payload = payload
+
+            def json(self) -> Any:
+                return self._payload if self._payload is not None else json.loads(self.text)
+
+            def raise_for_status(self) -> None:
+                if not self.ok:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            if "w/api.php" in url:
+                return Response("[]", url, payload=["query", [], [], []])
+            if "esearch.fcgi" in url:
+                return Response("{}", url, payload={"esearchresult": {"idlist": ["12345"]}})
+            if "esummary.fcgi" in url:
+                return Response("{}", url, payload={"result": {"12345": {"title": "Important Hafnia paper", "source": "PubMed", "pubdate": "2026"}}})
+            if "crossref.org" in url:
+                return Response("{}", url, payload={"message": {"items": []}})
+            return Response("<html><title>empty</title></html>", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(ctx, {"headless": True, "code": "result = search_web('hafnia', max_results=1)"})
+
+            self.assertTrue(result.data["ok"])
+            payload = result.data["result"]
+            self.assertEqual(payload["results"][0]["title"], "Important Hafnia paper")
+            self.assertEqual(payload["results"][0]["url"], "https://pubmed.ncbi.nlm.nih.gov/12345/")
+
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:

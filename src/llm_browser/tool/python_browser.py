@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import base64
 import html
 import io
 import json
@@ -17,7 +18,7 @@ import types
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolImage, ToolResult
@@ -466,31 +467,100 @@ class PythonBrowserTool:
                 direct_error=direct_error,
             )
 
-        def search_web(query: str, max_results: int = 8, timeout: float = 20.0) -> Dict[str, Any]:
+        def search_web(
+            query: str,
+            max_results: int = 8,
+            timeout: float = 20.0,
+            save_raw: Any = "auto",
+            include_specialized: bool = True,
+        ) -> Dict[str, Any]:
             try:
                 import requests
             except Exception as exc:
                 raise RuntimeError("requests is not installed") from exc
 
+            raw_mode = str(save_raw).lower()
+            save_raw_always = save_raw is True or raw_mode in {"1", "true", "yes", "always", "all"}
+            save_raw_auto = raw_mode in {"auto", "failed", "empty"}
             urls = [
                 ("bing", f"https://www.bing.com/search?q={quote_plus(query)}"),
+                ("duckduckgo_html", f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"),
+                ("duckduckgo_lite", f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"),
+                ("brave", f"https://search.brave.com/search?q={quote_plus(query)}"),
+                ("google_reader", _jina_reader_url(f"https://www.google.com/search?q={quote_plus(query)}")),
                 ("bing_reader", _jina_reader_url(f"https://www.bing.com/search?q={quote_plus(query)}")),
             ]
             results: List[Dict[str, str]] = []
             attempts: List[Dict[str, Any]] = []
+            seen_urls: set[str] = set()
+
+            def add_results(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
+                added: List[Dict[str, str]] = []
+                for candidate in candidates:
+                    url = _normalize_search_url(candidate.get("url", ""))
+                    if not url or url in seen_urls:
+                        continue
+                    if not _looks_like_external_result_url(url):
+                        continue
+                    seen_urls.add(url)
+                    item = dict(candidate)
+                    item["url"] = url
+                    results.append(item)
+                    added.append(item)
+                    if len(results) >= max_results:
+                        break
+                return added
+
+            def save_search_page(source: str, text: str) -> str:
+                search_dir = ctx.session.cwd / "search_pages"
+                search_dir.mkdir(parents=True, exist_ok=True)
+                slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", query).strip("-")[:80] or "query"
+                path = search_dir / f"{int(time.time() * 1000)}-{source}-{slug}.html"
+                path.write_text(text, encoding="utf-8", errors="replace")
+                return str(path)
+
             for source, search_url in urls:
                 try:
                     response = requests.get(search_url, headers=_browser_headers(), timeout=timeout)
                     text = response.text
-                    attempts.append({"source": source, "status": response.status_code, "url": response.url, "chars": len(text)})
                     if source == "bing":
-                        results.extend(_parse_bing_results(text, limit=max_results - len(results)))
+                        parsed = _parse_bing_results(text, limit=max_results - len(results))
+                    elif source.startswith("duckduckgo"):
+                        parsed = _parse_duckduckgo_results(text, limit=max_results - len(results))
+                    elif source.endswith("_reader"):
+                        parsed = _parse_markdown_links(text, limit=max_results - len(results), source=source)
                     else:
-                        results.extend(_parse_markdown_links(text, limit=max_results - len(results)))
+                        parsed = _parse_generic_search_results(text, source=source, limit=max_results - len(results))
+                    added = add_results(parsed)
+                    attempt: Dict[str, Any] = {
+                        "source": source,
+                        "status": response.status_code,
+                        "url": response.url,
+                        "chars": len(text),
+                        "parsed": len(added),
+                    }
+                    if save_raw_always or (save_raw_auto and not added):
+                        attempt["raw_path"] = save_search_page(source, text)
+                    attempts.append(attempt)
                 except Exception as exc:
                     attempts.append({"source": source, "url": search_url, "error": str(exc)})
                 if len(results) >= max_results:
                     break
+            if include_specialized and len(results) < max_results:
+                for source, searcher in (
+                    ("wikipedia_api", _search_wikipedia_api),
+                    ("pubmed_api", _search_pubmed_api),
+                    ("crossref_api", _search_crossref_api),
+                ):
+                    try:
+                        found, attempt = searcher(query, limit=max_results - len(results), timeout=timeout)
+                        added = add_results(found)
+                        attempt["parsed"] = len(added)
+                        attempts.append(attempt)
+                    except Exception as exc:
+                        attempts.append({"source": source, "error": str(exc)})
+                    if len(results) >= max_results:
+                        break
             return {"query": query, "results": results[:max_results], "attempts": attempts}
 
         def extract_links(text: str, pattern: Optional[str] = None, limit: int = 1000) -> List[str]:
@@ -1007,40 +1077,306 @@ def _parse_bing_results(page: str, limit: int) -> List[Dict[str, str]]:
             if not link:
                 continue
             title = link.get_text(" ", strip=True)
-            url = str(link.get("href") or "")
+            url = _normalize_search_url(str(link.get("href") or ""))
             snippet = item.get_text(" ", strip=True)
-            results.append({"title": title, "url": url, "snippet": snippet[:600], "source": "bing"})
+            _append_search_result(results, title=title, url=url, snippet=snippet, source="bing", limit=limit)
+            if len(results) >= limit:
+                return results
+        for link in soup.select("h2 a[href]"):
+            title = link.get_text(" ", strip=True)
+            url = _normalize_search_url(str(link.get("href") or ""))
+            _append_search_result(results, title=title, url=url, snippet="", source="bing", limit=limit)
             if len(results) >= limit:
                 return results
     except Exception:
         pass
 
     for match in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.I | re.S):
-        url = html.unescape(match.group(1))
+        url = _normalize_search_url(match.group(1))
         title = re.sub(r"<[^>]+>", " ", match.group(2))
         title = html.unescape(re.sub(r"\s+", " ", title)).strip()
-        if title and url.startswith(("http://", "https://")):
-            results.append({"title": title, "url": url, "snippet": "", "source": "bing"})
+        _append_search_result(results, title=title, url=url, snippet="", source="bing", limit=limit)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _parse_duckduckgo_results(page: str, limit: int) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if limit <= 0:
+        return results
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(page, "html.parser")
+        blocks = soup.select(".result, .web-result, tr")
+        for block in blocks:
+            link = block.select_one("a.result__a, a.result-link, a[href]")
+            if not link:
+                continue
+            title = link.get_text(" ", strip=True)
+            url = _normalize_search_url(str(link.get("href") or ""))
+            snippet_node = block.select_one(".result__snippet, .result-snippet")
+            snippet = snippet_node.get_text(" ", strip=True) if snippet_node else block.get_text(" ", strip=True)
+            _append_search_result(results, title=title, url=url, snippet=snippet, source="duckduckgo", limit=limit)
+            if len(results) >= limit:
+                return results
+    except Exception:
+        pass
+    return _parse_generic_search_results(page, source="duckduckgo", limit=limit)
+
+
+def _parse_generic_search_results(page: str, *, source: str, limit: int) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if limit <= 0:
+        return results
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(page, "html.parser")
+        for link in soup.find_all("a", href=True):
+            title = link.get_text(" ", strip=True)
+            url = _normalize_search_url(str(link.get("href") or ""))
+            _append_search_result(results, title=title, url=url, snippet="", source=source, limit=limit)
+            if len(results) >= limit:
+                break
+    except Exception:
+        for match in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.I | re.S):
+            title = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", match.group(2)))).strip()
+            url = _normalize_search_url(match.group(1))
+            _append_search_result(results, title=title, url=url, snippet="", source=source, limit=limit)
             if len(results) >= limit:
                 break
     return results
 
 
-def _parse_markdown_links(markdown: str, limit: int) -> List[Dict[str, str]]:
+def _parse_markdown_links(markdown: str, limit: int, source: str = "bing_reader") -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     if limit <= 0:
         return results
     seen = set()
     for match in re.finditer(r"\[([^\]]{1,220})\]\((https?://[^)\s]+)\)", markdown):
         title = re.sub(r"\s+", " ", match.group(1)).strip()
-        url = match.group(2).strip()
+        url = _normalize_search_url(match.group(2))
         if not title or url in seen:
             continue
         seen.add(url)
-        results.append({"title": title, "url": url, "snippet": "", "source": "bing_reader"})
+        _append_search_result(results, title=title, url=url, snippet="", source=source, limit=limit)
         if len(results) >= limit:
             break
     return results
+
+
+def _append_search_result(
+    results: List[Dict[str, str]],
+    *,
+    title: str,
+    url: str,
+    snippet: str,
+    source: str,
+    limit: int,
+) -> None:
+    if len(results) >= limit:
+        return
+    title = re.sub(r"\s+", " ", html.unescape(title or "")).strip()
+    snippet = re.sub(r"\s+", " ", html.unescape(snippet or "")).strip()
+    url = _normalize_search_url(url)
+    if not title or not url or not _looks_like_external_result_url(url):
+        return
+    if any(existing.get("url") == url for existing in results):
+        return
+    results.append({"title": title[:300], "url": url, "snippet": snippet[:600], "source": source})
+
+
+def _normalize_search_url(url: str) -> str:
+    url = html.unescape(str(url or "")).strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    if url.startswith("/l/") and "uddg=" in url:
+        query = parse_qs(urlparse("https://duckduckgo.com" + url).query)
+        if "uddg" in query:
+            return _normalize_search_url(query["uddg"][0])
+    if url.startswith("/"):
+        return ""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    query = parse_qs(parsed.query)
+    if "duckduckgo.com" in host and "uddg" in query:
+        return _normalize_search_url(query["uddg"][0])
+    if "bing.com" in host and "u" in query:
+        decoded = _decode_bing_redirect(query["u"][0])
+        if decoded:
+            return _normalize_search_url(decoded)
+    if "google." in host and "url" in parsed.path and "q" in query:
+        return _normalize_search_url(query["q"][0])
+    return unquote(url)
+
+
+def _decode_bing_redirect(value: str) -> str:
+    value = unquote(value)
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("a1"):
+        value = value[2:]
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    return decoded if decoded.startswith(("http://", "https://")) else ""
+
+
+def _looks_like_external_result_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    blocked_hosts = (
+        "bing.com",
+        "duckduckgo.com",
+        "google.com",
+        "google.",
+        "startpage.com",
+        "search.brave.com",
+        "mojeek.com",
+        "kagi.com",
+        "r.jina.ai",
+        "s.jina.ai",
+    )
+    if any(blocked in host for blocked in blocked_hosts):
+        return False
+    blocked_path_parts = ("/search", "/preferences", "/settings", "/account", "/signin", "/login", "/captcha")
+    return not any(part in path for part in blocked_path_parts)
+
+
+def _search_wikipedia_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if limit <= 0:
+        return [], {"source": "wikipedia_api", "skipped": True}
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "opensearch",
+        "search": query,
+        "limit": min(max(limit, 1), 10),
+        "namespace": 0,
+        "format": "json",
+    }
+    response = requests.get(url, params=params, headers=_browser_headers(), timeout=timeout)
+    attempt = {"source": "wikipedia_api", "status": response.status_code, "url": response.url, "chars": len(response.text)}
+    response.raise_for_status()
+    payload = response.json()
+    titles = payload[1] if len(payload) > 1 and isinstance(payload[1], list) else []
+    snippets = payload[2] if len(payload) > 2 and isinstance(payload[2], list) else []
+    urls = payload[3] if len(payload) > 3 and isinstance(payload[3], list) else []
+    results: List[Dict[str, str]] = []
+    for title, snippet, result_url in zip(titles, snippets, urls):
+        _append_search_result(
+            results,
+            title=str(title),
+            url=str(result_url),
+            snippet=str(snippet),
+            source="wikipedia_api",
+            limit=limit,
+        )
+    return results, attempt
+
+
+def _search_pubmed_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if limit <= 0:
+        return [], {"source": "pubmed_api", "skipped": True}
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    search_params = {
+        "db": "pubmed",
+        "term": query,
+        "retmode": "json",
+        "retmax": min(max(limit, 1), 10),
+        "sort": "relevance",
+    }
+    search_response = requests.get(search_url, params=search_params, headers=_browser_headers(), timeout=timeout)
+    attempt = {
+        "source": "pubmed_api",
+        "status": search_response.status_code,
+        "url": search_response.url,
+        "chars": len(search_response.text),
+    }
+    search_response.raise_for_status()
+    ids = (search_response.json().get("esearchresult") or {}).get("idlist") or []
+    if not ids:
+        return [], attempt
+
+    summary_response = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+        params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"},
+        headers=_browser_headers(),
+        timeout=timeout,
+    )
+    attempt["summary_status"] = summary_response.status_code
+    attempt["summary_chars"] = len(summary_response.text)
+    summary_response.raise_for_status()
+    payload = summary_response.json().get("result") or {}
+    results: List[Dict[str, str]] = []
+    for pubmed_id in ids:
+        item = payload.get(str(pubmed_id)) or {}
+        title = str(item.get("title") or f"PubMed {pubmed_id}")
+        pubdate = str(item.get("pubdate") or "")
+        source = str(item.get("source") or "")
+        snippet = " ".join(part for part in [source, pubdate] if part)
+        _append_search_result(
+            results,
+            title=title,
+            url=f"https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}/",
+            snippet=snippet,
+            source="pubmed_api",
+            limit=limit,
+        )
+    return results, attempt
+
+
+def _search_crossref_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if limit <= 0:
+        return [], {"source": "crossref_api", "skipped": True}
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    response = requests.get(
+        "https://api.crossref.org/works",
+        params={"query": query, "rows": min(max(limit, 1), 10), "select": "title,URL,DOI,container-title,published-print,published-online"},
+        headers=_browser_headers(),
+        timeout=timeout,
+    )
+    attempt = {"source": "crossref_api", "status": response.status_code, "url": response.url, "chars": len(response.text)}
+    response.raise_for_status()
+    items = ((response.json().get("message") or {}).get("items") or [])[:limit]
+    results: List[Dict[str, str]] = []
+    for item in items:
+        title_values = item.get("title") or []
+        title = str(title_values[0] if title_values else item.get("DOI") or "Crossref result")
+        container_values = item.get("container-title") or []
+        container = str(container_values[0] if container_values else "")
+        result_url = str(item.get("URL") or "")
+        _append_search_result(
+            results,
+            title=title,
+            url=result_url,
+            snippet=container,
+            source="crossref_api",
+            limit=limit,
+        )
+    return results, attempt
 
 
 def _extract_links(text: str, pattern: Optional[str] = None, limit: int = 1000) -> List[str]:
