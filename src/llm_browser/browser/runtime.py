@@ -6,16 +6,150 @@ import math
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote, urlparse
 
 import requests
 
-from llm_browser.browser.cdp import CdpClient, CdpConnectionError
+from llm_browser.browser.cdp import CdpClient, CdpConnectionError, CdpError
 from llm_browser.browser.chrome import ChromeProcess, start_chrome
 from llm_browser.events.event import now_ms
 from llm_browser.tool.result import ToolImage
+
+
+BROWSER_USE_CLOUD_API = "https://api.browser-use.com/api/v3"
+DEFAULT_CDP_PORTS = (9222, 9223)
+BROWSER_LEVEL_DOMAINS = {"Browser", "Target", "SystemInfo", "Schema"}
+
+REAL_BROWSER_PROFILE_DIRS = [
+    Path.home() / "Library/Application Support/Google/Chrome",
+    Path.home() / "Library/Application Support/Comet",
+    Path.home() / "Library/Application Support/Arc/User Data",
+    Path.home() / "Library/Application Support/Dia/User Data",
+    Path.home() / "Library/Application Support/Microsoft Edge",
+    Path.home() / "Library/Application Support/Microsoft Edge Beta",
+    Path.home() / "Library/Application Support/Microsoft Edge Dev",
+    Path.home() / "Library/Application Support/Microsoft Edge Canary",
+    Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser",
+    Path.home() / ".config/google-chrome",
+    Path.home() / ".config/chromium",
+    Path.home() / ".config/chromium-browser",
+    Path.home() / ".config/microsoft-edge",
+    Path.home() / ".config/microsoft-edge-beta",
+    Path.home() / ".config/microsoft-edge-dev",
+    Path.home() / ".var/app/org.chromium.Chromium/config/chromium",
+    Path.home() / ".var/app/com.google.Chrome/config/google-chrome",
+    Path.home() / ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+    Path.home() / ".var/app/com.microsoft.Edge/config/microsoft-edge",
+    Path.home() / "AppData/Local/Google/Chrome/User Data",
+    Path.home() / "AppData/Local/Chromium/User Data",
+    Path.home() / "AppData/Local/Microsoft/Edge/User Data",
+    Path.home() / "AppData/Local/Microsoft/Edge Beta/User Data",
+    Path.home() / "AppData/Local/Microsoft/Edge Dev/User Data",
+    Path.home() / "AppData/Local/Microsoft/Edge SxS/User Data",
+    Path.home() / "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+]
+
+
+@dataclass(frozen=True)
+class BrowserRuntimeOptions:
+    mode: str = "auto"
+    cdp_http_url: Optional[str] = None
+    cdp_ws_url: Optional[str] = None
+    chrome_path: Optional[Path] = None
+    profile_template: Optional[Path] = None
+    preserve_profile: bool = False
+    width: int = 1280
+    height: int = 900
+    cloud_api_key: Optional[str] = None
+    cloud_api_base: str = BROWSER_USE_CLOUD_API
+    cloud_profile_id: Optional[str] = None
+    cloud_profile_name: Optional[str] = None
+    cloud_proxy_country: Optional[str] = None
+    cloud_timeout: Optional[int] = None
+    cloud_allow_resizing: Optional[bool] = None
+    cloud_enable_recording: Optional[bool] = None
+    cloud_custom_proxy: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_env(cls) -> "BrowserRuntimeOptions":
+        return cls(
+            mode=os.environ.get("LLM_BROWSER_MODE") or os.environ.get("BROWSER_USE_TERMINAL_BROWSER") or "auto",
+            cdp_http_url=_first_env(
+                "LLM_BROWSER_CDP_HTTP_URL",
+                "BROWSER_USE_CDP_HTTP_URL",
+                "BU_CDP_URL",
+            ),
+            cdp_ws_url=_first_env(
+                "LLM_BROWSER_CDP_WS_URL",
+                "BROWSER_USE_CDP_WS_URL",
+                "BU_CDP_WS",
+            ),
+            chrome_path=_env_path("LLM_BROWSER_CHROME_PATH") or _env_path("LLM_BROWSER_CHROME"),
+            profile_template=_env_path("LLM_BROWSER_PROFILE_TEMPLATE"),
+            preserve_profile=_env_bool("LLM_BROWSER_KEEP_CHROME_PROFILE", False),
+            width=_env_int("LLM_BROWSER_WIDTH", 1280),
+            height=_env_int("LLM_BROWSER_HEIGHT", 900),
+            cloud_api_key=_first_env("BROWSER_USE_API_KEY", "BU_API_KEY"),
+            cloud_api_base=_first_env("LLM_BROWSER_CLOUD_API_BASE", "BROWSER_USE_CLOUD_API_BASE") or BROWSER_USE_CLOUD_API,
+            cloud_profile_id=_first_env("LLM_BROWSER_CLOUD_PROFILE_ID", "BROWSER_USE_CLOUD_PROFILE_ID"),
+            cloud_profile_name=_first_env("LLM_BROWSER_CLOUD_PROFILE_NAME", "BROWSER_USE_CLOUD_PROFILE_NAME"),
+            cloud_proxy_country=_env_optional_value("LLM_BROWSER_CLOUD_PROXY_COUNTRY"),
+            cloud_timeout=_env_int_optional("LLM_BROWSER_CLOUD_TIMEOUT"),
+            cloud_allow_resizing=_env_bool_optional("LLM_BROWSER_CLOUD_ALLOW_RESIZING"),
+            cloud_enable_recording=_env_bool_optional("LLM_BROWSER_CLOUD_ENABLE_RECORDING"),
+            cloud_custom_proxy=_env_json_object("LLM_BROWSER_CLOUD_CUSTOM_PROXY_JSON"),
+        )
+
+    def normalized_mode(self) -> str:
+        mode = self.mode.strip().lower().replace("_", "-")
+        aliases = {
+            "": "auto",
+            "local": "chromium",
+            "chrome": "chromium",
+            "owned": "chromium",
+            "owned-chrome": "chromium",
+            "owned-chromium": "chromium",
+            "headless": "headless-chromium",
+            "headless-chrome": "headless-chromium",
+            "remote": "cloud",
+            "browser-use": "cloud",
+            "browser-use-cloud": "cloud",
+            "real-chrome": "real",
+            "existing": "real",
+            "attach": "cdp",
+        }
+        return aliases.get(mode, mode)
+
+    def cloud_create_body(self) -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        if self.cloud_profile_id:
+            body["profileId"] = self.cloud_profile_id
+        if self.cloud_proxy_country is not None:
+            proxy = self.cloud_proxy_country.strip()
+            body["proxyCountryCode"] = None if proxy.lower() in {"", "none", "null", "off", "false"} else proxy
+        if self.cloud_timeout is not None:
+            body["timeout"] = self.cloud_timeout
+        if self.width:
+            body["browserScreenWidth"] = self.width
+        if self.height:
+            body["browserScreenHeight"] = self.height
+        if self.cloud_allow_resizing is not None:
+            body["allowResizing"] = self.cloud_allow_resizing
+        if self.cloud_enable_recording is not None:
+            body["enableRecording"] = self.cloud_enable_recording
+        if self.cloud_custom_proxy is not None:
+            body["customProxy"] = self.cloud_custom_proxy
+        return body
+
+
+@dataclass(frozen=True)
+class DiscoveredCdpEndpoint:
+    http_url: Optional[str] = None
+    websocket_url: Optional[str] = None
+    source: str = ""
 
 
 class BrowserRuntime:
@@ -23,22 +157,66 @@ class BrowserRuntime:
         self.root_dir = root_dir
         self.http_url = http_url
         self.preserve_profile = preserve_profile
+        self.mode = "unknown"
         self.chrome: Optional[ChromeProcess] = None
         self.client: Optional[CdpClient] = None
         self.target: Optional[Dict[str, Any]] = None
+        self.websocket_url: Optional[str] = None
+        self.default_session_id: Optional[str] = None
+        self.browser_level_ws = False
+        self.cloud_browser_id: Optional[str] = None
+        self.cloud_live_url: Optional[str] = None
+        self.cloud_api_key: Optional[str] = None
+        self.cloud_api_base: str = BROWSER_USE_CLOUD_API
         self._screenshot_index = 0
 
     @classmethod
-    def start(cls, root_dir: Path, headless: bool = False) -> "BrowserRuntime":
-        cdp_http_url = os.environ.get("LLM_BROWSER_CDP_HTTP_URL") or os.environ.get("BROWSER_USE_CDP_HTTP_URL")
-        if cdp_http_url:
-            return cls.attach(root_dir=root_dir, http_url=cdp_http_url)
-        cdp_ws_url = os.environ.get("LLM_BROWSER_CDP_WS_URL") or os.environ.get("BROWSER_USE_CDP_WS_URL")
-        if cdp_ws_url:
-            return cls.attach_ws(root_dir=root_dir, websocket_url=cdp_ws_url)
-        runtime = cls(root_dir=root_dir, preserve_profile=_env_bool("LLM_BROWSER_KEEP_CHROME_PROFILE", False))
+    def start(
+        cls,
+        root_dir: Path,
+        headless: bool = False,
+        options: Optional[BrowserRuntimeOptions] = None,
+    ) -> "BrowserRuntime":
+        options = options or BrowserRuntimeOptions.from_env()
+        mode = options.normalized_mode()
+        if mode == "headless-chromium":
+            headless = True
+            mode = "chromium"
+
+        if mode == "auto":
+            if options.cdp_http_url:
+                return cls.attach_devtools_http(root_dir=root_dir, http_url=options.cdp_http_url, mode="cdp")
+            if options.cdp_ws_url:
+                return cls.attach_ws(root_dir=root_dir, websocket_url=options.cdp_ws_url, mode="cdp")
+            mode = "chromium"
+
+        if mode == "cdp":
+            if options.cdp_http_url:
+                return cls.attach_devtools_http(root_dir=root_dir, http_url=options.cdp_http_url, mode="cdp")
+            if options.cdp_ws_url:
+                return cls.attach_ws(root_dir=root_dir, websocket_url=options.cdp_ws_url, mode="cdp")
+            raise RuntimeError("browser mode 'cdp' requires --cdp-url, --cdp-ws, LLM_BROWSER_CDP_HTTP_URL, or LLM_BROWSER_CDP_WS_URL")
+
+        if mode == "real":
+            return cls.attach_real(root_dir=root_dir, options=options)
+
+        if mode == "cloud":
+            return cls.start_cloud(root_dir=root_dir, options=options)
+
+        if mode not in {"chromium"}:
+            raise RuntimeError(f"unknown browser mode {options.mode!r}; expected auto, chromium, real, cdp, or cloud")
+
+        runtime = cls(root_dir=root_dir, preserve_profile=options.preserve_profile)
+        runtime.mode = "chromium"
         try:
-            runtime.chrome = start_chrome(root_dir=root_dir, headless=headless)
+            runtime.chrome = start_chrome(
+                root_dir=root_dir,
+                profile_template=options.profile_template,
+                chrome_path=options.chrome_path,
+                headless=headless,
+                width=options.width,
+                height=options.height,
+            )
             runtime.http_url = runtime.chrome.http_url
             runtime.attach_first_page()
         except BaseException:
@@ -49,20 +227,82 @@ class BrowserRuntime:
     @classmethod
     def attach(cls, root_dir: Path, http_url: str) -> "BrowserRuntime":
         runtime = cls(root_dir=root_dir, http_url=http_url.rstrip("/"), preserve_profile=True)
+        runtime.mode = "cdp"
         runtime.attach_first_page()
         return runtime
 
     @classmethod
-    def attach_ws(cls, root_dir: Path, websocket_url: str) -> "BrowserRuntime":
+    def attach_devtools_http(cls, root_dir: Path, http_url: str, mode: str = "cdp") -> "BrowserRuntime":
+        try:
+            runtime = cls.attach(root_dir=root_dir, http_url=http_url)
+            if isinstance(runtime, cls):
+                runtime.mode = mode
+            return runtime
+        except Exception:
+            websocket_url = _ws_from_devtools_active_port(http_url)
+            if websocket_url:
+                return cls.attach_ws(root_dir=root_dir, websocket_url=websocket_url, mode=mode)
+            raise
+
+    @classmethod
+    def attach_real(cls, root_dir: Path, options: Optional[BrowserRuntimeOptions] = None) -> "BrowserRuntime":
+        options = options or BrowserRuntimeOptions.from_env()
+        if options.cdp_http_url:
+            return cls.attach_devtools_http(root_dir=root_dir, http_url=options.cdp_http_url, mode="real")
+        if options.cdp_ws_url:
+            return cls.attach_ws(root_dir=root_dir, websocket_url=options.cdp_ws_url, mode="real")
+        endpoint = discover_real_browser_endpoint()
+        if endpoint.http_url:
+            return cls.attach_devtools_http(root_dir=root_dir, http_url=endpoint.http_url, mode="real")
+        if endpoint.websocket_url:
+            return cls.attach_ws(root_dir=root_dir, websocket_url=endpoint.websocket_url, mode="real")
+        raise RuntimeError("real browser discovery returned no CDP endpoint")
+
+    @classmethod
+    def start_cloud(cls, root_dir: Path, options: Optional[BrowserRuntimeOptions] = None) -> "BrowserRuntime":
+        options = options or BrowserRuntimeOptions.from_env()
+        if not options.cloud_api_key:
+            raise RuntimeError("Browser Use cloud mode requires BROWSER_USE_API_KEY or BU_API_KEY")
+        browser_id: Optional[str] = None
+        try:
+            body = options.cloud_create_body()
+            if options.cloud_profile_name:
+                if options.cloud_profile_id:
+                    raise RuntimeError("pass cloud profile id or cloud profile name, not both")
+                body["profileId"] = _resolve_cloud_profile_name(
+                    api_base=options.cloud_api_base,
+                    api_key=options.cloud_api_key,
+                    profile_name=options.cloud_profile_name,
+                )
+            browser = _browser_use_request(
+                api_base=options.cloud_api_base,
+                api_key=options.cloud_api_key,
+                path="/browsers",
+                method="POST",
+                body=body,
+            )
+            browser_id = str(browser.get("id") or "")
+            websocket_url = _cloud_browser_websocket_url(browser)
+            runtime = cls.attach_ws(root_dir=root_dir, websocket_url=websocket_url, mode="cloud")
+            runtime.cloud_browser_id = browser_id or None
+            runtime.cloud_live_url = str(browser.get("liveUrl") or browser.get("live_url") or "") or None
+            runtime.cloud_api_key = options.cloud_api_key
+            runtime.cloud_api_base = options.cloud_api_base
+            runtime.preserve_profile = True
+            return runtime
+        except BaseException:
+            if browser_id and options.cloud_api_key:
+                _stop_cloud_browser(options.cloud_api_base, options.cloud_api_key, browser_id)
+            raise
+
+    @classmethod
+    def attach_ws(cls, root_dir: Path, websocket_url: str, mode: str = "cdp") -> "BrowserRuntime":
         runtime = cls(root_dir=root_dir, preserve_profile=True)
-        runtime.target = {"id": "external", "type": "page", "url": "", "webSocketDebuggerUrl": websocket_url}
+        runtime.mode = mode
+        runtime.websocket_url = websocket_url
         runtime.client = CdpClient(websocket_url)
         runtime.client.connect()
-        for domain in ("Page", "Runtime", "Network"):
-            try:
-                runtime.cdp(f"{domain}.enable", retry=False)
-            except Exception:
-                pass
+        runtime._initialize_websocket_target()
         return runtime
 
     def close(self) -> None:
@@ -75,16 +315,33 @@ class BrowserRuntime:
             self.chrome = None
             if not self.preserve_profile:
                 shutil.rmtree(profile_dir, ignore_errors=True)
+        if self.cloud_browser_id and self.cloud_api_key:
+            _stop_cloud_browser(self.cloud_api_base, self.cloud_api_key, self.cloud_browser_id)
+            self.cloud_browser_id = None
+
+    def connection_info(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "http_url": self.http_url,
+            "websocket_url": _redact_url(self.websocket_url),
+            "browser_level_ws": self.browser_level_ws,
+            "target": self.target,
+            "cloud_browser_id": self.cloud_browser_id,
+            "cloud_live_url": self.cloud_live_url,
+        }
 
     def version(self) -> Dict[str, Any]:
         if not self.http_url:
             return self.cdp("Browser.getVersion")
-        return requests.get(f"{self.http_url}/json/version", timeout=5).json()
+        return _get_json(f"{self.http_url}/json/version", timeout=5)
 
     def targets(self) -> List[Dict[str, Any]]:
         if not self.http_url:
+            if self.client is not None and self.browser_level_ws:
+                result = self.client.call("Target.getTargets", timeout_s=5)
+                return [_normalize_target_info(target) for target in result.get("targetInfos", [])]
             return [self.target or {"id": "external", "type": "page", "url": ""}]
-        return requests.get(f"{self.http_url}/json/list", timeout=5).json()
+        return _get_json(f"{self.http_url}/json/list", timeout=5)
 
     def tabs(self) -> List[Dict[str, Any]]:
         return [target for target in self.targets() if target.get("type") == "page"]
@@ -119,22 +376,27 @@ class BrowserRuntime:
         return self.attach_target(pages[index])
 
     def attach_target(self, target: Dict[str, Any]) -> Dict[str, Any]:
+        if self.browser_level_ws and self.client is not None and not target.get("webSocketDebuggerUrl"):
+            return self._attach_browser_target(str(target.get("id") or target.get("targetId") or ""))
+
         websocket_url = target.get("webSocketDebuggerUrl")
         if not websocket_url:
             raise RuntimeError(f"target has no websocket URL: {target}")
         if self.client is not None:
             self.client.close()
         self.target = target
+        self.websocket_url = websocket_url
+        self.default_session_id = None
+        self.browser_level_ws = False
         self.client = CdpClient(websocket_url)
         self.client.connect()
-        for domain in ("Page", "Runtime", "Network"):
-            try:
-                self.cdp(f"{domain}.enable")
-            except Exception:
-                pass
+        self._enable_page_domains()
         return target
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
+        if not self.http_url and self.browser_level_ws and self.client is not None:
+            result = self.client.call("Target.createTarget", {"url": url})
+            return self._attach_browser_target(str(result["targetId"]))
         if not self.http_url:
             if url != "about:blank":
                 self.navigate(url, wait=False)
@@ -161,26 +423,109 @@ class BrowserRuntime:
         if self.client is None:
             self.attach_first_page()
         assert self.client is not None
+        effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
         try:
-            return self.client.call(method, params=params, session_id=session_id, timeout_s=timeout_s)
+            return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
         except CdpConnectionError:
             if not retry:
                 raise
             self._reattach_after_disconnect()
             assert self.client is not None
-            return self.client.call(method, params=params, session_id=session_id, timeout_s=timeout_s)
+            effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
+            return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
 
     def _reattach_after_disconnect(self) -> None:
         if self.client is not None:
             self.client.close()
             self.client = None
         target_id = str((self.target or {}).get("id") or "")
-        if target_id:
+        if self.http_url and target_id:
             for page in self.tabs():
                 if page.get("id") == target_id:
                     self.attach_target(page)
                     return
+        if self.websocket_url:
+            self.client = CdpClient(self.websocket_url)
+            self.client.connect()
+            if self.browser_level_ws:
+                if target_id:
+                    self._attach_browser_target(target_id)
+                else:
+                    self._initialize_websocket_target()
+            else:
+                self._enable_page_domains()
+            return
         self.attach_first_page()
+
+    def _initialize_websocket_target(self) -> None:
+        assert self.client is not None
+        self.target = {"id": "external", "type": "page", "url": "", "webSocketDebuggerUrl": self.websocket_url or ""}
+        self.default_session_id = None
+        self.browser_level_ws = False
+        try:
+            result = self.client.call("Target.getTargets", timeout_s=2)
+        except CdpError:
+            self._enable_page_domains()
+            return
+        except CdpConnectionError:
+            raise
+        except Exception:
+            self._enable_page_domains()
+            return
+        raw_targets = result.get("targetInfos")
+        if not isinstance(raw_targets, list):
+            self._enable_page_domains()
+            return
+        targets = [_normalize_target_info(target) for target in raw_targets]
+        self.browser_level_ws = True
+        pages = [target for target in targets if target.get("type") == "page"]
+        target = pages[0] if pages else self._create_browser_target("about:blank")
+        self._attach_browser_target(str(target.get("id") or target.get("targetId") or ""))
+
+    def _create_browser_target(self, url: str) -> Dict[str, Any]:
+        assert self.client is not None
+        result = self.client.call("Target.createTarget", {"url": url})
+        return {"id": str(result["targetId"]), "type": "page", "url": url}
+
+    def _attach_browser_target(self, target_id: str) -> Dict[str, Any]:
+        if not target_id:
+            raise RuntimeError("browser-level CDP attach requires a target id")
+        assert self.client is not None
+        result = self.client.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+        self.default_session_id = str(result["sessionId"])
+        self.browser_level_ws = True
+        target = self._target_info_by_id(target_id) or {"id": target_id, "type": "page", "url": ""}
+        self.target = target
+        self._enable_page_domains()
+        return target
+
+    def _target_info_by_id(self, target_id: str) -> Optional[Dict[str, Any]]:
+        if self.client is None:
+            return None
+        try:
+            result = self.client.call("Target.getTargets", timeout_s=5)
+        except Exception:
+            return None
+        for target in result.get("targetInfos", []):
+            normalized = _normalize_target_info(target)
+            if normalized.get("id") == target_id:
+                return normalized
+        return None
+
+    def _enable_page_domains(self) -> None:
+        for domain in ("Page", "Runtime", "Network"):
+            try:
+                self.cdp(f"{domain}.enable", retry=False)
+            except Exception:
+                pass
+
+    def _default_session_id_for_method(self, method: str) -> Optional[str]:
+        if not self.default_session_id:
+            return None
+        domain = method.split(".", 1)[0]
+        if domain in BROWSER_LEVEL_DOMAINS:
+            return None
+        return self.default_session_id
 
     def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
         result = self.cdp("Page.navigate", {"url": url})
@@ -414,8 +759,285 @@ def _key_event(key: str) -> Dict[str, Any]:
     return {"key": key, "code": key}
 
 
+def browser_runtime_diagnostics(options: Optional[BrowserRuntimeOptions] = None) -> Dict[str, Any]:
+    options = options or BrowserRuntimeOptions.from_env()
+    active_ports = _active_devtools_ports(REAL_BROWSER_PROFILE_DIRS)
+    return {
+        "mode": options.normalized_mode(),
+        "headless_env": _env_bool("LLM_BROWSER_HEADLESS", False),
+        "cdp_http_url": options.cdp_http_url,
+        "cdp_ws_url": _redact_url(options.cdp_ws_url),
+        "chrome_path": str(options.chrome_path) if options.chrome_path else None,
+        "profile_template": str(options.profile_template) if options.profile_template else None,
+        "preserve_owned_profile": options.preserve_profile,
+        "viewport": {"width": options.width, "height": options.height},
+        "real_chrome": {
+            "active_profile_ports": [{"profile_dir": str(base), "port": port} for base, port, _ in active_ports],
+            "fallback_probe_ports": list(DEFAULT_CDP_PORTS),
+        },
+        "cloud": {
+            "api_key_available": bool(options.cloud_api_key),
+            "api_base": options.cloud_api_base,
+            "profile_id": options.cloud_profile_id,
+            "profile_name": options.cloud_profile_name,
+            "proxy_country": options.cloud_proxy_country,
+            "timeout": options.cloud_timeout,
+            "allow_resizing": options.cloud_allow_resizing,
+            "enable_recording": options.cloud_enable_recording,
+            "custom_proxy_configured": bool(options.cloud_custom_proxy),
+        },
+    }
+
+
+def discover_real_browser_endpoint(
+    profile_dirs: Sequence[Path] = REAL_BROWSER_PROFILE_DIRS,
+    probe_ports: Sequence[int] = DEFAULT_CDP_PORTS,
+    timeout_s: float = 15.0,
+) -> DiscoveredCdpEndpoint:
+    active_ports = _active_devtools_ports(profile_dirs)
+    if active_ports:
+        deadline = time.time() + timeout_s
+        last_error: Optional[str] = None
+        while True:
+            for base, port, ws_path in active_ports:
+                endpoint, error = _resolve_real_http_port(port, ws_path=ws_path, source=str(base))
+                if endpoint is not None:
+                    return endpoint
+                if error:
+                    last_error = error
+            if time.time() >= deadline:
+                break
+            time.sleep(0.25)
+        raise RuntimeError(
+            "real Chrome DevToolsActivePort exists but CDP is not reachable yet. "
+            "If Chrome opened a profile picker, choose the profile, then enable chrome://inspect/#remote-debugging "
+            "and click Allow if Chrome asks. Last error: "
+            f"{last_error or 'unknown'}"
+        )
+
+    for port in probe_ports:
+        endpoint, _ = _resolve_real_http_port(port, ws_path="", source=f"127.0.0.1:{port}")
+        if endpoint is not None:
+            return endpoint
+
+    raise RuntimeError(
+        "real Chrome CDP endpoint not found. Open Chrome, visit chrome://inspect/#remote-debugging, "
+        "enable remote debugging for this browser instance, then click Allow if Chrome prompts. "
+        "For isolated automation, launch Chrome with --remote-debugging-port=9222 "
+        "--user-data-dir=<non-default-dir> and pass --browser cdp --cdp-url http://127.0.0.1:9222."
+    )
+
+
+def _active_devtools_ports(profile_dirs: Sequence[Path]) -> List[Tuple[Path, str, str]]:
+    active: List[Tuple[Path, str, str]] = []
+    for base in profile_dirs:
+        try:
+            lines = (base / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            continue
+        port = lines[0].strip() if lines else ""
+        ws_path = lines[1].strip() if len(lines) > 1 else ""
+        if port:
+            active.append((base, port, ws_path))
+    return active
+
+
+def _resolve_real_http_port(port: str, ws_path: str, source: str) -> Tuple[Optional[DiscoveredCdpEndpoint], Optional[str]]:
+    http_url = f"http://127.0.0.1:{port}"
+    try:
+        response = requests.get(f"{http_url}/json/version", timeout=1)
+    except requests.RequestException as exc:
+        return None, str(exc)
+    if response.status_code == 200:
+        return DiscoveredCdpEndpoint(http_url=http_url, source=source), None
+    if response.status_code == 404 and ws_path:
+        return DiscoveredCdpEndpoint(websocket_url=f"ws://127.0.0.1:{port}{ws_path}", source=source), None
+    return None, f"{http_url}/json/version returned HTTP {response.status_code}"
+
+
+def _ws_from_devtools_active_port(http_url: str) -> Optional[str]:
+    parsed = urlparse(http_url)
+    if parsed.port is None:
+        return None
+    host = parsed.hostname or "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    for _, port, ws_path in _active_devtools_ports(REAL_BROWSER_PROFILE_DIRS):
+        if port == str(parsed.port) and ws_path:
+            return f"ws://{host}:{port}{ws_path}"
+    return None
+
+
+def _get_json(url: str, timeout: float) -> Any:
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _normalize_target_info(target: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(target)
+    if "id" not in normalized and "targetId" in normalized:
+        normalized["id"] = normalized["targetId"]
+    return normalized
+
+
+def _cloud_browser_websocket_url(browser: Dict[str, Any]) -> str:
+    for key in (
+        "webSocketDebuggerUrl",
+        "websocketUrl",
+        "websocket_url",
+        "wsUrl",
+        "ws_url",
+        "connectUrl",
+        "connect_url",
+        "cdpWsUrl",
+        "cdp_ws_url",
+    ):
+        value = browser.get(key)
+        if value:
+            return str(value)
+    cdp_url = browser.get("cdpUrl") or browser.get("cdp_url") or browser.get("devtoolsUrl") or browser.get("devtools_url")
+    if not cdp_url:
+        raise RuntimeError(f"Browser Use cloud browser response had no CDP endpoint fields: {sorted(browser.keys())}")
+    version = _get_json(f"{str(cdp_url).rstrip('/')}/json/version", timeout=15)
+    websocket_url = version.get("webSocketDebuggerUrl")
+    if not websocket_url:
+        raise RuntimeError(f"Browser Use cloud CDP endpoint returned no webSocketDebuggerUrl: {version}")
+    return str(websocket_url)
+
+
+def _browser_use_request(
+    api_base: str,
+    api_key: str,
+    path: str,
+    method: str,
+    body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    response = requests.request(
+        method,
+        f"{api_base.rstrip('/')}{path}",
+        json=body,
+        timeout=60,
+        headers={"X-Browser-Use-API-Key": api_key, "Content-Type": "application/json"},
+    )
+    response.raise_for_status()
+    if not response.content:
+        return {}
+    return response.json()
+
+
+def _resolve_cloud_profile_name(api_base: str, api_key: str, profile_name: str) -> str:
+    matches: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        listing = _browser_use_request(
+            api_base=api_base,
+            api_key=api_key,
+            path=f"/profiles?pageSize=100&pageNumber={page}",
+            method="GET",
+        )
+        items = listing.get("items") if isinstance(listing, dict) else listing
+        if not items:
+            break
+        for item in items:
+            if isinstance(item, dict) and item.get("name") == profile_name:
+                matches.append(item)
+        if not isinstance(listing, dict):
+            break
+        total = listing.get("totalItems")
+        if total is None or page * 100 >= int(total):
+            break
+        page += 1
+    if not matches:
+        raise RuntimeError(f"no Browser Use cloud profile named {profile_name!r}")
+    if len(matches) > 1:
+        raise RuntimeError(f"{len(matches)} Browser Use cloud profiles named {profile_name!r}; pass --cloud-profile-id")
+    profile_id = matches[0].get("id")
+    if not profile_id:
+        raise RuntimeError(f"Browser Use cloud profile {profile_name!r} had no id")
+    return str(profile_id)
+
+
+def _stop_cloud_browser(api_base: str, api_key: str, browser_id: str) -> None:
+    try:
+        _browser_use_request(
+            api_base=api_base,
+            api_key=api_key,
+            path=f"/browsers/{browser_id}",
+            method="PATCH",
+            body={"action": "stop"},
+        )
+    except BaseException:
+        pass
+
+
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _env_path(name: str) -> Optional[Path]:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_int_optional(name: str) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool_optional(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_optional_value(name: str) -> Optional[str]:
+    if name not in os.environ:
+        return None
+    return os.environ.get(name, "")
+
+
+def _env_json_object(name: str) -> Optional[Dict[str, Any]]:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+    return parsed
+
+
+def _redact_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.query and not parsed.params:
+        return url
+    safe = parsed._replace(query="...", params="")
+    return safe.geturl()

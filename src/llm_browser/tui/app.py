@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import re
 import shlex
@@ -16,6 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from llm_browser.agent import SessionManager
+from llm_browser.browser import browser_runtime_diagnostics
 from llm_browser.brand import PRODUCT_NAME
 from llm_browser.datasets import build_dataset_prompt, load_dataset, load_manifest, select_tasks, summarize_manifest
 from llm_browser.events import Event
@@ -86,7 +88,7 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #help {
-        height: 8;
+        height: 9;
         padding: 1;
         color: #c7baaa;
         background: #11151a;
@@ -173,6 +175,7 @@ class BrowserUseTerminalApp(App[None]):
                     "report <run-id>\n"
                     "show/resume/cancel [id]\n"
                     "trace/eval [id]\n"
+                    "browser\n"
                     "open [artifact]\n"
                     "ctrl-r refresh  ctrl-l clear",
                     id="help",
@@ -234,8 +237,9 @@ class BrowserUseTerminalApp(App[None]):
         log.write(
             "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 --task-id 20[/bold], "
             "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session, "
-            "[bold]report[/bold] a dataset run, [bold]open[/bold] an artifact."
+            "[bold]report[/bold] a dataset run, [bold]browser[/bold] config, [bold]open[/bold] an artifact."
         )
+        log.write(f"Browser: [bold]{escape(_browser_runtime_label())}[/bold]")
 
     def _handle_event(self, event: Event) -> None:
         if self.selected_session_id is None:
@@ -346,6 +350,8 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "artifacts":
             self.refresh_artifacts()
             log.write("[green]artifacts refreshed[/green]")
+        elif command == "browser":
+            log.write(escape(_browser_runtime_detail()))
         elif command == "report":
             run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
             if not run_id:
@@ -406,7 +412,7 @@ class BrowserUseTerminalApp(App[None]):
                     index += 1
             tasks = select_tasks(load_dataset(args[1]), count=count, task_ids=task_ids or None)
             for task in tasks:
-                session = self.manager.start(build_dataset_prompt(task, headless=True))
+                session = self.manager.start(build_dataset_prompt(task, headless=_browser_headless_default()))
                 self.selected_session_id = session.id
                 log.write(
                     f"[bold #9ccfd8]started {escape(task.dataset)} task {escape(task.task_id)} "
@@ -569,6 +575,7 @@ class BrowserUseTerminalApp(App[None]):
             f"[#9ccfd8]running[/] [bold]{counts.get('running', 0)}[/bold]  "
             f"[green]done[/green] [bold]{counts.get('done', 0)}[/bold]  "
             f"[red]failed[/red] [bold]{counts.get('failed', 0)}[/bold]  "
+            f"[#b9b2a7]browser[/] {escape(_browser_runtime_label())}  "
             f"{self._selected_run_summary_text()} "
             f"[#b9b2a7]selected[/] {escape(self.selected_session_id or '-')}"
         )
@@ -710,6 +717,48 @@ def _artifact_paths(session: SessionMetadata) -> list[Path]:
     if cwd.exists() and cwd != session.artifact_dir.resolve() and state_dir in cwd.parents:
         paths.extend([path for path in cwd.rglob("*") if path.is_file()])
     return sorted(set(paths), key=lambda path: path.stat().st_mtime, reverse=True)[:200]
+
+
+def _browser_headless_default() -> bool:
+    value = os.environ.get("LLM_BROWSER_HEADLESS")
+    if value is None:
+        return True
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _browser_runtime_label() -> str:
+    diagnostics = browser_runtime_diagnostics()
+    mode = str(diagnostics.get("mode") or "auto")
+    if mode == "chromium" and diagnostics.get("headless_env"):
+        return "chromium headless"
+    if mode == "cloud":
+        cloud = diagnostics.get("cloud") or {}
+        profile = cloud.get("profile_name") or cloud.get("profile_id")
+        return f"cloud {profile}" if profile else "cloud"
+    if mode == "real":
+        ports = ((diagnostics.get("real_chrome") or {}).get("active_profile_ports") or [])
+        return f"real chrome :{ports[0].get('port')}" if ports else "real chrome"
+    if mode == "cdp":
+        return "cdp"
+    return mode
+
+
+def _browser_runtime_detail() -> str:
+    diagnostics = browser_runtime_diagnostics()
+    real = diagnostics.get("real_chrome") or {}
+    cloud = diagnostics.get("cloud") or {}
+    ports = ", ".join(str(item.get("port")) for item in real.get("active_profile_ports") or []) or "-"
+    parts = [
+        "browser config",
+        f"mode: {diagnostics.get('mode')}",
+        f"headless env: {diagnostics.get('headless_env')}",
+        f"cdp http: {diagnostics.get('cdp_http_url') or '-'}",
+        f"cdp ws: {diagnostics.get('cdp_ws_url') or '-'}",
+        f"real chrome ports: {ports}",
+        f"cloud key: {'set' if cloud.get('api_key_available') else 'missing'}",
+        f"cloud profile: {cloud.get('profile_name') or cloud.get('profile_id') or '-'}",
+    ]
+    return "\n".join(parts)
 
 
 def _format_events_for_log(events: list[Event]) -> list[tuple[str, str]]:

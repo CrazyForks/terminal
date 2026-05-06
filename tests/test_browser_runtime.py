@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import Mock, patch
 
-from llm_browser.browser.runtime import BrowserRuntime
+from llm_browser.browser.cdp import CdpError
+from llm_browser.browser.runtime import (
+    BrowserRuntime,
+    BrowserRuntimeOptions,
+    DiscoveredCdpEndpoint,
+    discover_real_browser_endpoint,
+)
 
 
 class JsRuntime(BrowserRuntime):
@@ -173,6 +179,116 @@ class BrowserRuntimeTest(unittest.TestCase):
         client.call.assert_any_call("Runtime.enable", params=None, session_id=None, timeout_s=None)
         client.call.assert_any_call("Network.enable", params=None, session_id=None, timeout_s=None)
         client.call.assert_any_call("Page.navigate", params={"url": "https://example.com"}, session_id=None, timeout_s=None)
+
+    def test_attach_browser_level_ws_uses_page_session_for_page_commands(self) -> None:
+        client = Mock()
+
+        def call(method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+            if method == "Target.getTargets":
+                return {"targetInfos": [{"targetId": "page-1", "type": "page", "url": "about:blank"}]}
+            if method == "Target.attachToTarget":
+                return {"sessionId": "session-1"}
+            if method == "Target.createTarget":
+                return {"targetId": "page-2"}
+            return {}
+
+        client.call.side_effect = call
+        client_cls = Mock(return_value=client)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("llm_browser.browser.runtime.CdpClient", client_cls):
+                runtime = BrowserRuntime.attach_ws(Path(tmp), "ws://remote/browser")
+                runtime.navigate("https://example.com", wait=False)
+                new_target = runtime.new_tab("https://new.example")
+
+        self.assertTrue(runtime.browser_level_ws)
+        self.assertEqual(runtime.default_session_id, "session-1")
+        self.assertEqual(new_target["id"], "page-2")
+        client.call.assert_any_call(
+            "Page.navigate",
+            params={"url": "https://example.com"},
+            session_id="session-1",
+            timeout_s=None,
+        )
+        client.call.assert_any_call("Target.createTarget", {"url": "https://new.example"})
+
+    def test_start_cloud_creates_browser_attaches_ws_and_stops_on_close(self) -> None:
+        client = Mock()
+
+        def call(method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+            if method == "Target.getTargets":
+                raise CdpError("page websocket")
+            return {}
+
+        client.call.side_effect = call
+        client_cls = Mock(return_value=client)
+        post_response = Mock(content=b"{}")
+        post_response.raise_for_status.return_value = None
+        post_response.json.return_value = {"id": "browser-1", "wsUrl": "ws://cloud/page", "liveUrl": "https://live.example"}
+        patch_response = Mock(content=b"{}")
+        patch_response.raise_for_status.return_value = None
+        patch_response.json.return_value = {}
+
+        def request(method: str, url: str, **kwargs: Any):
+            if method == "POST":
+                return post_response
+            if method == "PATCH":
+                return patch_response
+            raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="cloud", cloud_api_key="key", cloud_timeout=30)
+            with patch("llm_browser.browser.runtime.CdpClient", client_cls), patch(
+                "llm_browser.browser.runtime.requests.request", side_effect=request
+            ) as request_mock:
+                runtime = BrowserRuntime.start(Path(tmp), options=options)
+                self.assertEqual(runtime.mode, "cloud")
+                self.assertEqual(runtime.cloud_live_url, "https://live.example")
+                runtime.close()
+
+        client_cls.assert_called_once_with("ws://cloud/page")
+        request_mock.assert_any_call(
+            "POST",
+            "https://api.browser-use.com/api/v3/browsers",
+            json={
+                "timeout": 30,
+                "browserScreenWidth": 1280,
+                "browserScreenHeight": 900,
+            },
+            timeout=60,
+            headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
+        )
+        request_mock.assert_any_call(
+            "PATCH",
+            "https://api.browser-use.com/api/v3/browsers/browser-1",
+            json={"action": "stop"},
+            timeout=60,
+            headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
+        )
+
+    def test_discover_real_browser_uses_devtools_active_port_ws_when_http_discovery_is_blocked(self) -> None:
+        response = Mock(status_code=404)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp)
+            (profile / "DevToolsActivePort").write_text("9333\n/devtools/browser/abc\n", encoding="utf-8")
+            with patch("llm_browser.browser.runtime.requests.get", return_value=response):
+                endpoint = discover_real_browser_endpoint(profile_dirs=[profile], probe_ports=[], timeout_s=0)
+
+        self.assertEqual(endpoint.websocket_url, "ws://127.0.0.1:9333/devtools/browser/abc")
+        self.assertIsNone(endpoint.http_url)
+
+    def test_start_real_uses_discovered_websocket_endpoint(self) -> None:
+        sentinel = object()
+        endpoint = DiscoveredCdpEndpoint(websocket_url="ws://real/browser", source="test")
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="real")
+            with patch("llm_browser.browser.runtime.discover_real_browser_endpoint", return_value=endpoint), patch.object(
+                BrowserRuntime, "attach_ws", return_value=sentinel
+            ) as attach_ws:
+                runtime = BrowserRuntime.start(Path(tmp), options=options)
+
+        self.assertIs(runtime, sentinel)
+        attach_ws.assert_called_once_with(root_dir=Path(tmp), websocket_url="ws://real/browser", mode="real")
 
     def test_js_uses_repl_mode_by_default_for_repeated_snippets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

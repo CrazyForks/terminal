@@ -27,6 +27,67 @@ from llm_browser.session.store import SessionStore
 
 DATASET_TIMEOUT_DRAIN_S = 10.0
 MAX_INLINE_DATASET_RESULT = 20_000
+BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud"]
+
+
+def add_browser_runtime_args(parser: argparse.ArgumentParser, headless_default: Optional[bool]) -> None:
+    parser.add_argument(
+        "--browser",
+        choices=BROWSER_MODE_CHOICES,
+        default=None,
+        help="Browser backend: owned Chromium, real Chrome, explicit CDP, or Browser Use cloud.",
+    )
+    parser.add_argument(
+        "--headless",
+        action=argparse.BooleanOptionalAction,
+        default=headless_default,
+        help="Run owned Chromium headless. Ignored for real/cdp/cloud backends.",
+    )
+    parser.add_argument("--cdp-url", default=None, help="DevTools HTTP endpoint, e.g. http://127.0.0.1:9222.")
+    parser.add_argument("--cdp-ws", default=None, help="Raw CDP websocket URL.")
+    parser.add_argument("--chrome-path", default=None, help="Chrome/Chromium executable for owned Chromium mode.")
+    parser.add_argument("--profile-template", default=None, help="Copy this profile directory into the owned Chromium profile.")
+    parser.add_argument("--keep-profile", action="store_true", help="Keep the owned Chromium profile after runtime close.")
+    parser.add_argument("--browser-width", type=int, default=None, help="Browser viewport/window width.")
+    parser.add_argument("--browser-height", type=int, default=None, help="Browser viewport/window height.")
+    parser.add_argument("--cloud-profile-id", default=None, help="Browser Use cloud profile UUID.")
+    parser.add_argument("--cloud-profile-name", default=None, help="Browser Use cloud profile name, resolved at startup.")
+    parser.add_argument("--cloud-proxy-country", default=None, help="Browser Use proxy country code; pass 'none' to disable.")
+    parser.add_argument("--cloud-timeout", type=int, default=None, help="Browser Use cloud timeout in minutes.")
+    parser.add_argument("--cloud-allow-resizing", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--cloud-recording", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--cloud-custom-proxy-json", default=None, help="JSON object forwarded as Browser Use customProxy.")
+
+
+def apply_browser_runtime_args(args: argparse.Namespace) -> None:
+    mappings = [
+        ("browser", "LLM_BROWSER_MODE"),
+        ("cdp_url", "LLM_BROWSER_CDP_HTTP_URL"),
+        ("cdp_ws", "LLM_BROWSER_CDP_WS_URL"),
+        ("chrome_path", "LLM_BROWSER_CHROME_PATH"),
+        ("profile_template", "LLM_BROWSER_PROFILE_TEMPLATE"),
+        ("browser_width", "LLM_BROWSER_WIDTH"),
+        ("browser_height", "LLM_BROWSER_HEIGHT"),
+        ("cloud_profile_id", "LLM_BROWSER_CLOUD_PROFILE_ID"),
+        ("cloud_profile_name", "LLM_BROWSER_CLOUD_PROFILE_NAME"),
+        ("cloud_proxy_country", "LLM_BROWSER_CLOUD_PROXY_COUNTRY"),
+        ("cloud_timeout", "LLM_BROWSER_CLOUD_TIMEOUT"),
+        ("cloud_custom_proxy_json", "LLM_BROWSER_CLOUD_CUSTOM_PROXY_JSON"),
+    ]
+    for attr, env_name in mappings:
+        if not hasattr(args, attr):
+            continue
+        value = getattr(args, attr)
+        if value is not None:
+            os.environ[env_name] = str(value)
+    if hasattr(args, "headless") and args.headless is not None:
+        os.environ["LLM_BROWSER_HEADLESS"] = "1" if args.headless else "0"
+    if getattr(args, "keep_profile", False):
+        os.environ["LLM_BROWSER_KEEP_CHROME_PROFILE"] = "1"
+    if hasattr(args, "cloud_allow_resizing") and args.cloud_allow_resizing is not None:
+        os.environ["LLM_BROWSER_CLOUD_ALLOW_RESIZING"] = "1" if args.cloud_allow_resizing else "0"
+    if hasattr(args, "cloud_recording") and args.cloud_recording is not None:
+        os.environ["LLM_BROWSER_CLOUD_ENABLE_RECORDING"] = "1" if args.cloud_recording else "0"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--model", default=None, help="Model name for provider=openai.")
     run.add_argument("--max-turns", type=int, default=80, help="Maximum model/tool turns before failing.")
+    add_browser_runtime_args(run, headless_default=None)
     run.set_defaults(func=cmd_run)
 
     sessions = sub.add_parser("sessions", help="Inspect sessions.")
@@ -95,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     browser_smoke = browser_sub.add_parser("smoke", help="Launch Chrome, navigate, and capture a screenshot.")
     browser_smoke.add_argument("--url", default="https://example.com", help="URL to open.")
-    browser_smoke.add_argument("--headless", action="store_true", help="Run Chrome headless.")
+    add_browser_runtime_args(browser_smoke, headless_default=False)
     browser_smoke.set_defaults(func=cmd_browser_smoke)
 
     datasets = sub.add_parser("datasets", help="Run or sample browser benchmark datasets.")
@@ -123,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     datasets_run.add_argument("--model", default="gpt-5.5")
     datasets_run.add_argument("--max-turns", type=int, default=80)
     datasets_run.add_argument("--task-timeout-s", type=float, default=0.0, help="Optional per-task timeout in seconds.")
-    datasets_run.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    add_browser_runtime_args(datasets_run, headless_default=True)
     datasets_run.add_argument(
         "--skip-failed",
         action="store_true",
@@ -140,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
     tui.add_argument("--model", default=None)
     tui.add_argument("--max-turns", type=int, default=80)
+    add_browser_runtime_args(tui, headless_default=None)
     tui.set_defaults(func=cmd_tui)
 
     auth = sub.add_parser("auth", help="Authentication commands.")
@@ -156,12 +219,15 @@ def store_from_args(args: argparse.Namespace) -> SessionStore:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from llm_browser.browser import browser_runtime_diagnostics
+
     state_dir = Path(args.state_dir)
-    print(json.dumps({"ok": True, "state_dir": str(state_dir.resolve())}, indent=2))
+    print(json.dumps({"ok": True, "state_dir": str(state_dir.resolve()), "browser": browser_runtime_diagnostics()}, indent=2))
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    apply_browser_runtime_args(args)
     store = store_from_args(args)
     provider = make_provider(args.provider, args.model)
     agent = Agent(store, provider=provider, max_turns=args.max_turns)
@@ -227,13 +293,14 @@ def cmd_sessions_self_eval(args: argparse.Namespace) -> int:
 def cmd_browser_smoke(args: argparse.Namespace) -> int:
     from llm_browser.browser import BrowserRuntime
 
+    apply_browser_runtime_args(args)
     root_dir = Path(args.state_dir) / "browser-smoke"
     runtime = BrowserRuntime.start(root_dir=root_dir, headless=args.headless)
     try:
         runtime.new_tab(args.url)
         runtime.wait_for_load()
         image = runtime.screenshot("loaded", attach=True)
-        payload = {"page": runtime.page_info(), "screenshot": image.to_dict()}
+        payload = {"connection": runtime.connection_info(), "page": runtime.page_info(), "screenshot": image.to_dict()}
         print(json.dumps(payload, indent=2))
     finally:
         runtime.close()
@@ -259,8 +326,7 @@ def cmd_datasets_sample(args: argparse.Namespace) -> int:
 
 
 def cmd_datasets_run(args: argparse.Namespace) -> int:
-    if args.headless:
-        os.environ["LLM_BROWSER_HEADLESS"] = "1"
+    apply_browser_runtime_args(args)
     tasks = load_dataset(args.dataset)
     count = len(tasks) if args.all else args.count
     selected = select_tasks(tasks, count=count, seed=args.seed, task_ids=args.task_id)
@@ -280,6 +346,7 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
             "provider": args.provider,
             "model": args.model,
             "headless": args.headless,
+            "browser": args.browser or os.environ.get("LLM_BROWSER_MODE") or "auto",
             "sessions": [],
         }
 
@@ -332,6 +399,8 @@ def cmd_datasets_report(args: argparse.Namespace) -> int:
 
 def cmd_tui(args: argparse.Namespace) -> int:
     from llm_browser.tui import TextualTui
+
+    apply_browser_runtime_args(args)
 
     def provider_factory():
         return make_provider(args.provider, args.model)

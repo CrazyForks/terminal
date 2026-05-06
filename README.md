@@ -7,7 +7,7 @@ Current status: vertical MVP is implemented and being hardened against the bundl
 - append-only session/event logs
 - fake, OpenAI Responses, and Codex Responses provider paths
 - redacted Codex auth detection from `~/.codex/auth.json`
-- harness-owned Chrome launch through CDP
+- browser backends for owned Chromium/Chrome, Browser Use cloud browsers, explicit CDP endpoints, and real Chrome profile attach
 - persistent Python browser tool with raw `cdp(...)`
 - model-visible screenshot tool outputs with ordered image timelines
 - shell streaming, shell cancellation, and basic file tools
@@ -26,8 +26,8 @@ uv run browser-use-terminal doctor
 uv run browser-use-terminal auth status
 uv run browser-use-terminal run --provider fake "Open example.com"
 uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done tool with result ok."
-uv run browser-use-terminal browser smoke --headless --url https://example.com
-uv run browser-use-terminal tui
+uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
+uv run browser-use-terminal tui --browser chromium
 uv run browser-use-terminal sessions list
 uv run browser-use-terminal datasets sample real_v8 --count 1 --seed 21
 uv run browser-use-terminal datasets run real_v8 --provider codex --model gpt-5.5 --count 1 --seed 21
@@ -39,15 +39,54 @@ By default runtime state is stored under `.browser-use-terminal/`.
 For headless browser tool runs:
 
 ```bash
-LLM_BROWSER_HEADLESS=1 uv run browser-use-terminal run --provider codex --model gpt-5.5 \
+uv run browser-use-terminal run --browser chromium --headless --provider codex --model gpt-5.5 \
   "Use python headless true. Open https://example.com, screenshot('loaded', attach=True), then call done with the title."
 ```
+
+## Browser Backends
+
+The browser primitive is still raw CDP. The backend only decides where the CDP websocket comes from.
+
+Owned Chromium/Chrome launches an isolated non-default profile, so it works with current Chrome remote-debugging restrictions:
+
+```bash
+uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
+uv run browser-use-terminal tui --browser chromium --headless --provider codex --model gpt-5.5
+```
+
+Real Chrome attaches to your already-running profile. In Chrome, open `chrome://inspect/#remote-debugging`, enable remote debugging for this browser instance, and click Allow if Chrome asks:
+
+```bash
+uv run browser-use-terminal tui --browser real --provider codex --model gpt-5.5
+uv run browser-use-terminal browser smoke --browser real --url https://example.com
+```
+
+Explicit CDP is the raw escape hatch. This also keeps compatibility with browser harness env vars `BU_CDP_URL` and `BU_CDP_WS`:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/browser-use-terminal-profile
+
+uv run browser-use-terminal tui --browser cdp --cdp-url http://127.0.0.1:9222
+uv run browser-use-terminal tui --browser cdp --cdp-ws ws://127.0.0.1:9222/devtools/browser/<id>
+```
+
+Browser Use cloud provisions a browser, attaches to its CDP websocket, records the live URL in runtime output, and stops the cloud browser on close:
+
+```bash
+export BROWSER_USE_API_KEY=...
+uv run browser-use-terminal browser smoke --browser cloud --cloud-timeout 60 --cloud-proxy-country us
+uv run browser-use-terminal tui --browser cloud --cloud-profile-id <uuid> --provider codex --model gpt-5.5
+```
+
+Useful shared options: `--browser-width`, `--browser-height`, `--chrome-path`, `--profile-template`, `--keep-profile`, `--cloud-profile-name`, `--cloud-recording`, and `--cloud-custom-proxy-json`.
 
 ## Recent Verification
 
 ```bash
 uv run python -m unittest discover -s tests
-uv run browser-use-terminal browser smoke --headless --url https://example.com
+uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
 uv run browser-use-terminal datasets run real_v8 --provider fake --count 1 --seed 3
 ```
 
