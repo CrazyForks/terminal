@@ -107,6 +107,8 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "For store/location directories, look for lower-cardinality state/city/category directory pages or JSON APIs "
         "before fetching one page per listed item; extract_markdown_link_blocks(...) is useful for repeated directory cards, "
         "and per-item page crawls should be rate-aware and treated as a fallback. "
+        "For FCC grantee-code count tasks, the official FCC pages often stall; if they do, use fccid.io/<grantee-code>/ "
+        "as a mirror and count the FCC ID application rows for the requested code. "
         "Recover from broken helpers by using raw CDP, JavaScript, shell, requests, or local helper code. "
         "Respect any output constraints in the task. If the task expects JSON, a schema object, markdown, or text output, "
         "the final done result must be that exact content, not a file link. For very large final text/JSON you already saved, "

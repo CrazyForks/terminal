@@ -30,6 +30,7 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("Attach screenshots", prompt)
         self.assertIn("output_path('/home/user/outputs/name.ext')", prompt)
         self.assertIn("fetch_many_text", prompt)
+        self.assertIn("fccid.io/<grantee-code>/", prompt)
 
     def test_summarize_manifest_uses_latest_attempt(self) -> None:
         manifest = {
