@@ -16,8 +16,83 @@ from llm_browser.tool.result import ToolResult
 MAX_READ_CHARS = 20000
 MAX_DIFF_CHARS = 20000
 MAX_SEARCH_OUTPUT = 30000
+DEFAULT_REPO_MAP_SCAN = 2000
+MAX_REPO_MAP_SCAN = 20000
+DEFAULT_REPO_MAP_LIMIT = 30
+MAX_REPO_MAP_LIMIT = 80
 _FILE_LOCKS: Dict[str, threading.RLock] = {}
 _FILE_LOCKS_LOCK = threading.Lock()
+_REPO_MAP_IGNORED_DIRS = {
+    ".browser-use-terminal",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "venv",
+}
+_REPO_MAP_MANIFEST_NAMES = {
+    "cargo.toml",
+    "composer.json",
+    "go.mod",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "requirements.txt",
+    "setup.cfg",
+    "setup.py",
+    "tsconfig.json",
+    "uv.lock",
+}
+_REPO_MAP_DOC_NAMES = {
+    "agents.md",
+    "changelog.md",
+    "contributing.md",
+    "readme.md",
+}
+_REPO_MAP_ENTRYPOINT_NAMES = {
+    "__main__.py",
+    "app.py",
+    "asgi.py",
+    "cli.py",
+    "index.js",
+    "index.jsx",
+    "index.ts",
+    "index.tsx",
+    "lib.rs",
+    "main.go",
+    "main.py",
+    "main.rs",
+    "main.ts",
+    "main.tsx",
+    "manage.py",
+    "mod.rs",
+    "server.py",
+    "wsgi.py",
+}
+_REPO_MAP_SOURCE_ROOT_NAMES = {
+    "app",
+    "cmd",
+    "docs",
+    "examples",
+    "internal",
+    "lib",
+    "pkg",
+    "scripts",
+    "src",
+    "test",
+    "tests",
+}
+_REPO_MAP_WORKSPACE_ROOT_NAMES = {"apps", "crates", "packages", "services"}
 
 
 def read_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -172,6 +247,59 @@ def grep_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     return ToolResult(text="\n".join(lines), data={"root": str(root), "pattern": pattern, "count": len(lines), "engine": "python"})
 
 
+def repo_map(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    root = _resolve(ctx, str(arguments.get("root", ".")))
+    if not root.exists():
+        raise FileNotFoundError(_missing_path_message(root))
+    if root.is_file():
+        root = root.parent
+
+    scan_limit = _bounded_int(arguments.get("scan_limit"), DEFAULT_REPO_MAP_SCAN, 1, MAX_REPO_MAP_SCAN)
+    section_limit = _bounded_int(arguments.get("limit"), DEFAULT_REPO_MAP_LIMIT, 1, MAX_REPO_MAP_LIMIT)
+    files, truncated = _repo_file_list(root, scan_limit)
+    git_root = _git_root(root)
+    top_level = _top_level_entries(root, section_limit)
+    manifests = _select_known_files(files, _REPO_MAP_MANIFEST_NAMES, section_limit)
+    docs = _select_known_files(files, _REPO_MAP_DOC_NAMES, section_limit)
+    source_roots = _source_roots(files, section_limit)
+    entrypoints = _entrypoint_files(files, section_limit)
+    tests = _test_files(files, section_limit)
+    suggested_next_reads = _suggested_next_reads(docs, manifests, entrypoints, tests, source_roots, section_limit)
+
+    lines = [
+        f"Repository map for {root}",
+        f"Git root: {git_root or 'not detected'}",
+        f"Scanned files: {len(files)}" + (" (truncated)" if truncated else ""),
+    ]
+    lines.extend(_format_repo_map_section("Top-level entries", top_level))
+    lines.extend(_format_repo_map_section("Docs", docs))
+    lines.extend(_format_repo_map_section("Manifests", manifests))
+    lines.extend(_format_repo_map_section("Source roots", [f"{item['path']} ({item['files']} files)" for item in source_roots]))
+    lines.extend(_format_repo_map_section("Likely entrypoints", entrypoints))
+    lines.extend(_format_repo_map_section("Likely tests", tests))
+    lines.extend(_format_repo_map_section("Suggested next reads", suggested_next_reads))
+    if truncated:
+        lines.append("Scan truncated; pass a larger scan_limit or use glob/grep for targeted follow-up.")
+
+    return ToolResult(
+        text="\n".join(lines),
+        data={
+            "root": str(root),
+            "git_root": git_root,
+            "scanned_files": len(files),
+            "scan_limit": scan_limit,
+            "truncated": truncated,
+            "top_level": top_level,
+            "docs": docs,
+            "manifests": manifests,
+            "source_roots": source_roots,
+            "entrypoints": entrypoints,
+            "tests": tests,
+            "suggested_next_reads": suggested_next_reads,
+        },
+    )
+
+
 class _TextMeta:
     def __init__(self, newline: str = "\n", bom: bool = False) -> None:
         self.newline = newline
@@ -289,6 +417,161 @@ def _iter_files(root: Path, include: str) -> Iterable[Path]:
     for path in sorted(root.rglob("*")):
         if path.is_file() and fnmatch.fnmatch(path.name, include):
             yield path
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return min(max(number, minimum), maximum)
+
+
+def _repo_file_list(root: Path, limit: int) -> Tuple[List[str], bool]:
+    files: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _: None):
+        dirnames[:] = sorted((name for name in dirnames if not _repo_map_ignored_dir(name)), key=str.lower)
+        for filename in sorted(filenames, key=str.lower):
+            if len(files) >= limit:
+                return files, True
+            path = Path(dirpath) / filename
+            try:
+                rel_path = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            files.append(rel_path)
+    return files, False
+
+
+def _repo_map_ignored_dir(name: str) -> bool:
+    return name in _REPO_MAP_IGNORED_DIRS or name.endswith(".egg-info")
+
+
+def _git_root(root: Path) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _top_level_entries(root: Path, limit: int) -> List[str]:
+    entries: List[str] = []
+    try:
+        children = sorted(root.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+    except OSError:
+        return entries
+    for child in children:
+        if child.is_dir() and _repo_map_ignored_dir(child.name):
+            continue
+        entries.append(child.name + ("/" if child.is_dir() else ""))
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _select_known_files(files: List[str], names: set[str], limit: int) -> List[str]:
+    matches = [path for path in files if _basename(path).lower() in names]
+    return sorted(matches, key=_repo_map_path_sort_key)[:limit]
+
+
+def _source_roots(files: List[str], limit: int) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    for path in files:
+        parts = path.split("/")
+        if not parts:
+            continue
+        first = parts[0]
+        first_lower = first.lower()
+        root_name: Optional[str] = None
+        if first_lower in _REPO_MAP_WORKSPACE_ROOT_NAMES and len(parts) > 1:
+            root_name = f"{first}/{parts[1]}"
+        elif first_lower in _REPO_MAP_SOURCE_ROOT_NAMES:
+            root_name = first
+        if root_name is not None:
+            counts[root_name] = counts.get(root_name, 0) + 1
+    return [
+        {"path": path, "files": counts[path]}
+        for path in sorted(counts, key=lambda item: (-counts[item], item.lower()))[:limit]
+    ]
+
+
+def _entrypoint_files(files: List[str], limit: int) -> List[str]:
+    matches = [path for path in files if _basename(path).lower() in _REPO_MAP_ENTRYPOINT_NAMES]
+    return sorted(matches, key=_entrypoint_sort_key)[:limit]
+
+
+def _test_files(files: List[str], limit: int) -> List[str]:
+    matches = []
+    for path in files:
+        basename = _basename(path).lower()
+        parts = [part.lower() for part in path.split("/")]
+        if (
+            "tests" in parts
+            or "test" in parts
+            or basename.startswith("test_")
+            or basename.endswith("_test.py")
+            or ".spec." in basename
+            or ".test." in basename
+        ):
+            matches.append(path)
+    return sorted(matches, key=_repo_map_path_sort_key)[:limit]
+
+
+def _suggested_next_reads(
+    docs: List[str],
+    manifests: List[str],
+    entrypoints: List[str],
+    tests: List[str],
+    source_roots: List[Dict[str, Any]],
+    limit: int,
+) -> List[str]:
+    candidates: List[str] = []
+    candidates.extend(docs)
+    candidates.extend(manifests)
+    candidates.extend(entrypoints[:8])
+    candidates.extend(item["path"] for item in source_roots[:8])
+    candidates.extend(tests[:5])
+    return _dedupe(candidates)[:limit]
+
+
+def _format_repo_map_section(title: str, values: List[str]) -> List[str]:
+    if not values:
+        return [f"{title}: none"]
+    return [f"{title}:"] + [f"  - {value}" for value in values]
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+def _repo_map_path_sort_key(path: str) -> Tuple[int, str]:
+    return (path.count("/"), path.lower())
+
+
+def _entrypoint_sort_key(path: str) -> Tuple[int, int, str]:
+    basename = _basename(path).lower()
+    priority = 0 if basename in {"main.py", "cli.py", "app.py", "server.py", "index.ts", "index.tsx"} else 1
+    return (priority, path.count("/"), path.lower())
+
+
+def _dedupe(values: Iterable[str]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _missing_path_message(path: Path) -> str:

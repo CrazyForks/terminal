@@ -5,7 +5,15 @@ from typing import Any, Dict
 
 from llm_browser.tool.browser_exports import BROWSER_TOOL_DESCRIPTION
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
+from llm_browser.tool.files import (
+    apply_patch_file,
+    edit_file,
+    glob_files,
+    grep_files,
+    read_file,
+    repo_map,
+    write_file,
+)
 from llm_browser.tool.python_browser import PythonBrowserTool
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
@@ -230,6 +238,25 @@ def build_builtin_registry() -> ToolRegistry:
             },
         ),
         grep_files,
+    )
+    registry.register(
+        ToolSpec(
+            name="repo_map",
+            description=(
+                "Summarize repository structure without reading file contents. "
+                "Use before open-ended codebase exploration to choose targeted read/grep calls."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "root": {"type": "string"},
+                    "scan_limit": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+        ),
+        repo_map,
     )
     registry.register(
         ToolSpec(

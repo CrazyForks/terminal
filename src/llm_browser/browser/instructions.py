@@ -9,6 +9,7 @@ Default workflow:
 - Prefer compositor-level interaction first: click_at_xy(x, y), press_key(...), type_text(...), fill_input(...) for framework inputs. Coordinate clicks work through iframes, shadow DOM, and cross-origin content.
 - Use raw CDP whenever a helper is too narrow: cdp("Page.navigate", url="..."), cdp("Input.dispatchMouseEvent", ...), cdp("Runtime.evaluate", ...).
 - Use js(...) for targeted inspection/extraction. Do not dump the whole DOM by default; extract the smallest text/data/geometry needed.
+- For open-ended repository/codebase questions, call repo_map first, then use targeted read/grep calls. Avoid broad recursive file dumps.
 - After navigation or form submits, use wait_for_load() and/or wait_for_network_idle(), then attach a screenshot to verify the actual state.
 - If the current tab is blank/internal/stale, call ensure_real_tab(), list_tabs(), switch_tab(...), or new_tab(...).
 - Native dialogs freeze page JS. Check page_info() or pending_dialog() and handle the dialog before continuing.
