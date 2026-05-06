@@ -137,6 +137,24 @@ class PythonBrowserTool:
                 timeout_s = timeout
             return runtime.wait_for_text(text, timeout_s=timeout_s)
 
+        def output_path(path: str = "") -> str:
+            workspace_output_dir = ctx.session.cwd / "outputs"
+            requested = Path(path).expanduser()
+            if not path:
+                workspace_output_dir.mkdir(parents=True, exist_ok=True)
+                return str(workspace_output_dir)
+            if requested.is_absolute():
+                try:
+                    relative = requested.relative_to("/home/user/outputs")
+                except ValueError:
+                    requested.parent.mkdir(parents=True, exist_ok=True)
+                    return str(requested)
+                target = workspace_output_dir / relative
+            else:
+                target = ctx.session.cwd / requested
+            target.parent.mkdir(parents=True, exist_ok=True)
+            return str(target)
+
         def load_helper(path: str) -> None:
             helper_path = Path(path).expanduser()
             if not helper_path.is_absolute():
@@ -270,6 +288,8 @@ class PythonBrowserTool:
                 "download_dir": runtime.root_dir / "downloads",
                 "cwd": ctx.session.cwd,
                 "workspace_dir": ctx.session.cwd,
+                "output_dir": ctx.session.cwd / "outputs",
+                "output_path": output_path,
                 "cdp": cdp,
                 "new_tab": new_tab,
                 "navigate": runtime.navigate,

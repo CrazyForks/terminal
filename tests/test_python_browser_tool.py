@@ -157,6 +157,30 @@ class PythonBrowserToolTest(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_output_path_maps_home_user_outputs_to_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp) / "work")
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "path = output_path('/home/user/outputs/result.csv')\n"
+                        "Path(path).write_text('a,b\\n1,2\\n')\n"
+                        "result = path"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            saved = Path(result.data["result"])
+            self.assertEqual(saved, session.cwd / "outputs" / "result.csv")
+            self.assertEqual(saved.read_text(), "a,b\n1,2\n")
+
     def test_statement_imports_and_display_shim_are_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))

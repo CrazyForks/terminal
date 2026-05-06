@@ -91,6 +91,8 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         f"When launching browser work, use headless {headless_text} unless the task requires visible Chrome. "
         "The current working directory is an isolated task workspace; save requested task files there, "
         "or use artifact_dir/save_artifact for supporting evidence. "
+        "If a task asks for /home/user/outputs, use output_path('/home/user/outputs/name.ext') so the file lands "
+        "in this workspace's outputs directory on systems where that absolute path is unavailable. "
         "If a task asks for a downloadable or Browser Use signed URL for a local file, call create_download_url(path) "
         "or upload_artifact(path) and use its downloadUrl. "
         "Attach screenshots after meaningful page transitions or before relying on visual state. "
