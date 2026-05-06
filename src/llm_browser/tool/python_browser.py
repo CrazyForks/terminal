@@ -883,11 +883,12 @@ class PythonBrowserTool:
                 ctx.emit_image(image)
             return {"selector": selector, "rect": rect, "clip": clip, "image": image.to_dict()}
 
+        downloads_dir = getattr(runtime, "downloads_dir", runtime.root_dir / "downloads")
         namespace.update(
             {
                 "browser": runtime,
                 "artifact_dir": ctx.session.artifact_dir,
-                "download_dir": runtime.root_dir / "downloads",
+                "download_dir": downloads_dir,
                 "cwd": ctx.session.cwd,
                 "workspace_dir": ctx.session.cwd,
                 "output_dir": ctx.session.cwd / "outputs",
@@ -908,6 +909,21 @@ class PythonBrowserTool:
                 "screenshot": screenshot,
                 "screenshot_element": screenshot_element,
                 "page_info": runtime.page_info,
+                "drain_cdp_events": getattr(runtime, "drain_events", lambda *args, **kwargs: []),
+                "recent_cdp_events": getattr(runtime, "recent_cdp_events", lambda *args, **kwargs: []),
+                "recent_console": getattr(runtime, "recent_console_events", lambda *args, **kwargs: []),
+                "recent_network": getattr(runtime, "recent_network_events", lambda *args, **kwargs: []),
+                "recent_network_failures": getattr(runtime, "recent_network_failures", lambda *args, **kwargs: []),
+                "download_info": getattr(
+                    runtime,
+                    "download_info",
+                    lambda *args, **kwargs: {"downloads_dir": str(downloads_dir), "files": [], "events": []},
+                ),
+                "save_browser_trace": getattr(
+                    runtime,
+                    "save_browser_trace",
+                    lambda *args, **kwargs: {"path": None, "event_count": 0, "drained_count": 0},
+                ),
                 "visible_text": runtime.visible_text,
                 "links": runtime.links,
                 "click_at": runtime.click_at,

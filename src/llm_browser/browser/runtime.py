@@ -169,6 +169,10 @@ class BrowserRuntime:
         self.cloud_api_key: Optional[str] = None
         self.cloud_api_base: str = BROWSER_USE_CLOUD_API
         self._screenshot_index = 0
+        self._trace_index = 0
+        self._event_log: List[Dict[str, Any]] = []
+        self.downloads_dir = root_dir / "downloads"
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def start(
@@ -217,6 +221,7 @@ class BrowserRuntime:
                 width=options.width,
                 height=options.height,
             )
+            runtime.downloads_dir = runtime.chrome.config.downloads_dir
             runtime.http_url = runtime.chrome.http_url
             runtime.attach_first_page()
         except BaseException:
@@ -328,6 +333,7 @@ class BrowserRuntime:
             "target": self.target,
             "cloud_browser_id": self.cloud_browser_id,
             "cloud_live_url": self.cloud_live_url,
+            "downloads_dir": str(self.downloads_dir),
         }
 
     def version(self) -> Dict[str, Any]:
@@ -513,11 +519,25 @@ class BrowserRuntime:
         return None
 
     def _enable_page_domains(self) -> None:
-        for domain in ("Page", "Runtime", "Network"):
+        for domain in ("Page", "Runtime", "Network", "Log"):
             try:
                 self.cdp(f"{domain}.enable", retry=False)
             except Exception:
                 pass
+        self._configure_downloads()
+
+    def _configure_downloads(self) -> None:
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        attempts = (
+            ("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(self.downloads_dir), "eventsEnabled": True}),
+            ("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": str(self.downloads_dir)}),
+        )
+        for method, params in attempts:
+            try:
+                self.cdp(method, params, retry=False)
+                return
+            except Exception:
+                continue
 
     def _default_session_id_for_method(self, method: str) -> Optional[str]:
         if not self.default_session_id:
@@ -738,6 +758,168 @@ class BrowserRuntime:
     def scroll(self, dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy})
 
+    def drain_events(self, timeout_s: float = 0.05, max_events: int = 1000) -> List[Dict[str, Any]]:
+        if self.client is None:
+            return []
+        try:
+            raw_events = self.client.drain_events(timeout_s=timeout_s, max_events=max_events)
+        except TypeError:
+            raw_events = self.client.drain_events()
+        events = [event for event in raw_events if isinstance(event, dict)]
+        return self._record_events(events)
+
+    def recent_cdp_events(
+        self,
+        prefix: Optional[str] = None,
+        limit: int = 100,
+        drain: bool = True,
+        timeout_s: float = 0.02,
+    ) -> List[Dict[str, Any]]:
+        if drain:
+            self.drain_events(timeout_s=timeout_s)
+        events = self._event_log
+        if prefix:
+            events = [event for event in events if str(event.get("method") or "").startswith(prefix)]
+        return events[-max(0, int(limit)) :]
+
+    def recent_console_events(self, limit: int = 50, drain: bool = True) -> List[Dict[str, Any]]:
+        events = self.recent_cdp_events(limit=limit * 4, drain=drain)
+        console = []
+        for event in events:
+            method = str(event.get("method") or "")
+            if method not in {"Runtime.consoleAPICalled", "Log.entryAdded"}:
+                continue
+            params = event.get("params") if isinstance(event.get("params"), dict) else {}
+            if method == "Runtime.consoleAPICalled":
+                args = params.get("args") if isinstance(params.get("args"), list) else []
+                text = " ".join(_remote_object_text(arg) for arg in args if isinstance(arg, dict)).strip()
+                console.append(
+                    {
+                        "method": method,
+                        "type": params.get("type"),
+                        "text": text,
+                        "timestamp": params.get("timestamp"),
+                        "raw": event,
+                    }
+                )
+            else:
+                entry = params.get("entry") if isinstance(params.get("entry"), dict) else {}
+                console.append(
+                    {
+                        "method": method,
+                        "type": entry.get("level") or entry.get("source"),
+                        "text": entry.get("text"),
+                        "url": entry.get("url"),
+                        "lineNumber": entry.get("lineNumber"),
+                        "raw": event,
+                    }
+                )
+        return console[-max(0, int(limit)) :]
+
+    def recent_network_events(self, limit: int = 100, drain: bool = True) -> List[Dict[str, Any]]:
+        return self.recent_cdp_events(prefix="Network.", limit=limit, drain=drain)
+
+    def recent_network_failures(self, limit: int = 50, drain: bool = True) -> List[Dict[str, Any]]:
+        events = self.recent_network_events(limit=limit * 8, drain=drain)
+        failures = []
+        for event in events:
+            method = str(event.get("method") or "")
+            params = event.get("params") if isinstance(event.get("params"), dict) else {}
+            if method == "Network.loadingFailed":
+                failures.append(
+                    {
+                        "method": method,
+                        "requestId": params.get("requestId"),
+                        "errorText": params.get("errorText"),
+                        "blockedReason": params.get("blockedReason"),
+                        "canceled": params.get("canceled"),
+                        "raw": event,
+                    }
+                )
+                continue
+            if method == "Network.responseReceived":
+                response = params.get("response") if isinstance(params.get("response"), dict) else {}
+                status = int(response.get("status") or 0)
+                if status >= 400:
+                    failures.append(
+                        {
+                            "method": method,
+                            "requestId": params.get("requestId"),
+                            "status": status,
+                            "url": response.get("url"),
+                            "statusText": response.get("statusText"),
+                            "raw": event,
+                        }
+                    )
+        return failures[-max(0, int(limit)) :]
+
+    def download_info(self, limit: int = 100, drain: bool = True) -> Dict[str, Any]:
+        if drain:
+            self.drain_events(timeout_s=0.02)
+        files: List[Dict[str, Any]] = []
+        if self.downloads_dir.exists():
+            for path in self.downloads_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                files.append(
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "relative_path": str(path.relative_to(self.downloads_dir)),
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "complete": not path.name.endswith(".crdownload"),
+                    }
+                )
+        files.sort(key=lambda item: float(item["mtime"]), reverse=True)
+        events = [
+            event
+            for event in self._event_log
+            if str(event.get("method") or "").startswith(("Browser.download", "Page.download"))
+        ][-max(0, int(limit)) :]
+        return {
+            "downloads_dir": str(self.downloads_dir),
+            "mode": self.mode,
+            "files": files[: max(0, int(limit))],
+            "events": events,
+        }
+
+    def save_browser_trace(self, label: str = "browser_trace", include_history: bool = True) -> Dict[str, Any]:
+        drained = self.drain_events(timeout_s=0.05)
+        events = self._event_log if include_history else drained
+        self._trace_index += 1
+        safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in label).strip("_")
+        if not safe_label:
+            safe_label = "browser_trace"
+        path = self.root_dir / "traces" / f"{self._trace_index:03d}_{safe_label}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts_ms": now_ms(),
+            "connection": self.connection_info(),
+            "event_count": len(events),
+            "drained_count": len(drained),
+            "events": events,
+        }
+        path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+        return {"path": str(path), "event_count": len(events), "drained_count": len(drained)}
+
+    def _record_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        stamped = []
+        ts_ms = now_ms()
+        for event in events:
+            item = dict(event)
+            item.setdefault("_ts_ms", ts_ms)
+            stamped.append(item)
+        if stamped:
+            self._event_log.extend(stamped)
+            if len(self._event_log) > 5000:
+                self._event_log = self._event_log[-5000:]
+        return stamped
+
 
 def _key_event(key: str) -> Dict[str, Any]:
     common = {
@@ -757,6 +939,22 @@ def _key_event(key: str) -> Dict[str, Any]:
         vk = ord(key.upper())
         return {"key": key, "text": key, "code": f"Key{key.upper()}", "windowsVirtualKeyCode": vk}
     return {"key": key, "code": key}
+
+
+def _remote_object_text(obj: Dict[str, Any]) -> str:
+    if "value" in obj:
+        value = obj.get("value")
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return str(value)
+    if "description" in obj:
+        return str(obj.get("description") or "")
+    if "unserializableValue" in obj:
+        return str(obj.get("unserializableValue") or "")
+    return str(obj.get("type") or "")
 
 
 def browser_runtime_diagnostics(options: Optional[BrowserRuntimeOptions] = None) -> Dict[str, Any]:

@@ -38,6 +38,8 @@ def build_builtin_registry() -> ToolRegistry:
                 "attach_tab(...), js(expr), wait_for_load(), screenshot(label, attach=True, timeout_s=8), "
                 "screenshot_element(selector, label=None, attach=True, padding=8), "
                 "click_at(x,y), type_text(text), press(key), scroll(dx=0, dy=500), page_info(), "
+                "drain_cdp_events(), recent_cdp_events(), recent_console(), recent_network(), recent_network_failures(), "
+                "download_info(), save_browser_trace(label='browser_trace'), "
                 "visible_text(), deep_text(), links(), click_text(text_or_regex), dismiss_cookie_banners(), "
                 "save_helper(), load_helper(), save_artifact(), "
                 "upload_artifact(path), create_download_url(path), download_file(url, path=None), "

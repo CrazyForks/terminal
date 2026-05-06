@@ -82,6 +82,16 @@ class EvalRuntime(BrowserRuntime):
         return {"result": {"value": "ok"}}
 
 
+class DrainClient:
+    def __init__(self, events: list[Dict[str, Any]]) -> None:
+        self.events = list(events)
+
+    def drain_events(self, timeout_s: float = 0.05, max_events: int = 1000):
+        events = self.events[:max_events]
+        self.events = self.events[max_events:]
+        return events
+
+
 class SequenceRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path, values: list[Any]) -> None:
         super().__init__(root_dir=root_dir)
@@ -265,6 +275,63 @@ class BrowserRuntimeTest(unittest.TestCase):
             timeout=60,
             headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
         )
+
+    def test_runtime_drains_console_and_network_failures(self) -> None:
+        events = [
+            {
+                "method": "Runtime.consoleAPICalled",
+                "params": {"type": "error", "args": [{"type": "string", "value": "boom"}]},
+            },
+            {
+                "method": "Network.responseReceived",
+                "params": {"requestId": "1", "response": {"status": 404, "statusText": "Not Found", "url": "https://e.test/missing"}},
+            },
+            {
+                "method": "Network.loadingFailed",
+                "params": {"requestId": "2", "errorText": "net::ERR_ABORTED", "canceled": True},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.client = DrainClient(events)  # type: ignore[assignment]
+
+            console = runtime.recent_console_events()
+            failures = runtime.recent_network_failures()
+
+        self.assertEqual(console[0]["text"], "boom")
+        self.assertEqual(failures[0]["status"], 404)
+        self.assertEqual(failures[1]["errorText"], "net::ERR_ABORTED")
+
+    def test_download_info_lists_files_and_download_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.client = DrainClient(
+                [
+                    {
+                        "method": "Browser.downloadWillBegin",
+                        "params": {"guid": "g1", "suggestedFilename": "report.csv"},
+                    }
+                ]
+            )  # type: ignore[assignment]
+            (runtime.downloads_dir / "report.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+
+            info = runtime.download_info()
+
+        self.assertEqual(info["files"][0]["name"], "report.csv")
+        self.assertTrue(info["files"][0]["complete"])
+        self.assertEqual(info["events"][0]["method"], "Browser.downloadWillBegin")
+
+    def test_save_browser_trace_writes_drained_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.client = DrainClient([{"method": "Log.entryAdded", "params": {"entry": {"text": "hi"}}}])  # type: ignore[assignment]
+
+            trace = runtime.save_browser_trace("checkout trace")
+
+            payload = json.loads(Path(trace["path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(trace["event_count"], 1)
+        self.assertEqual(payload["events"][0]["method"], "Log.entryAdded")
 
     def test_discover_real_browser_uses_devtools_active_port_ws_when_http_discovery_is_blocked(self) -> None:
         response = Mock(status_code=404)
