@@ -30,8 +30,9 @@ MAX_INLINE_TOOL_TEXT = 20000
 DEFAULT_COMPACT_AFTER_CHARS = 120000
 PARALLEL_SAFE_TOOL_NAMES = {"echo", "read", "grep", "glob"}
 PARALLEL_SAFE_SESSION_ACTIONS = {"read", "status", "list"}
-PARALLEL_SAFE_COMMANDS = {"pwd", "rg", "sed", "ls", "git", "head", "tail", "wc", "nl"}
+PARALLEL_SAFE_COMMANDS = {"pwd", "rg", "find", "sed", "ls", "git", "head", "tail", "wc", "nl", "sort"}
 PARALLEL_SAFE_GIT_SUBCOMMANDS = {"status", "show", "diff", "log", "rev-parse", "ls-files", "branch"}
+UNSAFE_FIND_FLAGS = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
 UNSAFE_SHELL_TOKENS = (";", "&&", "||", ">", "<", "`", "$(", "\n")
 
 
@@ -489,8 +490,14 @@ def _is_parallel_safe_command_segment(segment: str) -> bool:
     name = Path(parts[0]).name
     if name not in PARALLEL_SAFE_COMMANDS:
         return False
+    if name == "find":
+        return _is_parallel_safe_find_parts(parts)
     if name != "git":
         return True
     if len(parts) < 2:
         return False
     return parts[1] in PARALLEL_SAFE_GIT_SUBCOMMANDS
+
+
+def _is_parallel_safe_find_parts(parts: List[str]) -> bool:
+    return not any(part in UNSAFE_FIND_FLAGS for part in parts[1:])
