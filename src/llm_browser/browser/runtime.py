@@ -156,16 +156,17 @@ class BrowserRuntime:
         self,
         expression: str,
         await_promise: bool = False,
-        repl_mode: bool = True,
+        repl_mode: Optional[bool] = None,
         user_gesture: bool = False,
     ) -> Any:
+        effective_repl_mode = self._default_repl_mode(expression, await_promise) if repl_mode is None else repl_mode
         response = self.cdp(
             "Runtime.evaluate",
             {
                 "expression": expression,
                 "returnByValue": True,
                 "awaitPromise": await_promise,
-                "replMode": repl_mode,
+                "replMode": effective_repl_mode,
                 "userGesture": user_gesture,
             },
         )
@@ -178,6 +179,15 @@ class BrowserRuntime:
         if "unserializableValue" in result:
             return result["unserializableValue"]
         return None
+
+    def _default_repl_mode(self, expression: str, await_promise: bool) -> bool:
+        if not await_promise:
+            return True
+        snippet = expression.lstrip()
+        if snippet.startswith("(async") or snippet.startswith("async "):
+            return False
+        promise_markers = ("fetch(", ".then(", "Promise.", "new Promise")
+        return not any(marker in snippet for marker in promise_markers)
 
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
         deadline = time.time() + timeout_s
