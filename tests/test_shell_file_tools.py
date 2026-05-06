@@ -7,7 +7,15 @@ from pathlib import Path
 
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
+from llm_browser.tool.files import (
+    apply_patch_file,
+    edit_file,
+    glob_files,
+    grep_files,
+    read_file,
+    repo_map,
+    write_file,
+)
 from llm_browser.tool.shell import shell, shell_poll, shell_start, shell_stdin, shell_stop
 
 
@@ -47,6 +55,26 @@ class ShellFileToolsTest(unittest.TestCase):
 
             self.assertEqual(lines.text, "b\n")
             self.assertTrue(binary.data["binary"])
+
+    def test_repo_map_summarizes_without_reading_file_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "README.md", "content": "secret implementation detail\n"})
+            write_file(ctx, {"path": "pyproject.toml", "content": "[project]\nname = 'demo'\n"})
+            write_file(ctx, {"path": "src/demo/cli.py", "content": "def main():\n    pass\n"})
+            write_file(ctx, {"path": "tests/test_cli.py", "content": "def test_cli():\n    pass\n"})
+            write_file(ctx, {"path": "node_modules/pkg/index.js", "content": "ignored\n"})
+
+            result = repo_map(ctx, {"root": ".", "scan_limit": 100, "limit": 10})
+
+            self.assertIn("Repository map for", result.text)
+            self.assertIn("README.md", result.text)
+            self.assertIn("pyproject.toml", result.data["manifests"])
+            self.assertIn("src/demo/cli.py", result.data["entrypoints"])
+            self.assertIn("tests/test_cli.py", result.data["tests"])
+            self.assertEqual(result.data["source_roots"][0]["path"], "src")
+            self.assertNotIn("secret implementation detail", result.text)
+            self.assertNotIn("node_modules/pkg/index.js", result.text)
 
     def test_edit_preserves_utf8_bom_and_crlf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
