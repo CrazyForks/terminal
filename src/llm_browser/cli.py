@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -297,7 +298,7 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
             )
         workspace = store.state_dir / "dataset-runs" / run_id / f"task-{task.task_id}-workspace"
         workspace.mkdir(parents=True, exist_ok=True)
-        result = _run_dataset_task(
+        result = _run_dataset_task_with_retries(
             store=store,
             task_id=task.task_id,
             prompt=prompt,
@@ -390,6 +391,62 @@ def _resume_skip_task_ids(manifest: Dict[str, Any], *, skip_failed: bool = False
 def _dataset_manifest_exit_code(manifest: Dict[str, Any]) -> int:
     summary = summarize_manifest(manifest)
     return 0 if summary["failed"] == 0 and summary["pending"] == 0 else 1
+
+
+def _run_dataset_task_with_retries(
+    store: SessionStore,
+    task_id: str,
+    prompt: str,
+    workspace: Path,
+    provider_name: str,
+    model: Optional[str],
+    max_turns: int,
+    timeout_s: float,
+    max_attempts: int = 3,
+) -> Dict[str, Any]:
+    retry_history = []
+    attempts = max(1, max_attempts)
+    for attempt in range(1, attempts + 1):
+        result = _run_dataset_task(
+            store=store,
+            task_id=task_id,
+            prompt=prompt,
+            workspace=workspace,
+            provider_name=provider_name,
+            model=model,
+            max_turns=max_turns,
+            timeout_s=timeout_s,
+        )
+        result["attempt_number"] = attempt
+        if result.get("ok") or result.get("fatal_runner_restart_required") or not _is_transient_provider_failure(result):
+            if retry_history:
+                result["retry_history"] = retry_history
+            return result
+        retry_history.append(
+            {
+                "attempt": attempt,
+                "session_id": (result.get("session") or {}).get("id"),
+                "error_type": result.get("error_type"),
+                "error": result.get("error"),
+            }
+        )
+        if attempt < attempts:
+            time.sleep(min(2 ** attempt, 10))
+    if retry_history:
+        result["retry_history"] = retry_history
+    return result
+
+
+def _is_transient_provider_failure(result: Dict[str, Any]) -> bool:
+    text = f"{result.get('error_type', '')} {result.get('error', '')}".lower()
+    transient_markers = (
+        "service_unavailable_error",
+        "server_is_overloaded",
+        "servers are currently overloaded",
+        "rate_limit_exceeded",
+        "temporarily unavailable",
+    )
+    return "codex stream error" in text and any(marker in text for marker in transient_markers)
 
 
 def _run_dataset_task(

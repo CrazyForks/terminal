@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks, summarize_manifest
-from llm_browser.cli import _dataset_manifest_exit_code, _resume_skip_task_ids, _run_dataset_task
+from llm_browser.cli import _dataset_manifest_exit_code, _resume_skip_task_ids, _run_dataset_task, _run_dataset_task_with_retries
 from llm_browser.session.store import SessionStore
 
 
@@ -101,6 +101,44 @@ class DatasetTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["final_result"], "final answer")
         self.assertEqual(result["final_result_chars"], len("final answer"))
+
+    def test_dataset_task_retries_transient_codex_overload(self) -> None:
+        calls = 0
+
+        def fake_run_dataset_task(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "task_id": kwargs["task_id"],
+                    "ok": False,
+                    "session": {"id": "failed-session"},
+                    "error_type": "RuntimeError",
+                    "error": (
+                        "Codex stream error: {'type': 'error', 'error': {'type': "
+                        "'service_unavailable_error', 'code': 'server_is_overloaded'}}"
+                    ),
+                }
+            return {"task_id": kwargs["task_id"], "ok": True, "session": {"id": "ok-session"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli._run_dataset_task", side_effect=fake_run_dataset_task), patch("llm_browser.cli.time.sleep"):
+                result = _run_dataset_task_with_retries(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="codex",
+                    model="gpt-5.5",
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["attempt_number"], 2)
+        self.assertEqual(result["retry_history"][0]["session_id"], "failed-session")
 
     def test_dataset_task_spills_large_final_result(self) -> None:
         final = "x" * 21000
