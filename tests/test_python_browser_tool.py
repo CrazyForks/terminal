@@ -63,6 +63,8 @@ class FakeRuntime:
         self.last_js_expression = expression
         if expression == "document.title":
             return "Example Domain"
+        if "document.querySelector" in expression and "viewportX" in expression:
+            return {"x": 100, "y": 200, "width": 320, "height": 180, "viewportX": 100, "viewportY": 200}
         if "const maxChars" in expression and "shadowRoot" in expression:
             return "Light text\nShadow ticket text"
         if "const needle" in expression and "clickElement" in expression:
@@ -93,7 +95,9 @@ class FakeRuntime:
         attach: bool = True,
         full_page: bool = False,
         timeout_s: float = 8.0,
+        clip: Dict[str, float] | None = None,
     ) -> ToolImage:
+        self.last_screenshot_clip = clip
         path = self.root_dir / "shot.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"png-bytes")
@@ -156,6 +160,35 @@ class PythonBrowserToolTest(unittest.TestCase):
             image_events = [event for event in store.events.read(session.id) if event.type == "tool.image"]
             self.assertEqual(len(image_events), 1)
             self.assertEqual(image_events[0].payload["image"]["label"], "loaded")
+
+    def test_screenshot_element_captures_clipped_element(self) -> None:
+        runtime_holder: Dict[str, FakeRuntime] = {}
+
+        def factory(root: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "result = screenshot_element('#rate-table', label='rates', padding=10)",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["selector"], "#rate-table")
+            self.assertEqual(result.data["result"]["clip"]["x"], 90)
+            self.assertEqual(result.data["result"]["clip"]["width"], 340)
+            self.assertEqual(runtime_holder["runtime"].last_screenshot_clip["height"], 200)
+            self.assertEqual(result.images[0].label, "rates")
 
     def test_relative_state_dir_is_not_affected_by_python_cwd(self) -> None:
         previous = Path.cwd()

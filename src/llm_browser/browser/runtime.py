@@ -292,9 +292,19 @@ class BrowserRuntime:
         attach: bool = True,
         full_page: bool = False,
         timeout_s: float = 8.0,
+        clip: Optional[Dict[str, float]] = None,
     ) -> ToolImage:
         params: Dict[str, Any] = {"format": "png", "fromSurface": True}
-        if full_page:
+        if clip is not None:
+            params["captureBeyondViewport"] = True
+            params["clip"] = {
+                "x": max(0.0, float(clip.get("x") or 0)),
+                "y": max(0.0, float(clip.get("y") or 0)),
+                "width": max(1.0, float(clip.get("width") or 1)),
+                "height": max(1.0, float(clip.get("height") or 1)),
+                "scale": float(clip.get("scale") or 1),
+            }
+        elif full_page:
             params["captureBeyondViewport"] = True
             metrics = self.cdp("Page.getLayoutMetrics", timeout_s=timeout_s, retry=False)
             size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
