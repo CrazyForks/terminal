@@ -384,6 +384,7 @@ def _run_dataset_task(
     session = store.create(cwd=workspace)
     result: Dict[str, Any] = {"task_id": task_id, "workspace": str(workspace), "session": session.to_dict()}
     error: Dict[str, str] = {}
+    agent_ref: Dict[str, Agent] = {}
 
     def target() -> None:
         try:
@@ -393,6 +394,7 @@ def _run_dataset_task(
                 max_turns=max_turns,
                 time_budget_s=timeout_s if timeout_s and timeout_s > 0 else None,
             )
+            agent_ref["agent"] = agent
             finished = agent.run_session(session.id, prompt)
             result["session"] = finished.to_dict()
             result["ok"] = finished.status == "done"
@@ -409,9 +411,18 @@ def _run_dataset_task(
         thread.join(timeout_s)
         if thread.is_alive():
             store.request_cancel(session.id, reason=f"dataset task timeout after {timeout_s:g}s")
+            agent = agent_ref.get("agent")
+            if agent is not None:
+                try:
+                    agent.tools.close_session(session.id)
+                except Exception as exc:
+                    result["cleanup_error"] = str(exc)
             thread.join(10)
             loaded = store.load(session.id)
             if loaded is not None:
+                if loaded.status == "running":
+                    loaded = store.update_status(session.id, "cancelled")
+                    store.emit(session.id, "session.cancelled", {"reason": f"dataset task timeout after {timeout_s:g}s"})
                 result["session"] = loaded.to_dict()
             result.update({"ok": False, "error": f"dataset task timeout after {timeout_s:g}s", "error_type": "TimeoutError"})
             return result

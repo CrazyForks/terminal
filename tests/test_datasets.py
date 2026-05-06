@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks, summarize_manifest
-from llm_browser.cli import _dataset_manifest_exit_code
+from llm_browser.cli import _dataset_manifest_exit_code, _run_dataset_task
+from llm_browser.session.store import SessionStore
 
 
 class DatasetTest(unittest.TestCase):
@@ -55,6 +59,36 @@ class DatasetTest(unittest.TestCase):
         }
 
         self.assertEqual(_dataset_manifest_exit_code(manifest), 0)
+
+    def test_dataset_timeout_closes_agent_tools(self) -> None:
+        unblocked = threading.Event()
+        close_session = Mock(side_effect=lambda session_id: unblocked.set())
+
+        class HangingAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock(close_session=close_session)
+
+            def run_session(self, session_id: str, prompt: str):
+                unblocked.wait(5)
+                return store.update_status(session_id, "cancelled")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", HangingAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="hang",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0.01,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "TimeoutError")
+        close_session.assert_called_once()
 
 
 if __name__ == "__main__":
