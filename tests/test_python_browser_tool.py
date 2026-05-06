@@ -20,6 +20,7 @@ class FakeRuntime:
         self.tab_urls = []
         self.last_load_timeout = None
         self.last_await_promise = None
+        self.last_js_expression = None
 
     def cdp(self, method: str, params=None, session_id=None) -> Dict[str, Any]:
         return {"method": method, "params": params or {}, "session_id": session_id}
@@ -52,8 +53,15 @@ class FakeRuntime:
         user_gesture: bool = False,
     ) -> Any:
         self.last_await_promise = await_promise
+        self.last_js_expression = expression
         if expression == "document.title":
             return "Example Domain"
+        if "const maxChars" in expression and "shadowRoot" in expression:
+            return "Light text\nShadow ticket text"
+        if "const needle" in expression and "clickElement" in expression:
+            return {"clicked": True, "text": "Accept all", "tag": "BUTTON"}
+        if "OneTrust.AllowAll" in expression:
+            return {"clicked": False}
         return None
 
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
@@ -245,6 +253,46 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["selector"]["selector"], "#accept")
             self.assertTrue(result.data["result"]["selector"]["visible"])
             self.assertEqual(result.data["result"]["text"]["text"], "Accept")
+
+    def test_deep_text_and_click_text_are_shadow_dom_aware_helpers(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "result = {'text': deep_text(), 'clicked': click_text('Accept all')}",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertIn("Shadow ticket text", result.data["result"]["text"])
+            self.assertTrue(result.data["result"]["clicked"]["clicked"])
+            self.assertIn("shadowRoot", runtime_holder["runtime"].last_js_expression)
+
+    def test_dismiss_cookie_banners_uses_click_text_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(ctx, {"headless": True, "code": "result = dismiss_cookie_banners(timeout_s=1)"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["clicked"])
+            self.assertEqual(result.data["result"]["kind"], "cookie-banner")
 
     def test_pypdf_shims_pypdf2_import_and_exposes_pdf_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
