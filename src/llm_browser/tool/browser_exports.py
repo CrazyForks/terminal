@@ -8,23 +8,21 @@ from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 
 
 BROWSER_TOOL_DESCRIPTION = (
-    "Run persistent Python for browser work. Core primitives: raw cdp(method, params) or cdp('Domain.method', key=value), "
-    "js(expr), navigate/new_tab/tabs/switch_tab, click_at/fill_input/press/scroll, "
-    "screenshot(..., attach=True), attach_image(path), wait_for_load/wait_for_network_idle, page_info, "
-    "download_info/wait_for_download, cookies/storage/permissions, recent_console, recent_network_failures, save_browser_trace, "
-    "harnesless-compatible aliases capture_screenshot/goto_url/click_at_xy/wait_for_element/drain_events/upload_file/http_get, "
-    "agent_helpers_path/reload_agent_helpers, shell/file tools separately, and done. "
-    "Use help_browser() inside Python for the full helper list and examples. "
+    "Run persistent Python for browser work. Always-loaded core primitives: raw cdp('Domain.method', key=value), "
+    "js(expr), new_tab/navigate/tabs/switch_tab, click_at_xy/fill_input/press_key/scroll, "
+    "screenshot(..., attach=True), capture_screenshot(...), wait_for_load/wait_for_network_idle, page_info, "
+    "agent_helpers_path/reload_agent_helpers, and load_skill/list_skills/read_skill/help_browser. "
+    "Specialized helpers are skill-driven: load_skill('downloads'), load_skill('research'), load_skill('dom_tools'), etc. "
     "Set result or _result for structured output."
 )
 
 
 BROWSER_HELP_TEXT = (
-    "Browser Python tool quick reference\n\n"
+    "Browser Python harness quick reference\n\n"
     + BROWSER_HELP_PLAYBOOK.rstrip()
     + """
 
-Core CDP/browser:
+Core browser:
   cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...", timeout=30)
   check_cancel(), cancel_requested()
   js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
@@ -34,39 +32,37 @@ Core CDP/browser:
 Waiting and observation:
   wait_for_load(), wait_for_selector(selector, visible=False), wait_for_element(selector), wait_for_text(text)
   wait_for_network_idle(timeout_s=10, idle_ms=500)
-  page_info(), pending_dialog(), visible_text(), deep_text(), links()
-  drain_cdp_events(), drain_events(), recent_console(), recent_network(), recent_network_failures()
-  get_cookies(), set_cookie(...), clear_cookies()
-  storage_state(), clear_storage(origin=None)
-  grant_permissions([...], origin=None), reset_permissions()
+  page_info()
 
 Input:
   click_at(x, y), click_at_xy(x, y), fill_input(selector, text), type_text(text)
-  press(key), press_key(key, modifiers=0), dispatch_key(selector, key="Enter"), scroll(dx=0, dy=500)
-  upload_file(selector, path)
+  press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500)
 
 Images and artifacts:
-  screenshot(label, attach=True, timeout=8), capture_screenshot(path=None, attach=True, timeout=8), screenshot_element(selector, label=None)
-  download_info(), wait_for_download(pattern=None, timeout=30), save_browser_trace(label), attach_image(path)
-  save_artifact(name, content=None), upload_artifact(path), create_download_url(path)
-  output_path(path=''), download_file(url, path=None), read_pdf_text(path_or_url)
+  screenshot(label, attach=True, timeout=8), capture_screenshot(path=None, attach=True, timeout=8)
+  output_path(path='')
+
+Skills:
+  list_skills(), load_skill("research"), read_skill("iframes"), loaded_skills()
+  downloads: download_info, wait_for_download
+  cookies: get_cookies, set_cookie, clear_cookies, storage_state
+  artifacts: save_artifact, upload_artifact, attach_image, download_file, read_pdf_text
+  research: http_get, fetch_text, fetch_readable_text, fetch_many_text, search_web, crawl_site
+  extraction: html_to_text, extract_links, extract_emails, read_sitemap
+  dom_tools: deep_text, click_text, dismiss_cookie_banners, screenshot_element
+  tracing: recent_console, recent_network_failures, save_browser_trace
 
 Editable helpers:
   Path(agent_helpers_path()).write_text(...)
   reload_agent_helpers()
   from browser_helpers import *
 
-Fetch/extract helpers:
-  http_get(url)
-  fetch_text(url), fetch_readable_text(url), fetch_many_text(urls)
-  search_web(query), crawl_site(url), html_to_text(markup), read_sitemap(url)
-  extract_links(text), extract_emails(text), extract_markdown_link_blocks(text)
-
 Example:
   new_tab("https://example.com")
   wait_for_load()
   screenshot("loaded", attach=True)
-  result = {"title": js("document.title"), "text": visible_text(1000)}
+  load_skill("research")
+  result = {"title": js("document.title"), "page": page_info()}
 """
 )
 
@@ -82,6 +78,10 @@ EXPORT_NAMES = [
     "check_cancel",
     "cancel_requested",
     "sleep",
+    "load_skill",
+    "list_skills",
+    "read_skill",
+    "loaded_skills",
     "new_tab",
     "navigate",
     "goto_url",
@@ -230,7 +230,7 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         setattr(module, "search_web", search_web)
         export_names.extend(["search_web", "search_web_result"])
 
-    module.help_browser = help_browser
+    module.help_browser = namespace.get("help_browser", help_browser)
     module.__all__ = [name for name in export_names if hasattr(module, name)]
     sys.modules["browser_helpers"] = module
     sys.modules["browser_use"] = module

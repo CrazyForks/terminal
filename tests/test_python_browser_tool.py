@@ -506,6 +506,107 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["direct"])
             self.assertTrue(result.data["result"]["imported"])
 
+    def test_core_only_autoload_keeps_small_browser_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "result = {"
+                        "'has_cdp': callable(cdp), "
+                        "'has_search': 'search_web' in globals(), "
+                        "'has_load_skill': callable(load_skill), "
+                        "'skill_names': [item['name'] for item in list_skills()], "
+                        "'help_mentions_skills': 'load_skill' in help_browser()"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["has_cdp"])
+            self.assertFalse(result.data["result"]["has_search"])
+            self.assertTrue(result.data["result"]["has_load_skill"])
+            self.assertIn("research", result.data["result"]["skill_names"])
+            self.assertTrue(result.data["result"]["help_mentions_skills"])
+
+    def test_load_skill_inject_false_returns_namespace_without_globals(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response("hello skill", "https://example.com")):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "research = load_skill('research', inject=False)\n"
+                            "payload = research.fetch_text('https://example.com')\n"
+                            "result = {"
+                            "'text': payload['text'], "
+                            "'global_after': 'fetch_text' in globals(), "
+                            "'loaded': loaded_skills()"
+                            "}"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["text"], "hello skill")
+            self.assertFalse(result.data["result"]["global_after"])
+            self.assertEqual(result.data["result"]["loaded"], [])
+
+    def test_load_skill_injects_exports_idempotently_and_reads_interaction_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "first = load_skill('dom_tools')\n"
+                        "second = load_skill('dom_tools')\n"
+                        "from browser_helpers import deep_text as imported_deep_text\n"
+                        "result = {"
+                        "'has_deep_text': callable(deep_text), "
+                        "'module_updated': callable(imported_deep_text), "
+                        "'first_exports': first['exports'], "
+                        "'second_already': second['already_loaded'], "
+                        "'loaded': loaded_skills(), "
+                        "'iframe_skill': 'Iframes' in read_skill('iframes')"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["has_deep_text"])
+            self.assertTrue(result.data["result"]["module_updated"])
+            self.assertIn("deep_text", result.data["result"]["first_exports"])
+            self.assertTrue(result.data["result"]["second_already"])
+            self.assertEqual(result.data["result"]["loaded"], ["dom_tools"])
+            self.assertTrue(result.data["result"]["iframe_skill"])
+
     def test_wait_for_load_accepts_timeout_alias(self) -> None:
         runtime_holder = {}
 
