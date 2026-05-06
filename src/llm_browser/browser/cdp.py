@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any, Dict, Optional
 
 import websocket
@@ -100,7 +101,40 @@ class CdpClient:
                 if timeout_changed and previous_timeout is not None and self._ws is not None and hasattr(self._ws, "settimeout"):
                     self._ws.settimeout(previous_timeout)
 
-    def drain_events(self):
+    def drain_events(self, timeout_s: float = 0.05, max_events: int = 1000):
         events = list(self._events)
         self._events.clear()
+        if self._ws is None:
+            return events
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._lock:
+            previous_timeout = None
+            timeout_changed = hasattr(self._ws, "settimeout")
+            had_previous_timeout = False
+            if timeout_changed:
+                if hasattr(self._ws, "gettimeout"):
+                    previous_timeout = self._ws.gettimeout()
+                    had_previous_timeout = True
+                self._ws.settimeout(min(max(timeout_s, 0.001), 0.05))
+            try:
+                while len(events) < max_events and time.monotonic() <= deadline:
+                    try:
+                        raw = self._ws.recv()
+                    except IndexError:
+                        break
+                    except websocket.WebSocketTimeoutException:
+                        break
+                    except TimeoutError:
+                        break
+                    except (websocket.WebSocketException, OSError):
+                        self.close()
+                        break
+                    if not raw:
+                        self.close()
+                        break
+                    payload = json.loads(raw)
+                    events.append(payload)
+            finally:
+                if timeout_changed and had_previous_timeout and self._ws is not None:
+                    self._ws.settimeout(previous_timeout)
         return events
