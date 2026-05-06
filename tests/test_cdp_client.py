@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from llm_browser.browser.cdp import CdpClient, CdpError
+from llm_browser.browser.cdp import CdpClient, CdpConnectionError, CdpError
 
 
 class FakeWebSocket:
@@ -28,6 +28,14 @@ class FakeWebSocket:
 
     def close(self) -> None:
         self.closed = True
+
+
+class TimeoutWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__([])
+
+    def recv(self) -> str:
+        raise TimeoutError("timed out")
 
 
 class CdpClientTest(unittest.TestCase):
@@ -63,6 +71,16 @@ class CdpClientTest(unittest.TestCase):
             self.assertEqual(client.call("Runtime.evaluate", timeout_s=4), {"ok": True})
 
         self.assertEqual(ws.timeout, 30.0)
+
+    def test_call_treats_socket_timeout_as_connection_error(self) -> None:
+        ws = TimeoutWebSocket()
+
+        with patch("llm_browser.browser.cdp.websocket.create_connection", return_value=ws):
+            client = CdpClient("ws://example")
+            with self.assertRaises(CdpConnectionError):
+                client.call("Runtime.evaluate")
+
+        self.assertTrue(ws.closed)
 
 
 if __name__ == "__main__":

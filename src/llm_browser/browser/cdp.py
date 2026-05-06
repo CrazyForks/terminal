@@ -75,14 +75,14 @@ class CdpClient:
                     message["sessionId"] = session_id
                 try:
                     self._ws.send(json.dumps(message, separators=(",", ":")))
-                except websocket.WebSocketException as exc:
+                except (websocket.WebSocketException, TimeoutError, OSError) as exc:
                     self.close()
                     raise CdpConnectionError(f"CDP websocket send failed: {exc}") from exc
 
                 while True:
                     try:
                         raw = self._ws.recv()
-                    except websocket.WebSocketException as exc:
+                    except (websocket.WebSocketException, TimeoutError, OSError) as exc:
                         self.close()
                         raise CdpConnectionError(f"CDP websocket receive failed: {exc}") from exc
                     if not raw:
