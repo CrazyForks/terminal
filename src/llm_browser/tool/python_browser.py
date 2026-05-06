@@ -503,6 +503,34 @@ class PythonBrowserTool:
                     break
             return {"query": query, "results": results[:max_results], "attempts": attempts}
 
+        def extract_links(text: str, pattern: Optional[str] = None, limit: int = 1000) -> List[str]:
+            links = _extract_links(str(text), pattern=pattern, limit=limit)
+            return links
+
+        def read_sitemap(
+            url: str,
+            include: Optional[str] = None,
+            exclude: Optional[str] = None,
+            max_urls: int = 10000,
+            timeout: float = 30.0,
+            use_jina: Any = "auto",
+        ) -> Dict[str, Any]:
+            result = fetch_text(url, max_chars=2_000_000, use_jina=use_jina, timeout=timeout)
+            text = str(result.get("text") or "")
+            links = _extract_links(text, pattern=include, limit=max(max_urls * 2, max_urls))
+            if exclude:
+                exclude_re = re.compile(exclude)
+                links = [link for link in links if not exclude_re.search(link)]
+            return {
+                "url": url,
+                "source": result.get("source"),
+                "status": result.get("status"),
+                "chars": result.get("chars"),
+                "truncated": result.get("truncated"),
+                "links": links[:max_urls],
+                "count": len(links),
+            }
+
         def screenshot(
             label: str = "screenshot",
             attach: bool = True,
@@ -555,6 +583,8 @@ class PythonBrowserTool:
                 "read_pdf_text": read_pdf_text,
                 "fetch_text": fetch_text,
                 "search_web": search_web,
+                "extract_links": extract_links,
+                "read_sitemap": read_sitemap,
                 "curl_requests": namespace.get("curl_requests"),
             }
         )
@@ -772,6 +802,32 @@ def _parse_markdown_links(markdown: str, limit: int) -> List[Dict[str, str]]:
         if len(results) >= limit:
             break
     return results
+
+
+def _extract_links(text: str, pattern: Optional[str] = None, limit: int = 1000) -> List[str]:
+    if limit <= 0:
+        return []
+    compiled = re.compile(pattern) if pattern else None
+    seen: set[str] = set()
+    links: List[str] = []
+    link_re = re.compile(
+        r"\[[^\]]{0,300}\]\((https?://[^)\s]+)\)"
+        r"|<loc[^>]*>\s*(https?://[^<\s]+)"
+        r"|(https?://[^\s<>\]\)\"']+)",
+        flags=re.I,
+    )
+    for match in link_re.finditer(text):
+        url = html.unescape(next(group for group in match.groups() if group)).strip()
+        url = url.rstrip(".,;")
+        if not url or url in seen:
+            continue
+        if compiled and not compiled.search(url):
+            continue
+        seen.add(url)
+        links.append(url)
+        if len(links) >= limit:
+            return links
+    return links
 
 
 def _click_text_script(
@@ -1242,6 +1298,8 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "download_file",
         "read_pdf_text",
         "search_web",
+        "extract_links",
+        "read_sitemap",
         "requests",
         "http",
         "curl_requests",

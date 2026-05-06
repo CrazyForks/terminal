@@ -551,6 +551,49 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["text"], "curl worked")
             self.assertEqual(result.data["result"]["direct_error"], "HTTP 403")
 
+    def test_read_sitemap_extracts_large_url_lists(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        sitemap = "\n".join(
+            [
+                "<urlset>",
+                "<loc>https://example.com/keep/a</loc>",
+                "[B](https://example.com/keep/b)",
+                "https://example.com/skip/c",
+                "</urlset>",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response(sitemap, "https://example.com/sitemap.xml")):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import read_sitemap\n"
+                            "result = read_sitemap('https://example.com/sitemap.xml', include='/keep/')"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(
+                result.data["result"]["links"],
+                ["https://example.com/keep/a", "https://example.com/keep/b"],
+            )
+            self.assertEqual(result.data["result"]["count"], 2)
+
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
