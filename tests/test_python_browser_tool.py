@@ -189,6 +189,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "new_tab('https://example.com')",
                             "screenshot('loaded', attach=True)",
                             "Path('artifact.txt').write_text('saved')",
+                            "load_skill('artifacts')",
                             "saved_path = save_artifact('artifact.txt')",
                             "result = {'title': js('document.title'), 'cwd': str(Path.cwd()), 'saved_path': saved_path}",
                         ]
@@ -763,6 +764,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 {
                     "headless": True,
                     "code": (
+                        "load_skill('harnesless_compat')\n"
                         "result = {"
                         "'until': wait_until('window.ready', timeout=3), "
                         "'selector': wait_for_selector('#accept', visible=True), "
@@ -800,7 +802,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": "result = {'text': deep_text(), 'clicked': click_text('Accept all')}",
+                    "code": "load_skill('dom_tools')\nresult = {'text': deep_text(), 'clicked': click_text('Accept all')}",
                 },
             )
 
@@ -816,7 +818,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
-            result = tool(ctx, {"headless": True, "code": "result = dismiss_cookie_banners(timeout_s=1)"})
+            result = tool(ctx, {"headless": True, "code": "load_skill('cookie_banners')\nresult = dismiss_cookie_banners(timeout_s=1)"})
 
             self.assertTrue(result.data["ok"])
             self.assertTrue(result.data["result"]["clicked"])
@@ -841,6 +843,8 @@ class PythonBrowserToolTest(unittest.TestCase):
                 {
                     "headless": True,
                     "code": (
+                        "load_skill('cookies')\n"
+                        "load_skill('downloads')\n"
                         "result = {"
                         "'cookies': get_cookies(), "
                         "'set_cookie': set_cookie(name='token', value='abc'), "
@@ -875,6 +879,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     "headless": True,
                     "code": (
                         "from PyPDF2 import PdfReader as CompatReader\n"
+                        "load_skill('artifacts')\n"
                         "result = {"
                         "'compat': CompatReader.__module__.startswith('pypdf'), "
                         "'download_helper': callable(download_file), "
@@ -900,7 +905,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": "path = save_artifact('bill.pdf', b'%PDF-binary')\nresult = {'path': path}",
+                    "code": "load_skill('artifacts')\npath = save_artifact('bill.pdf', b'%PDF-binary')\nresult = {'path': path}",
                 },
             )
 
@@ -915,7 +920,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
-            result = tool(ctx, {"headless": True, "code": "result = upload_artifact('bill.pdf')"})
+            result = tool(ctx, {"headless": True, "code": "load_skill('cloud_artifacts')\nresult = upload_artifact('bill.pdf')"})
 
             self.assertTrue(result.data["ok"])
             self.assertFalse(result.data["result"]["cloud"])
@@ -965,7 +970,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
             with patch("requests.post", side_effect=fake_post), patch("requests.put", put), patch("requests.get", get):
-                result = tool(ctx, {"headless": True, "code": "result = upload_artifact('bill.pdf')"})
+                result = tool(ctx, {"headless": True, "code": "load_skill('cloud_artifacts')\nresult = upload_artifact('bill.pdf')"})
 
             self.assertTrue(result.data["ok"])
             self.assertTrue(result.data["result"]["cloud"])
@@ -1033,7 +1038,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 "llm_browser.tool.python_browser._fetch_text_with_curl_cffi",
                 return_value=None,
             ):
-                result = tool(ctx, {"headless": True, "code": "result = fetch_text('https://blocked.example/page', max_chars=12)"})
+                result = tool(ctx, {"headless": True, "code": "load_skill('research')\nresult = fetch_text('https://blocked.example/page', max_chars=12)"})
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"]["source"], "jina")
@@ -1069,7 +1074,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     "impersonate": "chrome136",
                 },
             ):
-                result = tool(ctx, {"headless": True, "code": "result = fetch_text('https://blocked.example/page')"})
+                result = tool(ctx, {"headless": True, "code": "load_skill('research')\nresult = fetch_text('https://blocked.example/page')"})
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"]["source"], "curl_cffi")
@@ -1098,7 +1103,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
             with patch("requests.get", return_value=Response(html_page, "https://example.com/report")):
-                result = tool(ctx, {"headless": True, "code": "result = fetch_readable_text('https://example.com/report')"})
+                result = tool(ctx, {"headless": True, "code": "load_skill('research')\nresult = fetch_readable_text('https://example.com/report')"})
 
             self.assertTrue(result.data["ok"])
             text = result.data["result"]["text"]
@@ -1138,6 +1143,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('extraction')\n"
                             "from browser_helpers import read_sitemap\n"
                             "result = read_sitemap('https://example.com/sitemap.xml', include='/keep/')"
                         ),
@@ -1179,6 +1185,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('research')\n"
                             "from browser_helpers import fetch_text_result\n"
                             "result = fetch_text_result('https://blocked.example/page', use_jina=True)"
                         ),
@@ -1214,6 +1221,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('research')\n"
                             "from browser_helpers import fetch_many_text\n"
                             "result = fetch_many_text(['https://example.com/a', 'https://example.com/b'], "
                             "max_workers=2, save_to='pages.json')"
@@ -1269,6 +1277,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('research')\n"
                             "from browser_helpers import fetch_many_text\n"
                             "result = fetch_many_text(['https://example.com/a'], "
                             "use_jina=True, requests_per_minute=60000, rate_limit_retries=1, save_to='pages.json')"
@@ -1308,6 +1317,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 {
                     "headless": True,
                     "code": (
+                        "load_skill('extraction')\n"
                         "from browser_helpers import extract_markdown_link_blocks\n"
                         f"markdown = {markdown!r}\n"
                         "result = extract_markdown_link_blocks(markdown, url_pattern=r'/tsc/store_', max_lines_after=4)"
@@ -1338,7 +1348,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": f"result = extract_emails({text!r}, domains='realexample.com')",
+                    "code": f"load_skill('extraction')\nresult = extract_emails({text!r}, domains='realexample.com')",
                 },
             )
 
@@ -1392,7 +1402,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = crawl_site('https://example.com', max_pages=4, use_jina=False, timeout=5)",
+                        "code": "load_skill('research')\nresult = crawl_site('https://example.com', max_pages=4, use_jina=False, timeout=5)",
                     },
                 )
 
@@ -1468,6 +1478,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('store_locators')\n"
                             "result = extract_store_locator_locations("
                             "'https://brand.example/locations', save_to='stores.json', include_locations=False)"
                         ),
@@ -1524,7 +1535,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('alpha beta', max_results=2, include_specialized=False)",
+                        "code": "load_skill('search')\nresult = search_web('alpha beta', max_results=2, include_specialized=False)",
                     },
                 )
 
@@ -1564,7 +1575,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('slow search query', max_results=1, timeout=30, include_specialized=False)",
+                        "code": "load_skill('search')\nresult = search_web('slow search query', max_results=1, timeout=30, include_specialized=False)",
                     },
                 )
 
@@ -1605,7 +1616,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('image-heavy query', max_results=2, include_specialized=False)",
+                        "code": "load_skill('search')\nresult = search_web('image-heavy query', max_results=2, include_specialized=False)",
                     },
                 )
 
@@ -1623,7 +1634,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": "result = search_web('CVE-2020-8166 Rails details', max_results=4, include_specialized=False)",
+                    "code": "load_skill('search')\nresult = search_web('CVE-2020-8166 Rails details', max_results=4, include_specialized=False)",
                 },
             )
 
@@ -1646,7 +1657,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": "result = search_web('site:fccid.io 2ACAH BCE FCC grantee code', max_results=4, include_specialized=False)",
+                    "code": "load_skill('search')\nresult = search_web('site:fccid.io 2ACAH BCE FCC grantee code', max_results=4, include_specialized=False)",
                 },
             )
 
@@ -1690,7 +1701,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
             with patch("requests.get", side_effect=fake_get):
-                result = tool(ctx, {"headless": True, "code": "result = search_web('Hafnia alvei animals', max_results=1)"})
+                result = tool(ctx, {"headless": True, "code": "load_skill('search')\nresult = search_web('Hafnia alvei animals', max_results=1)"})
 
             self.assertTrue(result.data["ok"])
             payload = result.data["result"]
@@ -1732,7 +1743,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('site:kaufland.de Nahrungsergaenzungsmittel bestseller', max_results=2)",
+                        "code": "load_skill('search')\nresult = search_web('site:kaufland.de Nahrungsergaenzungsmittel bestseller', max_results=2)",
                     },
                 )
 
@@ -1775,7 +1786,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('Pursuit startup government contracts website Mike Vichich', max_results=2)",
+                        "code": "load_skill('search')\nresult = search_web('Pursuit startup government contracts website Mike Vichich', max_results=2)",
                     },
                 )
 
@@ -1820,7 +1831,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     ctx,
                     {
                         "headless": True,
-                        "code": "result = search_web('site:kaufland.de/product supplements', max_results=3, include_specialized=False)",
+                        "code": "load_skill('search')\nresult = search_web('site:kaufland.de/product supplements', max_results=3, include_specialized=False)",
                     },
                 )
 
@@ -1848,6 +1859,9 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('research')\n"
+                            "load_skill('extraction')\n"
+                            "load_skill('store_locators')\n"
                             "from browser_helpers import *\n"
                             "result = {"
                             "'text': fetch_text('https://example.com')[:5], "
@@ -1894,6 +1908,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('search')\n"
                             "from browser_helpers import *\n"
                             "res = search_web('alpha', include_specialized=False)\n"
                             "result = {"
@@ -1932,6 +1947,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                     {
                         "headless": True,
                         "code": (
+                            "load_skill('research')\n"
                             "from browser_use import *\n"
                             "result = fetch_text('https://example.com')"
                         ),
