@@ -102,7 +102,7 @@ class PythonBrowserTool:
         def js(
             expression: str,
             await_promise: bool = True,
-            repl_mode: bool = True,
+            repl_mode: Optional[bool] = None,
             user_gesture: bool = False,
         ) -> Any:
             return runtime.js(

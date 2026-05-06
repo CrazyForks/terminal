@@ -137,6 +137,22 @@ class BrowserRuntimeTest(unittest.TestCase):
             self.assertTrue(runtime.last_params["replMode"])
             self.assertFalse(runtime.last_params["userGesture"])
 
+    def test_js_disables_repl_mode_for_promise_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("(async () => ({status: 200}))()", await_promise=True)
+
+            self.assertFalse(runtime.last_params["replMode"])
+
+    def test_js_allows_forcing_repl_mode_for_promise_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("(async () => ({status: 200}))()", await_promise=True, repl_mode=True)
+
+            self.assertTrue(runtime.last_params["replMode"])
+
     def test_js_allows_exact_runtime_evaluate_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = EvalRuntime(Path(tmp))

@@ -36,8 +36,9 @@ def build_builtin_registry() -> ToolRegistry:
                 "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
                 "PyPDF2 imports are shimmed to pypdf when available. "
                 "create_download_url(path) uploads to Browser Use cloud when BROWSER_USE_API_KEY is set and otherwise returns a local file URL. "
-                "js(expr) awaits promises and uses CDP replMode by default so repeated let/const snippets are recoverable; "
-                "pass await_promise=False or repl_mode=False only when you need exact Runtime.evaluate behavior. "
+                "js(expr) awaits promises, uses CDP replMode for ordinary snippets so repeated let/const declarations are recoverable, "
+                "and disables replMode automatically for async/fetch/Promise expressions so returned data serializes correctly; "
+                "pass await_promise=False, repl_mode=True, or repl_mode=False when you need exact Runtime.evaluate behavior. "
                 "Set result or _result for structured output."
             ),
             input_schema={
