@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import types
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -160,6 +161,54 @@ class PythonBrowserTool:
                 path.write_text(str(content), encoding="utf-8")
             return str(path)
 
+        def download_file(url: str, path: Optional[str] = None, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None) -> str:
+            try:
+                import requests
+            except Exception as exc:
+                raise RuntimeError("requests is not installed") from exc
+
+            target = Path(path or Path(url.split("?", 1)[0]).name or "download.bin").expanduser()
+            if not target.is_absolute():
+                target = ctx.session.cwd / target
+            target.parent.mkdir(parents=True, exist_ok=True)
+            request_headers = {"User-Agent": "Mozilla/5.0"}
+            if headers:
+                request_headers.update(headers)
+            response = requests.get(url, headers=request_headers, timeout=timeout)
+            response.raise_for_status()
+            target.write_bytes(response.content)
+            return str(target)
+
+        def read_pdf_text(source: str, max_pages: Optional[int] = None) -> str:
+            try:
+                from pypdf import PdfReader
+            except Exception as exc:
+                raise RuntimeError("pypdf is not installed") from exc
+
+            source_path = Path(source).expanduser()
+            stream: Any
+            close_stream = False
+            if source.startswith(("http://", "https://")):
+                try:
+                    import requests
+                except Exception as exc:
+                    raise RuntimeError("requests is not installed") from exc
+                response = requests.get(source, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                response.raise_for_status()
+                stream = BytesIO(response.content)
+                close_stream = True
+            else:
+                if not source_path.is_absolute():
+                    source_path = ctx.session.cwd / source_path
+                stream = source_path
+            try:
+                reader = PdfReader(stream)
+                pages = reader.pages[:max_pages] if max_pages is not None else reader.pages
+                return "\n".join(page.extract_text() or "" for page in pages)
+            finally:
+                if close_stream:
+                    stream.close()
+
         def screenshot(label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
             image = runtime.screenshot(label=label, attach=attach, full_page=full_page)
             if attach:
@@ -195,6 +244,8 @@ class PythonBrowserTool:
                 "load_helper": load_helper,
                 "save_helper": save_helper,
                 "save_artifact": save_artifact,
+                "download_file": download_file,
+                "read_pdf_text": read_pdf_text,
             }
         )
         return namespace
@@ -272,9 +323,11 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
     except Exception:
         pass
     try:
+        import pypdf
         from pypdf import PdfReader
 
         namespace["PdfReader"] = PdfReader
+        sys.modules.setdefault("PyPDF2", pypdf)
     except Exception:
         pass
     try:

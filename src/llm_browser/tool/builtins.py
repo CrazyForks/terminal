@@ -29,8 +29,10 @@ def build_builtin_registry() -> ToolRegistry:
                 "cdp(method, params=None). Helpers include new_tab(url), navigate(url), tabs(), "
                 "attach_tab(...), js(expr), wait_for_load(), screenshot(label, attach=True), "
                 "click_at(x,y), type_text(text), press(key), scroll(dx=0, dy=500), page_info(), "
-                "visible_text(), links(), save_helper(), load_helper(), and save_artifact(). "
+                "visible_text(), links(), save_helper(), load_helper(), save_artifact(), "
+                "download_file(url, path=None), and read_pdf_text(path_or_url, max_pages=None). "
                 "requests, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
+                "PyPDF2 imports are shimmed to pypdf when available. "
                 "Set result or _result for structured output."
             ),
             input_schema={

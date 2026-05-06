@@ -213,6 +213,33 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["selector"]["visible"])
             self.assertEqual(result.data["result"]["text"]["text"], "Accept")
 
+    def test_pypdf_shims_pypdf2_import_and_exposes_pdf_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "from PyPDF2 import PdfReader as CompatReader\n"
+                        "result = {"
+                        "'compat': CompatReader.__module__.startswith('pypdf'), "
+                        "'download_helper': callable(download_file), "
+                        "'pdf_helper': callable(read_pdf_text)"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["compat"])
+            self.assertTrue(result.data["result"]["download_helper"])
+            self.assertTrue(result.data["result"]["pdf_helper"])
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
