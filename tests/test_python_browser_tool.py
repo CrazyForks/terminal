@@ -1001,6 +1001,45 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual([timeout for _, timeout in calls[:4]], [6.0, 6.0, 6.0, 6.0])
             self.assertEqual(calls[4][1], 12.0)
 
+    def test_search_web_filters_reader_image_results(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = 200
+                self.ok = True
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            if "r.jina.ai/http://https://www.google.com/search" in url:
+                return Response(
+                    "[Image 1](https://encrypted-tbn1.gstatic.com/images?q=abc)\n"
+                    "[Favicon](https://encrypted-tbn2.gstatic.com/faviconV2?url=https://example.com)\n"
+                    "[Useful](https://example.com/useful)",
+                    url,
+                )
+            return Response("<html><title>empty</title></html>", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "result = search_web('image-heavy query', max_results=2, include_specialized=False)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual([item["url"] for item in result.data["result"]["results"]], ["https://example.com/useful"])
+
     def test_search_web_prioritizes_exact_cve_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))

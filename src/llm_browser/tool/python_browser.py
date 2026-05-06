@@ -1368,11 +1368,17 @@ def _looks_like_external_result_url(url: str) -> bool:
         "kagi.com",
         "r.jina.ai",
         "s.jina.ai",
+        "gstatic.com",
+        "googleusercontent.com",
+        "encrypted-tbn",
     )
     if any(blocked in host for blocked in blocked_hosts):
         return False
     blocked_path_parts = ("/search", "/preferences", "/settings", "/account", "/signin", "/login", "/captcha")
-    return not any(part in path for part in blocked_path_parts)
+    if any(part in path for part in blocked_path_parts):
+        return False
+    blocked_extensions = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico")
+    return not path.endswith(blocked_extensions)
 
 
 def _query_looks_scholarly(query: str) -> bool:
