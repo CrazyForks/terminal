@@ -913,6 +913,87 @@ class PythonBrowserToolTest(unittest.TestCase):
             contact_page = next(page for page in payload["pages"] if page["requested_url"] == "https://example.com/contact")
             self.assertEqual(contact_page["title"], "Contact")
 
+    def test_extract_store_locator_locations_drains_bullseye_json_list(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200, json_value: Any = None) -> None:
+                self.text = text
+                self.content = text.encode("utf-8")
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+                self._json_value = json_value
+
+            def json(self) -> Any:
+                if self._json_value is not None:
+                    return self._json_value
+                return json.loads(self.text)
+
+        locations = [
+            {"Name": "Alpha - PA", "Address1": "10 MAIN ST", "City": "ERIE", "StateAbbr": "PA", "PostCode": "16501"},
+            {"Name": "Beta - OH", "Address1": "20 MARKET ST", "City": "AKRON", "StateAbbr": "OH", "PostCode": "44308"},
+        ]
+        location_payload = json.dumps({"locations": locations})
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            if url == "https://brand.example/locations":
+                return Response(
+                    '<a href="https://stores.example.com/local/list/example-store-near-me">Find a store</a>',
+                    url,
+                )
+            if "GetInterfaceConfiguration" in url:
+                if (kwargs.get("params") or {}).get("interfaceName") != "example-store-near-me":
+                    return Response("", url, json_value={"clientId": None, "apiKey": None})
+                return Response(
+                    "",
+                    "https://wswrapper.bullseyelocations.com/InterfaceConfiguration/GetInterfaceConfiguration?interfaceName=example-store-near-me",
+                    json_value={
+                        "clientId": 123,
+                        "apiKey": "public-key",
+                        "locationIdentifier": 1,
+                        "countries": [{"id": 1, "name": "United States"}],
+                    },
+                )
+            if "GetLocationList" in url:
+                params = kwargs.get("params") or {}
+                self.assertEqual(params["action"], "json")
+                self.assertEqual(params["isSEO"], "true")
+                self.assertEqual(params["isProxy"], "true")
+                return Response(
+                    json.dumps(location_payload),
+                    "https://ws.bullseyelocations.com/RestSearch.svc/GetLocationList",
+                    json_value=location_payload,
+                )
+            return Response("", url, status_code=404)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "result = extract_store_locator_locations("
+                            "'https://brand.example/locations', save_to='stores.json', include_locations=False)"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            payload = result.data["result"]
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["provider"], "bullseye")
+            self.assertEqual(payload["interface_name"], "example-store-near-me")
+            self.assertEqual(payload["count"], 2)
+            self.assertEqual(payload["sample"][0]["Name"], "Alpha - PA")
+            self.assertNotIn("locations", payload)
+            saved = Path(payload["path"])
+            self.assertEqual(json.loads(saved.read_text(encoding="utf-8"))[1]["City"], "AKRON")
+
     def test_search_web_parses_duckduckgo_redirects_and_saves_empty_pages(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
@@ -1282,6 +1363,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "'structured': fetch_text_result('https://example.com')['source'], "
                             "'many': fetch_many_text(['https://example.com'], save_to='bulk.json')['count'], "
                             "'blocks': extract_markdown_link_blocks('[A](https://example.com/a)')[0]['title'], "
+                            "'locator': callable(extract_store_locator_locations), "
                             "'title': js('document.title')"
                             "}"
                         ),
@@ -1293,6 +1375,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["structured"], "direct")
             self.assertEqual(result.data["result"]["many"], 1)
             self.assertEqual(result.data["result"]["blocks"], "A")
+            self.assertTrue(result.data["result"]["locator"])
             self.assertEqual(result.data["result"]["title"], "Example Domain")
 
     def test_browser_use_module_alias_exports_helpers(self) -> None:

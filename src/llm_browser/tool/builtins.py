@@ -47,6 +47,7 @@ def build_builtin_registry() -> ToolRegistry:
                 "search_web(query, save_raw='auto', include_specialized='auto') with multi-engine parsing and scholarly fallbacks, "
                 "extract_links(text, pattern=None), extract_markdown_link_blocks(text, url_pattern=None), "
                 "extract_emails(text, domains=None), crawl_site(url, max_pages=12, purpose='contact') for bounded contact/about/team crawling, "
+                "extract_store_locator_locations(url_or_interface, save_to=None) for Bullseye-style store locator JSON lists, "
                 "and read_sitemap(url, include=None) for large XML or markdown URL lists. "
                 "You can also import these helpers with from browser_helpers import * or from browser_use import *. "
                 "requests, a browser-header http session, curl_requests from curl_cffi, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "

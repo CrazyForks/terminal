@@ -666,6 +666,36 @@ class PythonBrowserTool:
                 purpose=purpose,
             )
 
+        def extract_store_locator_locations(
+            target: str,
+            provider: str = "auto",
+            country_ids: Optional[Any] = None,
+            max_locations: int = 10000,
+            timeout: float = 30.0,
+            save_to: Optional[str] = None,
+            include_locations: bool = True,
+        ) -> Dict[str, Any]:
+            result = _extract_store_locator_locations(
+                target,
+                provider=provider,
+                country_ids=country_ids,
+                max_locations=max_locations,
+                timeout=timeout,
+            )
+            locations = result.get("locations")
+            if save_to and isinstance(locations, list):
+                target_path = Path(save_to).expanduser()
+                if not target_path.is_absolute():
+                    target_path = ctx.session.cwd / target_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(json.dumps(locations, ensure_ascii=False, indent=2), encoding="utf-8")
+                result["path"] = str(target_path)
+            if not include_locations:
+                result.pop("locations", None)
+            return result
+
+        store_locator_locations = extract_store_locator_locations
+
         def read_sitemap(
             url: str,
             include: Optional[str] = None,
@@ -901,6 +931,8 @@ class PythonBrowserTool:
                 "extract_markdown_link_blocks": extract_markdown_link_blocks,
                 "extract_emails": extract_emails,
                 "crawl_site": crawl_site,
+                "extract_store_locator_locations": extract_store_locator_locations,
+                "store_locator_locations": store_locator_locations,
                 "read_sitemap": read_sitemap,
                 "curl_requests": namespace.get("curl_requests"),
             }
@@ -1596,6 +1628,281 @@ def _looks_like_noise_email(email: str) -> bool:
         "do-not-reply",
     }
     return local in blocked_locals
+
+
+def _extract_store_locator_locations(
+    target: str,
+    *,
+    provider: str = "auto",
+    country_ids: Optional[Any] = None,
+    max_locations: int = 10000,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    provider_name = str(provider or "auto").lower()
+    if provider_name not in {"auto", "bullseye"}:
+        return {"ok": False, "provider": provider, "error": f"unsupported provider: {provider}"}
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    attempts: List[Dict[str, Any]] = []
+    candidates = _discover_bullseye_interface_names(str(target or ""), requests=requests, timeout=timeout, attempts=attempts)
+    if not candidates:
+        return {
+            "ok": False,
+            "provider": "bullseye",
+            "target": target,
+            "error": "no Bullseye interface name discovered",
+            "attempts": attempts,
+        }
+
+    errors: List[str] = []
+    for interface_name in candidates:
+        config_url = "https://wswrapper.bullseyelocations.com/InterfaceConfiguration/GetInterfaceConfiguration"
+        try:
+            config_response = requests.get(
+                config_url,
+                params={"interfaceName": interface_name},
+                headers=_browser_headers(),
+                timeout=min(timeout, 30.0),
+            )
+            config_attempt: Dict[str, Any] = {
+                "source": "bullseye_config",
+                "interface_name": interface_name,
+                "status": getattr(config_response, "status_code", None),
+                "url": getattr(config_response, "url", config_url),
+                "chars": len(getattr(config_response, "text", "") or ""),
+            }
+            config = config_response.json()
+            if not isinstance(config, dict):
+                config_attempt["error"] = "configuration response was not an object"
+                attempts.append(config_attempt)
+                continue
+            client_id = config.get("clientId")
+            api_key = config.get("apiKey")
+            config_attempt["client_id"] = client_id
+            attempts.append(config_attempt)
+            if not client_id or not api_key:
+                errors.append(f"{interface_name}: missing clientId/apiKey")
+                continue
+            locations_result = _fetch_bullseye_location_list(
+                requests=requests,
+                client_id=client_id,
+                api_key=str(api_key),
+                config=config,
+                country_ids=country_ids,
+                max_locations=max_locations,
+                timeout=timeout,
+            )
+            attempts.append(locations_result.pop("attempt"))
+            if locations_result.get("ok"):
+                locations = locations_result.get("locations") or []
+                return {
+                    "ok": True,
+                    "provider": "bullseye",
+                    "target": target,
+                    "interface_name": interface_name,
+                    "client_id": client_id,
+                    "country_ids": locations_result.get("country_ids"),
+                    "count": len(locations),
+                    "sample": locations[:3],
+                    "locations": locations,
+                    "attempts": attempts,
+                }
+            errors.append(f"{interface_name}: {locations_result.get('error', 'location list failed')}")
+        except Exception as exc:
+            attempts.append({"source": "bullseye_config", "interface_name": interface_name, "error": str(exc)})
+            errors.append(f"{interface_name}: {exc}")
+
+    return {
+        "ok": False,
+        "provider": "bullseye",
+        "target": target,
+        "interfaces": candidates,
+        "error": "; ".join(errors[-5:]) or "all Bullseye attempts failed",
+        "attempts": attempts,
+    }
+
+
+def _discover_bullseye_interface_names(
+    target: str,
+    *,
+    requests: Any,
+    timeout: float,
+    attempts: List[Dict[str, Any]],
+) -> List[str]:
+    candidates: List[str] = []
+
+    def add(value: Any) -> None:
+        name = html.unescape(unquote(str(value or ""))).strip().strip("/?#&")
+        name = name.split("?", 1)[0].split("#", 1)[0].strip("/")
+        if not name:
+            return
+        if "/" in name:
+            name = name.rstrip("/").rsplit("/", 1)[-1]
+        name = name.lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,140}", name):
+            return
+        blocked = {"local", "list", "citylist", "pages", "page", "static", "resources", "resource", "error", "ie", "index"}
+        if name in blocked or name.startswith("_next") or name.endswith(("-css", "-js")):
+            return
+        if name not in candidates:
+            candidates.append(name)
+
+    value = target.strip()
+    parsed = urlparse(value)
+    if parsed.query:
+        query = parse_qs(parsed.query)
+        for key in ("interfaceName", "interfacename", "interface_name"):
+            for item in query.get(key, []):
+                add(item)
+    if parsed.scheme in {"http", "https"}:
+        segments = [unquote(part) for part in parsed.path.split("/") if part]
+        for index, segment in enumerate(segments):
+            previous = segments[index - 1].lower() if index else ""
+            before_previous = segments[index - 2].lower() if index >= 2 else ""
+            if previous in {"list", "citylist", "pages"} or (before_previous == "local" and previous in {"list", "citylist"}):
+                add(segment)
+        if segments:
+            add(segments[-1])
+    elif value and "/" not in value and " " not in value:
+        add(value)
+
+    texts = [value]
+    if parsed.scheme in {"http", "https"}:
+        try:
+            response = requests.get(value, headers=_browser_headers(), timeout=min(timeout, 20.0))
+            text = getattr(response, "text", "") or ""
+            texts.append(text)
+            attempts.append(
+                {
+                    "source": "locator_page",
+                    "url": getattr(response, "url", value),
+                    "status": getattr(response, "status_code", None),
+                    "chars": len(text),
+                }
+            )
+        except Exception as exc:
+            attempts.append({"source": "locator_page", "url": value, "error": str(exc)})
+
+    for text in texts:
+        for pattern in (
+            r"GetInterfaceConfiguration\?[^\"'<>]*?interfaceName=([^&\"'<>]+)",
+            r"interfaceName[\"'\s:=]+([a-zA-Z0-9_-]{2,140})",
+            r"interface_name[\"'\s:=]+([a-zA-Z0-9_-]{2,140})",
+            r"/local/(?:list|citylist)/([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})",
+            r"/local/(?!static/|list/|citylist/|error/|ie\.html)([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})(?:[/?\"'<>#]|$)",
+            r"/pages/([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})",
+        ):
+            for match in re.finditer(pattern, text):
+                add(match.group(1))
+    return candidates
+
+
+def _fetch_bullseye_location_list(
+    *,
+    requests: Any,
+    client_id: Any,
+    api_key: str,
+    config: Dict[str, Any],
+    country_ids: Optional[Any],
+    max_locations: int,
+    timeout: float,
+) -> Dict[str, Any]:
+    country_value = _bullseye_country_ids(country_ids, config)
+    location_identifier = config.get("locationIdentifier") or 1
+    params = {
+        "countryIds": country_value,
+        "action": "json",
+        "isSEO": "true",
+        "isProxy": "true",
+        "locationIdentifier": location_identifier,
+        "callback": "results",
+        "ClientId": client_id,
+        "ApiKey": api_key,
+    }
+    url = "https://ws.bullseyelocations.com/RestSearch.svc/GetLocationList"
+    try:
+        response = requests.get(url, params=params, headers=_browser_headers(), timeout=min(timeout, 60.0))
+        payload = _decode_bullseye_location_payload(response)
+        locations = payload.get("locations")
+        if not isinstance(locations, list):
+            locations = payload.get("Locations")
+        if not isinstance(locations, list):
+            return {
+                "ok": False,
+                "error": "location payload did not contain a locations list",
+                "country_ids": country_value,
+                "attempt": {
+                    "source": "bullseye_location_list",
+                    "status": getattr(response, "status_code", None),
+                    "url": getattr(response, "url", url),
+                    "chars": len(getattr(response, "text", "") or ""),
+                    "parsed": 0,
+                },
+            }
+        limit = max(0, min(int(max_locations), len(locations)))
+        trimmed = locations[:limit]
+        return {
+            "ok": True,
+            "country_ids": country_value,
+            "locations": trimmed,
+            "attempt": {
+                "source": "bullseye_location_list",
+                "status": getattr(response, "status_code", None),
+                "url": getattr(response, "url", url),
+                "chars": len(getattr(response, "text", "") or ""),
+                "parsed": len(trimmed),
+                "total": len(locations),
+            },
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "country_ids": country_value,
+            "attempt": {"source": "bullseye_location_list", "url": url, "error": str(exc), "parsed": 0},
+        }
+
+
+def _bullseye_country_ids(country_ids: Optional[Any], config: Dict[str, Any]) -> str:
+    if country_ids is not None:
+        if isinstance(country_ids, str):
+            return country_ids
+        try:
+            return ",".join(str(item) for item in country_ids)
+        except TypeError:
+            return str(country_ids)
+    countries = config.get("countries")
+    if isinstance(countries, list):
+        ids = [str(item.get("id")) for item in countries if isinstance(item, dict) and item.get("id")]
+        if ids:
+            return ",".join(ids)
+    return "1"
+
+
+def _decode_bullseye_location_payload(response: Any) -> Dict[str, Any]:
+    try:
+        raw: Any = response.json()
+    except Exception:
+        raw = getattr(response, "text", "")
+    for _ in range(4):
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, list):
+            return {"locations": raw}
+        if not isinstance(raw, str):
+            break
+        text = raw.strip()
+        jsonp = re.match(r"^[a-zA-Z_$][\w$]*\((.*)\)\s*;?$", text, re.S)
+        if jsonp:
+            text = jsonp.group(1).strip()
+        try:
+            raw = json.loads(text)
+        except Exception:
+            break
+    return {}
 
 
 def _crawl_site(
@@ -2669,6 +2976,8 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "extract_markdown_link_blocks",
         "extract_emails",
         "crawl_site",
+        "extract_store_locator_locations",
+        "store_locator_locations",
         "read_sitemap",
         "fetch_many_text",
         "requests",
