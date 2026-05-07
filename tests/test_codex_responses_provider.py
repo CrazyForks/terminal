@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from llm_browser.auth import CodexAuth
-from llm_browser.provider.codex_responses import CodexResponsesProvider, _codex_url
+from llm_browser.provider.codex_responses import CodexResponsesProvider, _codex_compact_url, _codex_url
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, events: list, text: str = "") -> None:
+    def __init__(self, status_code: int, events: list, text: str = "", json_data=None) -> None:
         self.status_code = status_code
         self._events = events
         self.text = text
+        self._json_data = json_data
         self.closed = False
 
     def iter_lines(self, decode_unicode: bool = False):
@@ -22,6 +24,11 @@ class FakeResponse:
 
     def close(self) -> None:
         self.closed = True
+
+    def json(self):
+        if self._json_data is None:
+            raise json.JSONDecodeError("no json", "", 0)
+        return self._json_data
 
 
 def fake_auth() -> CodexAuth:
@@ -40,6 +47,7 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertEqual(_codex_url("https://chatgpt.com/backend-api"), "https://chatgpt.com/backend-api/codex/responses")
         self.assertEqual(_codex_url("https://x/codex"), "https://x/codex/responses")
         self.assertEqual(_codex_url("https://x/codex/responses"), "https://x/codex/responses")
+        self.assertEqual(_codex_compact_url("https://chatgpt.com/backend-api"), "https://chatgpt.com/backend-api/codex/responses/compact")
 
     def test_posts_with_codex_headers_and_parses_call(self) -> None:
         provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
@@ -74,8 +82,8 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertTrue(payload["stream"])
         self.assertFalse(payload["store"])
         self.assertEqual(payload["model"], "gpt-test")
-        self.assertIn("click_at_xy", payload["instructions"])
-        self.assertIn("whole DOM", payload["instructions"])
+        self.assertIn('cdp("Domain.method"', payload["instructions"])
+        self.assertIn("set_cdp_session", payload["instructions"])
         self.assertTrue(post.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
 
@@ -176,6 +184,83 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertIn("screenshot image", payload["input"][2]["output"])
         self.assertEqual(payload["input"][3]["role"], "user")
         self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
+
+    def test_prunes_older_visual_context_images_before_request(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+        messages = [{"role": "user", "content": "inspect"}]
+        for index in range(4):
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": f"call_{index}",
+                                "name": "python",
+                                "arguments": {"code": "capture_screenshot()"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"call_{index}",
+                        "name": "python",
+                        "content": [
+                            {"type": "input_text", "text": f"images=[shot_{index}]"},
+                            {
+                                "type": "input_image",
+                                "detail": "auto",
+                                "image_url": f"data:image/png;base64,img{index}",
+                            },
+                        ],
+                    },
+                ]
+            )
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response) as post:
+            list(provider.start_turn(messages, []))
+
+        payload_json = json.dumps(post.call_args.kwargs["json"])
+        image_urls = []
+        for item in post.call_args.kwargs["json"]["input"]:
+            for content_item in item.get("content") or []:
+                if content_item.get("type") == "input_image":
+                    image_urls.append(content_item["image_url"])
+
+        self.assertEqual(image_urls, ["data:image/png;base64,img2", "data:image/png;base64,img3"])
+        self.assertNotIn("img0", payload_json)
+        self.assertNotIn("img1", payload_json)
+        self.assertIn("older screenshot image omitted", payload_json)
+
+    def test_remote_compaction_posts_compact_payload_and_converts_output(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        response = FakeResponse(
+            200,
+            [],
+            json_data={
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kept user"}],
+                    },
+                    {"type": "compaction", "encrypted_content": "encrypted-summary"},
+                ]
+            },
+        )
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response) as post:
+            result = provider.compact_conversation_history([{"role": "user", "content": "hello"}], [])
+
+        self.assertEqual(post.call_args.args[0], "https://chatgpt.com/backend-api/codex/responses/compact")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][0]["role"], "user")
+        self.assertNotIn("stream", payload)
+        self.assertEqual(result.messages[0], {"role": "user", "content": "kept user"})
+        self.assertEqual(result.messages[1]["role"], "provider_item")
+        self.assertEqual(result.messages[1]["item"]["encrypted_content"], "encrypted-summary")
+        self.assertTrue(response.closed)
 
     def test_orphan_tool_output_is_recovered_as_user_context(self) -> None:
         provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")

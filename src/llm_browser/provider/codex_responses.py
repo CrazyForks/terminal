@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 import time
+from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
 from llm_browser.auth import CodexAuth, CodexAuthError, PermanentCodexAuthError, load_codex_auth, refresh_codex_auth
 from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
-from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
-from llm_browser.provider.types import ModelEvent, ToolCall
+from llm_browser.provider.tool_content import tool_output_text, trim_visual_context_images, visual_context_messages
+from llm_browser.provider.types import ModelEvent, ProviderCompactionResult, ToolCall
 from llm_browser.session.usage import ModelTokenUsage
 
 
@@ -42,6 +43,46 @@ class CodexResponsesProvider:
 
     def set_instructions(self, instructions: str) -> None:
         self.instructions = instructions
+
+    def reset_session(self) -> None:
+        return None
+
+    def supports_remote_compaction(self) -> bool:
+        return True
+
+    def compact_conversation_history(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> ProviderCompactionResult:
+        if self.auth is None:
+            raise RuntimeError("Codex auth missing. Run Codex login first, or use provider=openai with an API key.")
+
+        payload = self._build_compact_payload(messages, tools)
+        response = self._post_compact_payload(payload)
+        if response.status_code in {401, 403} and self.auth.refresh_token:
+            response.close()
+            try:
+                self.auth = refresh_codex_auth(auth=self.auth)
+            except PermanentCodexAuthError:
+                raise
+            except CodexAuthError as exc:
+                raise RuntimeError(f"Codex auth refresh failed after HTTP {response.status_code}: {exc}") from exc
+            response = self._post_compact_payload(payload)
+        try:
+            if response.status_code >= 400:
+                raise RuntimeError(f"Codex compact request failed: HTTP {response.status_code}: {response.text[:1000]}")
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Codex compact response was not JSON: {response.text[:1000]}") from exc
+        finally:
+            response.close()
+
+        output = data.get("output") if isinstance(data, dict) else data
+        if not isinstance(output, list):
+            raise RuntimeError(f"Codex compact response did not include output list: {data}")
+        return ProviderCompactionResult(messages=_response_items_to_messages(output))
 
     def start_turn(
         self,
@@ -103,7 +144,7 @@ class CodexResponsesProvider:
             response.close()
 
     def _build_payload(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-        input_items = self._convert_messages(messages)
+        input_items = trim_visual_context_images(self._convert_messages(messages))
 
         payload: Dict[str, Any] = {
             "model": self.model,
@@ -113,6 +154,19 @@ class CodexResponsesProvider:
             "instructions": self.instructions,
             "text": {"verbosity": "low"},
             "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+        if tools:
+            payload["tools"] = tools
+        return payload
+
+    def _build_compact_payload(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        input_items = trim_visual_context_images(self._convert_messages(messages))
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "instructions": self.instructions,
+            "text": {"verbosity": "low"},
             "parallel_tool_calls": True,
         }
         if tools:
@@ -150,6 +204,22 @@ class CodexResponsesProvider:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("Codex Responses request failed before receiving a response")
+
+    def _post_compact_payload(self, payload: Dict[str, Any]) -> requests.Response:
+        assert self.auth is not None
+        return requests.post(
+            _codex_compact_url(self.base_url),
+            headers={
+                "Authorization": f"Bearer {self.auth.access_token}",
+                "chatgpt-account-id": self.auth.account_id,
+                "originator": "llm-browser",
+                "OpenAI-Beta": "responses=experimental",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout_s,
+        )
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []
@@ -206,6 +276,10 @@ class CodexResponsesProvider:
                     }
                 )
                 input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
+            elif role == "provider_item":
+                item = message.get("item")
+                if isinstance(item, dict):
+                    input_items.append(deepcopy(item))
         return input_items
 
     def _events_from_message(self, item: Dict[str, Any]) -> Iterable[ModelEvent]:
@@ -231,6 +305,39 @@ def _codex_url(base_url: str) -> str:
     if normalized.endswith("/codex"):
         return f"{normalized}/responses"
     return f"{normalized}/codex/responses"
+
+
+def _codex_compact_url(base_url: str) -> str:
+    responses_url = _codex_url(base_url)
+    return f"{responses_url.rstrip('/')}/compact"
+
+
+def _response_items_to_messages(items: List[Any]) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            role = str(item.get("role") or "")
+            text = _response_message_text(item)
+            if role in {"user", "assistant"} and text:
+                messages.append({"role": role, "content": text})
+            continue
+        if item_type in {"compaction", "context_compaction"}:
+            messages.append({"role": "provider_item", "provider": "responses", "item": deepcopy(item)})
+    return messages
+
+
+def _response_message_text(item: Dict[str, Any]) -> str:
+    pieces: List[str] = []
+    for content in item.get("content") or []:
+        if not isinstance(content, dict):
+            continue
+        text = content.get("text")
+        if text:
+            pieces.append(str(text))
+    return "\n".join(pieces)
 
 
 def _iter_sse_json(response: requests.Response):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from importlib import resources
 import tempfile
 import threading
 import time
@@ -7,11 +9,18 @@ import unittest
 from pathlib import Path
 
 from llm_browser.agent import Agent
-from llm_browser.agent.compaction import compact_messages
+from llm_browser.agent.compaction import (
+    compact_messages,
+    message_context_units,
+    message_image_count,
+    trim_message_images,
+)
 from llm_browser.agent.service import MaxTurnsExceeded, _is_parallel_safe_shell_call
+from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS, BROWSER_HELP_PLAYBOOK, CODEX_AGENT_INSTRUCTIONS
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.store import SessionStore
+from llm_browser.session.usage import ModelTokenUsage
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolImage, ToolResult
@@ -52,6 +61,18 @@ class ManyToolCallsProvider:
 class TextOnlyProvider:
     def start_turn(self, messages, tools):
         yield ModelEvent.text("direct final")
+
+
+class UsageProvider:
+    model = "gpt-5.5"
+
+    def start_turn(self, messages, tools):
+        yield ModelEvent.text("direct final")
+        yield ModelEvent.usage(
+            ModelTokenUsage(input_tokens=1000, output_tokens=10, cache_read_tokens=100),
+            model=self.model,
+            provider="openai",
+        )
 
 
 class SpawnChildProvider:
@@ -192,14 +213,14 @@ class AgentLoopTest(unittest.TestCase):
             registry.close_session(session.id)
             self.assertEqual(recorder.closed, [(session.id, True)])
 
-    def test_auto_instruction_mode_switches_to_codex_for_repo_tasks(self) -> None:
+    def test_auto_instruction_mode_switches_to_repo_instructions_for_repo_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
             provider = InstructionCaptureProvider()
 
             Agent(store, provider=provider).run("what is in this repo", cwd=Path(tmp))
 
-            self.assertIn("You are Codex", provider.instructions)
+            self.assertIn("You are Browser Use", provider.instructions)
             self.assertIn("rg --files", provider.instructions)
 
     def test_auto_instruction_mode_keeps_browser_instructions_for_browser_tasks(self) -> None:
@@ -209,8 +230,26 @@ class AgentLoopTest(unittest.TestCase):
 
             Agent(store, provider=provider).run("Open example.com", cwd=Path(tmp))
 
-            self.assertIn("browser-native agent", provider.instructions)
-            self.assertIn("click_at_xy", provider.instructions)
+            self.assertIn("You control Chrome through Python", provider.instructions)
+            self.assertIn('cdp("Domain.method"', provider.instructions)
+            self.assertIn("set_cdp_session", provider.instructions)
+            self.assertNotIn("reconnect_browser", provider.instructions)
+
+    def test_browser_prompts_load_from_markdown_resources(self) -> None:
+        prompt_root = resources.files("llm_browser.browser").joinpath("prompts")
+
+        self.assertEqual(
+            CODEX_AGENT_INSTRUCTIONS,
+            prompt_root.joinpath("codex-agent-instructions.md").read_text(encoding="utf-8").rstrip("\n"),
+        )
+        self.assertEqual(
+            BROWSER_AGENT_INSTRUCTIONS,
+            prompt_root.joinpath("browser-agent-instructions.md").read_text(encoding="utf-8").rstrip("\n"),
+        )
+        self.assertEqual(
+            BROWSER_HELP_PLAYBOOK,
+            prompt_root.joinpath("browser-help-playbook.md").read_text(encoding="utf-8").rstrip("\n"),
+        )
 
     def test_max_turns_exhaustion_fails_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -252,6 +291,19 @@ class AgentLoopTest(unittest.TestCase):
             events = store.events.read(session.id)
             self.assertEqual(events[-1].type, "session.done")
             self.assertEqual(events[-1].payload["result"], "direct final")
+
+    def test_model_usage_event_is_persisted_with_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=UsageProvider()).run("answer directly", cwd=Path(tmp))
+
+            events = store.events.read(session.id)
+            usage_events = [event for event in events if event.type == "model.usage"]
+            self.assertEqual(len(usage_events), 1)
+            self.assertEqual(usage_events[0].payload["model"], "gpt-5.5")
+            self.assertEqual(usage_events[0].payload["usage"]["input_tokens"], 1000)
+            self.assertEqual(usage_events[0].payload["usage"]["cache_read_tokens"], 100)
+            self.assertGreater(usage_events[0].payload["cost_usd"], 0)
 
     def test_large_tool_output_spills_to_artifact(self) -> None:
         class LargeOutputProvider:
@@ -423,6 +475,236 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(compacted[2]["tool_call_id"], "call_3")
         self.assertEqual(compacted[3]["role"], "assistant")
         self.assertEqual(compacted[4]["role"], "tool")
+
+    def test_compaction_counts_and_prunes_screenshot_payloads(self) -> None:
+        image = {
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": "data:image/png;base64," + ("x" * 500000),
+        }
+        messages = [{"role": "user", "content": "start"}]
+        for index in range(8):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "name": "python",
+                            "arguments": {"code": "capture_screenshot(attach=True)"},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "python",
+                    "content": [
+                        {"type": "input_text", "text": f"screenshot {index}"},
+                        dict(image),
+                    ],
+                }
+            )
+
+        before_units = message_context_units(messages)
+        with tempfile.TemporaryDirectory() as tmp:
+            compacted, path = compact_messages(messages, Path(tmp), keep_last=12, max_kept_images=2)
+            self.assertTrue(path.exists())
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertGreater(before_units, message_context_units(compacted))
+        self.assertIn("replay_messages", payload)
+        self.assertNotIn("image_url", json.dumps(payload["replay_messages"]))
+        kept_images = 0
+        omitted_markers = 0
+        for message in compacted:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if item.get("type") == "input_image":
+                    kept_images += 1
+                if "omitted by compaction" in str(item.get("text") or ""):
+                    omitted_markers += 1
+
+        self.assertEqual(kept_images, 2)
+        self.assertGreater(omitted_markers, 0)
+
+    def test_context_image_pruning_keeps_latest_images_without_threshold_compaction(self) -> None:
+        messages = [{"role": "user", "content": "start"}]
+        for index in range(4):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "python",
+                    "content": [
+                        {"type": "input_text", "text": f"screenshot {index}"},
+                        {
+                            "type": "input_image",
+                            "detail": "auto",
+                            "image_url": f"data:image/png;base64,img{index}",
+                        },
+                    ],
+                }
+            )
+
+        trimmed = trim_message_images(messages, max_images=2)
+        payload = json.dumps(trimmed)
+
+        self.assertEqual(message_image_count(messages), 4)
+        self.assertEqual(message_image_count(trimmed), 2)
+        self.assertNotIn("img0", payload)
+        self.assertNotIn("img1", payload)
+        self.assertIn("img2", payload)
+        self.assertIn("img3", payload)
+        self.assertIn("omitted by context pruning", payload)
+
+    def test_old_tool_output_pruning_preserves_recent_turns(self) -> None:
+        from llm_browser.agent.compaction import prune_old_tool_outputs
+
+        big = "x" * 30000
+        messages = [{"role": "user", "content": "start"}]
+        for index in range(5):
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": f"call_{index}", "name": "python", "arguments": {}}],
+                    },
+                    {"role": "tool", "tool_call_id": f"call_{index}", "name": "python", "content": big + str(index)},
+                    {"role": "user", "content": f"next {index}"},
+                ]
+            )
+
+        pruned = prune_old_tool_outputs(messages, protect_context_units=40000, minimum_pruned_units=20000)
+        payload = json.dumps(pruned)
+
+        self.assertIn("Old tool result content cleared", payload)
+        self.assertIn(big + "4", payload)
+        self.assertIn(big + "3", payload)
+
+    def test_provider_size_error_compacts_and_retries_without_images(self) -> None:
+        class OversizeThenDoneProvider:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.image_counts = []
+
+            def start_turn(self, messages, tools):
+                self.calls += 1
+                self.image_counts.append(message_image_count(messages))
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "Codex Responses request failed: HTTP 507: exceeded request buffer limit while retrying upstream"
+                    )
+                yield ModelEvent.text("recovered")
+
+        image = {
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": "data:image/png;base64," + ("x" * 500000),
+        }
+        messages = [{"role": "user", "content": "continue"}]
+        for index in range(4):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "python",
+                    "content": [{"type": "input_text", "text": f"shot {index}"}, dict(image)],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            provider = OversizeThenDoneProvider()
+            result = Agent(store, provider=provider, compact_after_chars=10**9)._run_with_messages(session, messages)
+            events = store.events.read(session.id)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(provider.calls, 3)
+        self.assertGreater(provider.image_counts[0], 0)
+        self.assertEqual(provider.image_counts[1], 0)
+        self.assertEqual(provider.image_counts[2], 0)
+        compacted = [event for event in events if event.type == "session.compacted"]
+        self.assertTrue(compacted)
+        self.assertIn("replacement_history", compacted[-1].payload)
+
+    def test_resume_replay_starts_from_latest_compaction_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root)
+            session = store.create(cwd=root)
+            store.emit(session.id, "session.input", {"text": "old task"})
+            compaction_path = session.artifact_dir / "compactions" / "001.json"
+            compaction_path.parent.mkdir(parents=True, exist_ok=True)
+            compaction_path.write_text(
+                json.dumps(
+                    {
+                        "summary": "old task summarized",
+                        "replay_messages": [
+                            {
+                                "role": "user",
+                                "content": "Conversation was compacted.\n\nold task summarized",
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store.emit(session.id, "session.compacted", {"path": str(compaction_path)})
+            store.emit(session.id, "session.input", {"text": "new instruction", "resumed": True})
+
+            messages = Agent(store, provider=TextOnlyProvider())._messages_from_events(session.id)
+
+        self.assertEqual(len(messages), 2)
+        self.assertIn("old task summarized", messages[0]["content"])
+        self.assertEqual(messages[1]["content"], "new instruction")
+        self.assertNotIn("old task", messages[1]["content"])
+
+    def test_resume_replay_starts_from_latest_compaction_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root)
+            session = store.create(cwd=root)
+            store.emit(session.id, "session.input", {"text": "old task"})
+            store.emit(
+                session.id,
+                "session.compacted",
+                {
+                    "schema_version": 1,
+                    "compaction_id": "compact_1",
+                    "phase": "standalone_turn",
+                    "reason": "user_requested",
+                    "message": "checkpoint summary",
+                    "replacement_history": [{"role": "user", "content": "checkpoint summary"}],
+                    "before_messages": 1,
+                    "after_messages": 1,
+                },
+            )
+            store.emit(session.id, "session.input", {"text": "new instruction", "resumed": True})
+
+            messages = Agent(store, provider=TextOnlyProvider())._messages_from_events(session.id)
+
+        self.assertEqual(messages, [{"role": "user", "content": "checkpoint summary"}, {"role": "user", "content": "new instruction"}])
+
+    def test_manual_compact_allows_empty_session_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SessionStore(root)
+            session = store.create(cwd=root)
+
+            Agent(store, provider=TextOnlyProvider()).compact_session(session.id)
+
+            compacted = [event for event in store.events.read(session.id) if event.type == "session.compacted"]
+
+        self.assertTrue(compacted)
+        self.assertEqual(compacted[-1].payload["reason"], "user_requested")
+        self.assertIn("replacement_history", compacted[-1].payload)
 
     def test_deadline_warning_is_injected_before_timeout(self) -> None:
         class WarnAwareProvider:

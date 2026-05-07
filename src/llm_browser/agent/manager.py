@@ -107,6 +107,42 @@ class SessionManager:
         thread.start()
         return session
 
+    def compact(self, session_id: str) -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+        with self._lock:
+            active = self._active.get(session.id)
+            if active is not None and active.running:
+                raise RuntimeError(f"session already running: {session.id}")
+
+        active_ref: Dict[str, ActiveSession] = {}
+
+        def target() -> None:
+            try:
+                with self._lock:
+                    tools = self._tools.get(session.id)
+                agent = Agent(
+                    self.store,
+                    provider_factory=self.provider_factory,
+                    tools=tools,
+                    max_turns=self.max_turns,
+                    close_tools_on_finish=False,
+                )
+                with self._lock:
+                    self._tools[session.id] = agent.tools
+                agent.compact_session(session.id)
+            except BaseException:
+                active_ref["active"].error = traceback.format_exc()
+
+        thread = threading.Thread(target=target, name=f"browser-use-terminal-compact-{session.id}", daemon=True)
+        compacting = ActiveSession(session_id=session.id, task="/compact", thread=thread)
+        active_ref["active"] = compacting
+        with self._lock:
+            self._active[session.id] = compacting
+        thread.start()
+        return session
+
     def cancel(self, session_id: str, reason: str = "user requested cancellation") -> None:
         self.store.request_cancel(session_id, reason=reason)
 

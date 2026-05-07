@@ -56,6 +56,7 @@ class CdpClient:
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
+        return_on_event: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.connect()
         if self._ws is None:
@@ -63,11 +64,13 @@ class CdpClient:
 
         with self._lock:
             previous_timeout = None
-            timeout_changed = timeout_s is not None and hasattr(self._ws, "settimeout")
+            effective_timeout = self.timeout_s if timeout_s is None else timeout_s
+            deadline = time.monotonic() + max(0.0, effective_timeout)
+            timeout_changed = hasattr(self._ws, "settimeout")
             if timeout_changed:
                 if hasattr(self._ws, "gettimeout"):
                     previous_timeout = self._ws.gettimeout()
-                self._ws.settimeout(timeout_s)
+                self._ws.settimeout(max(0.001, effective_timeout))
             try:
                 self._next_id += 1
                 request_id = self._next_id
@@ -85,6 +88,12 @@ class CdpClient:
                     raise CdpConnectionError(f"CDP websocket send failed: {exc}") from exc
 
                 while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.close()
+                        raise CdpConnectionError(f"CDP websocket receive timed out waiting for {method}")
+                    if timeout_changed:
+                        self._ws.settimeout(max(0.001, remaining))
                     try:
                         raw = self._ws.recv()
                     except (websocket.WebSocketException, TimeoutError, OSError) as exc:
@@ -96,6 +105,8 @@ class CdpClient:
                     payload = json.loads(raw)
                     if payload.get("id") != request_id:
                         self._events.append(payload)
+                        if return_on_event and payload.get("method") == return_on_event:
+                            return {}
                         continue
                     if "error" in payload:
                         error = payload["error"]

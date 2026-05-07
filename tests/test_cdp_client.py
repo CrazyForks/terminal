@@ -38,6 +38,16 @@ class TimeoutWebSocket(FakeWebSocket):
         raise TimeoutError("timed out")
 
 
+class EventFloodWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__([])
+        self.recv_count = 0
+
+    def recv(self) -> str:
+        self.recv_count += 1
+        return json.dumps({"method": "Runtime.consoleAPICalled", "params": {"count": self.recv_count}})
+
+
 class CdpClientTest(unittest.TestCase):
     def test_call_matches_response_and_drains_events(self) -> None:
         ws = FakeWebSocket(
@@ -81,6 +91,35 @@ class CdpClientTest(unittest.TestCase):
                 client.call("Runtime.evaluate")
 
         self.assertTrue(ws.closed)
+
+    def test_call_times_out_even_when_events_keep_arriving(self) -> None:
+        ws = EventFloodWebSocket()
+
+        with patch("llm_browser.browser.cdp.websocket.create_connection", return_value=ws), patch(
+            "llm_browser.browser.cdp.time.monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]
+        ):
+            client = CdpClient("ws://example")
+            with self.assertRaisesRegex(CdpConnectionError, "timed out waiting for Runtime.evaluate"):
+                client.call("Runtime.evaluate", timeout_s=0.25)
+
+        self.assertTrue(ws.closed)
+        self.assertGreaterEqual(ws.recv_count, 2)
+
+    def test_call_can_return_when_specific_event_arrives(self) -> None:
+        ws = FakeWebSocket(
+            [
+                {"method": "Page.javascriptDialogOpening", "params": {"message": "Alert Token 123"}},
+                {"id": 1, "result": {"late": True}},
+            ]
+        )
+
+        with patch("llm_browser.browser.cdp.websocket.create_connection", return_value=ws):
+            client = CdpClient("ws://example")
+            result = client.call("Input.dispatchMouseEvent", return_on_event="Page.javascriptDialogOpening")
+
+        self.assertEqual(result, {})
+        self.assertFalse(ws.closed)
+        self.assertEqual(client.drain_events()[0]["method"], "Page.javascriptDialogOpening")
 
 
 if __name__ == "__main__":

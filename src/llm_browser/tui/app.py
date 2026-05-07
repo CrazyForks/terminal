@@ -49,6 +49,7 @@ COMMAND_PALETTE: list[tuple[str, str, str]] = [
     ("Dataset by task id", "dataset real_v8 --task-id ", "Start a specific dataset task"),
     ("Keyboard shortcuts", "keys", "Open the keyboard control map"),
     ("Resume selected", "resume", "Continue from the selected session"),
+    ("Compact selected", "compact", "Checkpoint and compact selected session"),
     ("Cancel selected", "cancel", "Interrupt the selected session"),
     ("Trace selected", "trace", "Write a trace bundle artifact"),
     ("Self eval", "eval", "Start a self-evaluation child session"),
@@ -75,6 +76,7 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("sessions", "sessions", "Switch session"),
     ("new", "new", "Start a new task"),
     ("resume", "resume", "Continue selected session"),
+    ("compact", "compact", "Checkpoint selected session"),
     ("cancel", "cancel", "Interrupt selected session"),
     ("clear", "clear", "Clear transcript"),
     ("refresh", "refresh", "Reload sessions and artifacts"),
@@ -226,8 +228,7 @@ class ComposerInput(TextArea):
             elif event.key in {"shift+enter", "alt+enter", "ctrl+enter", "cmd+enter", "ctrl+j"}:
                 event.prevent_default()
                 event.stop()
-                self.insert("\n")
-                self.app.resize_composer()
+                self.app.insert_composer_newline()
             return
         key = event.key
         action = None
@@ -1396,6 +1397,7 @@ class BrowserUseTerminalApp(App[None]):
         command_input = self.query_one("#command", ComposerInput)
         command_input.insert("\n")
         self.resize_composer()
+        self._sync_composer_scroll()
 
     def submit_composer(self) -> None:
         command_input = self.query_one("#command", ComposerInput)
@@ -1414,6 +1416,18 @@ class BrowserUseTerminalApp(App[None]):
         visible_lines = _composer_visible_line_count(command_input.text, command_input.size.width)
         command_input.styles.height = visible_lines
         self.query_one("#composer").styles.height = visible_lines + 2
+        self._sync_composer_scroll()
+        self.call_after_refresh(self._sync_composer_scroll)
+
+    def _sync_composer_scroll(self) -> None:
+        try:
+            command_input = self.query_one("#command", ComposerInput)
+        except Exception:
+            return
+        total_lines = _composer_visible_line_count(command_input.text, command_input.size.width, max_lines=10_000)
+        visible_lines = _composer_visible_line_count(command_input.text, command_input.size.width)
+        if total_lines <= visible_lines:
+            command_input.scroll_to(x=0, y=0, animate=False, force=True, immediate=True)
 
     def _set_composer_text(self, text: str) -> None:
         command_input = self.query_one("#command", ComposerInput)
@@ -1566,6 +1580,19 @@ class BrowserUseTerminalApp(App[None]):
                 log.write("[#e4e4e7]no selected session to resume[/]")
                 return
             self._resume_session(session_id, instruction)
+        elif command == "compact":
+            session_id = args[1] if len(args) > 1 else self.selected_session_id
+            if not session_id:
+                log.write("[#e4e4e7]no selected session to compact[/]")
+                return
+            try:
+                compacting = self.manager.compact(session_id)
+            except Exception as exc:
+                log.write(f"[#e4e4e7]compact failed: {escape(str(exc))}[/]")
+                return
+            self.selected_session_id = compacting.id
+            self._load_session_log(compacting.id, follow=False)
+            log.write(f"[#9b9ca5]compaction started for {escape(compacting.id)}[/]")
         elif command == "cancel":
             session_id = args[1] if len(args) > 1 else self.selected_session_id
             if not session_id:
@@ -2689,8 +2716,12 @@ def _format_event_for_transcript(event: Event) -> str:
         return ""
     if event.type == "session.cancel_requested":
         return f"cancel requested: {payload.get('reason', '')}"
+    if event.type == "session.compaction_started":
+        return f"compacting: {payload.get('reason', '')} {payload.get('phase', '')}".strip()
     if event.type == "session.compacted":
         return f"compacted: before={payload.get('before_messages')} after={payload.get('after_messages')}"
+    if event.type == "session.compaction_failed":
+        return f"compact failed: {_compact_error_text(payload.get('error') or '')}"
     if event.type == "session.deadline_warning":
         return f"deadline warning: {payload.get('remaining_s')}s remaining"
     if event.type == "model.usage":
@@ -3517,7 +3548,7 @@ def _compact_inline(value: object, limit: int = 160) -> str:
 def _composer_visible_line_count(text: str, width: int, *, max_lines: int = 5) -> int:
     available = max(20, int(width or 80) - 2)
     total = 0
-    for line in str(text or "").splitlines() or [""]:
+    for line in str(text or "").split("\n"):
         total += max(1, (len(line) + available - 1) // available)
     return max(1, min(max_lines, total))
 
@@ -3829,4 +3860,4 @@ def _textual_mouse_enabled() -> bool:
     configured = os.environ.get("LLM_BROWSER_TUI_MOUSE")
     if configured is not None:
         return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(os.environ.get("TMUX"))
+    return True

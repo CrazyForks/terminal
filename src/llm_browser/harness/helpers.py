@@ -17,6 +17,8 @@ PRIMARY_CORE_HELPERS = [
     "new_tab",
     "goto_url",
     "page_info",
+    "pending_dialog",
+    "handle_dialog",
     "capture_screenshot",
     "click_at_xy",
     "type_text",
@@ -30,6 +32,8 @@ PRIMARY_CORE_HELPERS = [
     "list_tabs",
     "current_tab",
     "switch_tab",
+    "current_cdp_session",
+    "set_cdp_session",
     "ensure_real_tab",
     "output_path",
     "agent_helpers_path",
@@ -42,6 +46,7 @@ COMPAT_CORE_HELPERS = [
     "attach_tab",
     "screenshot",
     "click_at",
+    "coordinate_click",
     "press",
     "wait_for_selector",
     "wait_for_text",
@@ -70,7 +75,7 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = True,
+        retry: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         if timeout is not None:
@@ -219,6 +224,9 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
     def click_at(x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         return click_at_xy(x, y, button=button, clicks=clicks)
 
+    def coordinate_click(x: float, y: float, button: str = "left", clicks: int = 1) -> None:
+        return click_at_xy(x, y, button=button, clicks=clicks)
+
     def type_text(text: str) -> None:
         api.check_cancel()
         return runtime.type_text(text)
@@ -249,6 +257,34 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
     def scroll(dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
         api.check_cancel()
         return runtime.scroll(dx=dx, dy=dy, x=x, y=y)
+
+    def pending_dialog() -> Optional[Dict[str, Any]]:
+        handler = getattr(runtime, "pending_dialog_info", None)
+        if handler is None:
+            return None
+        return handler()
+
+    def current_cdp_session() -> Dict[str, Any]:
+        handler = getattr(runtime, "current_cdp_session", None)
+        if handler is None:
+            return {"session_id": None, "target_id": None, "target": {}, "browser_level_ws": False}
+        return handler()
+
+    def set_cdp_session(session_id: Optional[str], target_id: Optional[str] = None) -> Dict[str, Any]:
+        handler = getattr(runtime, "set_cdp_session", None)
+        if handler is None:
+            raise RuntimeError("set_cdp_session is unavailable on this runtime")
+        return handler(session_id, target_id=target_id)
+
+    def handle_dialog(accept: bool = True, prompt_text: Optional[str] = None) -> Dict[str, Any]:
+        handler = getattr(runtime, "handle_dialog", None)
+        if handler is None:
+            params: Dict[str, Any] = {"accept": bool(accept)}
+            if prompt_text is not None:
+                params["promptText"] = str(prompt_text)
+            cdp("Page.handleJavaScriptDialog", **params)
+            return {"handled": True, "accepted": bool(accept), "dialog": None}
+        return handler(accept=accept, prompt_text=prompt_text)
 
     def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 20.0) -> str:
         try:
@@ -321,8 +357,11 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         "screenshot": screenshot,
         "capture_screenshot": capture_screenshot,
         "page_info": getattr(runtime, "page_info", lambda: {}),
+        "pending_dialog": pending_dialog,
+        "handle_dialog": handle_dialog,
         "click_at": click_at,
         "click_at_xy": click_at_xy,
+        "coordinate_click": coordinate_click,
         "fill_input": fill_input,
         "type_text": type_text,
         "press": press,
@@ -332,6 +371,8 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         "list_tabs": getattr(runtime, "list_tabs", getattr(runtime, "tabs", lambda: [])),
         "current_tab": getattr(runtime, "current_tab", lambda: {}),
         "switch_tab": getattr(runtime, "switch_tab", getattr(runtime, "attach_tab", lambda *args, **kwargs: None)),
+        "current_cdp_session": current_cdp_session,
+        "set_cdp_session": set_cdp_session,
         "ensure_real_tab": getattr(runtime, "ensure_real_tab", lambda: None),
         "iframe_target": getattr(runtime, "iframe_target", lambda url_substr=None: None),
         "agent_helpers_path": agent_helpers_path,

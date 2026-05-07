@@ -8,10 +8,8 @@ from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 
 
 BROWSER_TOOL_DESCRIPTION = (
-    "Run persistent Python for direct browser control. Default surface is intentionally small: "
-    "raw cdp('Domain.method', key=value), js(expr), new_tab/goto_url, capture_screenshot, coordinate clicks, "
-    "keyboard/text input, waits, tabs, simple http_get, output_path, agent_helpers_path/reload_agent_helpers, and "
-    "load_skill/list_skills/read_skill/help_browser. Specialized helpers are opt-in with load_skill(name). "
+    "Run Python in a browser-connected environment. "
+    "Use any appropriate approach: raw CDP, JavaScript, browser input events, HTTP, files, or helper code. "
     "Set result or _result for structured output."
 )
 
@@ -22,15 +20,16 @@ BROWSER_HELP_TEXT = (
     + """
 
 Core browser:
-  cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...", timeout=30)
+  cdp(method, params=None, timeout_s=None, retry=False) or cdp("Page.navigate", url="...", timeout=30)
   js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
   new_tab(url), goto_url(url), list_tabs(include_internal=True)
-  switch_tab(target), current_tab(), ensure_real_tab()
+  switch_tab(target), current_tab(), current_cdp_session(), set_cdp_session(session_id, target_id=None)
+  ensure_real_tab()
 
 Waiting and observation:
   wait_for_load(), wait_for_element(selector)
   wait_for_network_idle(timeout_s=10, idle_ms=500)
-  page_info()
+  page_info(), pending_dialog(), handle_dialog(accept=True, prompt_text=None)
   http_get(url)
 
 Input:
@@ -49,13 +48,10 @@ Skills:
 Editable helpers:
   Path(agent_helpers_path()).write_text(...)
   reload_agent_helpers()
-  from browser_helpers import *
+  from browser import *  # browser_helpers/browser_use/browser_tools are aliases
 
 Example:
-  new_tab("https://example.com")
-  wait_for_load()
-  capture_screenshot()
-  result = {"title": js("document.title"), "page": page_info()}
+  result = cdp("Browser.getVersion")
 """
 )
 
@@ -76,6 +72,8 @@ PRIMARY_CORE_EXPORT_NAMES = [
     "http_get",
     "capture_screenshot",
     "page_info",
+    "pending_dialog",
+    "handle_dialog",
     "click_at_xy",
     "fill_input",
     "type_text",
@@ -84,6 +82,8 @@ PRIMARY_CORE_EXPORT_NAMES = [
     "list_tabs",
     "current_tab",
     "switch_tab",
+    "current_cdp_session",
+    "set_cdp_session",
     "ensure_real_tab",
     "output_path",
     "agent_helpers_path",
@@ -105,6 +105,7 @@ COMPAT_CORE_EXPORT_NAMES = [
     "attach_tab",
     "screenshot",
     "click_at",
+    "coordinate_click",
     "press",
     "wait_for_selector",
     "wait_for_text",
@@ -190,8 +191,10 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
     module.help_browser = namespace.get("help_browser", help_browser)
     module.__all__ = _unique_names([name for name in star_names if hasattr(module, name)])
     sys.modules["browser_helpers"] = module
+    sys.modules["browser"] = module
     sys.modules["browser_use"] = module
     sys.modules["browser_tools"] = module
+    sys.modules["agent_browser"] = module
 
 
 def _browser_helper_export_names(namespace: Dict[str, Any], include_compat: bool) -> list[str]:

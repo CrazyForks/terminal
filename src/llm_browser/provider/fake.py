@@ -9,6 +9,12 @@ from llm_browser.provider.types import ModelEvent, ToolCall
 class FakeProvider:
     """Deterministic provider used for local spine tests."""
 
+    def reset_session(self) -> None:
+        return None
+
+    def supports_remote_compaction(self) -> bool:
+        return False
+
     def start_turn(
         self,
         messages: List[Dict[str, Any]],

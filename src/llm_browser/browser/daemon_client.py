@@ -41,7 +41,7 @@ class DaemonBrowserRuntime:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = True,
+        retry: bool = False,
     ) -> Dict[str, Any]:
         if timeout is not None:
             timeout_s = timeout
@@ -54,11 +54,7 @@ class DaemonBrowserRuntime:
             "retry": retry,
         }
         request_timeout_s = max(float(timeout_s or 30), 30)
-        try:
-            response = request(self.name, payload, timeout_s=request_timeout_s)
-        except Exception:
-            ensure_daemon(name=self.name, root_dir=self.root_dir, headless=self.headless, backend=self.backend)
-            response = request(self.name, payload, timeout_s=request_timeout_s)
+        response = request(self.name, payload, timeout_s=request_timeout_s)
         return response.get("result") or {}
 
     def connection_info(self) -> Dict[str, Any]:
@@ -84,6 +80,12 @@ class DaemonBrowserRuntime:
 
     def current_tab(self) -> Dict[str, Any]:
         return self._call("current_tab")
+
+    def current_cdp_session(self) -> Dict[str, Any]:
+        return self._call("current_cdp_session")
+
+    def set_cdp_session(self, session_id: Optional[str], target_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._call("set_cdp_session", session_id, target_id=target_id)
 
     def ensure_real_tab(self) -> Optional[Dict[str, Any]]:
         return self._call("ensure_real_tab")
@@ -222,11 +224,7 @@ class DaemonBrowserRuntime:
     def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         payload = {"op": "call", "name": name, "args": list(args), "kwargs": kwargs}
         timeout_s = max(float(kwargs.get("timeout_s", 30) or 30), 30)
-        try:
-            response = request(self.name, payload, timeout_s=timeout_s)
-        except Exception:
-            ensure_daemon(name=self.name, root_dir=self.root_dir, headless=self.headless, backend=self.backend)
-            response = request(self.name, payload, timeout_s=timeout_s)
+        response = request(self.name, payload, timeout_s=timeout_s)
         return response.get("result")
 
 

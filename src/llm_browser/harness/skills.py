@@ -65,12 +65,6 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
         interaction = ", ".join(sorted(_interaction_skill_paths()))
         return (
             "Browser Python harness\n\n"
-            "Default workflow:\n"
-            "  new_tab('https://example.com')\n"
-            "  capture_screenshot()\n"
-            "  click_at_xy(410, 520)\n"
-            "  wait_for_network_idle()\n"
-            "  capture_screenshot()\n\n"
             + BROWSER_HELP_PLAYBOOK.rstrip()
             + "\n\nCore helpers:\n  "
             + ", ".join(PRIMARY_CORE_HELPERS + ["load_skill", "list_skills", "read_skill", "loaded_skills", "help_browser"])
@@ -78,7 +72,7 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
             + (python_skills or "(none)")
             + "\n\nInteraction skills are readable playbooks, not default behavior. Use read_skill(name).\n  "
             + (interaction or "(none)")
-            + "\n\nKeep task-specific routines in agent_helpers.py. Use raw cdp(...) when a helper is too narrow."
+            + "\n\nUse any approach that fits. Keep task-specific routines in agent_helpers.py."
         )
 
     exports = {

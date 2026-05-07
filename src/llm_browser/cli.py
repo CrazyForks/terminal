@@ -215,6 +215,13 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     sessions_resume.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
     sessions_resume.set_defaults(func=cmd_sessions_resume)
 
+    sessions_compact = sessions_sub.add_parser("compact", help="Compact a session history checkpoint.")
+    sessions_compact.add_argument("session_id")
+    sessions_compact.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
+    sessions_compact.add_argument("--model", default=_model_default(config, "gpt-5.5"))
+    sessions_compact.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
+    sessions_compact.set_defaults(func=cmd_sessions_compact)
+
     sessions_trace = sessions_sub.add_parser("trace", help="Write a JSON trace bundle for a session.")
     sessions_trace.add_argument("session_id")
     sessions_trace.set_defaults(func=cmd_sessions_trace)
@@ -452,6 +459,18 @@ def cmd_sessions_resume(args: argparse.Namespace) -> int:
         mode=args.agent_mode,
     )
     session = agent.resume_session(args.session_id, args.instruction)
+    print(json.dumps(session.to_dict(), indent=2))
+    return 0
+
+
+def cmd_sessions_compact(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    agent = Agent(
+        store,
+        provider_factory=lambda: make_provider(args.provider, args.model, getattr(args, "loaded_config", {})),
+        mode=args.agent_mode,
+    )
+    session = agent.compact_session(args.session_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
 

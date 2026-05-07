@@ -2,13 +2,26 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
-import json
 import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from llm_browser.agent.compaction import compact_messages, message_chars, message_context_units
+from llm_browser.agent.compaction import (
+    COMPACTION_PROMPT,
+    COMPACTION_SUMMARY_PREFIX,
+    build_compacted_history,
+    collect_user_messages,
+    compaction_checkpoint_payload,
+    heuristic_summary,
+    message_context_units,
+    message_image_count,
+    new_compaction_id,
+    prune_old_tool_outputs,
+    replay_messages_from_compaction_payload,
+    trim_message_images,
+    write_compaction_artifact,
+)
 from llm_browser.provider.base import Provider
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.browser.instructions import select_agent_instructions
@@ -136,12 +149,34 @@ class Agent:
             raise KeyError(f"session not found: {session_id}")
 
         self.store.clear_cancel(session.id)
-        messages = self._messages_from_events(session.id)
+        try:
+            messages = self._messages_from_events(session.id)
+        except ValueError:
+            messages = []
         messages.append({"role": "user", "content": instruction})
         self.store.emit(session.id, "session.input", {"text": instruction, "resumed": True})
         self.store.update_status(session.id, "running")
         self._set_provider_instructions(select_agent_instructions(instruction, self.mode))
         return self._run_with_messages(session, messages)
+
+    def compact_session(self, session_id: str, reason: str = "user_requested") -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+
+        try:
+            messages = self._messages_from_events(session.id)
+        except ValueError:
+            messages = []
+        self._set_provider_instructions(select_agent_instructions("compact session history", self.mode))
+        self._run_compaction(
+            session,
+            messages,
+            phase="standalone_turn",
+            reason=reason,
+            force_local=False,
+        )
+        return self.store.load(session.id) or session
 
     def _run_with_messages(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> SessionMetadata:
         final_result: Optional[str] = None
@@ -153,35 +188,34 @@ class Agent:
                 self._check_cancel(session.id)
                 messages = self._maybe_add_deadline_warning(session, messages)
                 messages = self._maybe_compact(session, messages)
-                tool_calls: List[ToolCall] = []
-                text_parts: List[str] = []
-                for event in self.provider.start_turn(messages, self.tools.specs()):
-                    self._check_cancel(session.id)
-                    if event.type == "text_delta":
-                        text_parts.append(event.text)
-                        self.store.emit(session.id, "model.delta", {"text": event.text})
-                    elif event.type == "tool_call":
-                        if event.tool_call is None:
-                            raise RuntimeError("provider emitted tool_call without a call")
-                        tool_calls.append(event.tool_call)
-                    elif event.type == "usage":
-                        if event.token_usage is None:
-                            continue
-                        model = event.model or str(getattr(self.provider, "model", "") or "")
-                        cost = calculate_usage_cost(model, event.token_usage)
-                        payload: Dict[str, Any] = {
-                            "provider": event.provider or self.provider.__class__.__name__,
-                            "model": model,
-                            "usage": event.token_usage.to_dict(),
-                        }
-                        if cost is not None:
-                            payload["cost_usd"] = cost.total_cost_usd
-                            payload["cost"] = cost.to_dict()
-                        self.store.emit(session.id, "model.usage", payload)
-                    elif event.type == "done":
-                        pass
-                    else:
-                        raise RuntimeError(f"unknown provider event type: {event.type}")
+                overflow_retried = False
+                while True:
+                    tool_calls: List[ToolCall] = []
+                    text_parts: List[str] = []
+                    try:
+                        for event in self.provider.start_turn(messages, self.tools.specs()):
+                            self._check_cancel(session.id)
+                            if event.type == "text_delta":
+                                text_parts.append(event.text)
+                                self.store.emit(session.id, "model.delta", {"text": event.text})
+                            elif event.type == "tool_call":
+                                if event.tool_call is None:
+                                    raise RuntimeError("provider emitted tool_call without a call")
+                                tool_calls.append(event.tool_call)
+                            elif event.type == "usage":
+                                if event.token_usage is None:
+                                    continue
+                                self._emit_usage_event(session.id, event)
+                            elif event.type == "done":
+                                pass
+                            else:
+                                raise RuntimeError(f"unknown provider event type: {event.type}")
+                        break
+                    except Exception as exc:
+                        if overflow_retried or not _is_provider_request_too_large(exc):
+                            raise
+                        overflow_retried = True
+                        messages = self._compact_after_provider_overflow(session, messages, exc)
 
                 if not tool_calls:
                     if text_parts:
@@ -324,17 +358,10 @@ class Agent:
             if getattr(event, "type", "") != "session.compacted":
                 continue
             payload = getattr(event, "payload", {}) if isinstance(getattr(event, "payload", {}), dict) else {}
-            path = payload.get("path")
-            if not path:
+            replay = replay_messages_from_compaction_payload(payload)
+            if replay is None:
                 continue
-            try:
-                data = json.loads(Path(str(path)).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            replay = data.get("replay_messages")
-            if not isinstance(replay, list) or not all(isinstance(message, dict) for message in replay):
-                continue
-            return copy.deepcopy(replay), index + 1
+            return replay, index + 1
         return None, 0
 
     def _tool_event_provider_content(self, output: Any) -> Any:
@@ -354,33 +381,191 @@ class Agent:
             return ToolResult(text=text, data=data, images=images).to_provider_content()
         return text
 
+    def _compact_after_provider_overflow(
+        self,
+        session: SessionMetadata,
+        messages: List[Dict[str, Any]],
+        exc: BaseException,
+    ) -> List[Dict[str, Any]]:
+        try:
+            return self._run_compaction(
+                session,
+                messages,
+                phase="mid_turn",
+                reason="provider_request_too_large",
+                force_local=True,
+                max_compaction_images=0,
+                error=str(exc),
+            )
+        except Exception:
+            raise exc
+
     def _maybe_compact(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        before_chars = message_chars(messages)
         before_context_units = message_context_units(messages)
         if self.compact_after_chars <= 0 or before_context_units <= self.compact_after_chars:
             return messages
-        compacted, path = compact_messages(
+        return self._run_compaction(
+            session,
             messages,
-            session.artifact_dir,
-            session_events=[event.to_dict() for event in self.store.events.read(session.id)],
+            phase="pre_turn",
+            reason="context_limit",
         )
-        if compacted is not messages:
-            after_chars = message_chars(compacted)
-            after_context_units = message_context_units(compacted)
+
+    def _run_compaction(
+        self,
+        session: SessionMetadata,
+        messages: List[Dict[str, Any]],
+        *,
+        phase: str,
+        reason: str,
+        force_local: bool = False,
+        max_compaction_images: int = 2,
+        error: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        compaction_id = new_compaction_id()
+        before_context_units = message_context_units(messages)
+        before_images = message_image_count(messages)
+        self.store.emit(
+            session.id,
+            "session.compaction_started",
+            {
+                "compaction_id": compaction_id,
+                "phase": phase,
+                "reason": reason,
+                "before_messages": len(messages),
+                "before_context_units": before_context_units,
+                "before_images": before_images,
+                **({"error": error} if error else {}),
+            },
+        )
+
+        try:
+            if not force_local:
+                remote = self._try_remote_compaction(messages)
+                if remote is not None and remote.messages:
+                    replacement = remote.messages
+                    message = remote.message
+                else:
+                    self._reset_provider_session()
+                    replacement, message = self._run_local_compaction(
+                        session,
+                        messages,
+                        max_compaction_images=max_compaction_images,
+                    )
+            else:
+                self._reset_provider_session()
+                replacement, message = self._run_local_compaction(
+                    session,
+                    messages,
+                    max_compaction_images=max_compaction_images,
+                )
+        except Exception as exc:
             self.store.emit(
                 session.id,
-                "session.compacted",
+                "session.compaction_failed",
                 {
-                    "path": str(path),
-                    "before_messages": len(messages),
-                    "after_messages": len(compacted),
-                    "before_chars": before_chars,
-                    "after_chars": after_chars,
-                    "before_context_units": before_context_units,
-                    "after_context_units": after_context_units,
+                    "compaction_id": compaction_id,
+                    "phase": phase,
+                    "reason": reason,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
                 },
             )
-        return compacted
+            raise
+
+        payload = compaction_checkpoint_payload(
+            compaction_id=compaction_id,
+            phase=phase,
+            reason=reason,
+            message=message,
+            replacement_history=replacement,
+            before_messages=len(messages),
+            extra={
+                "before_context_units": before_context_units,
+                "after_context_units": message_context_units(replacement),
+                "before_images": before_images,
+                "after_images": message_image_count(replacement),
+                **({"error": error} if error else {}),
+            },
+        )
+        path = write_compaction_artifact(session.artifact_dir, payload)
+        payload["path"] = str(path)
+        self.store.emit(session.id, "session.compacted", payload)
+        self._reset_provider_session()
+        return copy.deepcopy(payload["replacement_history"])
+
+    def _try_remote_compaction(self, messages: List[Dict[str, Any]]):
+        if not messages:
+            return None
+        supports = getattr(self.provider, "supports_remote_compaction", None)
+        compact = getattr(self.provider, "compact_conversation_history", None)
+        if not callable(supports) or not callable(compact):
+            return None
+        if not supports():
+            return None
+        return compact(messages, self.tools.specs())
+
+    def _run_local_compaction(
+        self,
+        session: SessionMetadata,
+        messages: List[Dict[str, Any]],
+        *,
+        max_compaction_images: int,
+    ) -> tuple[List[Dict[str, Any]], str]:
+        history = trim_message_images(messages, max_images=max_compaction_images)
+        if max_compaction_images <= 0:
+            history = prune_old_tool_outputs(history, protect_context_units=0, minimum_pruned_units=0)
+
+        while True:
+            try:
+                summary_suffix = self._run_compaction_model_turn(session, [*history, {"role": "user", "content": COMPACTION_PROMPT}])
+                break
+            except Exception as exc:
+                if not _is_provider_request_too_large(exc) or len(history) <= 1:
+                    raise
+                history = history[1:]
+
+        if not summary_suffix:
+            events = [event.to_dict() for event in self.store.events.read(session.id)]
+            summary_suffix = heuristic_summary(messages, session_events=events)
+        message = f"{COMPACTION_SUMMARY_PREFIX}\n{summary_suffix.strip()}"
+        return build_compacted_history(collect_user_messages(messages), message), message
+
+    def _run_compaction_model_turn(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> str:
+        text_parts: List[str] = []
+        for event in self.provider.start_turn(messages, []):
+            self._check_cancel(session.id)
+            if event.type == "text_delta":
+                text_parts.append(event.text)
+            elif event.type == "usage" and event.token_usage is not None:
+                self._emit_usage_event(session.id, event, purpose="compaction")
+            elif event.type in {"tool_call", "done"}:
+                continue
+            else:
+                raise RuntimeError(f"unknown provider event type during compaction: {event.type}")
+        return "".join(text_parts).strip()
+
+    def _emit_usage_event(self, session_id: str, event: ModelEvent, purpose: Optional[str] = None) -> None:
+        if event.token_usage is None:
+            return
+        model = event.model or str(getattr(self.provider, "model", "") or "")
+        cost = calculate_usage_cost(model, event.token_usage)
+        payload: Dict[str, Any] = {
+            "provider": event.provider or self.provider.__class__.__name__,
+            "model": model,
+            "usage": event.token_usage.to_dict(),
+        }
+        if purpose:
+            payload["purpose"] = purpose
+        if cost is not None:
+            payload["cost_usd"] = cost.total_cost_usd
+            payload["cost"] = cost.to_dict()
+        self.store.emit(session_id, "model.usage", payload)
+
+    def _reset_provider_session(self) -> None:
+        reset = getattr(self.provider, "reset_session", None)
+        if callable(reset):
+            reset()
 
     def _maybe_add_deadline_warning(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.deadline_at is None or self._deadline_warning_sent:
@@ -596,3 +781,23 @@ def _is_parallel_safe_command_segment(segment: str) -> bool:
 
 def _is_parallel_safe_find_parts(parts: List[str]) -> bool:
     return not any(part in UNSAFE_FIND_FLAGS for part in parts[1:])
+
+
+def _is_provider_request_too_large(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "http 413",
+            "http 507",
+            "request buffer",
+            "request too large",
+            "payload too large",
+            "context length",
+            "context_length_exceeded",
+            "maximum context",
+            "input is too long",
+            "exceeds model context",
+            "exceeded provider",
+        )
+    )

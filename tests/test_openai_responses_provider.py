@@ -61,8 +61,9 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][0]["role"], "user")
         self.assertEqual(payload["tools"][0]["name"], "echo")
         self.assertTrue(payload["store"])
-        self.assertIn("screenshot", payload["instructions"])
-        self.assertIn("raw CDP", payload["instructions"])
+        self.assertIn('cdp("Domain.method"', payload["instructions"])
+        self.assertIn("set_cdp_session", payload["instructions"])
+        self.assertIn("CDP is the source of truth", payload["instructions"])
 
     def test_emits_normalized_usage_event(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="gpt-5.5")
@@ -213,6 +214,16 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][1]["role"], "user")
         self.assertIn("Recovered tool output", payload["input"][1]["content"][0]["text"])
         self.assertNotIn("function_call_output", [item.get("type") for item in payload["input"]])
+
+    def test_reset_session_clears_response_chain(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
+        provider.previous_response_id = "resp_1"
+        provider._sent_tool_call_ids.add("call_1")
+
+        provider.reset_session()
+
+        self.assertIsNone(provider.previous_response_id)
+        self.assertEqual(provider._sent_tool_call_ids, set())
 
     def test_retries_transient_response_errors(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")

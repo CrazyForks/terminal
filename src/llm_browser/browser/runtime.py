@@ -530,6 +530,23 @@ class BrowserRuntime:
                 return found
         return dict(self.target or {"id": "external", "type": "page", "url": ""})
 
+    def current_cdp_session(self) -> Dict[str, Any]:
+        target_id = self.target_id_from_session()
+        return {
+            "session_id": self.default_session_id,
+            "target_id": target_id,
+            "target": dict(self.target or {}),
+            "browser_level_ws": self.browser_level_ws,
+        }
+
+    def set_cdp_session(self, session_id: Optional[str], target_id: Optional[str] = None) -> Dict[str, Any]:
+        self.default_session_id = str(session_id) if session_id else None
+        if target_id:
+            self.browser_level_ws = True
+            self.target = self._target_info_by_id(str(target_id)) or {"id": str(target_id), "type": "page", "url": ""}
+        self._enable_page_domains()
+        return self.current_cdp_session()
+
     def target_id_from_session(self) -> Optional[str]:
         return str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "") or None
 
@@ -581,7 +598,8 @@ class BrowserRuntime:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = True,
+        retry: bool = False,
+        return_on_event: Optional[str] = None,
     ) -> Dict[str, Any]:
         if timeout is not None:
             timeout_s = timeout
@@ -592,7 +610,10 @@ class BrowserRuntime:
                 self.attach_first_page()
             assert self.client is not None
             effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-            result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            call_kwargs: Dict[str, Any] = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
+            if return_on_event is not None:
+                call_kwargs["return_on_event"] = return_on_event
+            result = self.client.call(method, **call_kwargs)
             self._check_cancel()
             return result
         except (CdpConnectionError, requests.RequestException, OSError) as exc:
@@ -601,7 +622,10 @@ class BrowserRuntime:
             self._self_heal_after_disconnect(exc)
             assert self.client is not None
             effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-            result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            call_kwargs = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
+            if return_on_event is not None:
+                call_kwargs["return_on_event"] = return_on_event
+            result = self.client.call(method, **call_kwargs)
             self._check_cancel()
             return result
         except CdpError as exc:
@@ -615,7 +639,10 @@ class BrowserRuntime:
                 if target_id:
                     self._attach_browser_target(target_id)
                     effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-                    result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+                    call_kwargs = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
+                    if return_on_event is not None:
+                        call_kwargs["return_on_event"] = return_on_event
+                    result = self.client.call(method, **call_kwargs)
                     self._check_cancel()
                     return result
             raise
@@ -1068,9 +1095,42 @@ class BrowserRuntime:
         if _env_bool("LLM_BROWSER_DEBUG_CLICKS", False):
             self._save_debug_click(x, y)
         base = {"x": x, "y": y, "button": button, "clickCount": clicks}
-        self.cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
-        self.cdp("Input.dispatchMouseEvent", {"type": "mousePressed", **base})
-        self.cdp("Input.dispatchMouseEvent", {"type": "mouseReleased", **base})
+        self._dispatch_mouse_event({"type": "mouseMoved", "x": x, "y": y})
+        self._dispatch_mouse_event({"type": "mousePressed", **base})
+        self._dispatch_mouse_event({"type": "mouseReleased", **base})
+
+    def _dispatch_mouse_event(self, params: Dict[str, Any]) -> None:
+        try:
+            self.cdp(
+                "Input.dispatchMouseEvent",
+                params,
+                timeout_s=5,
+                retry=False,
+                return_on_event="Page.javascriptDialogOpening",
+            )
+            self.drain_events(timeout_s=0.02)
+        except CdpConnectionError:
+            self.drain_events(timeout_s=0.05)
+            if self.pending_dialog:
+                return
+            raise
+
+    def handle_dialog(self, accept: bool = True, prompt_text: Optional[str] = None) -> Dict[str, Any]:
+        dialog = self.pending_dialog_info()
+        params: Dict[str, Any] = {"accept": bool(accept)}
+        if prompt_text is not None:
+            params["promptText"] = str(prompt_text)
+        try:
+            self.cdp("Page.handleJavaScriptDialog", params, timeout_s=5)
+        except CdpError as exc:
+            if "No dialog is showing" not in str(exc):
+                raise
+            handled = dialog or {}
+            self.pending_dialog = None
+            return {"handled": False, "already_closed": True, "accepted": bool(accept), "dialog": handled}
+        handled = dialog or {}
+        self.pending_dialog = None
+        return {"handled": True, "accepted": bool(accept), "dialog": handled}
 
     def type_text(self, text: str) -> None:
         self.cdp("Input.insertText", {"text": text})

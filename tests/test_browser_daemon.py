@@ -51,17 +51,17 @@ class BrowserDaemonTest(unittest.TestCase):
         request.assert_called_once()
         self.assertEqual(request.call_args.args[1]["name"], "screenshot")
 
-    def test_daemon_runtime_restarts_and_retries_failed_call(self) -> None:
+    def test_daemon_runtime_surfaces_failed_call_without_hidden_restart(self) -> None:
         runtime = DaemonBrowserRuntime("demo", Path("/tmp/demo"), headless=True, backend="chromium")
 
-        with patch("llm_browser.browser.daemon_client.request", side_effect=[RuntimeError("stale"), {"result": {"ok": True}}]) as request, patch(
+        with patch("llm_browser.browser.daemon_client.request", side_effect=RuntimeError("stale")) as request, patch(
             "llm_browser.browser.daemon_client.ensure_daemon"
         ) as ensure:
-            result = runtime.page_info()
+            with self.assertRaises(RuntimeError):
+                runtime.page_info()
 
-        self.assertEqual(result, {"ok": True})
-        ensure.assert_called_once_with(name="demo", root_dir=Path("/tmp/demo"), headless=True, backend="chromium")
-        self.assertEqual(request.call_count, 2)
+        ensure.assert_not_called()
+        self.assertEqual(request.call_count, 1)
 
     def test_daemon_identity_match_includes_root_backend_and_headless(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

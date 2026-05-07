@@ -108,6 +108,37 @@ class RecordingRuntime(BrowserRuntime):
         return {}
 
 
+class DialogClickRuntime(BrowserRuntime):
+    def __init__(self, root_dir: Path) -> None:
+        super().__init__(root_dir=root_dir)
+        self.calls: list[tuple[str, Dict[str, Any], Optional[float], bool]] = []
+        self.dialog_already_closed = False
+        self.client = DrainClient(
+            [
+                {
+                    "method": "Page.javascriptDialogOpening",
+                    "params": {"type": "alert", "message": "Alert Token 123"},
+                }
+            ]
+        )  # type: ignore[assignment]
+
+    def cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        retry: bool = True,
+        return_on_event: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.calls.append((method, params or {}, timeout_s, retry))
+        if method == "Input.dispatchMouseEvent" and (params or {}).get("type") == "mouseReleased":
+            raise CdpConnectionError("dialog blocked mouse release")
+        if method == "Page.handleJavaScriptDialog" and self.dialog_already_closed:
+            raise CdpError("Page.handleJavaScriptDialog failed: {'code': -32602, 'message': 'No dialog is showing'}")
+        return {}
+
+
 class DrainClient:
     def __init__(self, events: list[Dict[str, Any]]) -> None:
         self.events = list(events)
@@ -412,7 +443,7 @@ class BrowserRuntimeTest(unittest.TestCase):
             headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
         )
 
-    def test_cloud_runtime_self_heals_by_creating_new_browser_when_websocket_is_dead(self) -> None:
+    def test_cloud_runtime_retry_true_creates_new_browser_when_websocket_is_dead(self) -> None:
         broken = BrokenCdpClient()
         recovered = RecoveredBrowserClient()
 
@@ -446,7 +477,7 @@ class BrowserRuntimeTest(unittest.TestCase):
             with patch("llm_browser.browser.runtime.CdpClient", side_effect=[FailingConnectClient(), recovered]), patch(
                 "llm_browser.browser.runtime._browser_use_request", side_effect=cloud_request
             ) as request:
-                result = runtime.cdp("Browser.getVersion")
+                result = runtime.cdp("Browser.getVersion", retry=True)
 
         self.assertEqual(result, {"product": "Recovered Chrome"})
         self.assertTrue(broken.closed)
@@ -470,7 +501,7 @@ class BrowserRuntimeTest(unittest.TestCase):
             body={"timeout": 30},
         )
 
-    def test_cloud_runtime_retry_false_does_not_self_heal_dead_websocket(self) -> None:
+    def test_cloud_runtime_cdp_default_does_not_self_heal_dead_websocket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = BrowserRuntime(Path(tmp))
             runtime.mode = "cloud"
@@ -481,7 +512,7 @@ class BrowserRuntimeTest(unittest.TestCase):
 
             with patch("llm_browser.browser.runtime._browser_use_request") as request:
                 with self.assertRaises(CdpConnectionError):
-                    runtime.cdp("Browser.getVersion", retry=False)
+                    runtime.cdp("Browser.getVersion")
 
         request.assert_not_called()
 
@@ -550,6 +581,60 @@ class BrowserRuntimeTest(unittest.TestCase):
             info = runtime.page_info()
 
         self.assertEqual(info["dialog"]["message"], "Confirm")
+
+    def test_click_at_returns_when_mouse_release_opens_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = DialogClickRuntime(Path(tmp))
+
+            runtime.click_at(10, 20)
+
+        self.assertEqual(runtime.pending_dialog_info(drain=False)["message"], "Alert Token 123")
+        move_calls = [
+            call
+            for call in runtime.calls
+            if call[0] == "Input.dispatchMouseEvent" and call[1].get("type") == "mouseMoved"
+        ]
+        release_calls = [
+            call
+            for call in runtime.calls
+            if call[0] == "Input.dispatchMouseEvent" and call[1].get("type") == "mouseReleased"
+        ]
+        self.assertFalse(move_calls[0][3])
+        self.assertEqual(release_calls[0][2], 5)
+        self.assertFalse(release_calls[0][3])
+
+    def test_handle_dialog_accepts_and_clears_pending_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = DialogClickRuntime(Path(tmp))
+            runtime.pending_dialog_info()
+
+            result = runtime.handle_dialog(accept=True, prompt_text="ZEBRA")
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(result["dialog"]["message"], "Alert Token 123")
+        self.assertIsNone(runtime.pending_dialog)
+        self.assertIn(
+            (
+                "Page.handleJavaScriptDialog",
+                {"accept": True, "promptText": "ZEBRA"},
+                5,
+                True,
+            ),
+            runtime.calls,
+        )
+
+    def test_handle_dialog_tolerates_stale_dialog_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = DialogClickRuntime(Path(tmp))
+            runtime.dialog_already_closed = True
+            runtime.pending_dialog_info()
+
+            result = runtime.handle_dialog(accept=True)
+
+        self.assertFalse(result["handled"])
+        self.assertTrue(result["already_closed"])
+        self.assertEqual(result["dialog"]["message"], "Alert Token 123")
+        self.assertIsNone(runtime.pending_dialog)
 
     def test_wait_for_network_idle_filters_other_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

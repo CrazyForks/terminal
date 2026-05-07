@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import time
+from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
 from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
-from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
+from llm_browser.provider.tool_content import tool_output_text, trim_visual_context_images, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.usage import ModelTokenUsage
 
@@ -42,6 +43,13 @@ class OpenAIResponsesProvider:
 
     def set_instructions(self, instructions: str) -> None:
         self.instructions = instructions
+
+    def reset_session(self) -> None:
+        self.previous_response_id = None
+        self._sent_tool_call_ids.clear()
+
+    def supports_remote_compaction(self) -> bool:
+        return False
 
     def start_turn(
         self,
@@ -138,6 +146,8 @@ class OpenAIResponsesProvider:
                 }
             )
 
+        input_items = trim_visual_context_images(input_items)
+
         payload: Dict[str, Any] = {
             "model": self.model,
             "input": input_items,
@@ -213,6 +223,22 @@ class OpenAIResponsesProvider:
                     }
                 )
                 input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
+            elif role == "provider_item":
+                item = message.get("item")
+                if isinstance(item, dict) and item.get("type") in {"compaction", "context_compaction"}:
+                    input_items.append(deepcopy(item))
+                else:
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "[provider-specific compacted context item retained from prior history]",
+                                }
+                            ],
+                        }
+                    )
         return input_items
 
     def _latest_user_text(self, messages: List[Dict[str, Any]]) -> str:

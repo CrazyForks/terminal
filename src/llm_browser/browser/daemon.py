@@ -24,6 +24,8 @@ CALLABLES = {
     "attach_tab",
     "switch_tab",
     "current_tab",
+    "current_cdp_session",
+    "set_cdp_session",
     "ensure_real_tab",
     "iframe_target",
     "new_tab",
@@ -107,7 +109,7 @@ class BrowserDaemon:
                     params=request.get("params"),
                     session_id=request.get("session_id"),
                     timeout_s=request.get("timeout_s"),
-                    retry=bool(request.get("retry", True)),
+                    retry=bool(request.get("retry", False)),
                 )
             return {"result": result}
 

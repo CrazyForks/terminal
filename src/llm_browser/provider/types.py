@@ -39,3 +39,9 @@ class ModelEvent:
     @classmethod
     def done(cls) -> "ModelEvent":
         return cls(type="done")
+
+
+@dataclass(frozen=True)
+class ProviderCompactionResult:
+    messages: List[Dict[str, Any]]
+    message: str = ""

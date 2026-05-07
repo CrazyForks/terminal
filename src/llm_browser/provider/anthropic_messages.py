@@ -62,6 +62,12 @@ class AnthropicMessagesProvider:
     def set_instructions(self, instructions: str) -> None:
         self.instructions = instructions
 
+    def reset_session(self) -> None:
+        return None
+
+    def supports_remote_compaction(self) -> bool:
+        return False
+
     @property
     def is_oauth(self) -> bool:
         return self.credential_type == "oauth" or bool(self.api_key and is_anthropic_oauth_token(self.api_key))
@@ -204,6 +210,18 @@ class AnthropicMessagesProvider:
                     i += 1
                 converted.append({"role": "user", "content": tool_results})
                 continue
+            elif role == "provider_item":
+                converted.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "[provider-specific compacted context item retained from prior history]",
+                            }
+                        ],
+                    }
+                )
             i += 1
         _cache_last_user_block(converted)
         return converted

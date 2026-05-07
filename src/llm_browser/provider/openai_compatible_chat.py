@@ -41,6 +41,12 @@ class OpenAICompatibleChatProvider:
     def set_instructions(self, instructions: str) -> None:
         self.instructions = instructions
 
+    def reset_session(self) -> None:
+        return None
+
+    def supports_remote_compaction(self) -> bool:
+        return False
+
     def start_turn(
         self,
         messages: List[Dict[str, Any]],
@@ -144,6 +150,13 @@ class OpenAICompatibleChatProvider:
                         "role": "tool",
                         "tool_call_id": str(message["tool_call_id"]),
                         "content": tool_output_text(message.get("content", "")),
+                    }
+                )
+            elif role == "provider_item":
+                converted.append(
+                    {
+                        "role": "user",
+                        "content": "[provider-specific compacted context item retained from prior history]",
                     }
                 )
         return converted

@@ -97,8 +97,12 @@ def format_event(event: Event) -> str:
         return f"[{event.session_id}] status: {payload.get('status', '')}"
     if event.type == "session.cancel_requested":
         return f"[{event.session_id}] cancel requested: {payload.get('reason', '')}"
+    if event.type == "session.compaction_started":
+        return f"[{event.session_id}] compacting: {payload.get('reason', '')} {payload.get('phase', '')}"
     if event.type == "session.compacted":
         return f"[{event.session_id}] compacted: {payload.get('before_messages')} -> {payload.get('after_messages')} messages"
+    if event.type == "session.compaction_failed":
+        return f"[{event.session_id}] compact failed: {payload.get('error', '')}"
     if event.type == "session.deadline_warning":
         return f"[{event.session_id}] deadline warning: {payload.get('remaining_s')}s remaining"
     if event.type == "model.delta":

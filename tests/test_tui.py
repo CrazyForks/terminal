@@ -653,6 +653,22 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(command.scroll_y, input_scroll)
                 self.assertIs(app.focused, command)
 
+    async def test_composer_newline_keeps_existing_text_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                command = app.query_one("#command", ComposerInput)
+                app._set_composer_text("almdlaslda")
+                await pilot.pause()
+
+                await pilot.press("ctrl+j")
+                await pilot.pause()
+
+                self.assertEqual(command.text, "almdlaslda\n")
+                self.assertEqual(command.styles.height.value, 2)
+                self.assertEqual(command.scroll_y, 0)
+
     async def test_transcript_follows_live_events_when_near_bottom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -728,14 +744,14 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(transcript.scroll_y, scrolled_y)
                 self.assertLess(transcript.scroll_y, transcript.max_scroll_y)
 
-    def test_textual_tui_disables_mouse_reporting_outside_tmux_for_terminal_selection(self) -> None:
+    def test_textual_tui_enables_mouse_reporting_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tui = TextualTui(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
 
             with patch.dict(os.environ, {}, clear=True), patch.object(tui.app, "run") as run_mock:
                 self.assertEqual(tui.run(), 0)
 
-            run_mock.assert_called_once_with(mouse=False)
+            run_mock.assert_called_once_with(mouse=True)
 
     def test_textual_tui_enables_mouse_reporting_inside_tmux_for_scroll_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -32,9 +32,11 @@ class FakeRuntime:
         self.last_screenshot_timeout = None
         self.last_network_idle_timeout = None
         self.last_network_idle_idle_ms = None
+        self.session_id = "session-1"
+        self.target_id = "target-1"
         self.cdp_calls = []
 
-    def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=True) -> Dict[str, Any]:
+    def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=False) -> Dict[str, Any]:
         self.last_cdp_timeout = timeout_s
         self.last_cdp_retry = retry
         self.cdp_calls.append({"method": method, "params": params or {}, "session_id": session_id})
@@ -52,6 +54,26 @@ class FakeRuntime:
 
     def tabs(self):
         return [{"url": url, "type": "page"} for url in self.tab_urls]
+
+    def current_tab(self) -> Dict[str, Any]:
+        return {"id": self.target_id, "url": self.tab_urls[-1] if self.tab_urls else "about:blank", "type": "page"}
+
+    def current_cdp_session(self) -> Dict[str, Any]:
+        return {"session_id": self.session_id, "target_id": self.target_id, "target": self.current_tab()}
+
+    def set_cdp_session(self, session_id: Optional[str], target_id: Optional[str] = None) -> Dict[str, Any]:
+        self.session_id = str(session_id) if session_id else None
+        if target_id is not None:
+            self.target_id = str(target_id)
+        return self.current_cdp_session()
+
+    def connection_info(self) -> Dict[str, Any]:
+        return {
+            "mode": "fake",
+            "target": self.current_tab(),
+            "reconnect_count": 0,
+            "last_reconnect_reason": None,
+        }
 
     def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
         self.tab_urls.append(url)
@@ -252,6 +274,60 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(live_events[0].payload["mode"], "cloud")
             self.assertEqual(live_events[0].payload["browser_id"], "browser-1")
             self.assertEqual(live_events[0].payload["live_url"], "https://live.example/session")
+
+    def test_browser_module_alias_exports_core_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: FakeRuntime(root, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "\n".join(
+                        [
+                            "from browser import goto_url, js, pending_dialog, handle_dialog, current_cdp_session, set_cdp_session",
+                            "from agent_browser import capture_screenshot",
+                            "goto_url('https://example.com')",
+                            "before = current_cdp_session()",
+                            "after = set_cdp_session('session-2', target_id='target-2')",
+                            "capture_screenshot('alias', attach=True)",
+                            "result = {'title': js('document.title'), 'dialog': pending_dialog is not None, 'handler': callable(handle_dialog), 'before': before['session_id'], 'after': after['session_id']}",
+                        ]
+                    ),
+                },
+            )
+
+        self.assertTrue(result.data["ok"])
+        self.assertEqual(
+            result.data["result"],
+            {"title": "Example Domain", "dialog": True, "handler": True, "before": "session-1", "after": "session-2"},
+        )
+        self.assertEqual(result.images[0].label, "alias")
+
+    def test_cdp_session_helpers_are_explicit_raw_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: FakeRuntime(root, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "before = current_cdp_session()\n"
+                        "after = set_cdp_session('attached-session', target_id='page-target')\n"
+                        "result = {'before': before['session_id'], 'after': after['session_id'], 'target': after['target_id']}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"], {"before": "session-1", "after": "attached-session", "target": "page-target"})
 
     def test_cloud_runtime_emits_new_live_preview_after_reconnect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -603,8 +679,8 @@ class PythonBrowserToolTest(unittest.TestCase):
                         "import browser_helpers\n"
                         "result = {"
                         "'star': browser_helpers.__all__, "
-                        "'module_has_compat': all(hasattr(browser_helpers, name) for name in ['navigate', 'screenshot', 'tabs']), "
-                        "'namespace_has_compat': all(name in globals() for name in ['navigate', 'screenshot', 'tabs'])"
+                        "'module_has_compat': all(hasattr(browser_helpers, name) for name in ['navigate', 'screenshot', 'tabs', 'coordinate_click']), "
+                        "'namespace_has_compat': all(name in globals() for name in ['navigate', 'screenshot', 'tabs', 'coordinate_click'])"
                         "}"
                     ),
                 },
@@ -615,9 +691,12 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertIn("goto_url", star)
             self.assertIn("capture_screenshot", star)
             self.assertIn("click_at_xy", star)
+            self.assertIn("current_cdp_session", star)
+            self.assertIn("set_cdp_session", star)
             self.assertNotIn("navigate", star)
             self.assertNotIn("screenshot", star)
             self.assertNotIn("tabs", star)
+            self.assertNotIn("coordinate_click", star)
             self.assertNotIn("wait_for_text", star)
             self.assertTrue(result.data["result"]["module_has_compat"])
             self.assertTrue(result.data["result"]["namespace_has_compat"])
