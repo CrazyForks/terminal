@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from textual import events
+
 from llm_browser.events import Event
 from llm_browser.session.store import SessionStore
 from llm_browser.tui.app import (
@@ -591,6 +593,141 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(transcript.scroll_y, scrolled_up)
                 self.assertIs(app.focused, app.query_one("#command", ComposerInput))
 
+    async def test_composer_mouse_wheel_scrolls_transcript_while_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "long task"})
+            for index in range(80):
+                store.emit(session.id, "model.delta", {"text": f"line {index}\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                app._set_composer_text("one\ntwo\nthree\nfour\nfive\nsix")
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+                command = app.query_one("#command", ComposerInput)
+                transcript.scroll_end(animate=False, immediate=True)
+                command.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                bottom = transcript.scroll_y
+
+                input_scroll = command.scroll_y
+                self.assertGreater(bottom, 0)
+                await pilot._post_mouse_events([events.MouseScrollUp], widget="#command")
+                await pilot.pause()
+
+                self.assertLess(transcript.scroll_y, bottom)
+                self.assertEqual(command.scroll_y, input_scroll)
+                self.assertIs(app.focused, command)
+
+    async def test_composer_container_mouse_wheel_scrolls_transcript_while_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "long task"})
+            for index in range(80):
+                store.emit(session.id, "model.delta", {"text": f"line {index}\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                app._set_composer_text("one\ntwo\nthree\nfour\nfive\nsix")
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+                command = app.query_one("#command", ComposerInput)
+                transcript.scroll_end(animate=False, immediate=True)
+                command.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                bottom = transcript.scroll_y
+                input_scroll = command.scroll_y
+
+                self.assertGreater(bottom, 0)
+                await pilot._post_mouse_events([events.MouseScrollUp], widget="#composer")
+                await pilot.pause()
+
+                self.assertLess(transcript.scroll_y, bottom)
+                self.assertEqual(command.scroll_y, input_scroll)
+                self.assertIs(app.focused, command)
+
+    async def test_transcript_follows_live_events_when_near_bottom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "long task"})
+            for index in range(90):
+                store.emit(session.id, "model.delta", {"text": f"line {index}\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+                transcript.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                bottom = transcript.scroll_y
+
+                self.assertGreater(bottom, 0)
+                app._scroll_transcript(lines=-1)
+                await pilot.pause()
+                self.assertFalse(transcript.auto_scroll)
+                self.assertLess(transcript.scroll_y, bottom)
+
+                event = store.events.append(
+                    Event(type="session.input", session_id=session.id, payload={"text": "follow up", "resumed": True})
+                )
+                app._handle_event(event)
+                await pilot.pause()
+
+                self.assertEqual(transcript.scroll_y, transcript.max_scroll_y)
+
+                app._scroll_transcript(lines=-1)
+                await pilot.pause()
+                event = store.events.append(
+                    Event(type="tool.started", session_id=session.id, payload={"name": "python", "tool_call_id": "call_1"})
+                )
+                app._handle_event(event)
+                await pilot.pause()
+
+                self.assertEqual(transcript.scroll_y, transcript.max_scroll_y)
+
+    async def test_transcript_preserves_position_when_far_from_bottom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "long task"})
+            for index in range(120):
+                store.emit(session.id, "model.delta", {"text": f"line {index}\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+                transcript.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                bottom = transcript.scroll_y
+
+                self.assertGreater(bottom, 8)
+                app._scroll_transcript(lines=-4)
+                await pilot.pause()
+                scrolled_y = transcript.scroll_y
+                self.assertLess(scrolled_y, bottom - app._transcript_follow_margin(transcript))
+
+                event = store.events.append(
+                    Event(type="tool.started", session_id=session.id, payload={"name": "python", "tool_call_id": "call_far"})
+                )
+                app._handle_event(event)
+                await pilot.pause()
+
+                self.assertEqual(transcript.scroll_y, scrolled_y)
+                self.assertLess(transcript.scroll_y, transcript.max_scroll_y)
+
     def test_textual_tui_disables_mouse_reporting_outside_tmux_for_terminal_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tui = TextualTui(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
@@ -914,6 +1051,43 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.provider_label, "codex")
             self.assertEqual(app.model_label, "gpt-5.4")
 
+    async def test_provider_change_sets_provider_default_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="codex", model_label="gpt-5.5")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/provider anthropic")
+                await pilot.pause()
+
+            self.assertEqual(app.provider_label, "anthropic")
+            self.assertEqual(app.model_label, "claude-sonnet-4-6")
+
+    async def test_model_palette_is_scoped_to_current_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="anthropic", model_label="claude-sonnet-4-6")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+                rows = app._model_palette()
+
+            labels = [row[0] for row in rows]
+            commands = [row[1] for row in rows]
+            self.assertIn("Claude Opus 4.7", labels)
+            self.assertIn("provider", commands)
+            self.assertNotIn("model gpt-5.5", commands)
+            self.assertNotIn("model glm-5.1", commands)
+
+    async def test_settings_palette_lists_provider_before_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="anthropic", model_label="claude-sonnet-4-6")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+                rows = app._settings_palette()
+
+            self.assertEqual(rows[0][0], "Provider")
+            self.assertEqual(rows[1][0], "Model")
+
     async def test_running_cloud_session_detail_renders_live_preview_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -971,6 +1145,47 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("answer", str(detail.visual))
             self.assertIn("table: 1 row", str(detail.visual))
             self.assertNotIn("python done", str(detail.visual))
+
+    async def test_session_detail_shows_token_usage_breakdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.emit(session.id, "session.input", {"text": "inspect usage"})
+            store.emit(
+                session.id,
+                "model.usage",
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "input_total_tokens": 1100,
+                        "output_tokens": 200,
+                        "reasoning_tokens": 50,
+                        "cache_read_tokens": 100,
+                        "cache_write_tokens": 0,
+                        "total_tokens": 1350,
+                    },
+                    "cost_usd": 0.0123,
+                },
+            )
+            store.update_status(session.id, "done")
+            store.emit(session.id, "session.done", {"result": "complete"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._update_session_detail()
+                await pilot.pause()
+                detail = app.query_one("#session-detail")
+
+            visual = str(detail.visual)
+            self.assertIn("usage", visual)
+            self.assertIn("$0.01", visual)
+            self.assertIn("1,350 tokens", visual)
+            self.assertIn("in 1,100", visual)
+            self.assertIn("out 250", visual)
+            self.assertIn("cache read 100", visual)
 
     async def test_markdown_artifact_preview_renders_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

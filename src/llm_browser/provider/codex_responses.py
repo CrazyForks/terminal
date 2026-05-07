@@ -11,6 +11,7 @@ from llm_browser.auth import CodexAuth, CodexAuthError, PermanentCodexAuthError,
 from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
 from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
+from llm_browser.session.usage import ModelTokenUsage
 
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
@@ -92,6 +93,9 @@ class CodexResponsesProvider:
                                 if call_id not in seen_tool_calls:
                                     seen_tool_calls.add(call_id)
                                     yield self._event_from_function_call(item)
+                        usage = ModelTokenUsage.from_openai_usage(response_obj.get("usage"))
+                        if usage is not None:
+                            yield ModelEvent.usage(usage, model=self.model, provider="codex")
                     return
                 elif event_type == "error":
                     raise RuntimeError(f"Codex stream error: {event}")

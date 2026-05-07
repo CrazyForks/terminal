@@ -32,6 +32,7 @@ from llm_browser.datasets import (
     summarize_manifest,
 )
 from llm_browser.provider.base import Provider
+from llm_browser.llm.registry import provider_names
 from llm_browser.session.trace import build_self_eval_prompt, write_trace_bundle
 from llm_browser.session.store import SessionStore
 
@@ -39,6 +40,8 @@ DATASET_TIMEOUT_DRAIN_S = 10.0
 MAX_INLINE_DATASET_RESULT = 20_000
 BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "remote", "daemon"]
 AGENT_MODE_CHOICES = ["auto", "browser", "codex"]
+PROVIDER_CHOICES = provider_names()
+TOP_LEVEL_COMMANDS = {"doctor", "provider", "run", "sessions", "browser", "datasets", "tui", "config", "auth"}
 
 
 def add_browser_runtime_args(
@@ -124,7 +127,7 @@ def apply_browser_runtime_args(args: argparse.Namespace) -> None:
 
 def _provider_default(config: Optional[Dict[str, Any]], default: str) -> str:
     provider = config_get(config or {}, "provider", default)
-    if provider in {"fake", "openai", "codex"}:
+    if provider in PROVIDER_CHOICES:
         return str(provider)
     return default
 
@@ -168,7 +171,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
         "image-smoke",
         help="Send a two-frame synthetic screenshot timeline through a provider.",
     )
-    provider_image_smoke.add_argument("--provider", choices=["openai", "codex"], default=_provider_default(config, "codex"))
+    provider_image_smoke.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
     provider_image_smoke.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     provider_image_smoke.set_defaults(func=cmd_provider_image_smoke)
 
@@ -177,11 +180,11 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     run.add_argument("--parent-id", default=None, help="Optional parent session id.")
     run.add_argument(
         "--provider",
-        choices=["fake", "openai", "codex"],
+        choices=PROVIDER_CHOICES,
         default=_provider_default(config, "fake"),
         help="Provider to use.",
     )
-    run.add_argument("--model", default=_model_default(config, None), help="Model name for provider=openai/codex.")
+    run.add_argument("--model", default=_model_default(config, None), help="Model name for the selected provider.")
     run.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80), help="Maximum model/tool turns before failing.")
     run.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config), help="Instruction mode: auto, browser, or codex.")
     add_browser_runtime_args(run, headless_default=None, config=config)
@@ -206,7 +209,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     sessions_resume = sessions_sub.add_parser("resume", help="Resume a session from its event trace.")
     sessions_resume.add_argument("session_id")
     sessions_resume.add_argument("instruction", nargs="?", default="Continue from the previous session state.")
-    sessions_resume.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    sessions_resume.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
     sessions_resume.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     sessions_resume.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     sessions_resume.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
@@ -218,7 +221,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
 
     sessions_eval = sessions_sub.add_parser("self-eval", help="Run an LLM evaluator as a child session over a trace.")
     sessions_eval.add_argument("session_id")
-    sessions_eval.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    sessions_eval.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
     sessions_eval.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     sessions_eval.add_argument("--max-turns", type=int, default=_max_turns_default(config, 20))
     sessions_eval.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
@@ -264,7 +267,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     datasets_run.add_argument("--task-id", action="append", default=None)
     datasets_run.add_argument("--run-id", default=None, help="Use a stable run id for manifest/workspaces.")
     datasets_run.add_argument("--resume", action="store_true", help="Skip latest successful task attempts in the run manifest.")
-    datasets_run.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    datasets_run.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
     datasets_run.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     datasets_run.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     datasets_run.add_argument("--task-timeout-s", type=float, default=0.0, help="Optional per-task timeout in seconds.")
@@ -282,7 +285,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     datasets_report.set_defaults(func=cmd_datasets_report)
 
     tui = sub.add_parser("tui", help="Start the terminal UI.")
-    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    tui.add_argument("--provider", choices=PROVIDER_CHOICES, default=_provider_default(config, "codex"))
     tui.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     tui.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     add_browser_runtime_args(tui, headless_default=None, config=config)
@@ -329,6 +332,35 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     auth_codex_login = auth_codex_sub.add_parser("login", help="Login with OpenAI Codex device code auth.")
     auth_codex_login.set_defaults(func=cmd_auth_codex_login)
 
+    auth_api_key = auth_sub.add_parser("api-key", help="Store API keys for API-key providers.")
+    auth_api_key_sub = auth_api_key.add_subparsers(dest="api_key_command", required=True)
+
+    auth_api_key_set = auth_api_key_sub.add_parser("set", help="Store an API key for a provider.")
+    auth_api_key_set.add_argument("provider", choices=["openai", "anthropic", "zai", "qwen"])
+    auth_api_key_set.add_argument("--key", default=None, help="API key. If omitted, prompts securely.")
+    auth_api_key_set.set_defaults(func=cmd_auth_api_key_set)
+
+    auth_api_key_remove = auth_api_key_sub.add_parser("remove", help="Remove a stored API key/OAuth credential.")
+    auth_api_key_remove.add_argument("provider", choices=["openai", "anthropic", "zai", "qwen"])
+    auth_api_key_remove.set_defaults(func=cmd_auth_api_key_remove)
+
+    auth_anthropic = auth_sub.add_parser("anthropic", help="Anthropic API key and Claude Code login commands.")
+    auth_anthropic_sub = auth_anthropic.add_subparsers(dest="anthropic_auth_command", required=True)
+
+    auth_anthropic_status = auth_anthropic_sub.add_parser("status", help="Print Anthropic auth status.")
+    auth_anthropic_status.set_defaults(func=cmd_auth_anthropic_status)
+
+    auth_anthropic_login = auth_anthropic_sub.add_parser("login", help="Login with Anthropic Claude Code OAuth.")
+    auth_anthropic_login.add_argument("--code", default=None, help="Authorization code or final redirect URL.")
+    auth_anthropic_login.add_argument("--no-browser", action="store_true", help="Print the login URL without opening a browser.")
+    auth_anthropic_login.set_defaults(func=cmd_auth_anthropic_login)
+
+    auth_anthropic_refresh = auth_anthropic_sub.add_parser("refresh", help="Refresh stored Anthropic Claude Code OAuth.")
+    auth_anthropic_refresh.set_defaults(func=cmd_auth_anthropic_refresh)
+
+    auth_anthropic_logout = auth_anthropic_sub.add_parser("logout", help="Remove stored Anthropic auth.")
+    auth_anthropic_logout.set_defaults(func=cmd_auth_anthropic_logout)
+
     return parser
 
 
@@ -357,9 +389,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_provider_image_smoke(args: argparse.Namespace) -> int:
     from llm_browser.provider.image_smoke import run_image_smoke
 
-    provider = make_provider(args.provider, args.model)
+    provider = make_provider(args.provider, args.model, getattr(args, "loaded_config", {}))
     if provider is None:
-        print("image smoke requires provider=openai or provider=codex", file=sys.stderr)
+        print("image smoke requires a configured non-fake provider", file=sys.stderr)
         return 2
     artifact_dir = Path(args.state_dir) / "provider-smoke" / f"{args.provider}-{int(time.time())}"
     result = run_image_smoke(provider, artifact_dir)
@@ -372,7 +404,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     agent = Agent(
         store,
-        provider_factory=lambda: make_provider(args.provider, args.model),
+        provider_factory=lambda: make_provider(args.provider, args.model, getattr(args, "loaded_config", {})),
         max_turns=args.max_turns,
         mode=args.agent_mode,
     )
@@ -415,7 +447,7 @@ def cmd_sessions_resume(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     agent = Agent(
         store,
-        provider_factory=lambda: make_provider(args.provider, args.model),
+        provider_factory=lambda: make_provider(args.provider, args.model, getattr(args, "loaded_config", {})),
         max_turns=args.max_turns,
         mode=args.agent_mode,
     )
@@ -436,7 +468,7 @@ def cmd_sessions_self_eval(args: argparse.Namespace) -> int:
     prompt = build_self_eval_prompt(store, args.session_id)
     agent = Agent(
         store,
-        provider_factory=lambda: make_provider(args.provider, args.model),
+        provider_factory=lambda: make_provider(args.provider, args.model, getattr(args, "loaded_config", {})),
         max_turns=args.max_turns,
         mode=args.agent_mode,
     )
@@ -614,7 +646,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
     apply_browser_runtime_args(args)
 
     def provider_factory():
-        return make_provider(args.provider, args.model)
+        return make_provider(args.provider, args.model, getattr(args, "loaded_config", {}))
 
     store = store_from_args(args)
     return TextualTui(
@@ -630,14 +662,90 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
 def cmd_auth_status(args: argparse.Namespace) -> int:
     from llm_browser.auth import auth_status
+    from llm_browser.auth.store import provider_auth_status
 
     payload = {
         "codex": auth_status(),
-        "openai_api_key": {
-            "available": bool(os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
-        },
+        "providers": provider_auth_status(),
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_auth_api_key_set(args: argparse.Namespace) -> int:
+    import getpass
+
+    from llm_browser.auth.store import ProviderAuthStore
+
+    key = args.key or getpass.getpass(f"{args.provider} API key: ")
+    if not key:
+        print("API key cannot be empty", file=sys.stderr)
+        return 2
+    ProviderAuthStore().set_api_key(args.provider, key)
+    print(json.dumps({"ok": True, "provider": args.provider, "type": "api_key"}, indent=2))
+    return 0
+
+
+def cmd_auth_api_key_remove(args: argparse.Namespace) -> int:
+    from llm_browser.auth.store import ProviderAuthStore
+
+    removed = ProviderAuthStore().remove(args.provider)
+    print(json.dumps({"ok": True, "provider": args.provider, "removed": removed}, indent=2))
+    return 0
+
+
+def cmd_auth_anthropic_status(args: argparse.Namespace) -> int:
+    from llm_browser.auth.store import ProviderAuthStore
+
+    print(json.dumps({"anthropic": ProviderAuthStore().status("anthropic")}, indent=2))
+    return 0
+
+
+def cmd_auth_anthropic_login(args: argparse.Namespace) -> int:
+    from llm_browser.auth.anthropic import login_anthropic_oauth
+    from llm_browser.auth.store import ProviderAuthStore
+
+    credentials = login_anthropic_oauth(open_browser=not args.no_browser, code=args.code)
+    ProviderAuthStore().set_oauth(
+        "anthropic",
+        access=str(credentials["access"]),
+        refresh=str(credentials["refresh"]),
+        expires=int(credentials["expires"]),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "provider": "anthropic",
+                "type": "oauth",
+                "expires": credentials["expires"],
+                "warning": (
+                    "Anthropic Claude Code subscription auth is active. Usage may draw from Claude extra usage "
+                    "and be billed per token."
+                ),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_auth_anthropic_refresh(args: argparse.Namespace) -> int:
+    from llm_browser.auth.store import ProviderAuthStore
+
+    credential = ProviderAuthStore().resolve("anthropic", refresh_oauth=True)
+    if credential is None or credential.credential_type != "oauth":
+        print("No stored Anthropic OAuth credential to refresh.", file=sys.stderr)
+        return 1
+    print(json.dumps({"ok": True, "provider": "anthropic", "source": credential.source, "type": "oauth"}, indent=2))
+    return 0
+
+
+def cmd_auth_anthropic_logout(args: argparse.Namespace) -> int:
+    from llm_browser.auth.store import ProviderAuthStore
+
+    removed = ProviderAuthStore().remove("anthropic")
+    print(json.dumps({"ok": True, "provider": "anthropic", "removed": removed}, indent=2))
     return 0
 
 
@@ -681,16 +789,10 @@ def cmd_auth_codex_login(args: argparse.Namespace) -> int:
     return 0
 
 
-def make_provider(provider_name: str, model: Optional[str]) -> Optional[Provider]:
-    if provider_name == "openai":
-        from llm_browser.provider.openai_responses import OpenAIResponsesProvider
+def make_provider(provider_name: str, model: Optional[str], config: Optional[Dict[str, Any]] = None) -> Optional[Provider]:
+    from llm_browser.provider.factory import make_provider as make_provider_impl
 
-        return OpenAIResponsesProvider(model=model)
-    if provider_name == "codex":
-        from llm_browser.provider.codex_responses import CodexResponsesProvider
-
-        return CodexResponsesProvider(model=model)
-    return None
+    return make_provider_impl(provider_name, model, config=config)
 
 
 def _write_dataset_manifest(store: SessionStore, run_id: str, manifest: dict) -> Path:
@@ -918,6 +1020,8 @@ def tui_main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         tui_args.append(arg)
         index += 1
+    if tui_args and tui_args[0] in TOP_LEVEL_COMMANDS:
+        return main([*global_args, *tui_args])
     return main([*global_args, "tui", *tui_args])
 
 

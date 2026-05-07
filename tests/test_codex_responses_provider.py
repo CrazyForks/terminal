@@ -79,6 +79,39 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertTrue(post.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
 
+    def test_emits_normalized_usage_from_completed_response(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-5.5")
+        response = FakeResponse(
+            200,
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 2000,
+                            "input_tokens_details": {"cached_tokens": 400},
+                            "output_tokens": 120,
+                            "output_tokens_details": {"reasoning_tokens": 30},
+                            "total_tokens": 2120,
+                        },
+                    },
+                }
+            ],
+        )
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response):
+            events = list(provider.start_turn([{"role": "user", "content": "open site"}], []))
+
+        self.assertEqual(events[-1].type, "usage")
+        self.assertEqual(events[-1].model, "gpt-5.5")
+        self.assertEqual(events[-1].provider, "codex")
+        self.assertEqual(events[-1].token_usage.input_tokens, 1600)
+        self.assertEqual(events[-1].token_usage.cache_read_tokens, 400)
+        self.assertEqual(events[-1].token_usage.output_tokens, 90)
+        self.assertEqual(events[-1].token_usage.reasoning_tokens, 30)
+
     def test_uses_custom_instructions_when_set(self) -> None:
         provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test", instructions="custom codex instructions")
         response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])

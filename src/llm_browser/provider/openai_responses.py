@@ -10,6 +10,7 @@ import requests
 from llm_browser.browser.instructions import BROWSER_AGENT_INSTRUCTIONS
 from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
+from llm_browser.session.usage import ModelTokenUsage
 
 
 class OpenAIResponsesProvider:
@@ -73,6 +74,9 @@ class OpenAIResponsesProvider:
                 text = self._extract_text_from_unknown_item(item)
                 if text:
                     yield ModelEvent.text(text)
+        usage = ModelTokenUsage.from_openai_usage(data.get("usage"))
+        if usage is not None:
+            yield ModelEvent.usage(usage, model=self.model, provider="openai")
 
     def _post_payload(self, payload: Dict[str, Any]) -> requests.Response:
         last_exc: Optional[BaseException] = None

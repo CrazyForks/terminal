@@ -66,6 +66,12 @@ class ConfigCliTest(unittest.TestCase):
 
         main.assert_called_once_with(["--state-dir", "/tmp/state", "tui", "--browser", "remote"])
 
+    def test_tui_main_passes_through_top_level_commands(self) -> None:
+        with patch("llm_browser.cli.main", return_value=0) as main:
+            self.assertEqual(cli.tui_main(["--state-dir", "/tmp/state", "auth", "status"]), 0)
+
+        main.assert_called_once_with(["--state-dir", "/tmp/state", "auth", "status"])
+
     def test_write_default_config_refuses_overwrite_and_redacts_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

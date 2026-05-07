@@ -63,6 +63,8 @@ def run_image_smoke(provider: Provider, artifact_dir: Path) -> Dict[str, Any]:
             text_parts.append(event.text)
         elif event.type == "tool_call" and event.tool_call is not None:
             tool_calls.append(event.tool_call)
+        elif event.type == "usage":
+            continue
         elif event.type == "done":
             continue
         else:

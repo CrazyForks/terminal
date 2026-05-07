@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import json
 import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from llm_browser.agent.compaction import compact_messages, message_chars
+from llm_browser.agent.compaction import compact_messages, message_chars, message_context_units
 from llm_browser.provider.base import Provider
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.browser.instructions import select_agent_instructions
@@ -15,6 +16,7 @@ from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
+from llm_browser.session.usage import calculate_usage_cost
 from llm_browser.tool.builtins import build_builtin_registry
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
@@ -162,6 +164,20 @@ class Agent:
                         if event.tool_call is None:
                             raise RuntimeError("provider emitted tool_call without a call")
                         tool_calls.append(event.tool_call)
+                    elif event.type == "usage":
+                        if event.token_usage is None:
+                            continue
+                        model = event.model or str(getattr(self.provider, "model", "") or "")
+                        cost = calculate_usage_cost(model, event.token_usage)
+                        payload: Dict[str, Any] = {
+                            "provider": event.provider or self.provider.__class__.__name__,
+                            "model": model,
+                            "usage": event.token_usage.to_dict(),
+                        }
+                        if cost is not None:
+                            payload["cost_usd"] = cost.total_cost_usd
+                            payload["cost"] = cost.to_dict()
+                        self.store.emit(session.id, "model.usage", payload)
                     elif event.type == "done":
                         pass
                     else:
@@ -176,7 +192,12 @@ class Agent:
                     {
                         "role": "assistant",
                         "tool_calls": [
-                            {"id": call.id, "name": call.name, "arguments": call.arguments}
+                            {
+                                "id": call.id,
+                                "name": call.name,
+                                "arguments": call.arguments,
+                                **({"metadata": call.metadata} if call.metadata else {}),
+                            }
                             for call in tool_calls
                         ],
                     }
@@ -225,6 +246,10 @@ class Agent:
         messages: List[Dict[str, Any]] = []
         pending_tool_calls: List[Dict[str, Any]] = []
         unresolved_tool_calls: Dict[str, Dict[str, Any]] = {}
+        events = self.store.events.read(session_id)
+        replay_messages, start_index = self._latest_compaction_replay(events)
+        if replay_messages is not None:
+            messages = replay_messages
 
         def flush_pending_tool_calls() -> None:
             if not pending_tool_calls:
@@ -248,7 +273,7 @@ class Agent:
                 )
                 unresolved_tool_calls.pop(call_id, None)
 
-        for event in self.store.events.read(session_id):
+        for event in events[start_index:]:
             if event.type == "session.input":
                 if messages:
                     synthesize_missing_tool_outputs("new user input arrived before this tool completed")
@@ -293,6 +318,25 @@ class Agent:
             raise ValueError(f"session has no replayable messages: {session_id}")
         return messages
 
+    def _latest_compaction_replay(self, events: List[Any]) -> tuple[Optional[List[Dict[str, Any]]], int]:
+        for index in range(len(events) - 1, -1, -1):
+            event = events[index]
+            if getattr(event, "type", "") != "session.compacted":
+                continue
+            payload = getattr(event, "payload", {}) if isinstance(getattr(event, "payload", {}), dict) else {}
+            path = payload.get("path")
+            if not path:
+                continue
+            try:
+                data = json.loads(Path(str(path)).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            replay = data.get("replay_messages")
+            if not isinstance(replay, list) or not all(isinstance(message, dict) for message in replay):
+                continue
+            return copy.deepcopy(replay), index + 1
+        return None, 0
+
     def _tool_event_provider_content(self, output: Any) -> Any:
         if not isinstance(output, dict):
             return str(output or "")
@@ -311,7 +355,9 @@ class Agent:
         return text
 
     def _maybe_compact(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if self.compact_after_chars <= 0 or message_chars(messages) <= self.compact_after_chars:
+        before_chars = message_chars(messages)
+        before_context_units = message_context_units(messages)
+        if self.compact_after_chars <= 0 or before_context_units <= self.compact_after_chars:
             return messages
         compacted, path = compact_messages(
             messages,
@@ -319,6 +365,8 @@ class Agent:
             session_events=[event.to_dict() for event in self.store.events.read(session.id)],
         )
         if compacted is not messages:
+            after_chars = message_chars(compacted)
+            after_context_units = message_context_units(compacted)
             self.store.emit(
                 session.id,
                 "session.compacted",
@@ -326,8 +374,10 @@ class Agent:
                     "path": str(path),
                     "before_messages": len(messages),
                     "after_messages": len(compacted),
-                    "before_chars": message_chars(messages),
-                    "after_chars": message_chars(compacted),
+                    "before_chars": before_chars,
+                    "after_chars": after_chars,
+                    "before_context_units": before_context_units,
+                    "after_context_units": after_context_units,
                 },
             )
         return compacted

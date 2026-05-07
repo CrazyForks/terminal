@@ -32,9 +32,11 @@ from llm_browser.brand import PRODUCT_NAME
 from llm_browser.config import apply_config_environment, redacted_config, write_config_values
 from llm_browser.datasets import build_dataset_prompt, load_dataset, load_manifest, select_tasks, summarize_manifest
 from llm_browser.events import Event
+from llm_browser.llm.registry import default_model_for_provider, models_for_provider, provider_names, provider_palette
 from llm_browser.provider.base import Provider
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
+from llm_browser.session.usage import format_cost, format_tokens, summarize_usage_events
 from llm_browser.tui.simple import format_event
 
 
@@ -93,6 +95,8 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
 
 
 _ACTIVITY_FRAMES = ("∙", "●", "∙", "·")
+_TRANSCRIPT_FOLLOW_MIN_MARGIN = 1
+_TRANSCRIPT_FOLLOW_MAX_MARGIN = 2
 
 
 SHORTCUT_PALETTE: list[tuple[str, str, str]] = [
@@ -122,20 +126,7 @@ BROWSER_MODE_PALETTE: list[tuple[str, str, str]] = [
 
 
 PROVIDER_PALETTE: list[tuple[str, str, str]] = [
-    ("Codex", "provider codex", "Use Codex subscription auth"),
-    ("OpenAI", "provider openai", "Use OpenAI API key"),
-    ("Fake", "provider fake", "Use deterministic local fake provider"),
-]
-
-
-MODEL_PALETTE: list[tuple[str, str, str]] = [
-    ("GPT-5.5", "model gpt-5.5", "Frontier model"),
-    ("GPT-5.4", "model gpt-5.4", "Strong everyday model"),
-    ("GPT-5.4 Mini", "model gpt-5.4-mini", "Fast small model"),
-    ("GPT-5.3 Codex", "model gpt-5.3-codex", "Coding-optimized model"),
-    ("GPT-5.3 Codex Spark", "model gpt-5.3-codex-spark", "Fast coding model"),
-    ("GPT-5.2", "model gpt-5.2", "Long-running professional work"),
-    ("Custom", "model ", "Type a custom model id"),
+    *provider_palette(),
 ]
 
 
@@ -268,15 +259,43 @@ class ComposerInput(TextArea):
         if refocus is not None:
             refocus()
 
-    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         event.prevent_default()
         event.stop()
         self.app.action_scroll_transcript_up()
 
-    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         event.prevent_default()
         event.stop()
         self.app.action_scroll_transcript_down()
+
+    def _scroll_up_for_pointer(self, **_: Any) -> bool:
+        self.app.action_scroll_transcript_up()
+        return True
+
+    def _scroll_down_for_pointer(self, **_: Any) -> bool:
+        self.app.action_scroll_transcript_down()
+        return True
+
+    def _on_scroll_up(self, event: Any) -> None:
+        event.prevent_default()
+        event.stop()
+        self.app.action_scroll_transcript_page_up()
+
+    def _on_scroll_down(self, event: Any) -> None:
+        event.prevent_default()
+        event.stop()
+        self.app.action_scroll_transcript_page_down()
+
+
+class TranscriptLog(RichLog):
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        self.auto_scroll = False
+        super()._on_mouse_scroll_up(event)
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        self.auto_scroll = False
+        super()._on_mouse_scroll_down(event)
 
 
 class CommandPalette(ModalScreen[Optional[str]]):
@@ -904,7 +923,7 @@ class BrowserUseTerminalApp(App[None]):
             with Vertical(id="main"):
                 with Vertical(id="workspace"):
                     yield Static("", id="home-logo")
-                    yield RichLog(id="transcript", wrap=True, highlight=False, markup=True)
+                    yield TranscriptLog(id="transcript", wrap=True, highlight=False, markup=True)
                     yield Static("", id="activity")
                     yield Static("", id="runtime-meta")
                     slash_panel = DataTable(
@@ -984,6 +1003,31 @@ class BrowserUseTerminalApp(App[None]):
     def on_click(self, event: events.Click) -> None:
         pass
 
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self._mouse_event_targets_transcript_scroll(event):
+            event.prevent_default()
+            event.stop()
+            self.action_scroll_transcript_up()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self._mouse_event_targets_transcript_scroll(event):
+            event.prevent_default()
+            event.stop()
+            self.action_scroll_transcript_down()
+
+    def _mouse_event_targets_transcript_scroll(self, event: events.MouseEvent) -> bool:
+        widget = event.widget
+        while widget is not None:
+            if widget.id == "sidebar":
+                return False
+            if widget.id in {"main", "workspace", "transcript", "composer", "command"}:
+                return True
+            widget = widget.parent
+        try:
+            return self.focused is self.query_one("#command", ComposerInput)
+        except Exception:
+            return False
+
     def action_quit(self) -> None:
         self.exit()
 
@@ -1020,19 +1064,16 @@ class BrowserUseTerminalApp(App[None]):
         self.set_timer(0.01, focus_composer)
 
     def _make_provider_for_current_settings(self) -> Optional[Provider]:
-        if self.provider_label == "openai":
-            from llm_browser.provider.openai_responses import OpenAIResponsesProvider
-
-            return OpenAIResponsesProvider(model=self.model_label)
-        if self.provider_label == "codex":
-            from llm_browser.provider.codex_responses import CodexResponsesProvider
-
-            return CodexResponsesProvider(model=self.model_label)
         if self.provider_label == "fake":
             return None
-        if self._external_provider_factory is not None:
-            return self._external_provider_factory()
-        return None
+        from llm_browser.provider.factory import make_provider
+
+        try:
+            return make_provider(self.provider_label, self.model_label, config=self.config)
+        except Exception:
+            if self._external_provider_factory is not None:
+                return self._external_provider_factory()
+            raise
 
     def _listen_events(self) -> None:
         with self.store.bus.subscribe() as events:
@@ -1190,7 +1231,25 @@ class BrowserUseTerminalApp(App[None]):
         for session_id in list(self._model_buffers):
             self._flush_model_delta(session_id)
 
-    def _write_log_line(self, line: str, event_type: str) -> None:
+    def _transcript_follow_margin(self, transcript: RichLog) -> int:
+        height = int(transcript.size.height or 0)
+        if height <= 0:
+            return _TRANSCRIPT_FOLLOW_MIN_MARGIN
+        return max(
+            _TRANSCRIPT_FOLLOW_MIN_MARGIN,
+            min(_TRANSCRIPT_FOLLOW_MAX_MARGIN, height // 10),
+        )
+
+    def _should_follow_transcript_updates(self, transcript: RichLog) -> bool:
+        if bool(transcript.auto_scroll):
+            return True
+        max_scroll_y = int(transcript.max_scroll_y or 0)
+        if max_scroll_y <= 0:
+            return True
+        distance_from_bottom = max_scroll_y - int(transcript.scroll_y or 0)
+        return distance_from_bottom <= self._transcript_follow_margin(transcript)
+
+    def _write_log_line(self, line: str, event_type: str, *, follow: Optional[bool] = None) -> None:
         if not line:
             return
         if self.selected_session_id and event_type in {
@@ -1205,6 +1264,7 @@ class BrowserUseTerminalApp(App[None]):
                 previous = self._recent_model_text.get(self.selected_session_id, "")
                 self._recent_model_text[self.selected_session_id] = _join_transcript_text(previous, line)
         log = self.query_one("#transcript", RichLog)
+        log.auto_scroll = self._should_follow_transcript_updates(log) if follow is None else follow
         escaped = escape(line)
         if event_type == "session.input":
             log.write(_prompt_text(line, width=_prompt_width(log, fallback=self.size.width)))
@@ -1570,9 +1630,11 @@ class BrowserUseTerminalApp(App[None]):
             return
         self._start_task(instruction)
 
-    def _load_session_log(self, session_id: str) -> None:
+    def _load_session_log(self, session_id: str, *, follow: Optional[bool] = True) -> None:
         self._set_home_mode(False)
         log = self.query_one("#transcript", RichLog)
+        follow_transcript = self._should_follow_transcript_updates(log) if follow is None else follow
+        log.auto_scroll = follow_transcript
         log.clear()
         session = self.store.load(session_id)
         if session is None:
@@ -1590,7 +1652,7 @@ class BrowserUseTerminalApp(App[None]):
         self._recent_model_text[session.id] = ""
         for line, event_type in _format_events_for_transcript(events):
             if self._should_render_transcript_line(event_type, line):
-                self._write_log_line(line, event_type)
+                self._write_log_line(line, event_type, follow=follow_transcript)
         self._update_session_detail()
         self._update_activity_strip()
 
@@ -1770,7 +1832,8 @@ class BrowserUseTerminalApp(App[None]):
         )
 
     def action_show_model_selector(self) -> None:
-        self._open_command_selector("Select model", "Search models", self._model_palette())
+        provider = self.provider_label or "provider"
+        self._open_command_selector(f"Select {provider} model", f"Search {provider} models", self._model_palette())
 
     def action_show_provider_selector(self) -> None:
         self._open_command_selector("Select provider", "Search providers", PROVIDER_PALETTE)
@@ -1825,6 +1888,7 @@ class BrowserUseTerminalApp(App[None]):
 
     def _resume_session(self, session_id: str, instruction: str) -> None:
         log = self.query_one("#transcript", RichLog)
+        follow_transcript = self._should_follow_transcript_updates(log)
         session = self.store.load(session_id)
         if session is None:
             log.write(f"[#e4e4e7]session not found: {escape(session_id)}[/]")
@@ -1836,7 +1900,7 @@ class BrowserUseTerminalApp(App[None]):
             return
         self.selected_session_id = resumed.id
         self.selected_artifact_path = None
-        self._load_session_log(resumed.id)
+        self._load_session_log(resumed.id, follow=follow_transcript)
         self.refresh_sessions()
         self.refresh_artifacts()
 
@@ -1881,13 +1945,20 @@ class BrowserUseTerminalApp(App[None]):
     def _set_provider(self, provider: str) -> None:
         log = self.query_one("#transcript", RichLog)
         normalized = provider.strip().lower()
-        if normalized not in {"fake", "openai", "codex"}:
+        if normalized not in provider_names():
             log.write(f"[#e4e4e7]unknown provider: {escape(provider)}[/]")
-            log.write("[#7a7d86]expected codex, openai, or fake[/]")
+            log.write(f"[#7a7d86]expected one of: {escape(', '.join(provider_names()))}[/]")
             return
         self.provider_label = normalized
-        path = self._persist_config_values({"provider": normalized})
-        log.write(f"[#e4e4e7]provider[/] {escape(normalized)}{self._saved_suffix(path)}")
+        values: dict[str, Any] = {"provider": normalized}
+        default_model = default_model_for_provider(normalized)
+        if default_model and self.model_label != default_model:
+            self.model_label = default_model
+            os.environ["LLM_BROWSER_MODEL"] = default_model
+            values["model"] = default_model
+        path = self._persist_config_values(values)
+        suffix = f" · model {self.model_label}" if self.model_label else ""
+        log.write(f"[#e4e4e7]provider[/] {escape(normalized)}{escape(suffix)}{self._saved_suffix(path)}")
         self._update_statusbar()
         self._update_session_detail()
 
@@ -2054,21 +2125,22 @@ class BrowserUseTerminalApp(App[None]):
         if current:
             rows.append(("Current", f"model {current}", f"Current {self.provider_label} model"))
         seen = {current} if current else set()
-        for title, command, description in MODEL_PALETTE:
-            model = command.removeprefix("model ").strip()
+        for spec in models_for_provider(self.provider_label):
+            model = spec.model
             if model and model in seen:
                 continue
-            rows.append((title, command, description))
-            if model:
-                seen.add(model)
+            rows.append((spec.display_name, f"model {model}", spec.description))
+            seen.add(model)
+        rows.append(("Change provider", "provider", "Choose a provider first, then pick one of its models"))
+        rows.append(("Custom", "model ", "Type a custom model id for the current provider"))
         return rows
 
     def _settings_palette(self) -> list[tuple[str, str, str]]:
         width = os.environ.get("LLM_BROWSER_WIDTH") or "1280"
         height = os.environ.get("LLM_BROWSER_HEIGHT") or "900"
         return [
-            ("Model", "model", f"Current {self.model_label or '-'}"),
             ("Provider", "provider", f"Current {self.provider_label}"),
+            ("Model", "model", f"Current {self.model_label or '-'}"),
             ("Browser", "browser", f"Current {_browser_runtime_label()}"),
             ("Browser Use API key", "auth browser-use ", "Paste and save remote browser API key"),
             ("OpenAI API key", "auth openai ", "Paste and save OpenAI API key"),
@@ -2291,11 +2363,15 @@ class BrowserUseTerminalApp(App[None]):
                 f"{_rich_link('open live preview', live_url)}\n"
                 f"{_rich_link(_compact_inline(live_url, limit=42), live_url)}\n\n"
             )
+        usage_markup = _sidebar_usage_markup(events)
+        if usage_markup:
+            usage_markup += "\n\n"
         detail.update(
             f"[#9b9ca5]❯[/] [bold #e4e4e7]{escape(title)}[/bold #e4e4e7]\n\n"
             f"{_status_markup(session.status)} [#9b9ca5]· {escape(session.id)}[/]\n"
             f"[#9b9ca5]updated {_format_age(session.updated_ms / 1000)}[/]\n\n"
             f"{browser_markup}"
+            f"{usage_markup}"
             f"[bold #e4e4e7]answer[/bold #e4e4e7]\n"
             f"{result_markup}"
         )
@@ -2571,6 +2647,36 @@ def _browser_runtime_detail() -> str:
     return "\n".join(parts)
 
 
+def _sidebar_usage_markup(events: list[Event]) -> str:
+    usage = summarize_usage_events(events)
+    if usage.entries <= 0:
+        return ""
+
+    cost_label = f"{format_cost(usage.total_cost_usd)} est" if usage.has_cost else "cost unavailable"
+    input_total = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+    generated = usage.output_tokens + usage.reasoning_tokens
+    lines = [
+        "[bold #e4e4e7]usage[/bold #e4e4e7]",
+        f"[#e4e4e7]{escape(cost_label)}[/] [#9b9ca5]· {escape(format_tokens(usage.total_tokens))} tokens[/]",
+        f"[#9b9ca5]in {escape(format_tokens(input_total))} · out {escape(format_tokens(generated))}[/]",
+    ]
+    if usage.reasoning_tokens:
+        lines.append(f"[#9b9ca5]reasoning {escape(format_tokens(usage.reasoning_tokens))}[/]")
+    cache_total = usage.cache_read_tokens + usage.cache_write_tokens
+    if cache_total:
+        lines.append(
+            f"[#9b9ca5]cache read {escape(format_tokens(usage.cache_read_tokens))}"
+            f" · write {escape(format_tokens(usage.cache_write_tokens))}[/]"
+        )
+    if usage.latest_usage is not None:
+        latest_model = _compact_inline(usage.latest_model or "unknown", limit=34)
+        lines.append(
+            f"[#9b9ca5]latest {escape(format_tokens(usage.latest_usage.context_tokens))}"
+            f" · {escape(latest_model)}[/]"
+        )
+    return "\n".join(lines)
+
+
 def _format_event_for_transcript(event: Event) -> str:
     payload = event.payload
     if event.type == "session.created":
@@ -2587,6 +2693,8 @@ def _format_event_for_transcript(event: Event) -> str:
         return f"compacted: before={payload.get('before_messages')} after={payload.get('after_messages')}"
     if event.type == "session.deadline_warning":
         return f"deadline warning: {payload.get('remaining_s')}s remaining"
+    if event.type == "model.usage":
+        return ""
     if event.type == "browser.live_url":
         if payload.get("reconnected"):
             return ""

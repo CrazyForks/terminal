@@ -64,6 +64,34 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertIn("screenshot", payload["instructions"])
         self.assertIn("raw CDP", payload["instructions"])
 
+    def test_emits_normalized_usage_event(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="gpt-5.5")
+        response = FakeResponse(
+            200,
+            {
+                "id": "resp_1",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1000,
+                    "input_tokens_details": {"cached_tokens": 100},
+                    "output_tokens": 70,
+                    "output_tokens_details": {"reasoning_tokens": 20},
+                    "total_tokens": 1070,
+                },
+            },
+        )
+
+        with patch("llm_browser.provider.openai_responses.requests.post", return_value=response):
+            events = list(provider.start_turn([{"role": "user", "content": "hello"}], []))
+
+        self.assertEqual(events[-1].type, "usage")
+        self.assertEqual(events[-1].model, "gpt-5.5")
+        self.assertEqual(events[-1].provider, "openai")
+        self.assertEqual(events[-1].token_usage.input_tokens, 900)
+        self.assertEqual(events[-1].token_usage.cache_read_tokens, 100)
+        self.assertEqual(events[-1].token_usage.output_tokens, 50)
+        self.assertEqual(events[-1].token_usage.reasoning_tokens, 20)
+
     def test_uses_custom_instructions_when_set(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="test-model", instructions="custom instructions")
         response = FakeResponse(200, {"id": "resp_1", "output": []})
