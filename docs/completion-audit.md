@@ -7,12 +7,12 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - Rust workspace split into protocol, store, core, providers, Python-worker supervisor, CLI, and TUI crates.
 - SQLite is the durable state boundary for sessions, events, artifacts, runs, agent graph, mailbox, and app settings.
 - Old Python product runtime is removed from the package surface; Python is now the browser worker island.
-- Python worker loads local browser harness helpers, preserves per-session namespaces, exposes host helpers such as `artifact_root()` and `session_metadata()`, streams host events, and emits browser state/images/artifacts back to Rust.
+- Python worker loads local browser harness helpers, preserves per-session namespaces, exposes host helpers such as `artifact_root()` and `session_metadata()`, streams host events, and emits browser state/images/artifacts, tab count, and viewport details back to Rust.
 - Rust agent loop dispatches the tiny model-visible tool surface: `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`.
 - Child agents are separate sessions with canonical `/root/...` paths, configurable sanitized fork modes, durable graph edges, recursive close/cancel, and mailbox messages.
 - Provider adapters exist for fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter.
 - Claude Code account selection can run Anthropic Messages through a stored or environment OAuth bearer token from `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`.
-- CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, and dataset runners.
+- CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, dataset list/sample/report, and resumable dataset runners.
 - TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
 - Core checks for external cancellation between provider/tool turns, avoids finalizing cancelled sessions as done, and records cancelled run rows.
@@ -33,6 +33,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - `uv run but --help`
 - fake CLI task runner
 - fake dataset runner, including full `real_v14_short` count-10 and `real_v8` count-100 fake paths
+- fake dataset manifest/report/resume smoke under `/tmp/but-dataset-manifest-smoke`
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction

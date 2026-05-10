@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -12,12 +13,14 @@ use browser_use_protocol::{
 };
 use browser_use_providers::{
     load_codex_auth, load_codex_auth_file, AnthropicMessagesProvider, CodexAuth,
-    CodexResponsesProvider, OpenAICompatibleChatProvider, OpenAIResponsesProvider,
+    CodexResponsesProvider, FakeProvider, ModelProvider, OpenAICompatibleChatProvider,
+    OpenAIResponsesProvider,
 };
 use browser_use_python_worker::PythonWorker;
-use browser_use_store::Store;
+use browser_use_store::{now_ms, Store};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -157,54 +160,137 @@ enum Command {
     WaitAgent {
         target_id: String,
     },
+    DatasetList,
+    DatasetSample {
+        dataset: String,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    DatasetReport {
+        run_id_or_path: String,
+    },
     DatasetRunFake {
         dataset: String,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 1)]
+        max_attempts: usize,
     },
     DatasetRunOpenai {
         dataset: String,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "gpt-5.5")]
         model: String,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 1)]
+        max_attempts: usize,
     },
     DatasetRunCodex {
         dataset: String,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "gpt-5.5")]
         model: String,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 1)]
+        max_attempts: usize,
     },
     DatasetRunAnthropic {
         dataset: String,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 1)]
+        max_attempts: usize,
     },
     DatasetRunOpenrouter {
         dataset: String,
         #[arg(long, default_value_t = 1)]
         count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "openai/gpt-5.5")]
         model: String,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
         python_timeout_seconds: u64,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 1)]
+        max_attempts: usize,
     },
 }
 
@@ -245,10 +331,33 @@ enum AuthAccount {
     Openrouter,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 struct DatasetCase {
+    dataset: String,
+    path: String,
     task_id: String,
     confirmed_task: String,
+    raw: Value,
+}
+
+#[derive(Clone, Debug)]
+struct DatasetRunOptions {
+    count: usize,
+    task_ids: Vec<String>,
+    all: bool,
+    run_id: Option<String>,
+    resume: bool,
+    skip_failed: bool,
+    stop_on_failure: bool,
+    max_attempts: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DatasetProviderConfig<'a> {
+    provider: &'a str,
+    model: &'a str,
+    max_turns: usize,
+    python_timeout_seconds: u64,
 }
 
 fn main() -> Result<()> {
@@ -302,17 +411,64 @@ fn main() -> Result<()> {
             trigger_turn,
         } => send_agent_message(&store, &author_id, &target_id, &message, trigger_turn),
         Command::WaitAgent { target_id } => wait_agent(&store, &target_id),
-        Command::DatasetRunFake { dataset, count } => dataset_run_fake(&store, &dataset, count),
+        Command::DatasetList => dataset_list(),
+        Command::DatasetSample {
+            dataset,
+            count,
+            task_ids,
+            all,
+        } => dataset_sample(&dataset, count, task_ids, all),
+        Command::DatasetReport { run_id_or_path } => dataset_report(&store, &run_id_or_path),
+        Command::DatasetRunFake {
+            dataset,
+            count,
+            task_ids,
+            all,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
+        } => dataset_run_fake(
+            &store,
+            &dataset,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+            },
+        ),
         Command::DatasetRunOpenai {
             dataset,
             count,
+            task_ids,
+            all,
             model,
             max_turns,
             python_timeout_seconds,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
         } => dataset_run_openai(
             &store,
             &dataset,
-            count,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+            },
             model,
             max_turns,
             python_timeout_seconds,
@@ -320,13 +476,29 @@ fn main() -> Result<()> {
         Command::DatasetRunCodex {
             dataset,
             count,
+            task_ids,
+            all,
             model,
             max_turns,
             python_timeout_seconds,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
         } => dataset_run_codex(
             &store,
             &dataset,
-            count,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+            },
             model,
             max_turns,
             python_timeout_seconds,
@@ -334,13 +506,29 @@ fn main() -> Result<()> {
         Command::DatasetRunAnthropic {
             dataset,
             count,
+            task_ids,
+            all,
             model,
             max_turns,
             python_timeout_seconds,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
         } => dataset_run_anthropic(
             &store,
             &dataset,
-            count,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+            },
             model,
             max_turns,
             python_timeout_seconds,
@@ -348,13 +536,29 @@ fn main() -> Result<()> {
         Command::DatasetRunOpenrouter {
             dataset,
             count,
+            task_ids,
+            all,
             model,
             max_turns,
             python_timeout_seconds,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
         } => dataset_run_openrouter(
             &store,
             &dataset,
-            count,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+            },
             model,
             max_turns,
             python_timeout_seconds,
@@ -1304,45 +1508,117 @@ fn wait_agent(store: &Store, target_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn dataset_run_fake(store: &Store, dataset: &str, count: usize) -> Result<()> {
-    let cases = load_dataset_cases(dataset)?;
-    if cases.is_empty() || count == 0 {
-        println!("No dataset cases selected.");
-        return Ok(());
+fn dataset_list() -> Result<()> {
+    let mut datasets = vec![
+        serde_json::json!({
+            "name": "real_v14_short",
+            "path": "datasets/real_v14_short.json",
+            "description": "10-task current smoke dataset",
+        }),
+        serde_json::json!({
+            "name": "real_v14",
+            "path": "datasets/real_v14_short.json",
+            "description": "alias for real_v14_short in this repository",
+        }),
+        serde_json::json!({
+            "name": "real_v8",
+            "path": "datasets/real_v8.json",
+            "description": "100-task baseline dataset",
+        }),
+    ];
+    let dir = PathBuf::from("datasets");
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if datasets
+                .iter()
+                .any(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            {
+                continue;
+            }
+            datasets.push(serde_json::json!({
+                "name": name,
+                "path": path.display().to_string(),
+            }));
+        }
     }
-    for case in cases.into_iter().take(count) {
-        let session_id = run_fake_agent(
-            store,
-            &case.confirmed_task,
-            std::env::current_dir()?,
-            FakeAgentOptions { python_code: None },
-        )?;
-        store.append_event(
-            &session_id,
-            "dataset.case",
-            serde_json::json!({
-                "dataset": dataset,
-                "task_id": case.task_id,
-            }),
-        )?;
-        println!("{}  {}", case.task_id, session_id);
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "datasets": datasets }))?
+    );
     Ok(())
 }
 
-fn create_dataset_session(store: &Store, dataset: &str, case: &DatasetCase) -> Result<String> {
+fn dataset_sample(dataset: &str, count: usize, task_ids: Vec<String>, all: bool) -> Result<()> {
+    let cases = load_dataset_cases(dataset)?;
+    let selected = select_dataset_cases(
+        cases,
+        &DatasetRunOptions {
+            count,
+            task_ids,
+            all,
+            run_id: None,
+            resume: false,
+            skip_failed: false,
+            stop_on_failure: false,
+            max_attempts: 1,
+        },
+    )?;
+    let sample = selected
+        .iter()
+        .map(dataset_case_manifest)
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string_pretty(&sample)?);
+    Ok(())
+}
+
+fn dataset_report(store: &Store, run_id_or_path: &str) -> Result<()> {
+    let manifest = load_dataset_manifest(store, run_id_or_path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summarize_dataset_manifest(&manifest))?
+    );
+    Ok(())
+}
+
+fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) -> Result<()> {
+    let provider = FakeProvider::with_text("Fake dataset case completed.");
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        &provider,
+        DatasetProviderConfig {
+            provider: "fake",
+            model: "fake",
+            max_turns: 80,
+            python_timeout_seconds: 120,
+        },
+    )
+}
+
+fn create_dataset_session(store: &Store, case: &DatasetCase, attempt: usize) -> Result<String> {
     let session = store.create_session(None, std::env::current_dir()?)?;
+    let prompt = build_dataset_prompt(case);
     store.append_event(
         &session.id,
         "session.input",
-        serde_json::json!({ "text": case.confirmed_task }),
+        serde_json::json!({ "text": prompt }),
     )?;
     store.append_event(
         &session.id,
         "dataset.case",
         serde_json::json!({
-            "dataset": dataset,
+            "dataset": case.dataset,
+            "path": case.path,
             "task_id": case.task_id,
+            "attempt": attempt,
         }),
     )?;
     Ok(session.id)
@@ -1351,120 +1627,273 @@ fn create_dataset_session(store: &Store, dataset: &str, case: &DatasetCase) -> R
 fn dataset_run_openai(
     store: &Store,
     dataset: &str,
-    count: usize,
+    options: DatasetRunOptions,
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let cases = load_dataset_cases(dataset)?;
-    if cases.is_empty() || count == 0 {
-        println!("No dataset cases selected.");
-        return Ok(());
-    }
-    let provider = openai_provider(store, model)?;
-    for case in cases.into_iter().take(count) {
-        let session_id = create_dataset_session(store, dataset, &case)?;
-        println!("{}  {}", case.task_id, session_id);
-        io::stdout().flush()?;
-        run_existing_session_with_provider(
-            store,
-            &provider,
-            &session_id,
-            cli_agent_options_with(max_turns, python_timeout_seconds),
-        )?;
-    }
-    Ok(())
+    let provider = openai_provider(store, model.clone())?;
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        &provider,
+        DatasetProviderConfig {
+            provider: "openai",
+            model: &model,
+            max_turns,
+            python_timeout_seconds,
+        },
+    )
 }
 
 fn dataset_run_codex(
     store: &Store,
     dataset: &str,
-    count: usize,
+    options: DatasetRunOptions,
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let cases = load_dataset_cases(dataset)?;
-    if cases.is_empty() || count == 0 {
-        println!("No dataset cases selected.");
-        return Ok(());
-    }
-    let provider = codex_provider(store, model)?;
-    for case in cases.into_iter().take(count) {
-        let session_id = create_dataset_session(store, dataset, &case)?;
-        println!("{}  {}", case.task_id, session_id);
-        io::stdout().flush()?;
-        run_existing_session_with_provider(
-            store,
-            &provider,
-            &session_id,
-            cli_agent_options_with(max_turns, python_timeout_seconds),
-        )?;
-    }
-    Ok(())
+    let provider = codex_provider(store, model.clone())?;
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        &provider,
+        DatasetProviderConfig {
+            provider: "codex",
+            model: &model,
+            max_turns,
+            python_timeout_seconds,
+        },
+    )
 }
 
 fn dataset_run_anthropic(
     store: &Store,
     dataset: &str,
-    count: usize,
+    options: DatasetRunOptions,
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let cases = load_dataset_cases(dataset)?;
-    if cases.is_empty() || count == 0 {
-        println!("No dataset cases selected.");
-        return Ok(());
-    }
-    let provider = anthropic_provider(store, model)?;
-    for case in cases.into_iter().take(count) {
-        let session_id = create_dataset_session(store, dataset, &case)?;
-        println!("{}  {}", case.task_id, session_id);
-        io::stdout().flush()?;
-        run_existing_session_with_provider(
-            store,
-            &provider,
-            &session_id,
-            cli_agent_options_with(max_turns, python_timeout_seconds),
-        )?;
-    }
-    Ok(())
+    let provider = anthropic_provider(store, model.clone())?;
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        &provider,
+        DatasetProviderConfig {
+            provider: "anthropic",
+            model: &model,
+            max_turns,
+            python_timeout_seconds,
+        },
+    )
 }
 
 fn dataset_run_openrouter(
     store: &Store,
     dataset: &str,
-    count: usize,
+    options: DatasetRunOptions,
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let cases = load_dataset_cases(dataset)?;
-    if cases.is_empty() || count == 0 {
+    let provider = openrouter_provider(store, model.clone())?;
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        &provider,
+        DatasetProviderConfig {
+            provider: "openrouter",
+            model: &model,
+            max_turns,
+            python_timeout_seconds,
+        },
+    )
+}
+
+fn dataset_run_provider<P: ModelProvider>(
+    store: &Store,
+    dataset: &str,
+    options: DatasetRunOptions,
+    provider: &P,
+    config: DatasetProviderConfig<'_>,
+) -> Result<()> {
+    let all_cases = load_dataset_cases(dataset)?;
+    let run_id = options
+        .run_id
+        .clone()
+        .unwrap_or_else(|| dataset_run_id(dataset));
+    let manifest_path = dataset_manifest_path(store, &run_id);
+    let resume_manifest = options.resume && manifest_path.exists();
+    let selected = if resume_manifest {
+        cases_from_manifest_selection(&all_cases, &load_dataset_manifest(store, &run_id)?)?
+    } else {
+        select_dataset_cases(all_cases, &options)?
+    };
+    if selected.is_empty() {
         println!("No dataset cases selected.");
         return Ok(());
     }
-    let provider = openrouter_provider(store, model)?;
-    for case in cases.into_iter().take(count) {
-        let session_id = create_dataset_session(store, dataset, &case)?;
-        println!("{}  {}", case.task_id, session_id);
-        io::stdout().flush()?;
-        run_existing_session_with_provider(
+
+    let mut manifest = if resume_manifest {
+        load_dataset_manifest(store, &run_id)?
+    } else {
+        new_dataset_manifest(&run_id, dataset, &selected, config)
+    };
+    let skip_ids = if options.resume {
+        resume_skip_ids(&manifest, options.skip_failed)
+    } else {
+        HashSet::new()
+    };
+    write_dataset_manifest(store, &run_id, &manifest)?;
+
+    for case in selected {
+        if skip_ids.contains(&case.task_id) {
+            println!("{}  skipped", case.task_id);
+            continue;
+        }
+        let result = run_dataset_case_with_attempts(
             store,
-            &provider,
-            &session_id,
-            cli_agent_options_with(max_turns, python_timeout_seconds),
+            provider,
+            &case,
+            config,
+            options.max_attempts.max(1),
         )?;
+        let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        manifest_sessions_mut(&mut manifest)?.push(result);
+        manifest["summary"] = summarize_dataset_manifest(&manifest);
+        write_dataset_manifest(store, &run_id, &manifest)?;
+        if options.stop_on_failure && !ok {
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            bail!("dataset task {} failed", case.task_id);
+        }
+    }
+
+    manifest["summary"] = summarize_dataset_manifest(&manifest);
+    write_dataset_manifest(store, &run_id, &manifest)?;
+    println!("{}", serde_json::to_string_pretty(&manifest)?);
+    if !dataset_manifest_exit_ok(&manifest) {
+        bail!("dataset run has failures or pending tasks");
     }
     Ok(())
+}
+
+fn run_dataset_case_with_attempts<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    case: &DatasetCase,
+    config: DatasetProviderConfig<'_>,
+    max_attempts: usize,
+) -> Result<Value> {
+    let mut retry_history = Vec::new();
+    for attempt in 1..=max_attempts {
+        let mut result = run_dataset_case_with_provider(store, provider, case, config, attempt)?;
+        let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if ok {
+            if !retry_history.is_empty() {
+                result["retry_history"] = Value::Array(retry_history);
+            }
+            return Ok(result);
+        }
+        let should_retry = attempt < max_attempts && is_transient_provider_failure(&result);
+        if !should_retry {
+            if !retry_history.is_empty() {
+                result["retry_history"] = Value::Array(retry_history);
+            }
+            return Ok(result);
+        }
+        retry_history.push(result);
+    }
+    bail!("unreachable dataset retry loop")
+}
+
+fn run_dataset_case_with_provider<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    case: &DatasetCase,
+    config: DatasetProviderConfig<'_>,
+    attempt: usize,
+) -> Result<Value> {
+    let session_id = create_dataset_session(store, case, attempt)?;
+    println!("{}  {}", case.task_id, session_id);
+    io::stdout().flush()?;
+    let run_error = run_existing_session_with_provider(
+        store,
+        provider,
+        &session_id,
+        cli_agent_options_with(config.max_turns, config.python_timeout_seconds),
+    )
+    .err()
+    .map(|error| error.to_string());
+    dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
+}
+
+fn dataset_attempt_result(
+    store: &Store,
+    case: &DatasetCase,
+    session_id: &str,
+    config: DatasetProviderConfig<'_>,
+    attempt: usize,
+    run_error: Option<String>,
+) -> Result<Value> {
+    let session = ensure_task_exists(store, session_id)?;
+    let events = store.events_for_session(session_id)?;
+    let final_result = result_from_events(&events);
+    let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
+    let session_failure = failure_from_events(&events);
+    let error = run_error.clone().or(session_failure.clone());
+    let error_type = if run_error.is_some() {
+        Value::String("provider".to_string())
+    } else if session_failure.is_some() {
+        Value::String("session".to_string())
+    } else {
+        Value::Null
+    };
+    let ok = run_error.is_none()
+        && session.status.as_str() == "done"
+        && error.is_none()
+        && final_result.is_some();
+    Ok(serde_json::json!({
+        "task_id": case.task_id,
+        "dataset": case.dataset,
+        "path": case.path,
+        "ok": ok,
+        "attempt_number": attempt,
+        "provider": config.provider,
+        "model": config.model,
+        "final_result": final_result,
+        "final_result_chars": final_result_chars,
+        "error_type": error_type,
+        "error": error,
+        "session": {
+            "id": session.id,
+            "status": session.status.as_str(),
+            "cwd": session.cwd,
+            "artifact_root": session.artifact_root,
+        },
+    }))
 }
 
 fn load_dataset_cases(dataset: &str) -> Result<Vec<DatasetCase>> {
     let path = resolve_dataset_path(dataset);
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
+    let raw: Value =
+        serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
+    let array = raw
+        .as_array()
+        .with_context(|| format!("{} must contain a JSON array", path.display()))?;
+    let dataset_name = dataset_name_for_path(dataset, &path);
+    array
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| parse_dataset_case(&dataset_name, &path, idx, value.clone()))
+        .collect()
 }
 
 fn resolve_dataset_path(dataset: &str) -> PathBuf {
@@ -1472,11 +1901,330 @@ fn resolve_dataset_path(dataset: &str) -> PathBuf {
     if direct.exists() {
         return direct;
     }
+    match dataset {
+        "real_v14" | "real_v14_short" => return PathBuf::from("datasets/real_v14_short.json"),
+        "real_v8" => return PathBuf::from("datasets/real_v8.json"),
+        _ => {}
+    }
     let with_ext = PathBuf::from("datasets").join(format!("{dataset}.json"));
     if with_ext.exists() {
         return with_ext;
     }
     direct
+}
+
+fn parse_dataset_case(
+    dataset: &str,
+    path: &std::path::Path,
+    idx: usize,
+    raw: Value,
+) -> Result<DatasetCase> {
+    raw.as_object()
+        .with_context(|| format!("dataset row {} must be an object", idx + 1))?;
+    let task_id = raw
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| (idx + 1).to_string());
+    let confirmed_task = ["confirmed_task", "task", "text", "prompt"]
+        .iter()
+        .find_map(|key| raw.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("dataset row {task_id} has no task text"))?;
+    Ok(DatasetCase {
+        dataset: dataset.to_string(),
+        path: path.display().to_string(),
+        task_id,
+        confirmed_task,
+        raw,
+    })
+}
+
+fn dataset_name_for_path(dataset: &str, path: &std::path::Path) -> String {
+    match dataset {
+        "real_v14" | "real_v14_short" => "real_v14_short".to_string(),
+        "real_v8" => "real_v8".to_string(),
+        _ => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(dataset)
+            .to_string(),
+    }
+}
+
+fn select_dataset_cases(
+    cases: Vec<DatasetCase>,
+    options: &DatasetRunOptions,
+) -> Result<Vec<DatasetCase>> {
+    if !options.task_ids.is_empty() {
+        let requested = options
+            .task_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>();
+        let selected = cases
+            .into_iter()
+            .filter(|case| requested.contains(&case.task_id))
+            .collect::<Vec<_>>();
+        let found = selected
+            .iter()
+            .map(|case| case.task_id.clone())
+            .collect::<HashSet<_>>();
+        let missing = requested
+            .difference(&found)
+            .cloned()
+            .collect::<Vec<String>>();
+        if !missing.is_empty() {
+            bail!("dataset task id(s) not found: {}", missing.join(", "));
+        }
+        return Ok(selected);
+    }
+    if options.all {
+        return Ok(cases);
+    }
+    Ok(cases.into_iter().take(options.count).collect())
+}
+
+fn cases_from_manifest_selection(
+    cases: &[DatasetCase],
+    manifest: &Value,
+) -> Result<Vec<DatasetCase>> {
+    let empty = Vec::new();
+    let ids = manifest
+        .get("selection")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|case| case.get("task_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        bail!("resume manifest has no selection");
+    }
+    let by_id = cases
+        .iter()
+        .map(|case| (case.task_id.clone(), case.clone()))
+        .collect::<HashMap<_, _>>();
+    ids.into_iter()
+        .map(|id| {
+            by_id
+                .get(&id)
+                .cloned()
+                .with_context(|| format!("resume task id {id} no longer exists in dataset"))
+        })
+        .collect()
+}
+
+fn build_dataset_prompt(case: &DatasetCase) -> String {
+    format!(
+        "You are running a browser-use dataset case.\n\nDataset: {}\nTask ID: {}\n\nTask:\n{}\n\nUse the python tool for browser interaction. The python tool owns the browser connection and exposes browser-harness helpers plus raw CDP access when needed. Prefer robust DOM/CDP observations over guessing. Attach screenshots after meaningful visual transitions when they help audit the run. Return the final answer with the done tool only when the task is complete.",
+        case.dataset, case.task_id, case.confirmed_task
+    )
+}
+
+fn dataset_case_manifest(case: &DatasetCase) -> Value {
+    serde_json::json!({
+        "dataset": case.dataset,
+        "path": case.path,
+        "task_id": case.task_id,
+        "confirmed_task": case.confirmed_task,
+        "raw": case.raw,
+    })
+}
+
+fn new_dataset_manifest(
+    run_id: &str,
+    dataset: &str,
+    cases: &[DatasetCase],
+    config: DatasetProviderConfig<'_>,
+) -> Value {
+    let mut datasets = HashMap::<String, usize>::new();
+    for case in cases {
+        *datasets.entry(case.dataset.clone()).or_default() += 1;
+    }
+    serde_json::json!({
+        "run_id": run_id,
+        "dataset": dataset,
+        "created_ms": now_ms(),
+        "provider": config.provider,
+        "model": config.model,
+        "headless": true,
+        "browser": "headless",
+        "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
+        "summary": {
+            "count": cases.len(),
+            "datasets": datasets,
+            "passed": 0,
+            "failed": 0,
+            "pending": cases.len(),
+        },
+        "sessions": [],
+    })
+}
+
+fn dataset_run_id(dataset: &str) -> String {
+    let mut safe = dataset
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        safe.push_str("dataset");
+    }
+    format!("{safe}-{}", now_ms())
+}
+
+fn dataset_manifest_path(store: &Store, run_id: &str) -> PathBuf {
+    store
+        .state_dir()
+        .join("dataset-runs")
+        .join(format!("{run_id}.json"))
+}
+
+fn load_dataset_manifest(store: &Store, run_id_or_path: &str) -> Result<Value> {
+    let direct = PathBuf::from(run_id_or_path);
+    let path = if direct.exists() {
+        direct
+    } else {
+        dataset_manifest_path(store, run_id_or_path)
+    };
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))
+}
+
+fn write_dataset_manifest(store: &Store, run_id: &str, manifest: &Value) -> Result<()> {
+    let path = dataset_manifest_path(store, run_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(manifest)?),
+    )
+    .with_context(|| format!("write {}", path.display()))
+}
+
+fn manifest_sessions_mut(manifest: &mut Value) -> Result<&mut Vec<Value>> {
+    if !manifest.get("sessions").is_some_and(Value::is_array) {
+        manifest["sessions"] = Value::Array(Vec::new());
+    }
+    manifest
+        .get_mut("sessions")
+        .and_then(Value::as_array_mut)
+        .context("manifest sessions must be an array")
+}
+
+fn summarize_dataset_manifest(manifest: &Value) -> Value {
+    let selection = manifest
+        .get("selection")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let selected_ids = selection
+        .iter()
+        .filter_map(|case| case.get("task_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut datasets = HashMap::<String, usize>::new();
+    for case in &selection {
+        if let Some(dataset) = case.get("dataset").and_then(Value::as_str) {
+            *datasets.entry(dataset.to_string()).or_default() += 1;
+        }
+    }
+    let mut latest = HashMap::<String, Value>::new();
+    let mut attempts = HashMap::<String, usize>::new();
+    for session in manifest
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(task_id) = session.get("task_id").and_then(Value::as_str) else {
+            continue;
+        };
+        *attempts.entry(task_id.to_string()).or_default() += 1;
+        latest.insert(task_id.to_string(), session.clone());
+    }
+    let mut passed_ids = Vec::new();
+    let mut failed_ids = Vec::new();
+    let mut pending_ids = Vec::new();
+    for task_id in &selected_ids {
+        match latest.get(task_id) {
+            Some(session) if session.get("ok").and_then(Value::as_bool).unwrap_or(false) => {
+                passed_ids.push(task_id.clone());
+            }
+            Some(_) => failed_ids.push(task_id.clone()),
+            None => pending_ids.push(task_id.clone()),
+        }
+    }
+    serde_json::json!({
+        "run_id": manifest.get("run_id").cloned().unwrap_or(Value::Null),
+        "dataset": manifest.get("dataset").cloned().unwrap_or(Value::Null),
+        "provider": manifest.get("provider").cloned().unwrap_or(Value::Null),
+        "model": manifest.get("model").cloned().unwrap_or(Value::Null),
+        "count": selected_ids.len(),
+        "datasets": datasets,
+        "passed": passed_ids.len(),
+        "failed": failed_ids.len(),
+        "pending": pending_ids.len(),
+        "passed_ids": passed_ids,
+        "failed_ids": failed_ids,
+        "pending_ids": pending_ids,
+        "attempts_by_task": attempts,
+    })
+}
+
+fn resume_skip_ids(manifest: &Value, skip_failed: bool) -> HashSet<String> {
+    let mut skip = HashSet::new();
+    for session in manifest
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(task_id) = session.get("task_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let ok = session.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if ok || skip_failed {
+            skip.insert(task_id.to_string());
+        }
+    }
+    skip
+}
+
+fn dataset_manifest_exit_ok(manifest: &Value) -> bool {
+    let summary = summarize_dataset_manifest(manifest);
+    summary.get("failed").and_then(Value::as_u64).unwrap_or(1) == 0
+        && summary.get("pending").and_then(Value::as_u64).unwrap_or(1) == 0
+}
+
+fn is_transient_provider_failure(result: &Value) -> bool {
+    let Some(error) = result.get("error").and_then(Value::as_str) else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    [
+        "stream error",
+        "rate limit",
+        "overloaded",
+        "temporarily",
+        "timeout",
+        "timed out",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn ensure_task_exists(store: &Store, task_id: &str) -> Result<browser_use_protocol::SessionMeta> {

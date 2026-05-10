@@ -12,6 +12,11 @@ uv run browser-use-terminal --state-dir /tmp/but-rust-final-smoke run-fake "Open
 uv run browser-use-terminal --state-dir /tmp/but-rust-dataset-final dataset-run-fake real_v14_short --count 1
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v14-full dataset-run-fake real_v14_short --count 10
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-fake real_v8 --count 100
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-list
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-sample real_v14_short --count 2
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-report audit-smoke
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke --resume
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke run-codex --model gpt-5.5 \
   "Do not use the browser. Call the done tool with result exactly 'ok'."
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
@@ -146,6 +151,21 @@ Latest live Codex smoke:
 - model emitted a `done` tool call
 - final `session.done` payload was `{"result":"ok"}`
 
+Latest completion-audit deterministic TUI dumps inspected under `/tmp/but-completion-audit-tui/`:
+
+- `setup.txt`
+- `ready.txt`
+- `running.txt`
+- `result.txt`
+- `browser.txt`
+- `browser-refresh.txt`
+- `history.txt`
+- `actions.txt`
+- `help.txt`
+- `developer.txt`
+- `stopped.txt`
+- `browser-refresh.txt` shows live browser details as `tabs 1 open` and `viewport 1440 x 900`
+
 Latest bounded real Codex dataset attempt:
 
 - state dir `/tmp/but-rust-codex-real-v14-count2-bounded`
@@ -153,6 +173,16 @@ Latest bounded real Codex dataset attempt:
 - Python calls were bounded with `--python-timeout-seconds 60`; tool failures were recorded and the agent continued through 114 Python calls
 - the attempt stopped on a Codex provider stream error: `cyber_policy`
 - the stale-running state exposed by that provider error is now covered by `provider_stream_errors_mark_session_failed_and_finish_run`
+
+Latest fake dataset manifest/report smoke:
+
+- state dir `/tmp/but-dataset-manifest-smoke`
+- manifest path `/tmp/but-dataset-manifest-smoke/dataset-runs/audit-smoke.json`
+- `dataset-list` resolves `real_v14_short`, `real_v14`, and `real_v8`
+- `dataset-sample real_v14_short --count 2` loads cases `2` and `4`
+- `dataset-run-fake real_v14_short --count 2 --run-id audit-smoke` wrote two done sessions and summary `passed=2 failed=0 pending=0`
+- `dataset-report audit-smoke` returns the compact report with attempts by task
+- `dataset-run-fake ... --resume` skips already passed task ids `2` and `4`
 
 Provider coverage:
 

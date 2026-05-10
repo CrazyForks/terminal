@@ -136,6 +136,8 @@ pub struct BrowserSummary {
     pub title: Option<String>,
     pub url: Option<String>,
     pub live_url: Option<String>,
+    pub tabs: Option<i64>,
+    pub viewport: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +214,8 @@ pub fn browser_summary_from_events(
         title: None,
         url: None,
         live_url: None,
+        tabs: None,
+        viewport: None,
     };
     for event in events {
         match event.event_type.as_str() {
@@ -224,6 +228,9 @@ pub fn browser_summary_from_events(
                     .map(ToOwned::to_owned);
             }
             "browser.page" | "browser.state" => {
+                if let Some(status) = event.payload.get("status").and_then(Value::as_str) {
+                    summary.status = status.to_string();
+                }
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
                     summary.url = Some(url.to_string());
                     summary.status = "connected".to_string();
@@ -231,11 +238,38 @@ pub fn browser_summary_from_events(
                 if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
                     summary.title = Some(title.to_string());
                 }
+                if let Some(tabs) = event
+                    .payload
+                    .get("tabs")
+                    .or_else(|| event.payload.get("tab_count"))
+                    .and_then(Value::as_i64)
+                {
+                    summary.tabs = Some(tabs);
+                }
+                if let Some(viewport) = viewport_label_from_payload(&event.payload) {
+                    summary.viewport = Some(viewport);
+                }
             }
             _ => {}
         }
     }
     summary
+}
+
+fn viewport_label_from_payload(payload: &Value) -> Option<String> {
+    if let Some(label) = payload.get("viewport").and_then(Value::as_str) {
+        return (!label.trim().is_empty()).then(|| label.trim().to_string());
+    }
+    let viewport = payload.get("viewport").unwrap_or(payload);
+    let width = viewport
+        .get("w")
+        .or_else(|| viewport.get("width"))
+        .and_then(Value::as_i64)?;
+    let height = viewport
+        .get("h")
+        .or_else(|| viewport.get("height"))
+        .and_then(Value::as_i64)?;
+    Some(format!("{width} x {height}"))
 }
 
 pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
@@ -404,7 +438,12 @@ mod tests {
                 session_id: "s1".to_string(),
                 ts_ms: 2,
                 event_type: "browser.page".to_string(),
-                payload: json!({"url": "https://example.com/", "title": "Example"}),
+                payload: json!({
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "tabs": 2,
+                    "viewport": {"w": 1440, "h": 900},
+                }),
             },
             EventRecord {
                 seq: 3,
@@ -420,6 +459,8 @@ mod tests {
         let browser = browser_summary_from_events(&events, "local chrome");
         assert_eq!(browser.status, "connected");
         assert_eq!(browser.title.as_deref(), Some("Example"));
+        assert_eq!(browser.tabs, Some(2));
+        assert_eq!(browser.viewport.as_deref(), Some("1440 x 900"));
         assert_eq!(activity_from_events(&events), vec!["browsing example.com"]);
     }
 

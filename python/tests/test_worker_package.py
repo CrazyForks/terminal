@@ -48,3 +48,29 @@ def test_worker_records_artifacts_and_images(tmp_path: Path) -> None:
     assert response["images"][0]["label"] == "shot"
     assert response["images"][0]["mime_type"] == "image/png"
     assert Path(response["images"][0]["path"]).exists()
+
+
+def test_worker_records_browser_state_details(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "browser-state",
+            "session_id": "task-3",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "emit_browser_state(url='https://example.com', title='Example', status='connected', tabs=2, viewport={'w': 1440, 'h': 900})",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["browser_events"] == [
+        {
+            "type": "browser.state",
+            "payload": {
+                "url": "https://example.com",
+                "title": "Example",
+                "status": "connected",
+                "tabs": 2,
+                "viewport": {"w": 1440, "h": 900},
+            },
+        }
+    ]

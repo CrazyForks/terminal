@@ -22,11 +22,11 @@ Objective audited:
 | Providers cover fake, Codex, OpenAI, Anthropic, and OpenRouter. | Provider crate has fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter adapters with mocked HTTP/SSE tests. | Done |
 | Claude Code path exists. | `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_AUTH_TOKEN` route to Anthropic bearer-token auth with redaction and tests. | Done |
 | Cancellation is runtime-visible. | Store records cancel events/status; core now checks cancellation before finalizing model/tool turns and records cancelled run rows; `provider_loop_respects_external_cancel_before_finalizing` covers this. | Done |
-| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; fake `real_v14_short` count-10 and fake `real_v8` count-100 passed; Codex count-1 `real_v14_short` passed. | Mostly done |
+| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; dataset list/sample/report commands exist; runs write resumable manifests under `state_dir/dataset-runs`; fake `real_v14_short` count-10 and fake `real_v8` count-100 passed; Codex count-1 `real_v14_short` passed. | Mostly done |
 | Terminal UI first-run setup matches the UX doc. | TUI has setup, sign-in, model, browser choice, setup-complete, persisted choices, and tests for setup flow. | Done |
 | Terminal UI workbench matches the UX doc vocabulary. | Normal TUI uses `task/browser/account/model/result/history/setup` vocabulary and hides artifact/trace/provider/event concepts behind developer overlay. | Done |
 | Terminal UI running/result/history/actions/browser behavior works. | Unit tests plus manual PTY runs cover task entry, running, result, follow-up, history, actions, help, browser overlay, browser picker, and quit. | Done |
-| Browser overlay actions do what they say. | Fixed and tested: `Open browser` records `browser.open_requested`, `Reconnect` records `browser.reconnect_requested`, `Change browser` opens browser picker without accidental backend mutation. | Done |
+| Browser overlay actions do what they say. | Fixed and tested: `Open browser` records `browser.open_requested`, `Reconnect` records `browser.reconnect_requested`, `Change browser` opens browser picker without accidental backend mutation; live browser state now projects tab count and viewport details instead of hardcoded unknowns. | Done |
 | Terminal UI was manually tested. | `/tmp/but-goal-final-tui` and `/tmp/but-goal-browser-overlay-tui` PTY runs inspected; SQLite evidence recorded in `docs/rewrite-verification.md`. | Done |
 | Rust package choices are current/reasonable. | Current checks found `ratatui 0.30.0`, `rusqlite 0.39.0`, `reqwest 0.12.x`, `sqlx 0.8.6`, `async-openai v0.37.0`, and `eventsource-client` as available options. The implementation uses Ratatui, rusqlite, and thin reqwest adapters where SDK coverage is not worth extra complexity. | Done |
 | Provider failures leave durable failed state. | Core records `session.failed` and closes the run row when a provider stream errors; regression test `provider_stream_errors_mark_session_failed_and_finish_run` covers the path exposed by a live Codex `cyber_policy` stream error. | Done |
@@ -41,6 +41,13 @@ cargo fmt --check
 cargo test
 uv run --with pytest python -m pytest -q
 cargo test -p browser-use-core -p browser-use-tui
+cargo test -p browser-use-cli -p browser-use-protocol -p browser-use-tui -p browser-use-python-worker
+uv run --with pytest python -m pytest -q
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-list
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-sample real_v14_short --count 2
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-report audit-smoke
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke --resume
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v14-full dataset-run-fake real_v14_short --count 10
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-fake real_v8 --count 100
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-real-v14-count2-bounded \

@@ -338,7 +338,13 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         ns.setdefault("browser_events", []).append(record)
         _emit_protocol_event(request_id, "browser", record)
 
-    def emit_browser_state(url: str | None = None, title: str | None = None, status: str | None = None) -> None:
+    def emit_browser_state(
+        url: str | None = None,
+        title: str | None = None,
+        status: str | None = None,
+        tabs: int | None = None,
+        viewport: Any | None = None,
+    ) -> None:
         payload: Dict[str, Any] = {}
         if url is not None:
             payload["url"] = str(url)
@@ -346,6 +352,10 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             payload["title"] = str(title)
         if status is not None:
             payload["status"] = str(status)
+        if tabs is not None:
+            payload["tabs"] = int(tabs)
+        if viewport is not None:
+            payload["viewport"] = viewport
         record = {"type": "browser.state", "payload": payload}
         ns.setdefault("browser_events", []).append(record)
         _emit_protocol_event(request_id, "browser", record)
@@ -399,6 +409,21 @@ def _auto_emit_browser_state(ns: Dict[str, Any], request_id: str) -> None:
             payload["title"] = str(tab["title"])
         if tab.get("targetId"):
             payload["target_id"] = str(tab["targetId"])
+    try:
+        tabs = helpers.list_tabs(include_chrome=False)
+        if isinstance(tabs, list):
+            payload["tabs"] = len(tabs)
+    except Exception:
+        pass
+    try:
+        metrics = helpers.cdp("Page.getLayoutMetrics")
+        viewport = metrics.get("cssVisualViewport") or metrics.get("cssLayoutViewport") or {}
+        width = viewport.get("clientWidth")
+        height = viewport.get("clientHeight")
+        if width and height:
+            payload["viewport"] = {"w": round(float(width)), "h": round(float(height))}
+    except Exception:
+        pass
     if not payload:
         return
     record = {"type": "browser.state", "payload": payload}

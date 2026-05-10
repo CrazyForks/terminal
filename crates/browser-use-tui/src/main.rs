@@ -1306,8 +1306,18 @@ fn render_browser_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state: &
             "live",
             state.browser.live_url.as_deref().unwrap_or("not available"),
         ),
-        kv_line("tabs", "unknown"),
-        kv_line("viewport", "unknown"),
+        kv_line(
+            "tabs",
+            &state
+                .browser
+                .tabs
+                .map(|tabs| format!("{tabs} open"))
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        kv_line(
+            "viewport",
+            state.browser.viewport.as_deref().unwrap_or("unknown"),
+        ),
         Line::from(""),
         selected("Open browser", 0, app.selected_row),
         selected("Reconnect", 1, app.selected_row),
@@ -1471,7 +1481,12 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
     store.append_event(
         &session.id,
         "browser.page",
-        serde_json::json!({"url": "https://news.ycombinator.com", "title": "Hacker News"}),
+        serde_json::json!({
+            "url": "https://news.ycombinator.com",
+            "title": "Hacker News",
+            "tabs": 1,
+            "viewport": {"w": 1440, "h": 900},
+        }),
     )?;
     store.append_event(
         &session.id,
@@ -1840,8 +1855,21 @@ mod tests {
             "browser.live_url",
             serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
         )?;
+        app.store.append_event(
+            &session.id,
+            "browser.state",
+            serde_json::json!({
+                "url": "https://example.com",
+                "title": "Example",
+                "tabs": 2,
+                "viewport": {"w": 1440, "h": 900},
+            }),
+        )?;
         app.selected_session_id = Some(session.id.clone());
         app.open_overlay(Overlay::Browser);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("2 open"));
+        assert!(screen.contains("1440 x 900"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.browser, "Headless Chromium");
