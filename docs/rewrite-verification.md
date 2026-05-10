@@ -214,8 +214,8 @@ Provider coverage:
 - Anthropic Messages also has mocked bearer-token coverage for the Claude Code OAuth-token path. The CLI stores `auth.claude_code.auth_token`, redacts it in `config show`, detects `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`, and reports external Claude Code CLI login status without scraping Keychain tokens.
 - Python worker tests cover browser-harness download-style artifacts and refreshed browser target identity across calls.
 - Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, cancellation checks before finalization, compaction events, large Python output spillover to artifacts, recursive sub-agent close, per-parent sub-agent path uniqueness, configurable spawn fork modes, isolated sub-agent provider execution with compact parent completion events, persistent TUI setup choices, browser overlay action routing, result follow-up execution on the existing task, and Enter-to-retry behavior for failed tasks.
-- Store tests include checked-in golden legacy session/event fixture import from `tests/golden-events/legacy-session`.
-- Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close.
+- Store and TUI tests include checked-in golden legacy session/event fixture import and projection from `tests/golden-events/legacy-session`.
+- Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close, plus bounded `wait_agent` timeout behavior for active helpers.
 - Live Anthropic/OpenRouter smokes were not run in this branch because they require live credentials.
 
 Trace export smoke:

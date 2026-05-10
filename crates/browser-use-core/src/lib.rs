@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -528,7 +530,7 @@ fn browser_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "wait_agent".to_string(),
-            description: "Read the compact status and final result for a helper session."
+            description: "Read, and optionally briefly wait for, the compact status and final result for a helper session."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -536,6 +538,11 @@ fn browser_tool_specs() -> Vec<ToolSpec> {
                     "child_session_id": {
                         "type": "string",
                         "description": "The helper session id or canonical helper path returned by spawn_agent."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional maximum time to wait for an active helper to finish before returning its current status."
                     }
                 },
                 "required": ["child_session_id"],
@@ -1047,6 +1054,12 @@ fn dispatch_wait_agent_tool(
     };
     let child_session_id = child_summary.child_session_id.clone();
     let agent_path = child_summary.agent_path.clone();
+    let timeout_ms = call
+        .arguments
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(300_000);
     store.append_event(
         &session.id,
         "tool.started",
@@ -1056,9 +1069,20 @@ fn dispatch_wait_agent_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let child = store
-        .load_session(&child_session_id)?
-        .with_context(|| format!("unknown child session id: {child_session_id}"))?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let (child, timed_out) = loop {
+        let child = store
+            .load_session(&child_session_id)?
+            .with_context(|| format!("unknown child session id: {child_session_id}"))?;
+        if timeout_ms == 0 || !child.status.is_active() {
+            break (child, false);
+        }
+        if started.elapsed() >= timeout {
+            break (child, true);
+        }
+        thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
+    };
     let child_events = store.events_for_session(&child_session_id)?;
     let messages = store
         .messages_for_agent(&child_session_id)?
@@ -1092,6 +1116,7 @@ fn dispatch_wait_agent_tool(
                 "status": child.status.as_str(),
                 "result": result_from_events(&child_events),
                 "failure": failure_from_events(&child_events),
+                "timed_out": timed_out,
                 "messages": messages,
             }),
         )?],
@@ -2171,6 +2196,50 @@ mod tests {
         assert_eq!(mailbox.len(), 2);
         assert!(!mailbox[0].trigger_turn);
         assert!(mailbox[1].trigger_turn);
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_can_return_after_timeout_for_active_child() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/helper"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "still running"}),
+        )?;
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_active".to_string(),
+                name: "wait_agent".to_string(),
+                arguments: serde_json::json!({
+                    "child_session_id": "/root/helper",
+                    "timeout_ms": 1,
+                }),
+            },
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        assert_eq!(data["status"], "running");
+        assert_eq!(data["timed_out"], true);
+
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .any(|event| event.event_type == "tool.finished"
+                && event.payload["name"] == "wait_agent"));
         Ok(())
     }
 

@@ -1934,6 +1934,44 @@ mod tests {
     }
 
     #[test]
+    fn dump_screen_projects_checked_in_legacy_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/golden-events/legacy-session");
+        let session = app.store.import_legacy_session(&fixture)?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Find the top Hacker News post"));
+        assert!(screen.contains("Top story found"));
+        assert!(screen.contains("Hacker News"));
+        assert!(!screen.contains("artifact"));
+        assert!(!screen.contains("trace"));
+
+        app.open_overlay(Overlay::Browser);
+        let browser_screen = render_dump(&mut app)?;
+        assert!(browser_screen.contains("1 open"));
+        assert!(browser_screen.contains("1440 x 900"));
+        Ok(())
+    }
+
+    #[test]
     fn dump_screen_with_history_stays_on_ready_workbench_until_selected() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let args = Args {

@@ -6,11 +6,11 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 
 - Rust workspace split into protocol, store, core, providers, Python-worker supervisor, CLI, and TUI crates.
 - SQLite is the durable state boundary for sessions, events, artifacts, runs, agent graph, mailbox, and app settings.
-- Checked-in golden legacy events under `tests/golden-events/legacy-session` verify import compatibility for old session/event JSONL shape.
+- Checked-in golden legacy events under `tests/golden-events/legacy-session` verify import compatibility for old session/event JSONL shape and TUI projection from imported events.
 - Old Python product runtime is removed from the package surface; Python is now the browser worker island.
 - Python worker loads local browser harness helpers, preserves per-session namespaces, exposes host helpers such as `artifact_root()` and `session_metadata()`, streams host events, and emits browser state/images/artifacts, tab count, and viewport details back to Rust.
 - Rust agent loop dispatches the tiny model-visible tool surface: `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`.
-- Child agents are separate sessions with canonical `/root/...` paths, per-parent path uniqueness, configurable sanitized fork modes, durable graph edges, recursive close/cancel, mailbox messages, and provider execution isolated from the parent transcript.
+- Child agents are separate sessions with canonical `/root/...` paths, per-parent path uniqueness, configurable sanitized fork modes, durable graph edges, recursive close/cancel, bounded `wait_agent`, mailbox messages, and provider execution isolated from the parent transcript.
 - Provider adapters exist for fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter.
 - Claude Code account selection can run Anthropic Messages through a stored or environment OAuth bearer token from `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`.
 - CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, dataset list/sample/report, and resumable dataset runners with isolated per-case workspaces.
@@ -37,7 +37,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - fake dataset runner, including full `real_v14_short` count-10 and `real_v8` count-100 fake paths
 - fake dataset manifest/report/resume smoke under `/tmp/but-dataset-manifest-smoke`
 - fake dataset isolated-workspace smoke under `/tmp/but-dataset-workspace-smoke`
-- checked-in legacy event fixture import test
+- checked-in legacy event fixture import and TUI projection tests
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction
