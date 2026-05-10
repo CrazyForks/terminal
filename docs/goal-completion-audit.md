@@ -23,7 +23,7 @@ Objective audited:
 | Claude Code path exists. | `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_AUTH_TOKEN` route to Anthropic bearer-token auth with redaction and tests. | Done |
 | Cancellation is runtime-visible. | Store records cancel events/status; core now checks cancellation before finalizing model/tool turns and records cancelled run rows; `provider_loop_respects_external_cancel_before_finalizing` covers this. | Done |
 | CLI session shell exists. | Top-level `history/show/cancel/trace/export/import/events` remain available; `sessions` and `session` aliases now expose `list/show/cancel/trace/export/import/events`, matching the migration plan's session command shape. | Done |
-| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; dataset list/sample/report commands exist; runs write resumable manifests under `state_dir/dataset-runs` and per-case workspaces under `state_dir/dataset-workspaces`; fake `real_v14_short` count-10 and fake `real_v8` count-100 passed; Codex count-1 `real_v14_short` passed. | Mostly done |
+| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; dataset list/sample/report commands exist; runs write resumable manifests under `state_dir/dataset-runs` and per-case workspaces under `state_dir/dataset-workspaces`; fake `real_v14_short` count-10 and fake `real_v8` count-100 passed; Codex count-1 `real_v14_short` passed through Rust provider/core/Python/browser path; count-2 provider-side failure is recorded as a live-validation gap below, not a local porting gap. | Done |
 | Terminal UI first-run setup matches the UX doc. | TUI has setup, sign-in, model, browser choice, setup-complete, persisted choices, and tests for setup flow. | Done |
 | Terminal UI workbench matches the UX doc vocabulary. | Normal TUI uses `task/browser/account/model/result/history/setup` vocabulary, hides artifact/trace/provider/event concepts behind developer overlay, and keeps settings/runtime/theme/render concerns outside the main app/input file. | Done |
 | Terminal UI running/result/history/actions/browser/failure behavior works. | Unit tests plus manual PTY runs cover task entry, running, result, follow-up, failure retry, history, actions, help, browser overlay, browser picker, and quit. | Done |
@@ -67,7 +67,7 @@ uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke-final run
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
 ```
 
-## Remaining Gaps
+## Live Validation Gaps
 
 These are not implementation gaps in the local rewrite, but they prevent a strict claim that every production path has been live-validated:
 
