@@ -17,6 +17,7 @@ pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
 }
 
+#[derive(Clone, Debug)]
 pub struct AgentRunOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
@@ -219,7 +220,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
             for call in tool_calls {
                 ensure_not_cancelled(store, &session.id)?;
-                let outcome = dispatch_tool_call(store, &session, &mut worker, &call, &options)?;
+                let outcome =
+                    dispatch_tool_call(store, provider, &session, &mut worker, &call, &options)?;
                 messages.extend(outcome.messages);
                 maybe_compact_messages(
                     store,
@@ -624,8 +626,9 @@ fn tool_call_message(call: &ToolCall) -> Value {
     })
 }
 
-fn dispatch_tool_call(
+fn dispatch_tool_call<P: ModelProvider>(
     store: &Store,
+    provider: &P,
     session: &browser_use_protocol::SessionMeta,
     worker: &mut PythonWorker,
     call: &ToolCall,
@@ -640,10 +643,14 @@ fn dispatch_tool_call(
             call,
             options.python_tool_timeout_seconds,
         ),
-        "spawn_agent" => dispatch_spawn_agent_tool(store, session, call),
+        "spawn_agent" => dispatch_spawn_agent_tool(store, provider, session, call, options),
         "wait_agent" => dispatch_wait_agent_tool(store, session, call),
-        "send_message" => dispatch_agent_message_tool(store, session, call, false),
-        "followup_task" => dispatch_agent_message_tool(store, session, call, true),
+        "send_message" => {
+            dispatch_agent_message_tool(store, provider, session, call, false, options)
+        }
+        "followup_task" => {
+            dispatch_agent_message_tool(store, provider, session, call, true, options)
+        }
         "list_agents" => dispatch_list_agents_tool(store, session, call),
         "close_agent" => dispatch_close_agent_tool(store, session, call),
         _ => dispatch_unknown_tool(store, session, call),
@@ -759,10 +766,12 @@ fn dispatch_python_tool(
     })
 }
 
-fn dispatch_spawn_agent_tool(
+fn dispatch_spawn_agent_tool<P: ModelProvider>(
     store: &Store,
+    provider: &P,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     let message = call
         .arguments
@@ -841,6 +850,10 @@ fn dispatch_spawn_agent_tool(
             "tool_call_id": call.id,
         }),
     )?;
+    let run_error = run_existing_session_with_provider(store, provider, &child.id, options.clone())
+        .err()
+        .map(|error| error.to_string());
+    let child_result = update_parent_from_child_run(store, &session.id, &child.id, run_error)?;
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
@@ -849,10 +862,54 @@ fn dispatch_spawn_agent_tool(
             serde_json::json!({
                 "child_session_id": child.id,
                 "agent_path": agent_path,
-                "status": "created",
+                "status": child_result.get("status").cloned().unwrap_or(Value::Null),
+                "result": child_result.get("result").cloned().unwrap_or(Value::Null),
+                "failure": child_result.get("failure").cloned().unwrap_or(Value::Null),
             }),
         )?],
     })
+}
+
+fn update_parent_from_child_run(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_error: Option<String>,
+) -> Result<Value> {
+    let child = store
+        .load_session(child_id)?
+        .with_context(|| format!("unknown child session id: {child_id}"))?;
+    let child_events = store.events_for_session(child_id)?;
+    let result = result_from_events(&child_events);
+    let failure = failure_from_events(&child_events).or(run_error);
+    let status = child.status.as_str().to_string();
+    let event_type = match status.as_str() {
+        "done" => "agent.completed",
+        "failed" => "agent.failed",
+        "cancelled" => "agent.cancelled",
+        _ => "agent.updated",
+    };
+    let edge_status = match status.as_str() {
+        "done" | "failed" | "cancelled" => status.as_str(),
+        _ => "open",
+    };
+    store.set_child_agent_status(child_id, edge_status)?;
+    let payload = serde_json::json!({
+        "child_session_id": child_id,
+        "status": status,
+        "result": result,
+        "failure": failure,
+    });
+    store.append_event(
+        parent_id,
+        event_type,
+        serde_json::json!({
+            "child_session_id": child_id,
+            "status": status,
+            "payload": payload,
+        }),
+    )?;
+    Ok(payload)
 }
 
 fn inherited_context_for_spawn(
@@ -1041,11 +1098,13 @@ fn dispatch_wait_agent_tool(
     })
 }
 
-fn dispatch_agent_message_tool(
+fn dispatch_agent_message_tool<P: ModelProvider>(
     store: &Store,
+    provider: &P,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
     trigger_turn: bool,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     let tool_name = if trigger_turn {
         "followup_task"
@@ -1127,6 +1186,20 @@ fn dispatch_agent_message_tool(
             "tool_call_id": call.id,
         }),
     )?;
+    let child_result = if trigger_turn {
+        let run_error =
+            run_existing_session_with_provider(store, provider, &child_session_id, options.clone())
+                .err()
+                .map(|error| error.to_string());
+        Some(update_parent_from_child_run(
+            store,
+            &session.id,
+            &child_session_id,
+            run_error,
+        )?)
+    } else {
+        None
+    };
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
@@ -1137,6 +1210,21 @@ fn dispatch_agent_message_tool(
                 "child_session_id": child_session_id,
                 "agent_path": agent_path,
                 "trigger_turn": trigger_turn,
+                "status": child_result
+                    .as_ref()
+                    .and_then(|result| result.get("status"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "result": child_result
+                    .as_ref()
+                    .and_then(|result| result.get("result"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "failure": child_result
+                    .as_ref()
+                    .and_then(|result| result.get("failure"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
             }),
         )?],
     })
@@ -2016,6 +2104,10 @@ mod tests {
             .any(|event| event.event_type == "agent.spawned"));
         assert!(parent_events
             .iter()
+            .any(|event| event.event_type == "agent.completed"
+                && event.payload["payload"]["result"] == "child inspected constraints"));
+        assert!(parent_events
+            .iter()
             .any(|event| event.event_type == "agent.cancelled"));
         assert!(parent_events
             .iter()
@@ -2067,6 +2159,14 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "session.followup"
                 && event.payload["text"] == "run the focused follow-up"));
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|event| event.event_type == "session.done"
+                    && event.payload["result"] == "child inspected constraints")
+                .count(),
+            2
+        );
         let mailbox = store.messages_for_agent(&children[0].child_session_id)?;
         assert_eq!(mailbox.len(), 2);
         assert!(!mailbox[0].trigger_turn);
@@ -2274,6 +2374,25 @@ mod tests {
 
     impl ModelProvider for AgentToolProvider {
         fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            if turn.messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("inspect flight search constraints"))
+            }) {
+                return Ok(vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "child_done".to_string(),
+                            name: "done".to_string(),
+                            arguments: serde_json::json!({
+                                "result": "child inspected constraints",
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
             let mut step = self.step.lock().expect("step lock");
             let event = match *step {
                 0 => ModelEvent::ToolCall {
