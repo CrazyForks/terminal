@@ -1,6 +1,7 @@
 use browser_use_protocol::ToolSpec;
 
 pub(crate) mod command;
+pub(crate) mod files;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolHandlerKind {
@@ -8,6 +9,11 @@ pub(crate) enum ToolHandlerKind {
     Python,
     ExecCommand,
     WriteStdin,
+    ApplyPatch,
+    ReadFile,
+    SearchFiles,
+    ListFiles,
+    ViewImage,
     SpawnAgent,
     WaitAgent,
     SendMessage,
@@ -32,6 +38,11 @@ impl ToolRegistry {
         let mut registry = Self::default();
         registry.register(exec_command_tool_spec(), ToolHandlerKind::ExecCommand);
         registry.register(write_stdin_tool_spec(), ToolHandlerKind::WriteStdin);
+        registry.register(apply_patch_tool_spec(), ToolHandlerKind::ApplyPatch);
+        registry.register(read_file_tool_spec(), ToolHandlerKind::ReadFile);
+        registry.register(search_files_tool_spec(), ToolHandlerKind::SearchFiles);
+        registry.register(list_files_tool_spec(), ToolHandlerKind::ListFiles);
+        registry.register(view_image_tool_spec(), ToolHandlerKind::ViewImage);
         registry.register(python_tool_spec(), ToolHandlerKind::Python);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         registry.register(spawn_agent_tool_spec(), ToolHandlerKind::SpawnAgent);
@@ -128,6 +139,156 @@ fn write_stdin_tool_spec() -> ToolSpec {
                 }
             },
             "required": ["session_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn apply_patch_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "apply_patch".to_string(),
+        description: concat!(
+            "Apply a Codex-style patch to local files. The patch string must use ",
+            "*** Begin Patch / *** End Patch with add, delete, update, and move directives."
+        )
+        .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "Codex-style patch body."
+                }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn read_file_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "read_file".to_string(),
+        description: "Read a local text file with optional line range and truncation.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to read. Relative paths resolve from the task cwd."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-based line number to stop reading."
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum lines to return."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum output characters to return."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn search_files_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "search_files".to_string(),
+        description: "Search files under a path using ripgrep when available.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query. Treated as a ripgrep regex when ripgrep is available."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Root path to search. Defaults to the task cwd."
+                },
+                "glob": {
+                    "description": "Optional glob or list of globs, such as *.rs.",
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of context lines to include around matches."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of matches to return."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn list_files_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_files".to_string(),
+        description: "List or fuzzy-filter files under a path while respecting ignore files."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Root path to list. Defaults to the task cwd."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional path substring or fuzzy query."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of paths to return."
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Whether to include hidden files."
+                },
+                "include_dirs": {
+                    "type": "boolean",
+                    "description": "Whether to include directories as well as files."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn view_image_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "view_image".to_string(),
+        description: "Inspect a local image file and pass it back to the model when supported."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Image path to inspect. Relative paths resolve from the task cwd."
+                },
+                "detail": {
+                    "type": "string",
+                    "description": "Image detail hint: auto, low, or high."
+                }
+            },
+            "required": ["path"],
             "additionalProperties": false
         }),
     }

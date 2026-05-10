@@ -809,6 +809,11 @@ fn dispatch_tool_call<P: ModelProvider>(
         ),
         ToolHandlerKind::ExecCommand => dispatch_exec_command_tool(store, session, call),
         ToolHandlerKind::WriteStdin => dispatch_write_stdin_tool(store, session, call),
+        ToolHandlerKind::ApplyPatch => dispatch_apply_patch_tool(store, session, call),
+        ToolHandlerKind::ReadFile => dispatch_read_file_tool(store, session, call),
+        ToolHandlerKind::SearchFiles => dispatch_search_files_tool(store, session, call),
+        ToolHandlerKind::ListFiles => dispatch_list_files_tool(store, session, call),
+        ToolHandlerKind::ViewImage => dispatch_view_image_tool(store, session, call),
         ToolHandlerKind::SpawnAgent => {
             dispatch_spawn_agent_tool(store, provider, session, call, options)
         }
@@ -845,6 +850,66 @@ fn dispatch_write_stdin_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(call, "write_stdin", result.content)?],
+    })
+}
+
+fn dispatch_apply_patch_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::files::apply_patch_tool(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(call, "apply_patch", result.content)],
+    })
+}
+
+fn dispatch_read_file_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::files::read_file(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(call, "read_file", result.content)],
+    })
+}
+
+fn dispatch_search_files_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::files::search_files(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(call, "search_files", result.content)],
+    })
+}
+
+fn dispatch_list_files_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::files::list_files(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(call, "list_files", result.content)],
+    })
+}
+
+fn dispatch_view_image_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::files::view_image(store, session, call)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(call, "view_image", result.content)],
     })
 }
 
@@ -1662,6 +1727,15 @@ fn tool_json_message(call: &ToolCall, name: &str, content: Value) -> Result<Valu
     }))
 }
 
+fn tool_content_message(call: &ToolCall, name: &str, content: Value) -> Value {
+    serde_json::json!({
+        "role": "tool",
+        "tool_call_id": call.id,
+        "name": name,
+        "content": content,
+    })
+}
+
 fn python_tool_message_content(response: &RunPythonResponse) -> String {
     if response.ok {
         let mut parts = Vec::new();
@@ -2245,6 +2319,85 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "command complete"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_can_use_file_tools() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let patch = r#"*** Begin Patch
+*** Add File: note.txt
++alpha
++bravo
+*** End Patch"#;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "patch_1".to_string(),
+                        name: "apply_patch".to_string(),
+                        arguments: serde_json::json!({ "patch": patch }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "read_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "note.txt" }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "search_1".to_string(),
+                        name: "search_files".to_string(),
+                        arguments: serde_json::json!({ "query": "bravo", "path": "." }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "list_1".to_string(),
+                        name: "list_files".to_string(),
+                        arguments: serde_json::json!({ "query": "note" }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_files".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "files complete"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "use file tools",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "patch.file_changed" && event.payload["kind"] == "added"
+        }));
+        assert!(events.iter().any(|event| event.event_type == "file.read"));
+        assert!(events.iter().any(|event| event.event_type == "file.search"));
+        assert!(events.iter().any(|event| event.event_type == "file.list"));
+        assert!(temp.path().join("note.txt").exists());
         Ok(())
     }
 

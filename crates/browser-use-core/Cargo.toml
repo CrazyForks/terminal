@@ -11,6 +11,7 @@ browser-use-protocol = { path = "../browser-use-protocol" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-python-worker = { path = "../browser-use-python-worker" }
 browser-use-store = { path = "../browser-use-store" }
+ignore.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
