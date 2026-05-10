@@ -21,7 +21,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - Core records provider stream failures as `session.failed` and closes run rows instead of leaving stale `running` sessions.
 - Python tool calls have a configurable timeout; timed-out snippets produce `tool.failed` and the worker namespace remains usable for later calls.
 - Default provider runs allow up to 80 turns; compacted Responses input converts summarized system context to user context and avoids replaying stale historical function-call outputs.
-- Managed headless browser mode is owned by the Python island and prefers Playwright's bundled testing browser, avoiding the user's personal Chrome remote-debugging prompt and quarantined system Chromium apps.
+- Managed headless browser mode is owned by the Python island and defaults to Playwright's bundled testing browser, avoiding the user's personal Chrome remote-debugging prompt and quarantined system Chromium apps. System Chromium and Google Chrome require explicit opt-in environment variables.
 - Browser Use cloud mode is also owned by the Python island when selected and `BROWSER_USE_API_KEY` is available.
 
 ## Verified

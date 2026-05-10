@@ -51,17 +51,24 @@ def _pick_chromium_path() -> str:
 
     # Do not attach automated tests to the user's personal Chrome profile.
     # Recent Chrome builds show a blocking "Allow remote debugging?" prompt
-    # for CDP, so managed browser mode prefers Chromium and only falls back to
-    # Google Chrome when explicitly requested.
+    # for CDP. Homebrew/system Chromium builds can also be quarantined or
+    # otherwise blocked by macOS Gatekeeper, so managed browser mode defaults
+    # to Playwright's bundled testing browser and requires explicit opt-in for
+    # system browsers.
+    allow_system_chromium = os.environ.get("LLM_BROWSER_ALLOW_SYSTEM_CHROMIUM") == "1"
     allow_google_chrome = os.environ.get("LLM_BROWSER_ALLOW_GOOGLE_CHROME") == "1"
-    candidates = _playwright_chromium_candidates() + [
-        "/opt/homebrew/Caskroom/chromium/latest/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        "/opt/homebrew/bin/chromium",
-        "/usr/local/bin/chromium",
-        "chromium",
-        "chromium-browser",
-    ]
+    candidates = _playwright_chromium_candidates()
+    if allow_system_chromium:
+        candidates.extend(
+            [
+                "/opt/homebrew/Caskroom/chromium/latest/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "/opt/homebrew/bin/chromium",
+                "/usr/local/bin/chromium",
+                "chromium",
+                "chromium-browser",
+            ]
+        )
     if allow_google_chrome:
         candidates.extend(
             [
@@ -84,7 +91,11 @@ def _pick_chromium_path() -> str:
         if not allow_google_chrome and _looks_like_google_chrome_wrapper(resolved):
             continue
         return str(resolved)
-    raise RuntimeError("Chromium not found; install Chromium or set CHROME_PATH explicitly")
+    raise RuntimeError(
+        "Playwright Chromium not found; run `python -m playwright install chromium`, "
+        "set CHROME_PATH explicitly, use Browser Use cloud, or opt into system Chromium "
+        "with LLM_BROWSER_ALLOW_SYSTEM_CHROMIUM=1"
+    )
 
 
 def _playwright_chromium_candidates() -> list[str]:

@@ -74,3 +74,25 @@ def test_worker_records_browser_state_details(tmp_path: Path) -> None:
             },
         }
     ]
+
+
+def test_managed_browser_does_not_use_system_chromium_without_opt_in(
+    tmp_path: Path, monkeypatch
+) -> None:
+    system_chromium = tmp_path / "chromium"
+    system_chromium.write_text("#!/bin/sh\n")
+    monkeypatch.delenv("CHROME_PATH", raising=False)
+    monkeypatch.delenv("LLM_BROWSER_ALLOW_SYSTEM_CHROMIUM", raising=False)
+    monkeypatch.delenv("LLM_BROWSER_ALLOW_GOOGLE_CHROME", raising=False)
+    monkeypatch.setattr(worker, "_playwright_chromium_candidates", lambda: [])
+    monkeypatch.setattr(worker.shutil, "which", lambda name: str(system_chromium))
+
+    try:
+        worker._pick_chromium_path()
+    except RuntimeError as exc:
+        assert "Playwright Chromium not found" in str(exc)
+    else:
+        raise AssertionError("system Chromium should require explicit opt-in")
+
+    monkeypatch.setenv("LLM_BROWSER_ALLOW_SYSTEM_CHROMIUM", "1")
+    assert worker._pick_chromium_path()
