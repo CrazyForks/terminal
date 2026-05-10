@@ -140,6 +140,14 @@ pub struct BrowserSummary {
     pub viewport: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TelemetrySummary {
+    pub trace_id: Option<String>,
+    pub backend: Option<String>,
+    pub endpoint: Option<String>,
+    pub failure: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryRow {
     pub session_id: String,
@@ -157,6 +165,7 @@ pub struct WorkbenchState {
     pub failure: Option<String>,
     pub activity: Vec<String>,
     pub browser: BrowserSummary,
+    pub telemetry: TelemetrySummary,
     pub history: Vec<HistoryRow>,
 }
 
@@ -249,6 +258,45 @@ pub fn browser_summary_from_events(
                 if let Some(viewport) = viewport_label_from_payload(&event.payload) {
                     summary.viewport = Some(viewport);
                 }
+            }
+            _ => {}
+        }
+    }
+    summary
+}
+
+pub fn telemetry_summary_from_events(events: &[EventRecord]) -> TelemetrySummary {
+    let mut summary = TelemetrySummary::default();
+    for event in events {
+        match event.event_type.as_str() {
+            "telemetry.trace" => {
+                summary.trace_id = event
+                    .payload
+                    .get("trace_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                summary.backend = event
+                    .payload
+                    .get("backend")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                summary.endpoint = event
+                    .payload
+                    .get("endpoint")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                summary.failure = None;
+            }
+            "telemetry.failed" => {
+                summary.failure = event
+                    .payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| Some("Laminar exporter setup failed".to_string()));
+                summary.trace_id = None;
+                summary.backend = None;
+                summary.endpoint = None;
             }
             _ => {}
         }
@@ -429,6 +477,7 @@ pub fn project_workbench(
         failure,
         activity: activity_from_events(events_for_current),
         browser: browser_summary_from_events(events_for_current, browser_backend),
+        telemetry: telemetry_summary_from_events(events_for_current),
         history,
     }
 }
@@ -479,6 +528,40 @@ mod tests {
         assert_eq!(browser.tabs, Some(2));
         assert_eq!(browser.viewport.as_deref(), Some("1440 x 900"));
         assert_eq!(activity_from_events(&events), vec!["browsing example.com"]);
+    }
+
+    #[test]
+    fn projects_latest_telemetry_state_from_events() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "telemetry.failed".to_string(),
+                payload: json!({"error": "bad endpoint"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "telemetry.trace".to_string(),
+                payload: json!({
+                    "trace_id": "abc123",
+                    "backend": "laminar",
+                    "endpoint": "https://api.lmnr.ai/v1/traces",
+                }),
+            },
+        ];
+        let telemetry = telemetry_summary_from_events(&events);
+        assert_eq!(telemetry.trace_id.as_deref(), Some("abc123"));
+        assert_eq!(telemetry.backend.as_deref(), Some("laminar"));
+        assert_eq!(
+            telemetry.endpoint.as_deref(),
+            Some("https://api.lmnr.ai/v1/traces")
+        );
+        assert!(telemetry.failure.is_none());
     }
 
     #[test]

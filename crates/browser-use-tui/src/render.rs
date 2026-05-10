@@ -1,5 +1,8 @@
 use anyhow::Result;
-use browser_use_protocol::{HistoryRow, SessionMeta, SessionStatus, WorkbenchState};
+use browser_use_protocol::{
+    HistoryRow, SessionMeta, SessionStatus, TelemetrySummary, WorkbenchState,
+};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::Style;
@@ -44,6 +47,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         failure: Some("Could not load state.".to_string()),
         activity: Vec::new(),
         browser: Default::default(),
+        telemetry: Default::default(),
         history: Vec::new(),
     });
 
@@ -82,13 +86,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
-    let block = Block::bordered()
-        .title(workbench_title(app, state, area.width))
-        .style(Style::default().fg(text()).bg(background()));
-    frame.render_widget(block, area);
-
     let outer = area.inner(Margin {
-        vertical: 1,
+        vertical: 0,
         horizontal: 2,
     });
     let composer_h = app.composer_height();
@@ -96,19 +95,21 @@ fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Workbe
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2),
             Constraint::Min(8),
             Constraint::Length(composer_h),
             Constraint::Length(footer_h),
         ])
         .split(outer);
 
+    render_workbench_header(frame, chunks[0], app, state);
     let content = if let Some(session) = state.current_session.as_ref() {
         if session.status.is_active() {
             running_lines(state)
         } else if session.status == SessionStatus::Cancelled {
-            cancelled_lines()
+            cancelled_lines(&state.telemetry)
         } else if let Some(error) = state.failure.as_ref() {
-            failure_lines(error)
+            failure_lines(error, &state.telemetry)
         } else {
             result_lines(state)
         }
@@ -119,20 +120,56 @@ fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Workbe
         Paragraph::new(content)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        chunks[0],
+        chunks[1],
     );
-    render_composer(frame, chunks[1], app, state.current_session.as_ref());
-    render_footer(frame, chunks[2], app, state);
+    render_composer(frame, chunks[2], app, state.current_session.as_ref());
+    render_footer(frame, chunks[3], app, state);
+}
+
+fn render_workbench_header(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let left = if let Some(session) = state.current_session.as_ref() {
+        let task = truncate(state.task.as_deref().unwrap_or("browser task"), width / 2);
+        format!("{task}  {}", session.status.as_str())
+    } else {
+        "browser-use".to_string()
+    };
+    let right = format!("{}  {}", app.browser, app.model);
+    let max_left = width.saturating_sub(right.chars().count() + 2).max(10);
+    let left = truncate(&left, max_left);
+    let right = truncate(&right, width.saturating_sub(left.chars().count() + 2));
+    let spaces = width.saturating_sub(left.chars().count() + right.chars().count());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(left, bold()),
+            Span::raw(" ".repeat(spaces)),
+            Span::styled(right, muted()),
+        ]),
+        Line::from(Span::styled("─".repeat(width), dim())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(text())),
+        area,
+    );
 }
 
 fn ready_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled("What should the browser do?", bold())),
         Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled("Recent", muted())),
-        Line::from(""),
     ];
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            status_style("failed"),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("Recent", muted())));
+    lines.push(Line::from(""));
     if state.history.is_empty() {
         lines.push(Line::from(Span::styled("  No previous work yet.", dim())));
     } else {
@@ -141,47 +178,131 @@ fn ready_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(""));
-    if let Some(notice) = app.status_notice.as_ref() {
-        lines.push(Line::from(Span::styled(
-            notice.clone(),
-            status_style("failed"),
-        )));
-        lines.push(Line::from(""));
-    }
     let auth_status = if app.auth_notice().ok().flatten().is_some() {
         "needs sign in"
     } else {
         "ready"
     };
-    lines.push(Line::from(vec![
-        Span::styled("Ready  ", muted()),
-        Span::styled(auth_status, text_style()),
-        Span::raw("      "),
-        Span::styled("browser connected", text_style()),
-    ]));
+    lines.push(Line::from(Span::styled("Ready", muted())));
+    lines.push(kv_line("account", auth_status));
+    lines.push(kv_line("browser", "connected"));
     lines
 }
 
 fn running_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from("")];
-    let activity = if state.activity.is_empty() {
-        vec!["starting browser task".to_string()]
+    let mut lines = Vec::new();
+    append_task_section(&mut lines, "You", state);
+    lines.push(Line::from(""));
+    append_activity_section(&mut lines, "Agent is working", state, true);
+    lines.push(Line::from(""));
+    append_browser_section(&mut lines, state);
+    append_telemetry_lines(&mut lines, &state.telemetry);
+    lines
+}
+
+fn result_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    append_task_section(&mut lines, "Task", state);
+    lines.push(Line::from(""));
+    append_activity_section(&mut lines, "What ran", state, false);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Result", bold())));
+    lines.push(Line::from(""));
+    if let Some(result) = state.result.as_ref() {
+        lines.extend(markdown_result_lines(result));
     } else {
-        state
-            .activity
-            .iter()
-            .rev()
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    for item in activity.into_iter().rev() {
+        lines.push(Line::from(Span::styled("No result yet.", dim())));
+    }
+    if let Some(source) = state
+        .browser
+        .url
+        .as_ref()
+        .or(state.browser.live_url.as_ref())
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Source", bold())));
+        lines.push(Line::from(Span::styled(source.clone(), link())));
+    }
+    append_telemetry_lines(&mut lines, &state.telemetry);
+    lines
+}
+
+fn failure_lines(error: &str, telemetry: &TelemetrySummary) -> Vec<Line<'static>> {
+    let message = friendly_error_message(error);
+    let mut lines = vec![
+        Line::from(Span::styled("The agent could not finish the task.", bold())),
+        Line::from(""),
+        Line::from(Span::styled(message, muted())),
+        Line::from(""),
+        Line::from("> Retry"),
+        Line::from("  Sign in"),
+        Line::from("  Choose model"),
+        Line::from("  Change browser"),
+        Line::from(""),
+        Line::from(Span::styled("Work preserved in history.", muted())),
+    ];
+    append_telemetry_lines(&mut lines, telemetry);
+    lines
+}
+
+fn cancelled_lines(telemetry: &TelemetrySummary) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled("The task was stopped.", bold())),
+        Line::from(""),
+        Line::from(Span::styled("Work preserved in history.", muted())),
+        Line::from(""),
+        Line::from("> Start a follow-up"),
+        Line::from("  Previous work"),
+        Line::from("  Setup"),
+    ];
+    append_telemetry_lines(&mut lines, telemetry);
+    lines
+}
+
+fn append_task_section(lines: &mut Vec<Line<'static>>, title: &str, state: &WorkbenchState) {
+    lines.push(Line::from(Span::styled(title.to_string(), bold())));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            state
+                .task
+                .clone()
+                .unwrap_or_else(|| "browser task".to_string()),
+            text_style(),
+        ),
+    ]));
+}
+
+fn append_activity_section(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    state: &WorkbenchState,
+    running: bool,
+) {
+    lines.push(Line::from(Span::styled(title.to_string(), bold())));
+    if state.activity.is_empty() {
+        let fallback = if running {
+            "starting browser task"
+        } else {
+            "no recorded steps"
+        };
+        lines.push(bullet_line(fallback));
+        return;
+    }
+    let max_items = 10usize;
+    let skipped = state.activity.len().saturating_sub(max_items);
+    if skipped > 0 {
         lines.push(Line::from(vec![
-            Span::styled("* ", accent()),
-            Span::styled(item, text_style()),
+            Span::raw("  "),
+            Span::styled(format!("... {skipped} earlier steps"), dim()),
         ]));
     }
-    lines.push(Line::from(""));
+    for item in state.activity.iter().skip(skipped) {
+        lines.push(bullet_line(item));
+    }
+}
+
+fn append_browser_section(lines: &mut Vec<Line<'static>>, state: &WorkbenchState) {
     lines.push(Line::from(Span::styled("Browser", bold())));
     lines.push(kv_line(
         "page",
@@ -196,71 +317,13 @@ fn running_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
             .map(|_| "live browser")
             .unwrap_or("not available yet"),
     ));
-    lines
 }
 
-fn result_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled("Result", bold())), Line::from("")];
-    if let Some(result) = state.result.as_ref() {
-        lines.extend(markdown_result_lines(result).into_iter().take(18));
-    } else {
-        lines.push(Line::from(Span::styled("No result yet.", dim())));
-    }
-    if let Some(source) = state
-        .browser
-        .url
-        .as_ref()
-        .or(state.browser.live_url.as_ref())
-    {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Source", bold())));
-        lines.push(Line::from(Span::styled(source.clone(), link())));
-    }
-    lines
-}
-
-fn failure_lines(error: &str) -> Vec<Line<'static>> {
-    let message = friendly_error_message(error);
-    vec![
-        Line::from(Span::styled("The agent could not finish the task.", bold())),
-        Line::from(""),
-        Line::from(Span::styled(message, muted())),
-        Line::from(""),
-        Line::from("> Retry"),
-        Line::from("  Sign in"),
-        Line::from("  Choose model"),
-        Line::from("  Change browser"),
-        Line::from(""),
-        Line::from(Span::styled("Work preserved in history.", muted())),
-    ]
-}
-
-fn cancelled_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled("The task was stopped.", bold())),
-        Line::from(""),
-        Line::from(Span::styled("Work preserved in history.", muted())),
-        Line::from(""),
-        Line::from("> Start a follow-up"),
-        Line::from("  Previous work"),
-        Line::from("  Setup"),
-    ]
-}
-
-fn workbench_title(app: &App, state: &WorkbenchState, width: u16) -> String {
-    let max_title = width.saturating_sub(4) as usize;
-    if let Some(session) = state.current_session.as_ref() {
-        let status = session.status.as_str();
-        let max_task = max_title.saturating_sub(status.len() + 4).max(12);
-        let task = truncate(state.task.as_deref().unwrap_or("browser task"), max_task);
-        truncate(&format!(" {task}  {status} "), max_title)
-    } else {
-        let prefix = " browser-use";
-        let details = format!("{}  {}", app.browser, app.model);
-        let details = truncate(&details, max_title.saturating_sub(prefix.len() + 2).max(12));
-        let spaces = max_title.saturating_sub(prefix.len() + details.len());
-        format!("{prefix}{}{}", " ".repeat(spaces), details)
-    }
+fn bullet_line(value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  • ", accent()),
+        Span::styled(value.to_string(), text_style()),
+    ])
 }
 
 fn render_composer(
@@ -579,6 +642,7 @@ fn render_actions_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "Setup",
         "Choose model",
         "Sign in",
+        "Developer trace",
     ];
     let rows = items
         .iter()
@@ -604,6 +668,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("tab", "previous work"),
         ("f2", "browser"),
         ("/", "actions"),
+        ("ctrl+e", "developer trace"),
         ("ctrl+c", "clear input, stop task, or quit"),
         ("esc", "close overlay"),
     ];
@@ -620,12 +685,19 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
 fn render_developer_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
     frame.render_widget(Clear, area);
     let inner = modal(frame, area, "Developer");
-    let mut lines = vec![Line::from(Span::styled("Events", bold())), Line::from("")];
+    let mut lines = vec![
+        Line::from(Span::styled("Telemetry", bold())),
+        Line::from(""),
+    ];
     let Some(session) = state.current_session.as_ref() else {
         lines.push(Line::from(Span::styled("No task selected.", dim())));
         frame.render_widget(Paragraph::new(lines), inner);
         return;
     };
+    append_telemetry_detail_lines(&mut lines, &state.telemetry);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Events", bold())));
+    lines.push(Line::from(""));
     match app.store.events_for_session(&session.id) {
         Ok(events) => {
             for event in events.iter().rev().take(12).rev() {
@@ -645,6 +717,54 @@ fn render_developer_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state:
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("esc close", muted())));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn append_telemetry_lines(lines: &mut Vec<Line<'static>>, telemetry: &TelemetrySummary) {
+    if telemetry.trace_id.is_none() && telemetry.failure.is_none() {
+        return;
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Telemetry", bold())));
+    if let Some(trace_id) = telemetry.trace_id.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("laminar  ", muted()),
+            Span::styled(trace_id.clone(), link()),
+        ]));
+    }
+    if let Some(error) = telemetry.failure.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("laminar  ", muted()),
+            Span::styled(
+                format!("disabled: {}", truncate(&first_line(error), 96)),
+                status_style("failed"),
+            ),
+        ]));
+    }
+}
+
+fn append_telemetry_detail_lines(lines: &mut Vec<Line<'static>>, telemetry: &TelemetrySummary) {
+    if telemetry.trace_id.is_none() && telemetry.failure.is_none() {
+        lines.push(Line::from(Span::styled(
+            "No Laminar event for this task.",
+            dim(),
+        )));
+        return;
+    }
+    if let Some(trace_id) = telemetry.trace_id.as_ref() {
+        lines.push(kv_line("trace", trace_id));
+    }
+    if let Some(backend) = telemetry.backend.as_ref() {
+        lines.push(kv_line("backend", backend));
+    }
+    if let Some(endpoint) = telemetry.endpoint.as_ref() {
+        lines.push(kv_line("endpoint", endpoint));
+    }
+    if let Some(error) = telemetry.failure.as_ref() {
+        lines.push(kv_line(
+            "status",
+            &format!("disabled: {}", truncate(&first_line(error), 120)),
+        ));
+    }
 }
 
 fn setup_status_line(prefix: &str, label: &str, value: &str) -> Line<'static> {
@@ -759,140 +879,228 @@ fn visible_composer_lines(mut lines: Vec<Line<'static>>, max_lines: usize) -> Ve
 }
 
 fn markdown_result_lines(markdown: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-
-    for source in markdown.lines() {
-        let trimmed = source.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            lines.push(Line::from(Span::styled("code", muted())));
-            continue;
-        }
-        if in_code {
-            lines.push(Line::from(Span::styled(source.to_string(), muted())));
-            continue;
-        }
-        if trimmed.is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
-        if let Some(text) = trimmed.strip_prefix("### ") {
-            lines.push(Line::from(Span::styled(text.to_string(), bold())));
-            continue;
-        }
-        if let Some(text) = trimmed.strip_prefix("## ") {
-            lines.push(Line::from(Span::styled(text.to_string(), bold())));
-            continue;
-        }
-        if let Some(text) = trimmed.strip_prefix("# ") {
-            lines.push(Line::from(Span::styled(text.to_string(), bold())));
-            continue;
-        }
-        if let Some(text) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            let mut spans = vec![Span::styled("• ", accent())];
-            spans.extend(inline_markdown_spans(text));
-            lines.push(Line::from(spans));
-            continue;
-        }
-        if let Some((marker, text)) = numbered_markdown_item(trimmed) {
-            let mut spans = vec![Span::styled(format!("{marker} "), accent())];
-            spans.extend(inline_markdown_spans(text));
-            lines.push(Line::from(spans));
-            continue;
-        }
-        lines.push(Line::from(inline_markdown_spans(source)));
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(markdown, options);
+    let mut writer = MarkdownWriter::default();
+    for event in parser {
+        writer.handle_event(event);
     }
-
-    if lines.is_empty() {
-        lines.push(Line::from(""));
-    }
-    lines
+    writer.finish()
 }
 
-fn numbered_markdown_item(value: &str) -> Option<(&str, &str)> {
-    let (marker, text) = value.split_once(' ')?;
-    if marker.ends_with('.')
-        && marker[..marker.len().saturating_sub(1)]
-            .parse::<usize>()
-            .is_ok()
-    {
-        Some((marker, text))
-    } else {
-        None
-    }
+#[derive(Clone, Debug)]
+struct ListState {
+    next: Option<u64>,
 }
 
-fn inline_markdown_spans(value: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = value;
-
-    while let Some(start) = rest.find('[') {
-        push_inline_text(&mut spans, &rest[..start]);
-        let after_open = &rest[start + 1..];
-        let Some(label_end) = after_open.find("](") else {
-            rest = &rest[start..];
-            break;
-        };
-        let after_label = &after_open[label_end + 2..];
-        let Some(url_end) = after_label.find(')') else {
-            rest = &rest[start..];
-            break;
-        };
-        let label = &after_open[..label_end];
-        let url = &after_label[..url_end];
-        spans.push(Span::styled(label.to_string(), link()));
-        spans.push(Span::raw(" ("));
-        spans.push(Span::styled(url.to_string(), link()));
-        spans.push(Span::raw(")"));
-        rest = &after_label[url_end + 1..];
-    }
-
-    push_inline_text(&mut spans, rest);
-    spans
+#[derive(Default)]
+struct MarkdownWriter {
+    lines: Vec<Line<'static>>,
+    current: Vec<Span<'static>>,
+    style_stack: Vec<Style>,
+    list_stack: Vec<ListState>,
+    link_stack: Vec<String>,
+    pending_prefix: Option<String>,
+    in_code_block: bool,
 }
 
-fn push_inline_text(spans: &mut Vec<Span<'static>>, value: &str) {
-    let mut rest = value;
-    while let Some(start) = rest.find('`') {
-        if start > 0 {
-            spans.extend(bare_link_spans(&rest[..start]));
-        }
-        let after_open = &rest[start + 1..];
-        let Some(end) = after_open.find('`') else {
-            spans.extend(bare_link_spans(&rest[start..]));
-            return;
-        };
-        spans.push(Span::styled(after_open[..end].to_string(), muted()));
-        rest = &after_open[end + 1..];
-    }
-    spans.extend(bare_link_spans(rest));
-}
-
-fn bare_link_spans(value: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = value;
-    loop {
-        let http = rest.find("http://");
-        let https = rest.find("https://");
-        let Some(start) = [http, https].into_iter().flatten().min() else {
-            if !rest.is_empty() {
-                spans.push(Span::styled(rest.to_string(), text_style()));
+impl MarkdownWriter {
+    fn handle_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) => self.push_text(&text),
+            Event::Code(code) => {
+                self.ensure_prefix();
+                self.current.push(Span::styled(code.to_string(), muted()));
             }
-            break;
-        };
-        if start > 0 {
-            spans.push(Span::styled(rest[..start].to_string(), text_style()));
+            Event::SoftBreak | Event::HardBreak => self.flush_current(),
+            Event::Rule => {
+                self.flush_current();
+                self.push_non_duplicate_blank();
+                self.lines.push(Line::from(Span::styled("---", muted())));
+                self.push_non_duplicate_blank();
+            }
+            Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
+            Event::FootnoteReference(text) => self.push_text(&format!("[{text}]")),
+            Event::TaskListMarker(checked) => {
+                self.ensure_prefix();
+                self.current
+                    .push(Span::styled(if checked { "[x] " } else { "[ ] " }, muted()));
+            }
         }
-        let tail = &rest[start..];
-        let end = tail.find(char::is_whitespace).unwrap_or_else(|| tail.len());
-        spans.push(Span::styled(tail[..end].to_string(), link()));
-        rest = &tail[end..];
     }
-    spans
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {}
+            Tag::Heading { level, .. } => {
+                self.flush_current();
+                self.style_stack.push(heading_style(level));
+            }
+            Tag::BlockQuote => {
+                self.flush_current();
+                self.pending_prefix = Some("> ".to_string());
+            }
+            Tag::CodeBlock(kind) => {
+                self.flush_current();
+                let label = match kind {
+                    CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                        format!("code {language}")
+                    }
+                    _ => "code".to_string(),
+                };
+                self.lines.push(Line::from(Span::styled(label, muted())));
+                self.in_code_block = true;
+            }
+            Tag::List(start) => {
+                self.flush_current();
+                self.list_stack.push(ListState { next: start });
+            }
+            Tag::Item => {
+                self.flush_current();
+                self.pending_prefix = Some(self.next_list_marker());
+            }
+            Tag::Emphasis => self.style_stack.push(muted()),
+            Tag::Strong => self.style_stack.push(bold()),
+            Tag::Strikethrough => self.style_stack.push(muted()),
+            Tag::Link { dest_url, .. } => {
+                self.link_stack.push(dest_url.to_string());
+                self.style_stack.push(link());
+            }
+            Tag::Image {
+                title, dest_url, ..
+            } => {
+                self.ensure_prefix();
+                let label = if title.is_empty() {
+                    dest_url.to_string()
+                } else {
+                    title.to_string()
+                };
+                self.current
+                    .push(Span::styled(format!("[image: {label}]"), muted()));
+            }
+            Tag::FootnoteDefinition(_)
+            | Tag::HtmlBlock
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_) => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote => self.flush_current(),
+            TagEnd::CodeBlock => {
+                self.flush_current();
+                self.in_code_block = false;
+            }
+            TagEnd::List(_) => {
+                self.flush_current();
+                self.list_stack.pop();
+            }
+            TagEnd::Item => self.flush_current(),
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.style_stack.pop();
+            }
+            TagEnd::Link => {
+                self.style_stack.pop();
+                if let Some(dest) = self.link_stack.pop() {
+                    self.current.push(Span::raw(" ("));
+                    self.current.push(Span::styled(dest, link()));
+                    self.current.push(Span::raw(")"));
+                }
+            }
+            TagEnd::Image
+            | TagEnd::FootnoteDefinition
+            | TagEnd::HtmlBlock
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_) => {}
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        for (idx, line) in text.lines().enumerate() {
+            if idx > 0 {
+                self.flush_current();
+            }
+            self.ensure_prefix();
+            let style = if self.in_code_block {
+                muted()
+            } else {
+                self.style_stack.last().copied().unwrap_or_else(text_style)
+            };
+            if looks_like_bare_link(line) {
+                self.current.push(Span::styled(line.to_string(), link()));
+            } else {
+                self.current.push(Span::styled(line.to_string(), style));
+            }
+        }
+    }
+
+    fn ensure_prefix(&mut self) {
+        if self.current.is_empty() {
+            if let Some(prefix) = self.pending_prefix.take() {
+                self.current.push(Span::styled(prefix, accent()));
+            }
+        }
+    }
+
+    fn flush_current(&mut self) {
+        if self.current.is_empty() {
+            return;
+        }
+        self.lines
+            .push(Line::from(std::mem::take(&mut self.current)));
+        self.pending_prefix = None;
+    }
+
+    fn push_non_duplicate_blank(&mut self) {
+        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
+            self.lines.push(Line::from(""));
+        }
+    }
+
+    fn next_list_marker(&mut self) -> String {
+        let depth = self.list_stack.len().saturating_sub(1);
+        let indent = "  ".repeat(depth);
+        let Some(list) = self.list_stack.last_mut() else {
+            return format!("{indent}• ");
+        };
+        match &mut list.next {
+            Some(next) => {
+                let marker = format!("{indent}{next}. ");
+                *next += 1;
+                marker
+            }
+            None => format!("{indent}• "),
+        }
+    }
+
+    fn finish(mut self) -> Vec<Line<'static>> {
+        self.flush_current();
+        if self.lines.is_empty() {
+            self.lines.push(Line::from(""));
+        }
+        self.lines
+    }
+}
+
+fn heading_style(level: HeadingLevel) -> Style {
+    match level {
+        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => bold(),
+        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => text_style(),
+    }
+}
+
+fn looks_like_bare_link(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn modal(frame: &mut Frame<'_>, area: Rect, title: &str) -> Rect {

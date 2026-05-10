@@ -100,6 +100,16 @@ Provider auth:
 
 `auth status` reports the currently usable auth paths. `config show` redacts stored API keys and access tokens.
 
+Optional Laminar tracing:
+
+- Set `LMNR_PROJECT_API_KEY` to emit one OpenTelemetry trace per agent session.
+- LLM turns are exported as Laminar `LLM` spans using the same Laminar/OpenLLMetry attribute shape as the TypeScript SDK: `lmnr.span.input`, `lmnr.span.output`, `lmnr.span.path`, `gen_ai.prompt.*`, `gen_ai.completion.*`, tool-call attributes, and token usage when the provider returns usage.
+- The default OTLP/HTTP/proto endpoint is `https://api.lmnr.ai/v1/traces`; override it with `LLM_BROWSER_LAMINAR_OTLP_ENDPOINT` or set `OTEL_EXPORTER_OTLP_ENDPOINT` for self-hosted Laminar.
+- Set `LLM_BROWSER_LAMINAR_CAPTURE_PAYLOADS=0` to keep only metadata, or tune `LLM_BROWSER_LAMINAR_MAX_ATTR_CHARS` when payload attributes are too large.
+- Telemetry is fail-open: exporter setup errors disable telemetry for the run, export happens on a background batch thread, and end-of-run flushing is off by default. For one-shot CLI smoke tests, set `LLM_BROWSER_LAMINAR_FLUSH_ON_FINISH=1`.
+- Local session events include `telemetry.trace` with the Laminar trace id and endpoint.
+- The TUI shows the Laminar trace id on the current task when telemetry is present. Use `/` -> `Developer trace` or `ctrl+e` for trace endpoint and raw telemetry events.
+
 ## Product UI
 
 The TUI follows `docs/terminal-ui-product-ux.md`.

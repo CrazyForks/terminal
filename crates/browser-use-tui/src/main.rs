@@ -587,7 +587,7 @@ impl App {
 
     fn execute_overlay_selection(&mut self) -> Result<()> {
         match self.overlay {
-            Overlay::Actions => match self.selected_row.min(5) {
+            Overlay::Actions => match self.selected_row.min(6) {
                 0 => {
                     self.selected_session_id = None;
                     self.close_overlay();
@@ -596,7 +596,8 @@ impl App {
                 2 => self.open_overlay(Overlay::History),
                 3 => self.open_overlay(Overlay::Setup),
                 4 => self.open_overlay(Overlay::Model),
-                _ => self.open_overlay(Overlay::Account),
+                5 => self.open_overlay(Overlay::Account),
+                _ => self.open_overlay(Overlay::Developer),
             },
             Overlay::History => {
                 let sessions = self.store.list_sessions()?;
@@ -694,7 +695,10 @@ impl App {
             "browser.open_requested",
             serde_json::json!({ "target": target }),
         )?;
-        self.browser_notice = Some(format!("Open requested for {target}"));
+        self.browser_notice = Some(match open_external_url(target) {
+            Ok(()) => format!("Opened {target}"),
+            Err(error) => format!("Could not open {target}: {error}"),
+        });
         Ok(())
     }
 
@@ -739,7 +743,7 @@ impl App {
             Overlay::BrowserChoice => BROWSER_CHOICES.len(),
             Overlay::SetupComplete => 1,
             Overlay::History => self.store.list_sessions()?.len(),
-            Overlay::Actions => 6,
+            Overlay::Actions => 7,
             Overlay::Help | Overlay::Developer => 0,
         })
     }
@@ -1174,6 +1178,23 @@ fn line_end_for(chars: &[char], cursor: usize) -> usize {
         .unwrap_or(chars.len())
 }
 
+#[cfg(not(test))]
+fn open_external_url(target: &str) -> Result<()> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("browser target is empty");
+    }
+    open::that_detached(target).with_context(|| format!("launch external browser for {target}"))
+}
+
+#[cfg(test)]
+fn open_external_url(target: &str) -> Result<()> {
+    if target.trim().is_empty() {
+        anyhow::bail!("browser target is empty");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResetKeyboardEnhancementFlags;
 
@@ -1522,7 +1543,7 @@ mod tests {
         for _ in 0..50 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, 5);
+        assert_eq!(app.selected_row, 6);
 
         app.open_overlay(Overlay::BrowserChoice);
         for _ in 0..50 {
@@ -1713,6 +1734,10 @@ mod tests {
             event.event_type == "browser.open_requested"
                 && event.payload["target"] == "https://live.browser-use.com/?wss=example"
         }));
+        assert_eq!(
+            app.browser_notice.as_deref(),
+            Some("Opened https://live.browser-use.com/?wss=example")
+        );
 
         app.selected_row = 1;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -1787,7 +1812,7 @@ mod tests {
             &session.id,
             "session.done",
             serde_json::json!({
-                "result": "# Summary\n\n- Saved [Hacker News](https://news.ycombinator.com/news)\n- Wrote `hackernews_top5.json`"
+                "result": "# Summary\n\n- Saved [Hacker News](https://news.ycombinator.com/news)\n- Wrote `hackernews_top5.json`\n- Cart has **14 items** with subtotal **$1,240.70**"
             }),
         )?;
         app.selected_session_id = Some(session.id);
@@ -1796,7 +1821,63 @@ mod tests {
         assert!(screen.contains("Summary"));
         assert!(screen.contains("Saved Hacker News (https://news.ycombinator.com/news)"));
         assert!(screen.contains("Wrote hackernews_top5.json"));
+        assert!(screen.contains("Cart has 14 items with subtotal $1,240.70"));
         assert!(!screen.contains("# Summary"));
+        assert!(!screen.contains("**14 items**"));
+        assert!(!screen.contains("**$1,240.70**"));
+        Ok(())
+    }
+
+    #[test]
+    fn result_and_developer_views_render_laminar_trace() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "smoke telemetry"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "telemetry.trace",
+            serde_json::json!({
+                "trace_id": "trace123",
+                "backend": "laminar",
+                "endpoint": "https://api.lmnr.ai/v1/traces",
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "ok"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Telemetry"));
+        assert!(screen.contains("trace123"));
+
+        app.open_overlay(Overlay::Developer);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Telemetry"));
+        assert!(screen.contains("https://api.lmnr.ai/v1/traces"));
+        assert!(screen.contains("telemetry.trace"));
         Ok(())
     }
 

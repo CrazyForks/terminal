@@ -20,10 +20,6 @@ pub(crate) fn panel() -> Color {
     Color::Rgb(30, 32, 38)
 }
 
-pub(crate) fn background() -> Color {
-    Color::Rgb(18, 19, 23)
-}
-
 pub(crate) fn composer_bg() -> Color {
     Color::Rgb(28, 30, 36)
 }

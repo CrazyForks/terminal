@@ -2,6 +2,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod telemetry;
+
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
@@ -15,7 +17,9 @@ use browser_use_providers::{
 };
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{AgentSummary, Store};
+use opentelemetry::KeyValue;
 use serde_json::Value;
+use telemetry::AgentTelemetry;
 
 const MAX_TOOL_OUTPUT_TEXT_CHARS: usize = 16_000;
 
@@ -337,6 +341,39 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     options: AgentRunOptions,
 ) -> Result<String> {
     let run_id = store.record_run_started(&session.id, Some(std::process::id() as i64))?;
+    let telemetry = match AgentTelemetry::from_env() {
+        Ok(telemetry) => telemetry,
+        Err(error) => {
+            store.append_event(
+                &session.id,
+                "telemetry.failed",
+                serde_json::json!({
+                    "backend": "laminar",
+                    "error": format!("{error:#}"),
+                }),
+            )?;
+            AgentTelemetry::disabled()
+        }
+    };
+    let task_text = task_text_from_provider_messages(&messages);
+    let agent_span = telemetry.start_agent_span(
+        &session.id,
+        session.parent_id.as_deref(),
+        &session.cwd,
+        task_text.as_deref(),
+    );
+    if telemetry.is_enabled() {
+        store.append_event(
+            &session.id,
+            "telemetry.trace",
+            serde_json::json!({
+                "backend": "laminar",
+                "transport": "otlp_http_proto",
+                "trace_id": agent_span.trace_id(),
+                "endpoint": telemetry.endpoint(),
+            }),
+        )?;
+    }
     let result = (|| -> Result<String> {
         let mut worker = PythonWorker::start_with_browser_mode(options.browser_mode.as_deref())?;
         store.append_event(
@@ -366,10 +403,33 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             let mut assistant_text = String::new();
             let mut tool_calls = Vec::new();
 
-            for event in provider.start_turn(ProviderTurn {
-                messages: messages.clone(),
-                tools: browser_tool_specs(),
-            })? {
+            let turn_messages = messages.clone();
+            let turn_tools = browser_tool_specs();
+            let model_span = telemetry.start_model_turn_span(
+                &agent_span,
+                &session.id,
+                turn_idx,
+                provider.provider_name(),
+                provider.model_name(),
+                &turn_messages,
+                &turn_tools,
+            );
+            let provider_events = match provider.start_turn(ProviderTurn {
+                messages: turn_messages,
+                tools: turn_tools,
+            }) {
+                Ok(events) => {
+                    telemetry.record_model_events(&model_span, &events);
+                    events
+                }
+                Err(error) => {
+                    model_span.record_error(error.as_ref());
+                    return Err(error);
+                }
+            };
+            drop(model_span);
+
+            for event in provider_events {
                 match event {
                     ModelEvent::TextDelta { text } => {
                         store.append_event(
@@ -422,8 +482,39 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
             for call in tool_calls {
                 ensure_not_cancelled(store, &session.id)?;
-                let outcome =
-                    dispatch_tool_call(store, provider, &session, &mut worker, &call, &options)?;
+                let tool_span =
+                    telemetry.start_tool_span(&agent_span, &session.id, turn_idx, &call);
+                let outcome = match dispatch_tool_call(
+                    store,
+                    provider,
+                    &session,
+                    &mut worker,
+                    &call,
+                    &options,
+                ) {
+                    Ok(outcome) => {
+                        telemetry.record_tool_outcome(
+                            &tool_span,
+                            &outcome.messages,
+                            outcome.finished,
+                        );
+                        tool_span.set_attribute(KeyValue::new(
+                            "browser_use.tool.finished_session",
+                            outcome.finished,
+                        ));
+                        tool_span.set_attribute(KeyValue::new(
+                            "browser_use.tool.message_count",
+                            outcome.messages.len() as i64,
+                        ));
+                        tool_span.set_ok();
+                        outcome
+                    }
+                    Err(error) => {
+                        tool_span.record_error(error.as_ref());
+                        return Err(error);
+                    }
+                };
+                drop(tool_span);
                 messages.extend(outcome.messages);
                 maybe_compact_messages(
                     store,
@@ -446,6 +537,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     })();
     let cancelled = is_cancelled(store, &session.id)?;
     if let Err(error) = &result {
+        agent_span.record_error(error.as_ref());
         if !cancelled && !has_terminal_session_event(store, &session.id)? {
             store.append_event(
                 &session.id,
@@ -453,6 +545,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 serde_json::json!({ "error": error.to_string() }),
             )?;
         }
+    } else {
+        agent_span.set_ok();
     }
     let run_status = if cancelled {
         "cancelled"
@@ -462,6 +556,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         "failed"
     };
     store.finish_run(&run_id, run_status)?;
+    drop(agent_span);
+    telemetry.force_flush();
     result
 }
 
@@ -644,6 +740,31 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
         }
     }
     messages
+}
+
+fn task_text_from_provider_messages(messages: &[Value]) -> Option<String> {
+    messages.iter().find_map(|message| {
+        (message.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| message_content_text(message))
+            .filter(|text| !text.trim().is_empty())
+    })
+}
+
+fn message_content_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
 }
 
 struct ToolDispatchOutcome {
