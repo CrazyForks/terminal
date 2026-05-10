@@ -3,6 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod telemetry;
+mod tools;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -20,6 +21,7 @@ use browser_use_store::{AgentSummary, Store};
 use opentelemetry::KeyValue;
 use serde_json::Value;
 use telemetry::AgentTelemetry;
+use tools::{ToolHandlerKind, ToolRegistry};
 
 const MAX_TOOL_OUTPUT_TEXT_CHARS: usize = 16_000;
 
@@ -773,177 +775,7 @@ struct ToolDispatchOutcome {
 }
 
 fn browser_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "python".to_string(),
-            description: concat!(
-                "Run Python in the persistent browser session. Browser-harness helpers are already imported when available: ",
-                "goto_url, page_info, js, fill_input, click_at_xy, type_text, press_key, scroll, wait_for_load, ",
-                "wait_for_element, wait_for_network_idle, capture_screenshot, current_tab, list_tabs, switch_tab, ",
-                "new_tab, cdp, drain_events, and http_get. Do not import Playwright, Selenium, or Pyppeteer. ",
-                "Use copy_artifact and emit_image for files and screenshots."
-            )
-            .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "Python code to run in the persistent browser namespace."
-                    }
-                },
-                "required": ["code"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "done".to_string(),
-            description: "Finish the browser task with a final user-facing result.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "result": {
-                        "type": "string",
-                        "description": "Final answer for the user."
-                    }
-                },
-                "required": ["result"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "spawn_agent".to_string(),
-            description: "Create a separate helper session for bounded background exploration."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The bounded task for the helper session."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Optional stable task path, such as flight-search. Relative paths are stored under /root/."
-                    },
-                    "nickname": {
-                        "type": "string",
-                        "description": "Optional short display name."
-                    },
-                    "role": {
-                        "type": "string",
-                        "description": "Optional helper role label."
-                    },
-                    "fork_mode": {
-                        "type": "string",
-                        "enum": ["summary", "none", "all", "last_n"],
-                        "description": "How much parent context to provide. summary is sanitized and compact."
-                    },
-                    "fork_turns": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Number of recent user/follow-up turns to include when fork_mode is last_n."
-                    }
-                },
-                "required": ["message"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "wait_agent".to_string(),
-            description: "Read, and optionally briefly wait for, the compact status and final result for a helper session."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "child_session_id": {
-                        "type": "string",
-                        "description": "The helper session id or canonical helper path returned by spawn_agent."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Optional maximum time to wait for an active helper to finish before returning its current status."
-                    }
-                },
-                "required": ["child_session_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "send_message".to_string(),
-            description: "Queue a message for a helper session without waking a new turn."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "child_session_id": {
-                        "type": "string",
-                        "description": "The helper session id or canonical helper path returned by spawn_agent."
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "The message to queue for the helper."
-                    }
-                },
-                "required": ["child_session_id", "message"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "followup_task".to_string(),
-            description: "Queue a follow-up message for a helper session and wake its next turn."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "child_session_id": {
-                        "type": "string",
-                        "description": "The helper session id or canonical helper path returned by spawn_agent."
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "The follow-up instruction for the helper."
-                    }
-                },
-                "required": ["child_session_id", "message"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "list_agents".to_string(),
-            description: "List helper sessions spawned by this task.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path_prefix": {
-                        "type": "string",
-                        "description": "Optional canonical path prefix, such as /root/research."
-                    }
-                },
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: "close_agent".to_string(),
-            description: "Cancel and close a helper session that is no longer needed.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "child_session_id": {
-                        "type": "string",
-                        "description": "The helper session id or canonical helper path returned by spawn_agent."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Short reason for closing the helper."
-                    }
-                },
-                "required": ["child_session_id"],
-                "additionalProperties": false
-            }),
-        },
-    ]
+    ToolRegistry::browser_agent().specs()
 }
 
 fn tool_call_message(call: &ToolCall) -> Value {
@@ -962,26 +794,31 @@ fn dispatch_tool_call<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    match call.name.as_str() {
-        "done" => dispatch_done_tool(store, session, call),
-        "python" => dispatch_python_tool(
+    let registry = ToolRegistry::browser_agent();
+    let Some(handler) = registry.handler_for(&call.name) else {
+        return dispatch_unknown_tool(store, session, call);
+    };
+    match handler {
+        ToolHandlerKind::Done => dispatch_done_tool(store, session, call),
+        ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
             worker,
             call,
             options.python_tool_timeout_seconds,
         ),
-        "spawn_agent" => dispatch_spawn_agent_tool(store, provider, session, call, options),
-        "wait_agent" => dispatch_wait_agent_tool(store, session, call),
-        "send_message" => {
+        ToolHandlerKind::SpawnAgent => {
+            dispatch_spawn_agent_tool(store, provider, session, call, options)
+        }
+        ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call),
+        ToolHandlerKind::SendMessage => {
             dispatch_agent_message_tool(store, provider, session, call, false, options)
         }
-        "followup_task" => {
+        ToolHandlerKind::FollowupTask => {
             dispatch_agent_message_tool(store, provider, session, call, true, options)
         }
-        "list_agents" => dispatch_list_agents_tool(store, session, call),
-        "close_agent" => dispatch_close_agent_tool(store, session, call),
-        _ => dispatch_unknown_tool(store, session, call),
+        ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
+        ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
     }
 }
 
