@@ -100,6 +100,7 @@ struct App {
     args: Args,
     selected_session_id: Option<String>,
     input: String,
+    input_cursor: usize,
     overlay: Overlay,
     selected_row: usize,
     setup_complete: bool,
@@ -109,6 +110,7 @@ struct App {
     provider_model: String,
     browser: String,
     browser_notice: Option<String>,
+    status_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
 }
@@ -148,6 +150,7 @@ impl App {
             args,
             selected_session_id,
             input: String::new(),
+            input_cursor: 0,
             overlay,
             selected_row: 0,
             setup_complete,
@@ -157,6 +160,7 @@ impl App {
             provider_model,
             browser,
             browser_notice: None,
+            status_notice: None,
             agent_backend,
             quit_hint_until: None,
         })
@@ -202,7 +206,7 @@ impl App {
 
     fn submit(&mut self) -> Result<()> {
         let text = self.input.trim().to_string();
-        self.input.clear();
+        self.clear_input();
         if text.is_empty() {
             if let Some(session) = self
                 .selected_session_id
@@ -210,6 +214,9 @@ impl App {
                 .and_then(|id| self.store.load_session(id).ok().flatten())
             {
                 if session.status == SessionStatus::Failed {
+                    if !self.ensure_agent_ready()? {
+                        return Ok(());
+                    }
                     self.start_agent_for_session(session.id)?;
                 }
             }
@@ -232,12 +239,18 @@ impl App {
                 )?;
                 return Ok(());
             }
+            if !self.ensure_agent_ready()? {
+                return Ok(());
+            }
             self.store.append_event(
                 &session.id,
                 "session.followup",
                 serde_json::json!({ "text": text }),
             )?;
             self.start_agent_for_session(session.id)?;
+            return Ok(());
+        }
+        if !self.ensure_agent_ready()? {
             return Ok(());
         }
         let session = self.store.create_session(None, std::env::current_dir()?)?;
@@ -254,6 +267,16 @@ impl App {
         self.selected_session_id = Some(session.id.clone());
         self.start_agent_for_session(session.id)?;
         Ok(())
+    }
+
+    fn ensure_agent_ready(&mut self) -> Result<bool> {
+        if let Some(notice) = self.auth_notice()? {
+            self.status_notice = Some(notice);
+            self.open_overlay(Overlay::Account);
+            return Ok(false);
+        }
+        self.status_notice = None;
+        Ok(true)
     }
 
     fn start_agent_for_session(&self, session_id: String) -> Result<()> {
@@ -315,7 +338,7 @@ impl App {
                 ..
             } => {
                 if !self.input.is_empty() {
-                    self.input.clear();
+                    self.clear_input();
                 } else if self.cancel_current_task()? {
                     self.quit_hint_until = None;
                 } else if self
@@ -345,7 +368,7 @@ impl App {
                 code: KeyCode::Char('e'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => self.open_overlay(Overlay::Developer),
+            } if self.input.is_empty() => self.open_overlay(Overlay::Developer),
             KeyEvent {
                 code: KeyCode::Char('/'),
                 modifiers: KeyModifiers::NONE,
@@ -365,12 +388,7 @@ impl App {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.is_first_run_setup_visible()? => self.open_overlay(Overlay::Account),
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.overlay == Overlay::Setup => self.open_overlay(Overlay::Account),
+            } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -382,23 +400,139 @@ impl App {
                 ..
             } => self.submit()?,
             KeyEvent {
+                code: KeyCode::Enter,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None
+                && modifiers.intersects(
+                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+                ) =>
+            {
+                self.insert_input_char('\n');
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None
+                && modifiers.intersects(KeyModifiers::META | KeyModifiers::SUPER) =>
+            {
+                self.clear_input_current_line_before_cursor();
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None
+                && modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.delete_input_word_backward();
+            }
+            KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            } => {
-                self.input.pop();
+            } if self.overlay == Overlay::None => self.delete_input_backward(),
+            KeyEvent {
+                code: KeyCode::Delete,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None
+                && modifiers.intersects(KeyModifiers::META | KeyModifiers::SUPER) =>
+            {
+                self.clear_input_current_line_after_cursor();
+            }
+            KeyEvent {
+                code: KeyCode::Delete,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None
+                && modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.clear_input_after_cursor();
+            }
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } if self.overlay == Overlay::None => self.delete_input_forward(),
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                self.input_cursor = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                self.input_cursor = self.input_len();
+            }
+            KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                self.clear_input_before_cursor();
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                self.clear_input_after_cursor();
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => self.input_cursor = 0,
+            KeyEvent {
+                code: KeyCode::End, ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                self.input_cursor = self.input_len();
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                if modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER)
+                {
+                    self.move_input_word_left();
+                } else {
+                    self.move_input_cursor(-1);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers,
+                ..
+            } if self.overlay == Overlay::None && !self.input.is_empty() => {
+                if modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER)
+                {
+                    self.move_input_word_right();
+                } else {
+                    self.move_input_cursor(1);
+                }
             }
             KeyEvent {
                 code: KeyCode::Up, ..
-            } => self.selected_row = self.selected_row.saturating_sub(1),
+            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
+                self.move_selection(-1)?
+            }
             KeyEvent {
                 code: KeyCode::Down,
                 ..
-            } => self.selected_row = self.selected_row.saturating_add(1),
+            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
+                self.move_selection(1)?
+            }
             KeyEvent {
                 code: KeyCode::Char(ch),
                 modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
                 ..
-            } => self.input.push(ch),
+            } if self.overlay == Overlay::None => self.insert_input_char(ch),
             _ => {}
         }
         Ok(false)
@@ -448,6 +582,7 @@ impl App {
                     .unwrap_or(&ACCOUNT_CHOICES[0])
                     .to_string();
                 self.persist_runtime_settings()?;
+                self.status_notice = self.auth_notice()?;
                 self.open_overlay(Overlay::Model);
             }
             Overlay::Model => {
@@ -460,6 +595,7 @@ impl App {
                 self.agent_backend = choice.backend;
                 self.model_configured = true;
                 self.persist_runtime_settings()?;
+                self.status_notice = self.auth_notice()?;
                 self.open_overlay(Overlay::BrowserChoice);
             }
             Overlay::Browser => match self.selected_row.min(2) {
@@ -489,6 +625,15 @@ impl App {
                 self.close_overlay();
             }
             Overlay::Help | Overlay::Developer | Overlay::None => self.close_overlay(),
+        }
+        Ok(())
+    }
+
+    fn execute_first_run_setup_selection(&mut self) -> Result<()> {
+        match self.selected_row.min(2) {
+            0 => self.open_overlay(Overlay::Account),
+            1 => self.open_overlay(Overlay::Model),
+            _ => self.open_overlay(Overlay::BrowserChoice),
         }
         Ok(())
     }
@@ -537,6 +682,279 @@ impl App {
         self.store
             .set_setting("agent.backend", self.agent_backend.as_setting())?;
         Ok(())
+    }
+
+    fn selectable_row_count(&self) -> Result<usize> {
+        Ok(match self.overlay {
+            Overlay::None => {
+                if self.is_first_run_setup_visible()? {
+                    3
+                } else {
+                    0
+                }
+            }
+            Overlay::Setup => 3,
+            Overlay::Account => ACCOUNT_CHOICES.len(),
+            Overlay::Model => MODEL_CHOICES.len(),
+            Overlay::Browser => 3,
+            Overlay::BrowserChoice => BROWSER_CHOICES.len(),
+            Overlay::SetupComplete => 1,
+            Overlay::History => self.store.list_sessions()?.len(),
+            Overlay::Actions => 6,
+            Overlay::Help | Overlay::Developer => 0,
+        })
+    }
+
+    fn move_selection(&mut self, delta: isize) -> Result<()> {
+        let count = self.selectable_row_count()?;
+        if count == 0 {
+            self.selected_row = 0;
+            return Ok(());
+        }
+        let max = count.saturating_sub(1) as isize;
+        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+        Ok(())
+    }
+
+    fn input_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn composer_height(&self) -> u16 {
+        let input_lines = if self.input.is_empty() {
+            1
+        } else {
+            self.input.split('\n').count()
+        };
+        input_lines.clamp(1, 10) as u16 + 2
+    }
+
+    #[cfg(test)]
+    fn set_input(&mut self, value: String) {
+        self.input = value;
+        self.input_cursor = self.input_len();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    fn insert_input_char(&mut self, ch: char) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        self.input_cursor = self.input_cursor.min(chars.len());
+        chars.insert(self.input_cursor, ch);
+        self.input = chars.into_iter().collect();
+        self.input_cursor += 1;
+    }
+
+    fn move_input_cursor(&mut self, delta: isize) {
+        let len = self.input_len() as isize;
+        self.input_cursor = (self.input_cursor as isize + delta).clamp(0, len) as usize;
+    }
+
+    fn move_input_word_left(&mut self) {
+        let chars = self.input.chars().collect::<Vec<_>>();
+        self.input_cursor = self.input_cursor.min(chars.len());
+        let mut cursor = self.input_cursor;
+        while cursor > 0 && chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        while cursor > 0 && !chars[cursor - 1].is_whitespace() {
+            cursor -= 1;
+        }
+        self.input_cursor = cursor;
+    }
+
+    fn move_input_word_right(&mut self) {
+        let chars = self.input.chars().collect::<Vec<_>>();
+        let len = chars.len();
+        let mut cursor = self.input_cursor.min(len);
+        while cursor < len && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        while cursor < len && !chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        self.input_cursor = cursor;
+    }
+
+    fn delete_input_backward(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        self.input_cursor = self.input_cursor.min(chars.len());
+        chars.remove(self.input_cursor - 1);
+        self.input_cursor -= 1;
+        self.input = chars.into_iter().collect();
+    }
+
+    fn delete_input_forward(&mut self) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        self.input_cursor = self.input_cursor.min(chars.len());
+        if self.input_cursor >= chars.len() {
+            return;
+        }
+        chars.remove(self.input_cursor);
+        self.input = chars.into_iter().collect();
+    }
+
+    fn delete_input_word_backward(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        self.input_cursor = self.input_cursor.min(chars.len());
+        let mut start = self.input_cursor;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        chars.drain(start..self.input_cursor);
+        self.input_cursor = start;
+        self.input = chars.into_iter().collect();
+    }
+
+    fn clear_input_before_cursor(&mut self) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let cursor = self.input_cursor.min(chars.len());
+        chars.drain(0..cursor);
+        self.input = chars.into_iter().collect();
+        self.input_cursor = 0;
+    }
+
+    fn clear_input_after_cursor(&mut self) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let cursor = self.input_cursor.min(chars.len());
+        chars.truncate(cursor);
+        self.input = chars.into_iter().collect();
+    }
+
+    fn clear_input_current_line_before_cursor(&mut self) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let cursor = self.input_cursor.min(chars.len());
+        let line_start = chars[..cursor]
+            .iter()
+            .rposition(|ch| *ch == '\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        chars.drain(line_start..cursor);
+        self.input = chars.into_iter().collect();
+        self.input_cursor = line_start;
+    }
+
+    fn clear_input_current_line_after_cursor(&mut self) {
+        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let cursor = self.input_cursor.min(chars.len());
+        let line_end = chars[cursor..]
+            .iter()
+            .position(|ch| *ch == '\n')
+            .map(|idx| cursor + idx)
+            .unwrap_or(chars.len());
+        chars.drain(cursor..line_end);
+        self.input = chars.into_iter().collect();
+        self.input_cursor = cursor;
+    }
+
+    fn auth_notice(&self) -> Result<Option<String>> {
+        let notice = match self.agent_backend {
+            AgentBackend::Openai
+                if !self.has_stored_or_env(
+                    "auth.openai.api_key",
+                    &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                )? =>
+            {
+                Some("OpenAI API key required. Run `browser-use-terminal auth login openai --api-key ...` or set OPENAI_API_KEY.")
+            }
+            AgentBackend::Openrouter
+                if !self.has_stored_or_env(
+                    "auth.openrouter.api_key",
+                    &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )? =>
+            {
+                Some("OpenRouter API key required. Run `browser-use-terminal auth login openrouter --api-key ...` or set OPENROUTER_API_KEY.")
+            }
+            AgentBackend::Anthropic
+                if self.account == "Claude Code login"
+                    && !self.has_stored_or_env(
+                        "auth.claude_code.auth_token",
+                        &[
+                            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                            "CLAUDE_CODE_OAUTH_TOKEN",
+                            "ANTHROPIC_AUTH_TOKEN",
+                        ],
+                    )? =>
+            {
+                Some("Claude Code OAuth token required. Run `claude setup-token` then `browser-use-terminal auth login claude-code --access-token ...`.")
+            }
+            AgentBackend::Anthropic
+                if self.account != "Claude Code login"
+                    && !self.has_stored_or_env(
+                        "auth.anthropic.api_key",
+                        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                    )? =>
+            {
+                Some("Anthropic API key required. Run `browser-use-terminal auth login anthropic --api-key ...` or set ANTHROPIC_API_KEY.")
+            }
+            _ => None,
+        };
+        Ok(notice.map(str::to_string))
+    }
+
+    fn has_stored_or_env(&self, setting_key: &str, env_names: &[&str]) -> Result<bool> {
+        if self
+            .store
+            .get_setting(setting_key)?
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(true);
+        }
+        Ok(env_names
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
+    }
+
+    fn auth_status_for_account(&self, account: &str) -> &'static str {
+        let connected = match account {
+            "OpenAI API key" => self
+                .has_stored_or_env(
+                    "auth.openai.api_key",
+                    &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                )
+                .unwrap_or(false),
+            "OpenRouter API key" => self
+                .has_stored_or_env(
+                    "auth.openrouter.api_key",
+                    &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )
+                .unwrap_or(false),
+            "Anthropic API key" => self
+                .has_stored_or_env(
+                    "auth.anthropic.api_key",
+                    &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                )
+                .unwrap_or(false),
+            "Claude Code login" => self
+                .has_stored_or_env(
+                    "auth.claude_code.auth_token",
+                    &[
+                        "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                        "CLAUDE_CODE_OAUTH_TOKEN",
+                        "ANTHROPIC_AUTH_TOKEN",
+                    ],
+                )
+                .unwrap_or(false),
+            "Codex login" => return "uses Codex auth",
+            _ => false,
+        };
+        if connected {
+            "connected"
+        } else {
+            "needs sign in"
+        }
     }
 }
 
@@ -696,6 +1114,116 @@ mod tests {
     }
 
     #[test]
+    fn composer_supports_cursor_word_and_line_editing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 100,
+            height: 28,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+
+        app.set_input("hello browser world".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT))?);
+        assert_eq!(app.input, "hello browser ");
+        assert_eq!(app.input_cursor, app.input_len());
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_cursor, 0);
+
+        app.set_input("hello world".to_string());
+        app.input_cursor = 5;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))?);
+        assert_eq!(app.input, "hello, world");
+        assert_eq!(app.input_cursor, 6);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.input_cursor, app.input_len());
+
+        app.set_input("first line\nprefix suffix".to_string());
+        app.input_cursor = "first line\nprefix ".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
+        assert_eq!(app.input, "first line\nsuffix");
+        assert_eq!(app.input_cursor, "first line\n".chars().count());
+
+        app.set_input("first line\nprefix suffix\nlast line".to_string());
+        app.input_cursor = "first line\nprefix".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::SUPER))?);
+        assert_eq!(app.input, "first line\nprefix\nlast line");
+        assert_eq!(app.input_cursor, "first line\nprefix".chars().count());
+
+        app.clear_input();
+        assert_eq!(app.composer_height(), 3);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))?);
+        assert_eq!(app.input, "a\nb");
+        assert_eq!(app.composer_height(), 4);
+
+        let long_input = (0..20)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.set_input(long_input);
+        assert_eq!(app.composer_height(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_navigation_clamps_at_menu_bounds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 100,
+            height: 28,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+
+        app.open_overlay(Overlay::Model);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, 0);
+
+        app.open_overlay(Overlay::Actions);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, 5);
+
+        app.open_overlay(Overlay::BrowserChoice);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, BROWSER_CHOICES.len() - 1);
+        Ok(())
+    }
+
+    #[test]
     fn setup_flow_persists_account_model_and_browser_choices() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let args = Args {
@@ -758,6 +1286,68 @@ mod tests {
         assert_eq!(restarted.browser, "Browser Use cloud");
         assert_eq!(restarted.agent_backend, AgentBackend::Openrouter);
         Ok(())
+    }
+
+    #[test]
+    fn missing_openrouter_key_blocks_run_before_creating_session() -> Result<()> {
+        let env_names = ["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"];
+        let saved = env_names
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in env_names {
+            std::env::remove_var(name);
+        }
+
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let args = Args {
+                state_dir: temp.path().to_path_buf(),
+                model: "GLM-5.1".to_string(),
+                account: "OpenRouter API key".to_string(),
+                browser: "Local Chrome".to_string(),
+                dump_screen: true,
+                width: 100,
+                height: 28,
+                select_latest: false,
+                seed_demo: None,
+                overlay: None,
+                agent: AgentBackend::Openrouter,
+            };
+            let mut app = App::new(args)?;
+            app.setup_complete = true;
+            app.store.set_setting("setup.complete", "1")?;
+            app.provider_model = "z-ai/glm-5.1".to_string();
+            app.set_input("go to hacker news".to_string());
+
+            anyhow::ensure!(
+                !app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?,
+                "enter should not quit"
+            );
+            anyhow::ensure!(
+                app.overlay == Overlay::Account,
+                "account overlay should open"
+            );
+            anyhow::ensure!(
+                app.store.list_sessions()?.is_empty(),
+                "missing auth should not create a session"
+            );
+            anyhow::ensure!(app
+                .status_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("OpenRouter API key required")));
+            anyhow::ensure!(app.input.is_empty(), "input should clear after submit");
+            Ok(())
+        })();
+
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        result
     }
 
     #[test]
@@ -856,6 +1446,48 @@ mod tests {
         assert!(screen.contains("Hacker News"));
         assert!(!screen.contains("artifact"));
         assert!(!screen.contains("trace"));
+        Ok(())
+    }
+
+    #[test]
+    fn result_view_renders_basic_markdown_and_visible_links() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a markdown result"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({
+                "result": "# Summary\n\n- Saved [Hacker News](https://news.ycombinator.com/news)\n- Wrote `hackernews_top5.json`"
+            }),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Summary"));
+        assert!(screen.contains("Saved Hacker News (https://news.ycombinator.com/news)"));
+        assert!(screen.contains("Wrote hackernews_top5.json"));
+        assert!(!screen.contains("# Summary"));
         Ok(())
     }
 
@@ -1027,6 +1659,51 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         anyhow::bail!("follow-up fake agent did not finish");
+    }
+
+    #[test]
+    fn history_selected_done_session_followup_stays_in_place() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: Some("done".to_string()),
+            overlay: None,
+            agent: AgentBackend::Fake,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let session_id = app
+            .store
+            .list_sessions()?
+            .first()
+            .context("seeded session")?
+            .id
+            .clone();
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+
+        app.set_input("now summarize it shorter".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.store.list_sessions()?.len(), 1);
+        let events = app.store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "now summarize it shorter"
+        }));
+        Ok(())
     }
 
     #[test]

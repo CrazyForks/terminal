@@ -91,7 +91,7 @@ fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Workbe
         vertical: 1,
         horizontal: 2,
     });
-    let composer_h = 3u16;
+    let composer_h = app.composer_height();
     let footer_h = 1u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -113,7 +113,7 @@ fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Workbe
             result_lines(state)
         }
     } else {
-        ready_lines(state)
+        ready_lines(app, state)
     };
     frame.render_widget(
         Paragraph::new(content)
@@ -125,7 +125,7 @@ fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &Workbe
     render_footer(frame, chunks[2], app, state);
 }
 
-fn ready_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
+fn ready_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled("What should the browser do?", bold())),
         Line::from(""),
@@ -141,9 +141,21 @@ fn ready_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(""));
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            status_style("failed"),
+        )));
+        lines.push(Line::from(""));
+    }
+    let auth_status = if app.auth_notice().ok().flatten().is_some() {
+        "needs sign in"
+    } else {
+        "ready"
+    };
     lines.push(Line::from(vec![
         Span::styled("Ready  ", muted()),
-        Span::styled("signed in", text_style()),
+        Span::styled(auth_status, text_style()),
         Span::raw("      "),
         Span::styled("browser connected", text_style()),
     ]));
@@ -190,9 +202,7 @@ fn running_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
 fn result_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled("Result", bold())), Line::from("")];
     if let Some(result) = state.result.as_ref() {
-        for line in result.lines().take(18) {
-            lines.push(Line::from(line.to_string()));
-        }
+        lines.extend(markdown_result_lines(result).into_iter().take(18));
     } else {
         lines.push(Line::from(Span::styled("No result yet.", dim())));
     }
@@ -210,10 +220,11 @@ fn result_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
 }
 
 fn failure_lines(error: &str) -> Vec<Line<'static>> {
+    let message = friendly_error_message(error);
     vec![
         Line::from(Span::styled("The agent could not finish the task.", bold())),
         Line::from(""),
-        Line::from(Span::styled(first_line(error), muted())),
+        Line::from(Span::styled(message, muted())),
         Line::from(""),
         Line::from("> Retry"),
         Line::from("  Sign in"),
@@ -268,13 +279,15 @@ fn render_composer(
     let text = if app.input.is_empty() {
         vec![Line::from(vec![
             Span::styled("> ", dim()),
+            Span::styled("▌ ", accent()),
             Span::styled(placeholder, dim()),
         ])]
     } else {
-        vec![Line::from(vec![
-            Span::styled("> ", accent()),
-            Span::styled(app.input.clone(), bold()),
-        ])]
+        let max_lines = area.height.saturating_sub(2).max(1) as usize;
+        visible_composer_lines(
+            composer_input_lines(&app.input, app.input_cursor),
+            max_lines,
+        )
     };
     frame.render_widget(
         Paragraph::new(text)
@@ -319,65 +332,84 @@ fn render_setup(frame: &mut Frame<'_>, area: Rect, app: &App, first_run: bool) {
     } else {
         modal(frame, area, "Setup")
     };
-    let lines = vec![
+    let mut lines = vec![
         if first_run {
             Line::from(Span::styled("Set up the browser agent", bold()))
         } else {
             Line::from(Span::styled("The browser agent needs attention.", bold()))
         },
         Line::from(""),
-        if first_run {
-            setup_line("1", "Sign in", "Not connected")
-        } else {
-            setup_status_line("ok", "Browser", &format!("{} found", app.browser))
-        },
-        Line::from(""),
-        if first_run {
-            setup_line("2", "Choose model", "No model selected")
-        } else {
-            setup_status_line("ok", "Sign in", &app.account)
-        },
-        Line::from(""),
-        if first_run {
-            setup_line("3", "Choose browser", &format!("{} available", app.browser))
-        } else {
-            setup_status_line("ok", "Model", &app.model)
-        },
-        Line::from(""),
-        if first_run {
-            Line::from("> Start setup")
-        } else {
-            selected("Sign in", 0, app.selected_row)
-        },
-        if first_run {
-            Line::from("")
-        } else {
-            selected("Choose model", 1, app.selected_row)
-        },
-        if first_run {
-            Line::from(Span::styled("enter continue", muted()))
-        } else {
-            selected("Change browser", 2, app.selected_row)
-        },
-        if first_run {
-            Line::from("")
-        } else {
-            Line::from("")
-        },
-        if first_run {
-            Line::from("")
-        } else {
-            Line::from(Span::styled("enter fix     esc back", muted()))
-        },
     ];
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            status_style("failed"),
+        )));
+        lines.push(Line::from(""));
+    }
+    if first_run {
+        lines.extend([
+            selected(
+                &format!(
+                    "Sign in                  {}",
+                    app.auth_status_for_account(&app.account)
+                ),
+                0,
+                app.selected_row,
+            ),
+            Line::from(""),
+            selected(
+                &format!(
+                    "Choose model             {}",
+                    if app.model_configured {
+                        app.model.as_str()
+                    } else {
+                        "No model selected"
+                    }
+                ),
+                1,
+                app.selected_row,
+            ),
+            Line::from(""),
+            selected(
+                &format!("Choose browser           {}", app.browser),
+                2,
+                app.selected_row,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "enter select     tab history     / actions",
+                muted(),
+            )),
+        ]);
+    } else {
+        lines.extend([
+            setup_status_line("ok", "Browser", &format!("{} found", app.browser)),
+            Line::from(""),
+            setup_status_line("ok", "Sign in", &app.account),
+            Line::from(""),
+            setup_status_line("ok", "Model", &app.model),
+            Line::from(""),
+            selected("Sign in", 0, app.selected_row),
+            selected("Choose model", 1, app.selected_row),
+            selected("Change browser", 2, app.selected_row),
+            Line::from(""),
+            Line::from(Span::styled("enter fix     esc back", muted())),
+        ]);
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_setup_complete(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
     let inner = modal(frame, area, "Ready");
+    let auth_state = app
+        .auth_notice()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("Signed in with {}", app.account));
     let lines = vec![
-        setup_status_line("ok", "Signed in", &app.account),
+        setup_status_line("ok", "Sign in", &auth_state),
         setup_status_line("ok", "Model", &app.model),
         setup_status_line("ok", "Browser", &app.browser),
         Line::from(""),
@@ -391,17 +423,28 @@ fn render_setup_complete(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_account_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
     let inner = modal(frame, area, "Sign in");
-    let lines = vec![
+    let mut lines = vec![
         Line::from("Choose how the agent should connect to a model."),
         Line::from(""),
-        selected("Codex login", 0, app.selected_row),
-        selected("Claude Code login", 1, app.selected_row),
-        selected("OpenAI API key", 2, app.selected_row),
-        selected("Anthropic API key", 3, app.selected_row),
-        selected("OpenRouter API key", 4, app.selected_row),
+    ];
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            status_style("failed"),
+        )));
+        lines.push(Line::from(""));
+    }
+    for (idx, account) in super::settings::ACCOUNT_CHOICES.iter().enumerate() {
+        lines.push(selected(
+            &format!("{account:<24} {}", app.auth_status_for_account(account)),
+            idx,
+            app.selected_row,
+        ));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled("enter select     esc back", muted())),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -548,7 +591,7 @@ fn render_actions_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(inner);
     frame.render_widget(List::new(rows), chunks[0]);
     frame.render_widget(
-        Paragraph::new("type to search     enter select     esc close").style(muted()),
+        Paragraph::new("enter select     esc close").style(muted()),
         chunks[1],
     );
 }
@@ -602,14 +645,6 @@ fn render_developer_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state:
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("esc close", muted())));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn setup_line(prefix: &str, label: &str, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("[{prefix}] "), accent()),
-        Span::styled(format!("{label:<16}"), bold()),
-        Span::styled(value.to_string(), muted()),
-    ])
 }
 
 fn setup_status_line(prefix: &str, label: &str, value: &str) -> Line<'static> {
@@ -676,6 +711,190 @@ fn selected(text: &str, idx: usize, selected: usize) -> Line<'static> {
     ])
 }
 
+fn composer_input_lines(input: &str, cursor: usize) -> Vec<Line<'static>> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let mut out = Vec::new();
+    let mut global = 0usize;
+
+    for (idx, source_line) in input.split('\n').enumerate() {
+        let line_len = source_line.chars().count();
+        let prefix = if idx == 0 { "> " } else { "  " };
+        if cursor >= global && cursor <= global + line_len {
+            let local = cursor - global;
+            let before = source_line.chars().take(local).collect::<String>();
+            let after = source_line.chars().skip(local).collect::<String>();
+            out.push(Line::from(vec![
+                Span::styled(prefix, accent()),
+                Span::styled(before, bold()),
+                Span::styled("▌", accent()),
+                Span::styled(after, bold()),
+            ]));
+        } else {
+            out.push(Line::from(vec![
+                Span::styled(prefix, accent()),
+                Span::styled(source_line.to_string(), bold()),
+            ]));
+        }
+        global += line_len + 1;
+    }
+
+    if out.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("> ", accent()),
+            Span::styled("▌", accent()),
+        ]));
+    }
+
+    out
+}
+
+fn visible_composer_lines(mut lines: Vec<Line<'static>>, max_lines: usize) -> Vec<Line<'static>> {
+    if lines.len() <= max_lines {
+        return lines;
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    lines.drain(0..start);
+    lines
+}
+
+fn markdown_result_lines(markdown: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code = false;
+
+    for source in markdown.lines() {
+        let trimmed = source.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            lines.push(Line::from(Span::styled("code", muted())));
+            continue;
+        }
+        if in_code {
+            lines.push(Line::from(Span::styled(source.to_string(), muted())));
+            continue;
+        }
+        if trimmed.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("### ") {
+            lines.push(Line::from(Span::styled(text.to_string(), bold())));
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("## ") {
+            lines.push(Line::from(Span::styled(text.to_string(), bold())));
+            continue;
+        }
+        if let Some(text) = trimmed.strip_prefix("# ") {
+            lines.push(Line::from(Span::styled(text.to_string(), bold())));
+            continue;
+        }
+        if let Some(text) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled("• ", accent())];
+            spans.extend(inline_markdown_spans(text));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        if let Some((marker, text)) = numbered_markdown_item(trimmed) {
+            let mut spans = vec![Span::styled(format!("{marker} "), accent())];
+            spans.extend(inline_markdown_spans(text));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        lines.push(Line::from(inline_markdown_spans(source)));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn numbered_markdown_item(value: &str) -> Option<(&str, &str)> {
+    let (marker, text) = value.split_once(' ')?;
+    if marker.ends_with('.')
+        && marker[..marker.len().saturating_sub(1)]
+            .parse::<usize>()
+            .is_ok()
+    {
+        Some((marker, text))
+    } else {
+        None
+    }
+}
+
+fn inline_markdown_spans(value: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = value;
+
+    while let Some(start) = rest.find('[') {
+        push_inline_text(&mut spans, &rest[..start]);
+        let after_open = &rest[start + 1..];
+        let Some(label_end) = after_open.find("](") else {
+            rest = &rest[start..];
+            break;
+        };
+        let after_label = &after_open[label_end + 2..];
+        let Some(url_end) = after_label.find(')') else {
+            rest = &rest[start..];
+            break;
+        };
+        let label = &after_open[..label_end];
+        let url = &after_label[..url_end];
+        spans.push(Span::styled(label.to_string(), link()));
+        spans.push(Span::raw(" ("));
+        spans.push(Span::styled(url.to_string(), link()));
+        spans.push(Span::raw(")"));
+        rest = &after_label[url_end + 1..];
+    }
+
+    push_inline_text(&mut spans, rest);
+    spans
+}
+
+fn push_inline_text(spans: &mut Vec<Span<'static>>, value: &str) {
+    let mut rest = value;
+    while let Some(start) = rest.find('`') {
+        if start > 0 {
+            spans.extend(bare_link_spans(&rest[..start]));
+        }
+        let after_open = &rest[start + 1..];
+        let Some(end) = after_open.find('`') else {
+            spans.extend(bare_link_spans(&rest[start..]));
+            return;
+        };
+        spans.push(Span::styled(after_open[..end].to_string(), muted()));
+        rest = &after_open[end + 1..];
+    }
+    spans.extend(bare_link_spans(rest));
+}
+
+fn bare_link_spans(value: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = value;
+    loop {
+        let http = rest.find("http://");
+        let https = rest.find("https://");
+        let Some(start) = [http, https].into_iter().flatten().min() else {
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), text_style()));
+            }
+            break;
+        };
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), text_style()));
+        }
+        let tail = &rest[start..];
+        let end = tail.find(char::is_whitespace).unwrap_or_else(|| tail.len());
+        spans.push(Span::styled(tail[..end].to_string(), link()));
+        rest = &tail[end..];
+    }
+    spans
+}
+
 fn modal(frame: &mut Frame<'_>, area: Rect, title: &str) -> Rect {
     let block = Block::bordered()
         .title(title.to_string())
@@ -712,4 +931,21 @@ fn truncate(value: &str, max: usize) -> String {
 
 fn first_line(value: &str) -> String {
     value.lines().next().unwrap_or(value).to_string()
+}
+
+fn friendly_error_message(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("auth login openrouter") || lower.contains("openrouter_api_key") {
+        return "OpenRouter API key is missing. Sign in before retrying.".to_string();
+    }
+    if lower.contains("auth login openai") || lower.contains("openai_api_key") {
+        return "OpenAI API key is missing. Sign in before retrying.".to_string();
+    }
+    if lower.contains("auth login anthropic") || lower.contains("anthropic_api_key") {
+        return "Anthropic API key is missing. Sign in before retrying.".to_string();
+    }
+    if lower.contains("claude setup-token") || lower.contains("claude_code_oauth_token") {
+        return "Claude Code login needs an OAuth token before retrying.".to_string();
+    }
+    truncate(&first_line(value), 96)
 }
