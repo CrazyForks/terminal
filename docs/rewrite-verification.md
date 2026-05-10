@@ -17,6 +17,8 @@ cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke d
 cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke
 cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-report audit-smoke
 cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-run-fake real_v14_short --count 2 --run-id audit-smoke --resume
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-workspace-smoke dataset-run-fake real_v14_short --count 1 --run-id workspace-smoke
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-workspace-smoke dataset-report workspace-smoke
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke run-codex --model gpt-5.5 \
   "Do not use the browser. Call the done tool with result exactly 'ok'."
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
@@ -183,6 +185,13 @@ Latest fake dataset manifest/report smoke:
 - `dataset-run-fake real_v14_short --count 2 --run-id audit-smoke` wrote two done sessions and summary `passed=2 failed=0 pending=0`
 - `dataset-report audit-smoke` returns the compact report with attempts by task
 - `dataset-run-fake ... --resume` skips already passed task ids `2` and `4`
+
+Latest fake dataset isolated-workspace smoke:
+
+- state dir `/tmp/but-dataset-workspace-smoke`
+- manifest path `/tmp/but-dataset-workspace-smoke/dataset-runs/workspace-smoke.json`
+- session `8a8e460ca4b2` used cwd `/tmp/but-dataset-workspace-smoke/dataset-workspaces/workspace-smoke/2-attempt-1`
+- summary `passed=1 failed=0 pending=0`
 
 Provider coverage:
 
