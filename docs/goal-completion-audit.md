@@ -12,7 +12,7 @@ Objective audited:
 
 | Requirement | Evidence | Status |
 | --- | --- | --- |
-| Rust owns durable state, orchestration, providers, model/tool scheduling, CLI, and TUI. | Workspace crates `browser-use-protocol`, `browser-use-store`, `browser-use-core`, `browser-use-providers`, `browser-use-cli`, and `browser-use-tui`; old Python product runtime removed from package surface. | Done |
+| Rust owns durable state, orchestration, providers, model/tool scheduling, CLI, and TUI. | Workspace crates `browser-use-protocol`, `browser-use-store`, `browser-use-core`, `browser-use-providers`, `browser-use-cli`, and `browser-use-tui`; old Python product runtime removed from package surface; TUI no longer constructs concrete provider adapters. | Done |
 | Python remains the browser island and understands live browser reconnect/identity. | `python/llm_browser_worker/worker.py` loads browser-harness helpers, emits browser state/artifacts, supports managed testing-browser and Browser Use cloud modes; browser-harness fixes committed in `/Users/greg/Developer/browser-harness`. | Done |
 | SQLite replaces per-session JSON files as primary state. | `crates/browser-use-store` migrations create `sessions`, `events`, `artifacts`, `runs`, `agent_edges`, `agent_messages`, and `app_settings`; tests cover store/session/events/import/export. | Done |
 | Append-only events are the integration contract. | Core/store append normalized `session.*`, `model.*`, `tool.*`, `browser.*`, `agent.*`, artifact, and compaction events; TUI projects `WorkbenchState` from events. | Done |

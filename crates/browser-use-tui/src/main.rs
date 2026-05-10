@@ -4,13 +4,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{run_existing_session_with_provider, AgentRunOptions};
+use browser_use_core::{
+    run_existing_session_from_config, AgentRunOptions, ProviderBackend, ProviderRunConfig,
+};
 use browser_use_protocol::{
     project_workbench, HistoryRow, SessionMeta, SessionStatus, WorkbenchState,
-};
-use browser_use_providers::{
-    load_codex_auth, AnthropicMessagesProvider, CodexAuth, CodexResponsesProvider, FakeProvider,
-    OpenAICompatibleChatProvider, OpenAIResponsesProvider,
 };
 use browser_use_store::Store;
 use clap::{Parser, ValueEnum};
@@ -84,6 +82,19 @@ impl AgentBackend {
             "fake" => Some(Self::Fake),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+}
+
+impl From<AgentBackend> for ProviderBackend {
+    fn from(value: AgentBackend) -> Self {
+        match value {
+            AgentBackend::Codex => Self::Codex,
+            AgentBackend::Openai => Self::Openai,
+            AgentBackend::Anthropic => Self::Anthropic,
+            AgentBackend::Openrouter => Self::Openrouter,
+            AgentBackend::Fake => Self::Fake,
+            AgentBackend::None => Self::None,
         }
     }
 }
@@ -676,54 +687,10 @@ fn run_agent_thread(
     browser: String,
 ) -> Result<()> {
     let store = Store::open(&state_dir)?;
-    let result = match backend {
-        AgentBackend::Codex => {
-            let provider = codex_provider(&store, model)?;
-            run_existing_session_with_provider(
-                &store,
-                &provider,
-                &session_id,
-                tui_agent_options(&browser),
-            )
-        }
-        AgentBackend::Openai => {
-            let provider = openai_provider(&store, model)?;
-            run_existing_session_with_provider(
-                &store,
-                &provider,
-                &session_id,
-                tui_agent_options(&browser),
-            )
-        }
-        AgentBackend::Anthropic => {
-            let provider = anthropic_provider(&store, model)?;
-            run_existing_session_with_provider(
-                &store,
-                &provider,
-                &session_id,
-                tui_agent_options(&browser),
-            )
-        }
-        AgentBackend::Openrouter => {
-            let provider = openrouter_provider(&store, model)?;
-            run_existing_session_with_provider(
-                &store,
-                &provider,
-                &session_id,
-                tui_agent_options(&browser),
-            )
-        }
-        AgentBackend::Fake => {
-            let provider = FakeProvider::with_text("Fake result from the Rust TUI agent loop.");
-            run_existing_session_with_provider(
-                &store,
-                &provider,
-                &session_id,
-                tui_agent_options(&browser),
-            )
-        }
-        AgentBackend::None => Ok(session_id.clone()),
-    };
+    let config = ProviderRunConfig::new(backend.into(), model)
+        .with_options(tui_agent_options(&browser))
+        .with_fake_result("Fake result from the Rust TUI agent loop.");
+    let result = run_existing_session_from_config(&store, &session_id, config);
     if let Err(error) = result {
         let _ = store.append_event(
             &session_id,
@@ -741,113 +708,6 @@ fn tui_agent_options(browser: &str) -> AgentRunOptions {
         "Browser Use cloud" => AgentRunOptions::default().with_browser_mode("cloud"),
         _ => AgentRunOptions::default(),
     }
-}
-
-fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.openai.api_key",
-        &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
-    )?
-    .context("run `browser-use-terminal auth login openai --api-key ...` or set LLM_BROWSER_OPENAI_API_KEY")?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.openai.base_url",
-        &["LLM_BROWSER_OPENAI_BASE_URL"],
-        "https://api.openai.com/v1",
-    )?;
-    Ok(OpenAIResponsesProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
-    let auth = match stored_codex_auth(store)? {
-        Some(auth) => auth,
-        None => load_codex_auth()?,
-    };
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.codex.base_url",
-        &["LLM_BROWSER_CODEX_BASE_URL"],
-        "https://chatgpt.com/backend-api",
-    )?;
-    Ok(CodexResponsesProvider::with_base_url(auth, model, base_url))
-}
-
-fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.anthropic.api_key",
-        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
-    )?
-    .context("run `browser-use-terminal auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.anthropic.base_url",
-        &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
-        "https://api.anthropic.com/v1",
-    )?;
-    Ok(AnthropicMessagesProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.openrouter.api_key",
-        &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
-    )?
-    .context(
-        "run `browser-use-terminal auth login openrouter --api-key ...` or set OPENROUTER_API_KEY",
-    )?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.openrouter.base_url",
-        &["LLM_BROWSER_OPENAI_COMPAT_BASE_URL", "OPENROUTER_BASE_URL"],
-        "https://openrouter.ai/api/v1",
-    )?;
-    Ok(OpenAICompatibleChatProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
-    let Some(access_token) = store.get_setting("auth.codex.access_token")? else {
-        return Ok(None);
-    };
-    let Some(account_id) = store.get_setting("auth.codex.account_id")? else {
-        return Ok(None);
-    };
-    if access_token.trim().is_empty() || account_id.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(CodexAuth {
-        access_token,
-        account_id,
-    }))
-}
-
-fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
-    if let Some(value) = store.get_setting(setting_key)? {
-        if !value.trim().is_empty() {
-            return Ok(Some(value));
-        }
-    }
-    Ok(env_names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .filter(|value| !value.trim().is_empty()))
-}
-
-fn setting_or_env_or_default(
-    store: &Store,
-    setting_key: &str,
-    env_names: &[&str],
-    default: &str,
-) -> Result<String> {
-    Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
 }
 
 fn main() -> Result<()> {

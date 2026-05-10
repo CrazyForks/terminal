@@ -8,7 +8,11 @@ use browser_use_protocol::{
     failure_from_events, result_from_events, sanitized_agent_context_from_events, ModelEvent,
     SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
-use browser_use_providers::{ModelProvider, ProviderTurn, ScriptedProvider};
+use browser_use_providers::{
+    load_codex_auth, AnthropicMessagesProvider, CodexAuth, CodexResponsesProvider, FakeProvider,
+    ModelProvider, OpenAICompatibleChatProvider, OpenAIResponsesProvider, ProviderTurn,
+    ScriptedProvider,
+};
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{AgentSummary, Store};
 use serde_json::Value;
@@ -17,6 +21,45 @@ const MAX_TOOL_OUTPUT_TEXT_CHARS: usize = 16_000;
 
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderBackend {
+    Codex,
+    Openai,
+    Anthropic,
+    Openrouter,
+    Fake,
+    None,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderRunConfig {
+    pub backend: ProviderBackend,
+    pub model: String,
+    pub options: AgentRunOptions,
+    pub fake_result: Option<String>,
+}
+
+impl ProviderRunConfig {
+    pub fn new(backend: ProviderBackend, model: impl Into<String>) -> Self {
+        Self {
+            backend,
+            model: model.into(),
+            options: AgentRunOptions::default(),
+            fake_result: None,
+        }
+    }
+
+    pub fn with_options(mut self, options: AgentRunOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn with_fake_result(mut self, result: impl Into<String>) -> Self {
+        self.fake_result = Some(result.into());
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +170,163 @@ pub fn run_existing_session_with_provider<P: ModelProvider>(
     let events = store.events_for_session(session_id)?;
     let messages = provider_messages_from_events(&events);
     run_loaded_session_with_provider(store, provider, session, messages, options)
+}
+
+pub fn run_existing_session_from_config(
+    store: &Store,
+    session_id: &str,
+    config: ProviderRunConfig,
+) -> Result<String> {
+    match config.backend {
+        ProviderBackend::Codex => {
+            let provider = codex_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::Openai => {
+            let provider = openai_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::Anthropic => {
+            let provider = anthropic_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::Openrouter => {
+            let provider = openrouter_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::Fake => {
+            let provider = FakeProvider::with_text(
+                config
+                    .fake_result
+                    .as_deref()
+                    .unwrap_or("Fake browser task completed."),
+            );
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::None => Ok(session_id.to_string()),
+    }
+}
+
+fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvider> {
+    let api_key = stored_or_env(
+        store,
+        "auth.openai.api_key",
+        &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+    )?
+    .context("run `auth login openai --api-key ...` or set LLM_BROWSER_OPENAI_API_KEY")?;
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.openai.base_url",
+        &["LLM_BROWSER_OPENAI_BASE_URL"],
+        "https://api.openai.com/v1",
+    )?;
+    Ok(OpenAIResponsesProvider::with_base_url(
+        api_key, model, base_url,
+    ))
+}
+
+fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
+    let auth = match stored_codex_auth(store)? {
+        Some(auth) => auth,
+        None => load_codex_auth()?,
+    };
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.codex.base_url",
+        &["LLM_BROWSER_CODEX_BASE_URL"],
+        "https://chatgpt.com/backend-api",
+    )?;
+    Ok(CodexResponsesProvider::with_base_url(auth, model, base_url))
+}
+
+fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.anthropic.base_url",
+        &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
+        "https://api.anthropic.com/v1",
+    )?;
+    if store.get_setting("account")?.as_deref() == Some("Claude Code login") {
+        let auth_token = stored_or_env(
+            store,
+            "auth.claude_code.auth_token",
+            &[
+                "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+            ],
+        )?
+        .context(
+            "run `claude setup-token`, then `auth login claude-code --access-token ...`, or set CLAUDE_CODE_OAUTH_TOKEN",
+        )?;
+        return Ok(AnthropicMessagesProvider::with_auth_token(
+            auth_token, model, base_url,
+        ));
+    }
+    let api_key = stored_or_env(
+        store,
+        "auth.anthropic.api_key",
+        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+    )?
+    .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
+    Ok(AnthropicMessagesProvider::with_base_url(
+        api_key, model, base_url,
+    ))
+}
+
+fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
+    let api_key = stored_or_env(
+        store,
+        "auth.openrouter.api_key",
+        &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+    )?
+    .context("run `auth login openrouter --api-key ...` or set OPENROUTER_API_KEY")?;
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.openrouter.base_url",
+        &["LLM_BROWSER_OPENAI_COMPAT_BASE_URL", "OPENROUTER_BASE_URL"],
+        "https://openrouter.ai/api/v1",
+    )?;
+    Ok(OpenAICompatibleChatProvider::with_base_url(
+        api_key, model, base_url,
+    ))
+}
+
+fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
+    let Some(access_token) = store.get_setting("auth.codex.access_token")? else {
+        return Ok(None);
+    };
+    let Some(account_id) = store.get_setting("auth.codex.account_id")? else {
+        return Ok(None);
+    };
+    if access_token.trim().is_empty() || account_id.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CodexAuth {
+        access_token,
+        account_id,
+    }))
+}
+
+fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
+    if let Some(value) = store.get_setting(setting_key)? {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    Ok(env_names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty()))
+}
+
+fn setting_or_env_or_default(
+    store: &Store,
+    setting_key: &str,
+    env_names: &[&str],
+    default: &str,
+) -> Result<String> {
+    Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
 }
 
 fn run_loaded_session_with_provider<P: ModelProvider>(
@@ -1760,6 +1960,30 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.done"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_config_runs_existing_session_without_ui_provider_construction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run from config"}),
+        )?;
+        run_existing_session_from_config(
+            &store,
+            &session.id,
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake")
+                .with_fake_result("configured fake result"),
+        )?;
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"] == "configured fake result"
+        }));
         Ok(())
     }
 
