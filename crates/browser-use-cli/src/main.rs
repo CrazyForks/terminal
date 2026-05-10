@@ -648,7 +648,10 @@ fn default_settings() -> Vec<(&'static str, &'static str)> {
 }
 
 fn is_secret_setting(key: &str) -> bool {
-    key.starts_with("auth.") && (key.ends_with(".api_key") || key.ends_with(".access_token"))
+    key.starts_with("auth.")
+        && (key.ends_with(".api_key")
+            || key.ends_with(".access_token")
+            || key.ends_with(".auth_token"))
 }
 
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
@@ -673,7 +676,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
             )?;
-            println!("Claude Code login: not connected (OAuth import is not implemented; use Anthropic API key)");
+            print_claude_code_status(store)?;
             Ok(())
         }
         AuthCommand::Login {
@@ -749,7 +752,19 @@ fn auth_login(
             Ok(())
         }
         AuthAccount::ClaudeCode => {
-            bail!("Claude Code OAuth login is not implemented; use `auth login anthropic --api-key ...` for Anthropic models")
+            let auth_token = read_optional_secret_from_env(
+                access_token,
+                &[
+                    "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "ANTHROPIC_AUTH_TOKEN",
+                ],
+                "Claude Code OAuth token",
+            )?;
+            store.set_setting("auth.claude_code.auth_token", auth_token.trim())?;
+            store.set_setting("account", "Claude Code login")?;
+            println!("Claude Code login: connected (stored OAuth token)");
+            Ok(())
         }
     }
 }
@@ -765,7 +780,9 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
                 store.delete_setting(key)?;
             }
         }
-        AuthAccount::ClaudeCode => {}
+        AuthAccount::ClaudeCode => {
+            store.delete_setting("auth.claude_code.auth_token")?;
+        }
     }
     Ok(())
 }
@@ -787,6 +804,31 @@ fn read_required_secret(value: Option<String>, prompt: &str) -> Result<String> {
         bail!("{prompt} cannot be empty");
     }
     Ok(trimmed)
+}
+
+fn read_optional_secret_from_env(
+    value: Option<String>,
+    env_names: &[&str],
+    prompt: &str,
+) -> Result<String> {
+    if let Some(value) = value {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("{prompt} cannot be empty");
+        }
+        return Ok(trimmed);
+    }
+    for name in env_names {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+    bail!(
+        "{prompt} not found; run `claude setup-token` and pass it with --access-token, or set CLAUDE_CODE_OAUTH_TOKEN"
+    )
 }
 
 fn store_codex_auth(store: &Store, auth: &CodexAuth) -> Result<()> {
@@ -830,6 +872,60 @@ fn print_codex_status(store: &Store) -> Result<()> {
         Err(error) => println!("Codex login: not connected ({error})"),
     }
     Ok(())
+}
+
+fn print_claude_code_status(store: &Store) -> Result<()> {
+    if store
+        .get_setting("auth.claude_code.auth_token")?
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        println!("Claude Code login: connected (stored OAuth token)");
+        return Ok(());
+    }
+    if env_any(&[
+        "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+    ]) {
+        println!("Claude Code login: connected (environment OAuth token)");
+        return Ok(());
+    }
+    match claude_code_cli_status() {
+        Ok(Some(summary)) => println!(
+            "Claude Code login: connected in Claude Code CLI ({summary}; run `claude setup-token` to make it usable here)"
+        ),
+        Ok(None) => print_auth_line("Claude Code login", false),
+        Err(error) => println!("Claude Code login: not connected ({error})"),
+    }
+    Ok(())
+}
+
+fn claude_code_cli_status() -> Result<Option<String>> {
+    let output = std::process::Command::new("claude")
+        .args(["auth", "status", "--json"])
+        .output()
+        .context("run `claude auth status --json`")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse Claude Code auth status")?;
+    if value
+        .get("loggedIn")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let email = value
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown email");
+        let subscription = value
+            .get("subscriptionType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown plan");
+        return Ok(Some(format!("{email}, {subscription}")));
+    }
+    Ok(None)
 }
 
 fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
@@ -902,18 +998,35 @@ fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider
 }
 
 fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.anthropic.api_key",
-        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
-    )?
-    .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
     let base_url = setting_or_env_or_default(
         store,
         "auth.anthropic.base_url",
         &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
         "https://api.anthropic.com/v1",
     )?;
+    if store.get_setting("account")?.as_deref() == Some("Claude Code login") {
+        let auth_token = stored_or_env(
+            store,
+            "auth.claude_code.auth_token",
+            &[
+                "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+            ],
+        )?
+        .context(
+            "run `claude setup-token`, then `auth login claude-code --access-token ...`, or set CLAUDE_CODE_OAUTH_TOKEN",
+        )?;
+        return Ok(AnthropicMessagesProvider::with_auth_token(
+            auth_token, model, base_url,
+        ));
+    }
+    let api_key = stored_or_env(
+        store,
+        "auth.anthropic.api_key",
+        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+    )?
+    .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
     Ok(AnthropicMessagesProvider::with_base_url(
         api_key, model, base_url,
     ))

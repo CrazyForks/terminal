@@ -275,11 +275,17 @@ impl ModelProvider for OpenAICompatibleChatProvider {
 
 #[derive(Clone, Debug)]
 pub struct AnthropicMessagesProvider {
-    api_key: String,
+    credential: AnthropicCredential,
     model: String,
     base_url: String,
     instructions: String,
     client: reqwest::blocking::Client,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AnthropicCredential {
+    ApiKey(String),
+    AuthToken(String),
 }
 
 impl AnthropicMessagesProvider {
@@ -292,8 +298,28 @@ impl AnthropicMessagesProvider {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        Self::with_credential(AnthropicCredential::ApiKey(api_key.into()), model, base_url)
+    }
+
+    pub fn with_auth_token(
+        auth_token: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::with_credential(
+            AnthropicCredential::AuthToken(auth_token.into()),
+            model,
+            base_url,
+        )
+    }
+
+    fn with_credential(
+        credential: AnthropicCredential,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
-            api_key: api_key.into(),
+            credential,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             instructions: default_instructions().to_string(),
@@ -302,12 +328,24 @@ impl AnthropicMessagesProvider {
     }
 
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
-        let api_key = std::env::var("LLM_BROWSER_ANTHROPIC_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .context("set LLM_BROWSER_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY")?;
         let base_url = std::env::var("LLM_BROWSER_ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string());
-        Ok(Self::with_base_url(api_key, model, base_url))
+        if let Ok(api_key) = std::env::var("LLM_BROWSER_ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+        {
+            if !api_key.trim().is_empty() {
+                return Ok(Self::with_base_url(api_key, model, base_url));
+            }
+        }
+        if let Ok(auth_token) = std::env::var("LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN")
+            .or_else(|_| std::env::var("CLAUDE_CODE_OAUTH_TOKEN"))
+            .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
+        {
+            if !auth_token.trim().is_empty() {
+                return Ok(Self::with_auth_token(auth_token, model, base_url));
+            }
+        }
+        bail!("set LLM_BROWSER_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_AUTH_TOKEN")
     }
 
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
@@ -337,11 +375,17 @@ impl ModelProvider for AnthropicMessagesProvider {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!({"type": "auto"});
         }
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", "2023-06-01");
+        request = match &self.credential {
+            AnthropicCredential::ApiKey(api_key) => request.header("x-api-key", api_key),
+            AnthropicCredential::AuthToken(auth_token) => request
+                .bearer_auth(auth_token)
+                .header("anthropic-beta", "oauth-2025-04-20"),
+        };
+        let response = request
             .json(&body)
             .send()
             .context("send Anthropic Messages request")?;
@@ -1675,6 +1719,43 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn anthropic_messages_provider_accepts_oauth_auth_token() -> Result<()> {
+        let (base_url, handle) = spawn_mock_server(
+            json!({
+                "id": "msg_123",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "OAuth ok." }],
+                "usage": { "input_tokens": 1, "output_tokens": 2 }
+            })
+            .to_string(),
+            "application/json",
+        )?;
+        let provider = AnthropicMessagesProvider::with_auth_token(
+            "claude-oauth-token",
+            "claude-test",
+            base_url,
+        );
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "OAuth ok.".to_string()
+        }));
+        assert!(events.contains(&ModelEvent::Usage {
+            usage: ModelUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                total_tokens: None,
+                cost_usd: None,
+            }
+        }));
+        Ok(())
+    }
+
     fn spawn_mock_server(
         body: String,
         content_type: &'static str,
@@ -1706,6 +1787,7 @@ mod tests {
             assert!(
                 request_text_lower.contains("authorization: bearer test-key")
                     || request_text_lower.contains("authorization: bearer chatgpt-token")
+                    || request_text_lower.contains("authorization: bearer claude-oauth-token")
                     || request_text_lower.contains("x-api-key: anthropic-key")
             );
             let response = format!(

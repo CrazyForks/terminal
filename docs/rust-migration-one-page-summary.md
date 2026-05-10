@@ -214,7 +214,7 @@ The event log stays append-only. Session status, runner state, cancellation, art
 - Result follow-ups run against the existing task instead of accidentally creating a new one.
 - Setup choices for account, model, provider model, browser, and backend persist in SQLite settings.
 - Core records run lifecycle rows, emits `model.config`, `session.status`, and `session.deadline_warning`, defaults provider runs to an 80-turn budget, compacts oversized context with protocol-safe Responses input, and spills huge Python output to artifact-backed tool output.
-- CLI includes `config init/show/set`, `auth status`, `auth login`, `auth import-codex`, `auth logout`, `diagnostics`, and trace bundle export.
+- CLI includes `config init/show/set`, `auth status`, `auth login`, `auth import-codex`, `auth logout`, diagnostics, trace bundle export, and Claude Code OAuth-token login through `claude setup-token` / `CLAUDE_CODE_OAUTH_TOKEN`.
 - Python worker exposes `artifact_root()` and `session_metadata()` to browser task code.
 - TUI follows the UX doc vocabulary in the normal product surface.
 - Dependencies updated to current stable Rust crates where used: `ratatui 0.30`, `rusqlite 0.39`, `crossterm 0.29`.

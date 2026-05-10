@@ -20,6 +20,9 @@ uv run browser-use-terminal --state-dir /tmp/but-auth-smoke auth login openai --
 uv run browser-use-terminal --state-dir /tmp/but-auth-smoke auth login anthropic --api-key test-anthropic
 uv run browser-use-terminal --state-dir /tmp/but-auth-smoke auth login openrouter --api-key test-openrouter
 uv run browser-use-terminal --state-dir /tmp/but-auth-smoke auth login codex --access-token test-codex-token --account-id test-account
+uv run browser-use-terminal --state-dir /tmp/but-auth-claude-code-smoke auth login claude-code --access-token test-oauth-token
+uv run browser-use-terminal --state-dir /tmp/but-auth-claude-code-smoke auth status
+uv run browser-use-terminal --state-dir /tmp/but-auth-claude-code-smoke config show
 uv run browser-use-terminal --state-dir /tmp/but-auth-smoke auth logout openai
 uv run browser-use-terminal --state-dir /tmp/but-rust-cli-config diagnostics
 ```
@@ -126,6 +129,7 @@ Latest live Codex smoke:
 Provider coverage:
 
 - OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter paths have mocked HTTP/SSE tests in Rust.
+- Anthropic Messages also has mocked bearer-token coverage for the Claude Code OAuth-token path. The CLI stores `auth.claude_code.auth_token`, redacts it in `config show`, detects `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`, and reports external Claude Code CLI login status without scraping Keychain tokens.
 - Python worker tests cover browser-harness download-style artifacts and refreshed browser target identity across calls.
 - Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, compaction events, large Python output spillover to artifacts, recursive sub-agent close, configurable spawn fork modes, persistent TUI setup choices, and result follow-up execution on the existing task.
 - Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close.
@@ -234,6 +238,6 @@ Earlier failed runs were still useful:
 
 Known gaps before calling the whole migration fully complete:
 
-- User-facing config, auth status/login/import/logout, diagnostics, and trace commands exist; true Claude Code OAuth/import is not implemented.
+- User-facing config, auth status/login/import/logout, diagnostics, trace commands, API-key auth, Codex import, and Claude Code OAuth-token import exist.
 - Browser Use cloud mode is now owned by the Python island when `LLM_BROWSER_BROWSER_MODE=cloud` and `BROWSER_USE_API_KEY` is set, but it was not live-tested in this branch because no key was available in the environment.
 - Full real-provider dataset regression has not been run. The count-1 Codex smoke on `real_v14_short` now passes.

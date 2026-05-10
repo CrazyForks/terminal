@@ -309,6 +309,7 @@ Implemented foundation in this branch:
 - setup completion, account choice, model choice, provider model, browser choice, and agent backend are persisted in SQLite, not a separate config file
 - Rust CLI has `config init/show/set`, `auth status`, `diagnostics`, and trace bundle export
 - Rust CLI has explicit stored credential flows: `auth login`, `auth import-codex`, and `auth logout`; provider runners use stored credentials before environment/file fallbacks
+- Claude Code account selection uses an Anthropic OAuth bearer token from `claude setup-token`, stored with `auth login claude-code --access-token ...`, or supplied through `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`
 - Rust core records run lifecycle rows, emits `session.status`, `model.config`, and `session.deadline_warning`, defaults provider runs to an 80-turn budget, compacts oversized contexts, and spills huge Python output to artifact-backed tool output
 - Responses input compaction is protocol-safe for Codex/OpenAI-style providers: compacted system context is carried as user context, and stale historical function-call outputs are not replayed after compaction
 - managed headless mode is owned by the Python browser island and prefers Playwright's bundled testing browser before system browsers, so automated tests do not attach to the user's personal Chrome profile
@@ -320,7 +321,7 @@ Implemented foundation in this branch:
 Next:
 
 - keep expanding focused reconnect/stale-session regressions at the Python/browser-harness boundary as new cases appear
-- implement true Claude Code OAuth/import if that account path remains a product requirement
+- keep hardening Claude Code OAuth-token import if Claude exposes a stable non-Keychain token export beyond `claude setup-token`
 
 ### Phase 2: Python Browser Worker
 
@@ -416,5 +417,5 @@ Current verification status:
 
 - done: TUI normal states, 80x24 PTY smoke, SQLite-backed state, fake provider path, Codex live no-browser smoke, Codex count-1 `real_v14_short` dataset smoke, sub-agent context isolation/path addressing, fake dataset smoke, Python runtime removal, browser-harness navigation/inspection/screenshot smoke, worker-boundary download artifact and refreshed browser identity tests
 - done: real testing-browser download artifact indexing and forced stale-session recovery preserving target id are covered by `scripts/live-browser-boundary-smoke.sh`
-- partially productized: API-key/Codex auth login/import/logout exists, but true Claude Code OAuth/import is not implemented
+- productized: API-key auth, Codex auth import/token login, and Claude Code OAuth-token login exist with stored-secret redaction
 - not verified live: Browser Use cloud provisioning without a local `BROWSER_USE_API_KEY`, real Anthropic/OpenRouter smoke with live credentials, full dataset regression

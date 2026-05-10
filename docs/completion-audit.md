@@ -11,6 +11,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - Rust agent loop dispatches the tiny model-visible tool surface: `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`.
 - Child agents are separate sessions with canonical `/root/...` paths, configurable sanitized fork modes, durable graph edges, recursive close/cancel, and mailbox messages.
 - Provider adapters exist for fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter.
+- Claude Code account selection can run Anthropic Messages through a stored or environment OAuth bearer token from `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`.
 - CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, and dataset runners.
 - TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
@@ -32,6 +33,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction
+- stored Claude Code OAuth-token smoke for login, status, provider credential routing, and `config show` secret redaction
 - deterministic TUI dumps for the main product states
 - manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
 - browser-harness navigation, page inspection, screenshot artifact, image event, and browser-state emission through the Rust/Python boundary
@@ -42,7 +44,6 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 
 ## Remaining Gaps
 
-- API-key and Codex credential login/import/logout are implemented, but true Claude Code OAuth/import is still not implemented.
 - Live Anthropic/OpenRouter smokes were not run.
 - Browser Use cloud mode was not live-tested because no `BROWSER_USE_API_KEY` was available in the environment.
 - Full real-provider dataset regression has not been run. The count-1 Codex run on `real_v14_short` now passes.
