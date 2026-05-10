@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use browser_use_protocol::{project_workbench, SessionStatus, WorkbenchState};
 use browser_use_store::Store;
 use clap::{Parser, ValueEnum};
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -473,14 +476,14 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.clear_input_before_cursor();
+                self.clear_input_current_line_before_cursor();
             }
             KeyEvent {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.clear_input_after_cursor();
+                self.clear_input_current_line_after_cursor();
             }
             KeyEvent {
                 code: KeyCode::Home,
@@ -818,14 +821,6 @@ impl App {
         self.input = chars.into_iter().collect();
     }
 
-    fn clear_input_before_cursor(&mut self) {
-        let mut chars = self.input.chars().collect::<Vec<_>>();
-        let cursor = self.input_cursor.min(chars.len());
-        chars.drain(0..cursor);
-        self.input = chars.into_iter().collect();
-        self.input_cursor = 0;
-    }
-
     fn clear_input_after_cursor(&mut self) {
         let mut chars = self.input.chars().collect::<Vec<_>>();
         let cursor = self.input_cursor.min(chars.len());
@@ -972,7 +967,14 @@ fn main() -> Result<()> {
 fn run_terminal(mut app: App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = loop {
@@ -986,7 +988,11 @@ fn run_terminal(mut app: App) -> Result<()> {
         }
     };
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -1158,9 +1164,21 @@ mod tests {
         assert_eq!(app.input, "first line\nsuffix");
         assert_eq!(app.input_cursor, "first line\n".chars().count());
 
+        app.set_input("first line\nprefix suffix".to_string());
+        app.input_cursor = "first line\nprefix ".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.input, "first line\nsuffix");
+        assert_eq!(app.input_cursor, "first line\n".chars().count());
+
         app.set_input("first line\nprefix suffix\nlast line".to_string());
         app.input_cursor = "first line\nprefix".chars().count();
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::SUPER))?);
+        assert_eq!(app.input, "first line\nprefix\nlast line");
+        assert_eq!(app.input_cursor, "first line\nprefix".chars().count());
+
+        app.set_input("first line\nprefix suffix\nlast line".to_string());
+        app.input_cursor = "first line\nprefix".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))?);
         assert_eq!(app.input, "first line\nprefix\nlast line");
         assert_eq!(app.input_cursor, "first line\nprefix".chars().count());
 
