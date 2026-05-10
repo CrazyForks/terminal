@@ -1603,8 +1603,16 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
     )
 }
 
-fn create_dataset_session(store: &Store, case: &DatasetCase, attempt: usize) -> Result<String> {
-    let session = store.create_session(None, std::env::current_dir()?)?;
+fn create_dataset_session(
+    store: &Store,
+    run_id: &str,
+    case: &DatasetCase,
+    attempt: usize,
+) -> Result<String> {
+    let workspace = dataset_workspace_path(store, run_id, case, attempt);
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("create {}", workspace.display()))?;
+    let session = store.create_session(None, &workspace)?;
     let prompt = build_dataset_prompt(case);
     store.append_event(
         &session.id,
@@ -1619,6 +1627,7 @@ fn create_dataset_session(store: &Store, case: &DatasetCase, attempt: usize) -> 
             "path": case.path,
             "task_id": case.task_id,
             "attempt": attempt,
+            "workspace": workspace.display().to_string(),
         }),
     )?;
     Ok(session.id)
@@ -1760,6 +1769,7 @@ fn dataset_run_provider<P: ModelProvider>(
         let result = run_dataset_case_with_attempts(
             store,
             provider,
+            &run_id,
             &case,
             config,
             options.max_attempts.max(1),
@@ -1786,13 +1796,15 @@ fn dataset_run_provider<P: ModelProvider>(
 fn run_dataset_case_with_attempts<P: ModelProvider>(
     store: &Store,
     provider: &P,
+    run_id: &str,
     case: &DatasetCase,
     config: DatasetProviderConfig<'_>,
     max_attempts: usize,
 ) -> Result<Value> {
     let mut retry_history = Vec::new();
     for attempt in 1..=max_attempts {
-        let mut result = run_dataset_case_with_provider(store, provider, case, config, attempt)?;
+        let mut result =
+            run_dataset_case_with_provider(store, provider, run_id, case, config, attempt)?;
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if ok {
             if !retry_history.is_empty() {
@@ -1815,11 +1827,12 @@ fn run_dataset_case_with_attempts<P: ModelProvider>(
 fn run_dataset_case_with_provider<P: ModelProvider>(
     store: &Store,
     provider: &P,
+    run_id: &str,
     case: &DatasetCase,
     config: DatasetProviderConfig<'_>,
     attempt: usize,
 ) -> Result<Value> {
-    let session_id = create_dataset_session(store, case, attempt)?;
+    let session_id = create_dataset_session(store, run_id, case, attempt)?;
     println!("{}  {}", case.task_id, session_id);
     io::stdout().flush()?;
     let run_error = run_existing_session_with_provider(
@@ -2086,6 +2099,42 @@ fn dataset_manifest_path(store: &Store, run_id: &str) -> PathBuf {
         .state_dir()
         .join("dataset-runs")
         .join(format!("{run_id}.json"))
+}
+
+fn dataset_workspace_path(
+    store: &Store,
+    run_id: &str,
+    case: &DatasetCase,
+    attempt: usize,
+) -> PathBuf {
+    store
+        .state_dir()
+        .join("dataset-workspaces")
+        .join(safe_path_segment(run_id))
+        .join(format!(
+            "{}-attempt-{}",
+            safe_path_segment(&case.task_id),
+            attempt
+        ))
+}
+
+fn safe_path_segment(value: &str) -> String {
+    let mut safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if safe.is_empty() {
+        safe.push_str("case");
+    }
+    safe
 }
 
 fn load_dataset_manifest(store: &Store, run_id_or_path: &str) -> Result<Value> {
