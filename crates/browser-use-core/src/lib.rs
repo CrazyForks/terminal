@@ -19,11 +19,12 @@ use browser_use_providers::{
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{AgentSummary, Store};
 use opentelemetry::KeyValue;
-use serde_json::Value;
-use telemetry::AgentTelemetry;
+use serde_json::{Map, Value};
+use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{ToolHandlerKind, ToolRegistry};
 
 const MAX_TOOL_OUTPUT_TEXT_CHARS: usize = 16_000;
+const IMAGE_CONTEXT_BUDGET_CHARS: usize = 8_000;
 
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
@@ -343,7 +344,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     options: AgentRunOptions,
 ) -> Result<String> {
     let run_id = store.record_run_started(&session.id, Some(std::process::id() as i64))?;
-    let telemetry = match AgentTelemetry::from_env() {
+    let telemetry = match AgentTelemetry::from_store(store) {
         Ok(telemetry) => telemetry,
         Err(error) => {
             store.append_event(
@@ -404,28 +405,36 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
             let mut assistant_text = String::new();
             let mut tool_calls = Vec::new();
+            let step_span =
+                telemetry.start_step_span(&agent_span, &session.id, turn_idx, options.max_turns);
 
             let turn_messages = messages.clone();
             let turn_tools = browser_tool_specs();
-            let model_span = telemetry.start_model_turn_span(
-                &agent_span,
-                &session.id,
+            let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
+                parent: &step_span,
+                session_id: &session.id,
                 turn_idx,
-                provider.provider_name(),
-                provider.model_name(),
-                &turn_messages,
-                &turn_tools,
-            );
+                provider_name: provider.provider_name(),
+                model_name: provider.model_name(),
+                messages: &turn_messages,
+                tools: &turn_tools,
+            });
             let provider_events = match provider.start_turn(ProviderTurn {
                 messages: turn_messages,
                 tools: turn_tools,
             }) {
                 Ok(events) => {
-                    telemetry.record_model_events(&model_span, &events);
+                    telemetry.record_model_events(
+                        &model_span,
+                        provider.provider_name(),
+                        turn_idx,
+                        &events,
+                    );
                     events
                 }
                 Err(error) => {
                     model_span.record_error(error.as_ref());
+                    step_span.record_error(error.as_ref());
                     return Err(error);
                 }
             };
@@ -477,15 +486,16 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         "session.done",
                         serde_json::json!({ "result": assistant_text.trim_end() }),
                     )?;
+                    step_span.set_ok();
                     return Ok(session.id.clone());
                 }
+                step_span.set_ok();
                 continue;
             }
 
             for call in tool_calls {
                 ensure_not_cancelled(store, &session.id)?;
-                let tool_span =
-                    telemetry.start_tool_span(&agent_span, &session.id, turn_idx, &call);
+                let tool_span = telemetry.start_tool_span(&step_span, &session.id, turn_idx, &call);
                 let outcome = match dispatch_tool_call(
                     store,
                     provider,
@@ -513,6 +523,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     }
                     Err(error) => {
                         tool_span.record_error(error.as_ref());
+                        step_span.record_error(error.as_ref());
                         return Err(error);
                     }
                 };
@@ -525,9 +536,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     options.max_context_chars,
                 )?;
                 if outcome.finished {
+                    step_span.set_ok();
                     return Ok(session.id.clone());
                 }
             }
+            step_span.set_ok();
         }
 
         store.append_event(
@@ -538,7 +551,12 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         bail!("agent exceeded maximum provider turns");
     })();
     let cancelled = is_cancelled(store, &session.id)?;
-    if let Err(error) = &result {
+    let final_events = store.events_for_session(&session.id).unwrap_or_default();
+    if cancelled {
+        telemetry.record_agent_output(&agent_span, "cancelled");
+    } else if let Err(error) = &result {
+        let output = failure_from_events(&final_events).unwrap_or_else(|| error.to_string());
+        telemetry.record_agent_output(&agent_span, &output);
         agent_span.record_error(error.as_ref());
         if !cancelled && !has_terminal_session_event(store, &session.id)? {
             store.append_event(
@@ -548,6 +566,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
         }
     } else {
+        if let Some(output) = result_from_events(&final_events) {
+            telemetry.record_agent_output(&agent_span, &output);
+        }
         agent_span.set_ok();
     }
     let run_status = if cancelled {
@@ -617,7 +638,7 @@ fn maybe_compact_messages(
     if max_context_chars == 0 {
         return Ok(());
     }
-    let before_chars = serde_json::to_string(messages)?.len();
+    let before_chars = estimated_context_chars(messages)?;
     if before_chars <= max_context_chars {
         return Ok(());
     }
@@ -635,15 +656,13 @@ fn maybe_compact_messages(
         let context = sanitized_agent_context_from_events(&events);
         let mut compacted = vec![serde_json::json!({
             "role": "system",
-            "content": format!(
-                "Compacted prior browser-agent context:\n{}",
-                serde_json::to_string_pretty(&context)?
-            ),
+            "content": compacted_context_system_message(&context)?,
         })];
-        if let Some(pending_call) = pending_assistant_tool_call(messages) {
+        let recent_messages = recent_messages_to_preserve(messages);
+        for recent_message in recent_messages {
             let max_recent_content_chars = (max_context_chars / 4).max(200);
             compacted.push(compact_recent_message(
-                pending_call.clone(),
+                recent_message,
                 max_recent_content_chars,
             ));
         }
@@ -663,22 +682,86 @@ fn maybe_compact_messages(
         "session.compacted",
         serde_json::json!({
             "message_count": messages.len(),
-            "chars": serde_json::to_string(messages)?.len(),
+            "chars": estimated_context_chars(messages)?,
         }),
     )?;
     Ok(())
 }
 
-fn pending_assistant_tool_call(messages: &[Value]) -> Option<&Value> {
-    let message = messages.last()?;
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return None;
+fn estimated_context_chars(messages: &[Value]) -> Result<usize> {
+    Ok(serde_json::to_string(&context_budget_value(&Value::Array(messages.to_vec())))?.len())
+}
+
+fn context_budget_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(context_budget_value).collect()),
+        Value::Object(map) => {
+            let mut out = Map::with_capacity(map.len());
+            for (key, value) in map {
+                if key == "image_url"
+                    && value
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("data:image/"))
+                {
+                    out.insert(
+                        key.clone(),
+                        Value::String(format!(
+                            "[image data omitted from text budget]{}",
+                            ".".repeat(IMAGE_CONTEXT_BUDGET_CHARS)
+                        )),
+                    );
+                } else {
+                    out.insert(key.clone(), context_budget_value(value));
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
     }
-    let has_tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .is_some_and(|calls| !calls.is_empty());
-    has_tool_calls.then_some(message)
+}
+
+fn recent_messages_to_preserve(messages: &[Value]) -> Vec<Value> {
+    let Some(message) = messages.last() else {
+        return Vec::new();
+    };
+    match message.get("role").and_then(Value::as_str) {
+        Some("assistant") => {
+            let has_tool_calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+            if has_tool_calls {
+                vec![message.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        Some("tool") => {
+            let mut out = Vec::new();
+            if let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+                if let Some(assistant) = matching_assistant_tool_call(messages, call_id) {
+                    out.push(assistant.clone());
+                }
+            }
+            out.push(message.clone());
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn matching_assistant_tool_call<'a>(messages: &'a [Value], call_id: &str) -> Option<&'a Value> {
+    messages.iter().rev().skip(1).find(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+                })
+    })
 }
 
 fn compact_recent_message(mut message: Value, max_content_chars: usize) -> Value {
@@ -718,15 +801,154 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn compacted_context_system_message(context: &Value) -> Result<String> {
+    let context_json = serde_json::to_string_pretty(context)?;
+    let browser_agent_contract = browser_agent_contract();
+    Ok(render_prompt_template(
+        include_str!("../../../prompts/compacted-context-system.md"),
+        &[
+            ("{{browser_agent_contract}}", &browser_agent_contract),
+            ("{{context_json}}", &context_json),
+        ],
+    ))
+}
+
+fn browser_agent_contract() -> String {
+    let mut contract = include_str!("../../../prompts/browser-agent-system.md")
+        .trim()
+        .to_string();
+    contract.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
+    contract.push_str(
+        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
+    );
+    for (path, content) in browser_harness_interaction_skills() {
+        contract.push_str("\n\n### ");
+        contract.push_str(path);
+        contract.push_str("\n\n");
+        contract.push_str(content.trim());
+    }
+    contract
+}
+
+fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "interaction-skills/connection.md",
+            include_str!("../../../prompts/interaction-skills/connection.md"),
+        ),
+        (
+            "interaction-skills/cookies.md",
+            include_str!("../../../prompts/interaction-skills/cookies.md"),
+        ),
+        (
+            "interaction-skills/cross-origin-iframes.md",
+            include_str!("../../../prompts/interaction-skills/cross-origin-iframes.md"),
+        ),
+        (
+            "interaction-skills/dialogs.md",
+            include_str!("../../../prompts/interaction-skills/dialogs.md"),
+        ),
+        (
+            "interaction-skills/downloads.md",
+            include_str!("../../../prompts/interaction-skills/downloads.md"),
+        ),
+        (
+            "interaction-skills/drag-and-drop.md",
+            include_str!("../../../prompts/interaction-skills/drag-and-drop.md"),
+        ),
+        (
+            "interaction-skills/dropdowns.md",
+            include_str!("../../../prompts/interaction-skills/dropdowns.md"),
+        ),
+        (
+            "interaction-skills/iframes.md",
+            include_str!("../../../prompts/interaction-skills/iframes.md"),
+        ),
+        (
+            "interaction-skills/network-requests.md",
+            include_str!("../../../prompts/interaction-skills/network-requests.md"),
+        ),
+        (
+            "interaction-skills/print-as-pdf.md",
+            include_str!("../../../prompts/interaction-skills/print-as-pdf.md"),
+        ),
+        (
+            "interaction-skills/profile-sync.md",
+            include_str!("../../../prompts/interaction-skills/profile-sync.md"),
+        ),
+        (
+            "interaction-skills/screenshots.md",
+            include_str!("../../../prompts/interaction-skills/screenshots.md"),
+        ),
+        (
+            "interaction-skills/scrolling.md",
+            include_str!("../../../prompts/interaction-skills/scrolling.md"),
+        ),
+        (
+            "interaction-skills/shadow-dom.md",
+            include_str!("../../../prompts/interaction-skills/shadow-dom.md"),
+        ),
+        (
+            "interaction-skills/tabs.md",
+            include_str!("../../../prompts/interaction-skills/tabs.md"),
+        ),
+        (
+            "interaction-skills/uploads.md",
+            include_str!("../../../prompts/interaction-skills/uploads.md"),
+        ),
+        (
+            "interaction-skills/viewport.md",
+            include_str!("../../../prompts/interaction-skills/viewport.md"),
+        ),
+    ]
+}
+
+fn render_prompt_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = template.trim().to_string();
+    for (placeholder, value) in replacements {
+        rendered = rendered.replace(placeholder, value);
+    }
+    rendered
+}
+
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
     let mut messages = Vec::new();
     for event in events {
         match event.event_type.as_str() {
             "agent.context" => {
+                let mut sections = Vec::new();
+                if let Some(role) = event.payload.get("role").and_then(Value::as_str) {
+                    let canonical_path_sentence = event
+                        .payload
+                        .get("agent_path")
+                        .and_then(Value::as_str)
+                        .map(|path| format!(" Canonical path: {path}."))
+                        .unwrap_or_default();
+                    let explorer_instruction = if role.to_ascii_lowercase().contains("explor") {
+                        "As the explorer, inspect the repository/codebase directly with local tools. Do not spawn another explorer for this same repository-analysis task unless explicitly instructed."
+                    } else {
+                        ""
+                    };
+                    sections.push(render_prompt_template(
+                        include_str!("../../../prompts/helper-session-identity.md"),
+                        &[
+                            ("{{role}}", role),
+                            ("{{canonical_path_sentence}}", &canonical_path_sentence),
+                            ("{{explorer_instruction}}", explorer_instruction),
+                        ],
+                    ));
+                }
                 if let Some(context) = event.payload.get("context") {
+                    let context = context.to_string();
+                    sections.push(render_prompt_template(
+                        include_str!("../../../prompts/helper-session-inherited-context.md"),
+                        &[("{{context}}", &context)],
+                    ));
+                }
+                if !sections.is_empty() {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": format!("Inherited compact context from parent session:\n{}", context),
+                        "content": sections.join("\n\n"),
                     }));
                 }
             }
@@ -1026,7 +1248,7 @@ fn dispatch_done_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    let result = call
+    let requested_result = call
         .arguments
         .get("result")
         .and_then(Value::as_str)
@@ -1034,6 +1256,29 @@ fn dispatch_done_tool(
         .unwrap_or("")
         .trim()
         .to_string();
+    let final_answer = persisted_final_answer(session)?;
+    let use_final_answer = call
+        .arguments
+        .get("use_final_answer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            requested_result.as_str(),
+            "__use_final_answer__" | "__final_answer__" | "FINAL_ANSWER"
+        )
+        || final_answer
+            .as_ref()
+            .is_some_and(|answer| should_replace_with_persisted_final(&requested_result, answer));
+    let result = if use_final_answer {
+        final_answer
+            .as_ref()
+            .and_then(|answer| answer.get("result").and_then(Value::as_str))
+            .unwrap_or(&requested_result)
+            .trim()
+            .to_string()
+    } else {
+        requested_result
+    };
     store.append_event(
         &session.id,
         "tool.started",
@@ -1042,6 +1287,16 @@ fn dispatch_done_tool(
             "arguments": call.arguments,
         }),
     )?;
+    if use_final_answer {
+        store.append_event(
+            &session.id,
+            "session.final_answer_used",
+            serde_json::json!({
+                "source": "python.set_final_answer",
+                "tool_call_id": call.id,
+            }),
+        )?;
+    }
     store.append_event(
         &session.id,
         "tool.finished",
@@ -1056,6 +1311,48 @@ fn dispatch_done_tool(
         finished: true,
         messages: Vec::new(),
     })
+}
+
+fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result<Option<Value>> {
+    let path = Path::new(&session.artifact_root).join(".final_answer.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read persisted final answer {}", path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("parse persisted final answer {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Value) -> bool {
+    let count = final_answer
+        .get("summary")
+        .and_then(|summary| summary.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    count > 0 && looks_like_empty_structured_result(requested_result)
+}
+
+fn looks_like_empty_structured_result(result: &str) -> bool {
+    let trimmed = result.trim();
+    if trimmed.is_empty() || matches!(trimmed, "{}" | "[]" | "null") {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    json_value_is_empty(&value)
+}
+
+fn json_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.values().all(json_value_is_empty),
+        _ => false,
+    }
 }
 
 fn dispatch_python_tool(
@@ -1187,6 +1484,9 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "from_session_id": session.id,
             "fork_mode": fork_mode,
             "fork_turns": fork_turns,
+            "agent_path": agent_path.clone(),
+            "nickname": call.arguments.get("nickname").and_then(Value::as_str),
+            "role": call.arguments.get("role").and_then(Value::as_str),
             "context": inherited_context,
         }),
     )?;
@@ -2657,6 +2957,175 @@ mod tests {
         assert!(!messages
             .iter()
             .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
+        Ok(())
+    }
+
+    #[test]
+    fn compacted_context_keeps_browser_agent_contract() -> Result<()> {
+        let message = compacted_context_system_message(&serde_json::json!({
+            "task": "look at a browser page",
+            "browser": {
+                "url": "https://example.com",
+                "status": "connected",
+            },
+        }))?;
+
+        assert!(
+            message.contains("You are still the same browser-use agent after context compaction")
+        );
+        assert!(message.contains("Raw CDP is the center"));
+        assert!(message.contains("Do not call `screenshot` repeatedly on an unchanged viewport"));
+        assert!(message.contains("Loaded Browser-Harness Interaction Skills"));
+        assert!(message.contains("interaction-skills/screenshots.md"));
+        assert!(message.contains("interaction-skills/tabs.md"));
+        assert!(message.contains("Compacted prior browser-agent context"));
+        assert!(message.contains("https://example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_ignores_image_data_urls_for_text_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "inspect screenshot" }),
+        )?;
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "inspect screenshot",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "shot_call",
+                    "name": "python",
+                    "arguments": { "code": "screenshot('current')" },
+                }],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "shot_call",
+                "name": "python",
+                "content": [
+                    { "type": "output_text", "text": "screenshot captured" },
+                    {
+                        "type": "input_image",
+                        "image_url": format!("data:image/png;base64,{}", "a".repeat(50_000)),
+                        "detail": "auto",
+                    },
+                ],
+            }),
+        ];
+
+        maybe_compact_messages(&store, &session.id, &mut messages, 10_000)?;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["content"][1]["type"], "input_image");
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.compaction_started"));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_preserves_recent_tool_result_after_summary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "compact after tool" }),
+        )?;
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "x".repeat(2000),
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "latest_tool",
+                    "name": "python",
+                    "arguments": { "code": "print('large')" },
+                }],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "latest_tool",
+                "name": "python",
+                "content": "y".repeat(2000),
+            }),
+        ];
+
+        maybe_compact_messages(&store, &session.id, &mut messages, 500)?;
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "latest_tool");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "latest_tool");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("[truncated]"));
+        Ok(())
+    }
+
+    #[test]
+    fn done_can_use_persisted_python_final_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'stores': [{'name': 'A', 'address': 'B'}]}, artifact_name='stores.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_final".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "{\"stores\":[]}",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract stores",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.final_answer_used"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"A\""))
+        }));
         Ok(())
     }
 

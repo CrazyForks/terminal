@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
@@ -393,6 +393,7 @@ struct DatasetProviderConfig<'a> {
 }
 
 fn main() -> Result<()> {
+    load_dotenv()?;
     let args = Args::parse();
     let store = Store::open(&args.state_dir)?;
     match args.command {
@@ -599,6 +600,44 @@ fn main() -> Result<()> {
     }
 }
 
+fn load_dotenv() -> Result<()> {
+    let path = Path::new(".env");
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = unquote_env_value(value.trim());
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+    Ok(())
+}
+
+fn unquote_env_value(value: &str) -> String {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
     match command {
         SessionsCommand::List => history(store),
@@ -639,7 +678,14 @@ fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<
 }
 
 fn cli_agent_options() -> AgentRunOptions {
-    AgentRunOptions::default().with_browser_mode("headless")
+    AgentRunOptions::default().with_browser_mode(cli_browser_mode())
+}
+
+fn cli_browser_mode() -> String {
+    std::env::var("LLM_BROWSER_BROWSER_MODE")
+        .ok()
+        .filter(|mode| !mode.trim().is_empty())
+        .unwrap_or_else(|| "headless".to_string())
 }
 
 fn cli_agent_options_with(max_turns: usize, python_timeout_seconds: u64) -> AgentRunOptions {
@@ -952,7 +998,7 @@ fn default_settings() -> Vec<(&'static str, &'static str)> {
         ("account", "Codex login"),
         ("model", "GPT-5.5"),
         ("provider.model", "gpt-5.5"),
-        ("browser", "Local Chrome"),
+        ("browser", "Browser Use cloud"),
         ("agent.backend", "codex"),
         ("setup.complete", "0"),
     ]
@@ -2079,10 +2125,11 @@ fn cases_from_manifest_selection(
 }
 
 fn build_dataset_prompt(case: &DatasetCase) -> String {
-    format!(
-        "You are running a browser-use dataset case.\n\nDataset: {}\nTask ID: {}\n\nTask:\n{}\n\nUse the python tool for browser interaction. The python tool owns the browser connection and exposes browser-harness helpers plus raw CDP access when needed. Prefer robust DOM/CDP observations over guessing. Attach screenshots after meaningful visual transitions when they help audit the run. Return the final answer with the done tool only when the task is complete.",
-        case.dataset, case.task_id, case.confirmed_task
-    )
+    include_str!("../../../prompts/dataset-case-user.md")
+        .trim()
+        .replace("{{dataset}}", &case.dataset)
+        .replace("{{task_id}}", &case.task_id)
+        .replace("{{task}}", &case.confirmed_task)
 }
 
 fn dataset_case_manifest(case: &DatasetCase) -> Value {
@@ -2111,8 +2158,8 @@ fn new_dataset_manifest(
         "created_ms": now_ms(),
         "provider": config.provider,
         "model": config.model,
-        "headless": true,
-        "browser": "headless",
+        "headless": cli_browser_mode() != "cloud",
+        "browser": cli_browser_mode(),
         "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
         "summary": {
             "count": cases.len(),

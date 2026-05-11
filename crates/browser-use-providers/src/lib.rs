@@ -3,7 +3,7 @@ use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{ModelEvent, ModelUsage, ToolCall, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -121,7 +121,7 @@ impl OpenAIResponsesProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -206,7 +206,7 @@ impl OpenAICompatibleChatProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -322,7 +322,7 @@ impl AnthropicMessagesProvider {
             credential,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -430,7 +430,7 @@ impl CodexResponsesProvider {
             auth,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -676,18 +676,94 @@ fn maybe_push_codex_output_item(
     Ok(())
 }
 
-fn default_instructions() -> &'static str {
-    concat!(
-        "You are a browser-use agent. Use the python tool for browser work and call done when the user-facing task is complete.\n",
-        "\n",
-        "The python tool runs in a persistent namespace with browser-harness helpers already imported when available. ",
-        "For browser tasks, start with goto_url(url), then use wait_for_load(), wait_for_element(), page_info(), js(...), ",
-        "fill_input(selector, text), click_at_xy(x, y), press_key(key), scroll(...), wait_for_network_idle(), ",
-        "capture_screenshot(...), current_tab(), list_tabs(), switch_tab(...), new_tab(...), cdp(...), and drain_events(). ",
-        "Do not import or install Playwright, Selenium, or Pyppeteer; the browser connection is already provided by these helpers. ",
-        "Use requests/http_get only after the browser path reveals a stable static endpoint or for downloaded files. ",
-        "Use copy_artifact() and emit_image() for user-visible files and screenshots."
-    )
+fn default_instructions() -> String {
+    let mut instructions = include_str!("../../../prompts/browser-agent-system.md")
+        .trim()
+        .to_string();
+    instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
+    instructions.push_str(
+        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
+    );
+    for (path, content) in browser_harness_interaction_skills() {
+        instructions.push_str("\n\n### ");
+        instructions.push_str(path);
+        instructions.push_str("\n\n");
+        instructions.push_str(content.trim());
+    }
+    instructions
+}
+
+fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "interaction-skills/connection.md",
+            include_str!("../../../prompts/interaction-skills/connection.md"),
+        ),
+        (
+            "interaction-skills/cookies.md",
+            include_str!("../../../prompts/interaction-skills/cookies.md"),
+        ),
+        (
+            "interaction-skills/cross-origin-iframes.md",
+            include_str!("../../../prompts/interaction-skills/cross-origin-iframes.md"),
+        ),
+        (
+            "interaction-skills/dialogs.md",
+            include_str!("../../../prompts/interaction-skills/dialogs.md"),
+        ),
+        (
+            "interaction-skills/downloads.md",
+            include_str!("../../../prompts/interaction-skills/downloads.md"),
+        ),
+        (
+            "interaction-skills/drag-and-drop.md",
+            include_str!("../../../prompts/interaction-skills/drag-and-drop.md"),
+        ),
+        (
+            "interaction-skills/dropdowns.md",
+            include_str!("../../../prompts/interaction-skills/dropdowns.md"),
+        ),
+        (
+            "interaction-skills/iframes.md",
+            include_str!("../../../prompts/interaction-skills/iframes.md"),
+        ),
+        (
+            "interaction-skills/network-requests.md",
+            include_str!("../../../prompts/interaction-skills/network-requests.md"),
+        ),
+        (
+            "interaction-skills/print-as-pdf.md",
+            include_str!("../../../prompts/interaction-skills/print-as-pdf.md"),
+        ),
+        (
+            "interaction-skills/profile-sync.md",
+            include_str!("../../../prompts/interaction-skills/profile-sync.md"),
+        ),
+        (
+            "interaction-skills/screenshots.md",
+            include_str!("../../../prompts/interaction-skills/screenshots.md"),
+        ),
+        (
+            "interaction-skills/scrolling.md",
+            include_str!("../../../prompts/interaction-skills/scrolling.md"),
+        ),
+        (
+            "interaction-skills/shadow-dom.md",
+            include_str!("../../../prompts/interaction-skills/shadow-dom.md"),
+        ),
+        (
+            "interaction-skills/tabs.md",
+            include_str!("../../../prompts/interaction-skills/tabs.md"),
+        ),
+        (
+            "interaction-skills/uploads.md",
+            include_str!("../../../prompts/interaction-skills/uploads.md"),
+        ),
+        (
+            "interaction-skills/viewport.md",
+            include_str!("../../../prompts/interaction-skills/viewport.md"),
+        ),
+    ]
 }
 
 fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -735,6 +811,7 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
 
 fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
     let mut input = Vec::new();
+    let mut seen_tool_calls = HashSet::new();
     for message in messages {
         let role = message
             .get("role")
@@ -746,11 +823,21 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .context("tool message missing tool_call_id")?;
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message_content_as_responses_output(message),
-                }));
+                if seen_tool_calls.contains(call_id) {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": tool_output_text(message),
+                    }));
+                    if let Some(visual_context) = responses_visual_context_message(message, call_id)
+                    {
+                        input.push(visual_context);
+                    }
+                } else if let Some(orphan_context) =
+                    responses_orphan_tool_context_message(message, call_id)
+                {
+                    input.push(orphan_context);
+                }
             }
             "system" => {
                 let content = message_content_as_text(message);
@@ -781,6 +868,13 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                         .into_iter()
                         .flatten()
                     {
+                        if let Some(call_id) = call
+                            .get("id")
+                            .or_else(|| call.get("call_id"))
+                            .and_then(Value::as_str)
+                        {
+                            seen_tool_calls.insert(call_id.to_string());
+                        }
                         input.push(tool_call_to_responses_input(call)?);
                     }
                 }
@@ -788,6 +882,28 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
         }
     }
     Ok(input)
+}
+
+fn responses_orphan_tool_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let text = tool_output_text(message);
+    let images = tool_output_images(message);
+    if text.trim().is_empty() && images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": format!(
+            "Tool output retained as context after history compaction. Original tool call {call_id} ({}):\n{}",
+            tool_name(message),
+            text,
+        ),
+    })];
+    content.extend(images);
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    }))
 }
 
 fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
@@ -798,14 +914,20 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
             .and_then(Value::as_str)
             .unwrap_or("user");
         match role {
-            "tool" => out.push(json!({
-                "role": "tool",
-                "tool_call_id": message
+            "tool" => {
+                let call_id = message
                     .get("tool_call_id")
                     .and_then(Value::as_str)
-                    .context("tool message missing tool_call_id")?,
-                "content": message_content_as_text(message),
-            })),
+                    .context("tool message missing tool_call_id")?;
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": tool_output_text(message),
+                }));
+                if let Some(visual_context) = chat_visual_context_message(message, call_id) {
+                    out.push(visual_context);
+                }
+            }
             "assistant" => {
                 let mut item = json!({
                     "role": "assistant",
@@ -895,17 +1017,23 @@ fn messages_to_anthropic_messages(messages: &[Value]) -> Result<Vec<Value>> {
                 "role": "assistant",
                 "content": anthropic_assistant_content(message)?,
             })),
-            "tool" => out.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": message
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                        .context("tool message missing tool_call_id")?,
-                    "content": message_content_as_text(message),
-                }],
-            })),
+            "tool" => {
+                let call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .context("tool message missing tool_call_id")?;
+                out.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": tool_output_text(message),
+                    }],
+                }));
+                if let Some(visual_context) = anthropic_visual_context_message(message, call_id) {
+                    out.push(visual_context);
+                }
+            }
             "system" => out.push(json!({
                 "role": "user",
                 "content": [{
@@ -1064,43 +1192,117 @@ fn message_content_as_text(message: &Value) -> String {
     }
 }
 
-fn message_content_as_responses_output(message: &Value) -> Value {
+fn tool_output_text(message: &Value) -> String {
+    let Some(Value::Array(parts)) = message.get("content") else {
+        return message_content_as_text(message);
+    };
+    let mut text_parts = Vec::new();
+    let mut image_count = 0;
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_image") => image_count += 1,
+            Some("output_text") | Some("input_text") | Some("text") | None => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text_parts.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if image_count > 0 {
+        text_parts.push(format!(
+            "[{image_count} screenshot image(s) attached in the following visual context message]"
+        ));
+    }
+    text_parts.join("\n")
+}
+
+fn tool_output_images(message: &Value) -> Vec<Value> {
     match message.get("content") {
-        Some(Value::Array(parts)) => Value::Array(
-            parts
-                .iter()
-                .filter_map(|part| normalize_tool_output_part(part))
-                .collect(),
-        ),
-        _ => Value::String(message_content_as_text(message)),
+        Some(Value::Array(parts)) => parts.iter().filter_map(normalize_tool_image_part).collect(),
+        _ => Vec::new(),
     }
 }
 
-fn normalize_tool_output_part(part: &Value) -> Option<Value> {
-    match part.get("type").and_then(Value::as_str) {
-        Some("input_image") => {
-            let image_url = part.get("image_url").and_then(Value::as_str)?;
-            let mut out = json!({
-                "type": "input_image",
-                "image_url": image_url,
-            });
-            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
-                out["detail"] = json!(detail);
-            }
-            Some(out)
-        }
-        Some("output_text") | Some("input_text") | Some("text") | None => part
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(|text| {
-                json!({
-                    "type": "input_text",
-                    "text": text,
-                })
-            }),
-        _ => None,
+fn normalize_tool_image_part(part: &Value) -> Option<Value> {
+    if part.get("type").and_then(Value::as_str) != Some("input_image") {
+        return None;
     }
+    let image_url = part.get("image_url").and_then(Value::as_str)?;
+    let mut out = json!({
+        "type": "input_image",
+        "image_url": image_url,
+    });
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        out["detail"] = json!(detail);
+    }
+    Some(out)
+}
+
+fn visual_context_text(call_id: &str, tool_name: &str) -> String {
+    format!(
+        "Visual context from tool call {call_id} ({tool_name}). Use these screenshots to verify the browser state before continuing. Do not call screenshot again unless the page changed or you need a different visual region."
+    )
+}
+
+fn tool_name(message: &Value) -> &str {
+    message
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+}
+
+fn responses_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    }))
+}
+
+fn chat_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    let visual_message = json!({ "content": content });
+    Some(json!({
+        "role": "user",
+        "content": chat_content(&visual_message),
+    }))
+}
+
+fn anthropic_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    let visual_message = json!({ "content": content });
+    Some(json!({
+        "role": "user",
+        "content": anthropic_user_content(&visual_message),
+    }))
 }
 
 fn tool_call_to_responses_input(call: &Value) -> Result<Value> {
@@ -1408,19 +1610,75 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_preserves_tool_output_image_parts() -> Result<()> {
-        let input = messages_to_responses_input(&[json!({
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": [
-                {"type": "output_text", "text": "screenshot"},
-                {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
-            ]
-        })])?;
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"][0]["type"], "input_text");
-        assert_eq!(input[0]["output"][1]["type"], "input_image");
+    fn responses_input_moves_tool_output_images_to_visual_context_message() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "name": "python",
+                    "arguments": {"code": "screenshot('x')"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "python",
+                "content": [
+                    {"type": "output_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                ]
+            }),
+        ])?;
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert!(input[1]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("following visual context message"));
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"][0]["type"], "input_text");
+        assert_eq!(input[2]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[2]["content"][1]["image_url"],
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(input[2]["content"][1]["detail"], "auto");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_converts_orphan_tool_output_to_context_message() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "system",
+                "content": "compacted context"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "missing_call",
+                "name": "python",
+                "content": [
+                    {"type": "output_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                ]
+            }),
+        ])?;
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert!(input[1]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Tool output retained as context"));
+        assert_eq!(input[1]["content"][1]["type"], "input_image");
+        assert!(!input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("missing_call")
+        }));
         Ok(())
     }
 
@@ -1754,6 +2012,35 @@ mod tests {
             }
         }));
         Ok(())
+    }
+
+    #[test]
+    fn default_instructions_preserve_bitter_cdp_browser_harness_contract() {
+        let instructions = default_instructions();
+        for expected in [
+            "bitter lesson",
+            "Raw CDP is the center",
+            "source of truth",
+            "new_tab(url)",
+            "not `goto_url(url)`",
+            "Prefer coordinate clicks",
+            "Chrome hit-testing handles iframes",
+            "screenshot(\"label\")",
+            "input_image",
+            "agent_helpers.py",
+            "Browser interaction tool",
+            "Loaded Browser-Harness Interaction Skills",
+            "interaction-skills/screenshots.md",
+            "interaction-skills/tabs.md",
+            "interaction-skills/dialogs.md",
+            "Do not build manager layers",
+            "Do not import or install Playwright",
+        ] {
+            assert!(
+                instructions.contains(expected),
+                "missing {expected:?} from default instructions:\n{instructions}"
+            );
+        }
     }
 
     fn spawn_mock_server(

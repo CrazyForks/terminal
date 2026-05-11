@@ -164,9 +164,19 @@ pub struct WorkbenchState {
     pub result: Option<String>,
     pub failure: Option<String>,
     pub activity: Vec<String>,
+    pub transcript: Vec<TranscriptTurn>,
     pub browser: BrowserSummary,
     pub telemetry: TelemetrySummary,
     pub history: Vec<HistoryRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub prompt: String,
+    pub is_followup: bool,
+    pub activity: Vec<String>,
+    pub result: Option<String>,
+    pub failure: Option<String>,
 }
 
 pub fn task_from_events(events: &[EventRecord]) -> Option<String> {
@@ -185,18 +195,101 @@ pub fn task_from_events(events: &[EventRecord]) -> Option<String> {
     })
 }
 
+pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
+    let mut starts = Vec::new();
+    for (idx, event) in events.iter().enumerate() {
+        let is_followup = match event.event_type.as_str() {
+            "session.input" => false,
+            "session.followup" => true,
+            _ => continue,
+        };
+        let Some(prompt) = event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        starts.push((idx, prompt.to_string(), is_followup));
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(turn_idx, (event_idx, prompt, is_followup))| {
+            let next_idx = starts
+                .get(turn_idx + 1)
+                .map(|(idx, _, _)| *idx)
+                .unwrap_or(events.len());
+            let segment = events
+                .get(event_idx.saturating_add(1)..next_idx)
+                .unwrap_or_default();
+            TranscriptTurn {
+                prompt: prompt.clone(),
+                is_followup: *is_followup,
+                activity: activity_from_events(segment),
+                result: turn_result_from_events(segment),
+                failure: turn_failure_from_events(segment),
+            }
+        })
+        .collect()
+}
+
 pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
-    events.iter().rev().find_map(|event| {
-        if event.event_type == "session.done" {
-            event
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "session.done" => event
                 .payload
                 .get("result")
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        } else {
-            None
-        }
-    })
+                .map(ToOwned::to_owned),
+            "agent.completed" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("result"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|result| !result.is_empty())
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+}
+
+pub fn helper_failure_from_events(events: &[EventRecord]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "agent.failed" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+                .map(ToOwned::to_owned),
+            "agent.cancelled" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+}
+
+pub fn turn_failure_from_events(events: &[EventRecord]) -> Option<String> {
+    failure_from_events(events).or_else(|| helper_failure_from_events(events))
+}
+
+pub fn turn_result_from_events(events: &[EventRecord]) -> Option<String> {
+    result_from_events(events)
 }
 
 pub fn failure_from_events(events: &[EventRecord]) -> Option<String> {
@@ -409,10 +502,9 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
             }
             "file.list" => activity.push("listed files".to_string()),
             "agent.spawned" => activity.push(agent_started_text(&event.payload)),
-            "agent.completed" => activity.push(agent_completed_text(&event.payload)),
-            "agent.failed" => activity.push(agent_failed_text(&event.payload)),
-            "agent.cancelled" => activity.push(agent_cancelled_text(&event.payload)),
-            "model.delta" => activity.push("writing result".to_string()),
+            "agent.completed" => activity.push("helper finished".to_string()),
+            "agent.failed" => activity.push("helper failed".to_string()),
+            "agent.cancelled" => activity.push("helper stopped".to_string()),
             _ => {}
         }
     }
@@ -479,45 +571,6 @@ fn agent_started_text(payload: &Value) -> String {
     format!("started {label} helper")
 }
 
-fn agent_completed_text(payload: &Value) -> String {
-    let result = payload
-        .get("payload")
-        .and_then(|payload| payload.get("result"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|result| !result.is_empty());
-    match result {
-        Some(result) => format!("helper finished: {result}"),
-        None => "helper finished".to_string(),
-    }
-}
-
-fn agent_failed_text(payload: &Value) -> String {
-    let error = payload
-        .get("payload")
-        .and_then(|payload| payload.get("error"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|error| !error.is_empty());
-    match error {
-        Some(error) => format!("helper failed: {error}"),
-        None => "helper failed".to_string(),
-    }
-}
-
-fn agent_cancelled_text(payload: &Value) -> String {
-    let reason = payload
-        .get("payload")
-        .and_then(|payload| payload.get("reason"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty());
-    match reason {
-        Some(reason) => format!("helper stopped: {reason}"),
-        None => "helper stopped".to_string(),
-    }
-}
-
 pub fn project_workbench(
     sessions: &[SessionMeta],
     events_for_current: &[EventRecord],
@@ -571,6 +624,7 @@ pub fn project_workbench(
         result,
         failure,
         activity: activity_from_events(events_for_current),
+        transcript: transcript_from_events(events_for_current),
         browser: browser_summary_from_events(events_for_current, browser_backend),
         telemetry: telemetry_summary_from_events(events_for_current),
         history,
@@ -785,10 +839,11 @@ mod tests {
         ];
         assert_eq!(
             activity_from_events(&events),
-            vec![
-                "started checkout helper",
-                "helper finished: checkout flow documented",
-            ]
+            vec!["started checkout helper", "helper finished"]
+        );
+        assert_eq!(
+            result_from_events(&events).as_deref(),
+            Some("checkout flow documented"),
         );
     }
 

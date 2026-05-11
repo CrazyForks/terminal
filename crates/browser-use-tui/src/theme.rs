@@ -16,14 +16,6 @@ fn accent_color() -> Color {
     Color::Rgb(92, 156, 245)
 }
 
-pub(crate) fn panel() -> Color {
-    Color::Rgb(30, 32, 38)
-}
-
-pub(crate) fn composer_bg() -> Color {
-    Color::Rgb(28, 30, 36)
-}
-
 pub(crate) fn text_style() -> Style {
     Style::default().fg(text())
 }
