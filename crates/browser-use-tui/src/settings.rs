@@ -67,7 +67,7 @@ pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
 ];
 
 pub(crate) const BROWSER_CHOICES: [&str; 3] =
-    ["Local Chrome", "Browser Use cloud", "Headless Chromium"];
+    ["Browser Use cloud", "Local Chrome", "Headless Chromium"];
 
 pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
     ModelChoice {
@@ -78,60 +78,60 @@ pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
         row: "GPT-5.5                         Codex login             best default",
     },
     ModelChoice {
+        display: "Claude Sonnet 4.6",
+        account: "Claude Code login",
+        backend: AgentBackend::Anthropic,
+        provider_model: "claude-sonnet-4-6",
+        row: "Claude Sonnet 4.6               Claude Code login       good browser agent",
+    },
+    ModelChoice {
+        display: "Claude Opus 4.7",
+        account: "Claude Code login",
+        backend: AgentBackend::Anthropic,
+        provider_model: "claude-opus-4-7",
+        row: "Claude Opus 4.7                 Claude Code login       strongest reasoning",
+    },
+    ModelChoice {
         display: "GPT-5.5",
         account: "OpenAI API key",
         backend: AgentBackend::Openai,
         provider_model: "gpt-5.5",
-        row: "GPT-5.5                         OpenAI API key          sign in required",
-    },
-    ModelChoice {
-        display: "Claude Opus 4.7",
-        account: "Claude Code login",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Claude Code login       sign in required",
-    },
-    ModelChoice {
-        display: "Claude Opus 4.7",
-        account: "Anthropic API key",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Anthropic API key       sign in required",
-    },
-    ModelChoice {
-        display: "Claude Sonnet 4.6",
-        account: "Claude Code login",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Claude Code login       sign in required",
+        row: "GPT-5.5                         OpenAI API key          needs key",
     },
     ModelChoice {
         display: "Claude Sonnet 4.6",
         account: "Anthropic API key",
         backend: AgentBackend::Anthropic,
         provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Anthropic API key       sign in required",
+        row: "Claude Sonnet 4.6               Anthropic API key       needs key",
+    },
+    ModelChoice {
+        display: "Claude Opus 4.7",
+        account: "Anthropic API key",
+        backend: AgentBackend::Anthropic,
+        provider_model: "claude-opus-4-7",
+        row: "Claude Opus 4.7                 Anthropic API key       needs key",
     },
     ModelChoice {
         display: "Qwen3.6 Plus",
         account: "OpenRouter API key",
         backend: AgentBackend::Openrouter,
         provider_model: "qwen/qwen3.6-plus",
-        row: "Qwen3.6 Plus                    OpenRouter API key      sign in required",
+        row: "Qwen3.6 Plus                    OpenRouter API key      needs key",
     },
     ModelChoice {
         display: "GLM-5.1",
         account: "OpenRouter API key",
         backend: AgentBackend::Openrouter,
         provider_model: "z-ai/glm-5.1",
-        row: "GLM-5.1                         OpenRouter API key      sign in required",
+        row: "GLM-5.1                         OpenRouter API key      needs key",
     },
     ModelChoice {
         display: "DeepSeek V4 Pro",
         account: "OpenRouter API key",
         backend: AgentBackend::Openrouter,
         provider_model: "deepseek/deepseek-v4-pro",
-        row: "DeepSeek V4 Pro                 OpenRouter API key      sign in required",
+        row: "DeepSeek V4 Pro                 OpenRouter API key      needs key",
     },
 ];
 

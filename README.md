@@ -136,6 +136,14 @@ cargo run -q -p browser-use-tui -- --state-dir /tmp/but-ui --seed-demo running -
 cargo run -q -p browser-use-tui -- --state-dir /tmp/but-ui --seed-demo done --select-latest --overlay browser --dump-screen
 ```
 
+Before landing terminal UI changes, run the real verification loop:
+
+```bash
+scripts/verify-terminal-ui.sh
+```
+
+It writes deterministic dumps to `/tmp/but-design-loop/` and drives the TUI through a real tmux terminal to catch scrollback, paste, arrow-key, redraw, and selectable-output regressions.
+
 ## Browser Boundary
 
 The Python worker tries to load local browser-harness helpers from:

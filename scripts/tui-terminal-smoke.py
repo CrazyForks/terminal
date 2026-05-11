@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Real-terminal smoke tests for the Rust TUI.
+
+This intentionally tests the app through tmux instead of Ratatui's TestBackend.
+The goal is to catch bugs that only appear with a live terminal viewport:
+duplicated panels in scrollback, broken bracketed paste, and stale redraws.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ARTIFACT_DIR = Path("/tmp/but-design-loop")
+
+
+def run(cmd: list[str], *, check: bool = True, text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=ROOT,
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=check,
+    )
+
+
+def tmux(*args: str, check: bool = True) -> str:
+    return run(["tmux", *args], check=check).stdout
+
+
+def tmux_send(session: str, *keys: str) -> None:
+    run(["tmux", "send-keys", "-t", session, *keys])
+
+
+def tmux_send_literal(session: str, value: str) -> None:
+    run(["tmux", "send-keys", "-t", session, "-l", value])
+
+
+def tmux_send_shift_enter(session: str) -> None:
+    # Crossterm decodes the kitty/CSI-u enhanced keyboard encoding that the
+    # TUI enables at startup. tmux's symbolic "S-Enter" is not reliable across
+    # terminal builds and can arrive as plain Enter.
+    tmux_send_literal(session, "\x1b[13;2u")
+
+
+def capture(session: str, name: str) -> str:
+    text = tmux("capture-pane", "-t", session, "-p", "-S", "-200")
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    (ARTIFACT_DIR / f"tui-terminal-smoke-{name}.txt").write_text(text)
+    return text
+
+
+def capture_visible(session: str, name: str) -> str:
+    text = tmux("capture-pane", "-t", session, "-p")
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    (ARTIFACT_DIR / f"tui-terminal-smoke-{name}.txt").write_text(text)
+    return text
+
+
+def wait_for(session: str, needle: str, name: str, timeout: float = 8.0) -> str:
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        last = capture(session, name)
+        if needle in last:
+            return last
+        time.sleep(0.2)
+    raise AssertionError(f"timed out waiting for {needle!r}\n\n{last}")
+
+
+def capture_after_idle(session: str, name: str, delay: float = 0.5, *, visible_only: bool = False) -> str:
+    time.sleep(delay)
+    if visible_only:
+        return capture_visible(session, name)
+    return capture(session, name)
+
+
+def assert_contains(text: str, needle: str, context: str) -> None:
+    if needle not in text:
+        raise AssertionError(f"{context}: expected {needle!r}\n\n{text}")
+
+
+def assert_not_contains(text: str, needle: str, context: str) -> None:
+    if needle in text:
+        raise AssertionError(f"{context}: unexpected {needle!r}\n\n{text}")
+
+
+def assert_count(text: str, needle: str, expected: int, context: str) -> None:
+    count = text.count(needle)
+    if count != expected:
+        raise AssertionError(f"{context}: expected {expected} x {needle!r}, saw {count}\n\n{text}")
+
+
+def assert_regex_count(text: str, pattern: str, expected: int, context: str) -> None:
+    count = len(re.findall(pattern, text, flags=re.MULTILINE))
+    if count != expected:
+        raise AssertionError(f"{context}: expected {expected} x /{pattern}/, saw {count}\n\n{text}")
+
+
+def assert_no_ansi(text: str, context: str) -> None:
+    if re.search(r"\x1b\[[0-?]*[ -/]*[@-~]", text):
+        raise AssertionError(f"{context}: output contained ANSI escapes\n\n{text!r}")
+
+
+def build_binary() -> Path:
+    run(["cargo", "build", "-q", "-p", "browser-use-tui", "--bin", "but"])
+    binary = ROOT / "target" / "debug" / "but"
+    if not binary.exists():
+        raise AssertionError(f"missing built binary: {binary}")
+    return binary
+
+
+def start_session(
+    session: str,
+    binary: Path,
+    state_dir: Path,
+    *,
+    seed_demo: str = "running",
+    select_latest: bool = True,
+) -> None:
+    tmux("kill-session", "-t", session, check=False)
+    tmux("new-session", "-d", "-s", session, "-x", "120", "-y", "28")
+    tmux("resize-window", "-t", session, "-x", "120", "-y", "28")
+    select_arg = "--select-latest " if select_latest else ""
+    command = (
+        f"cd {ROOT} && {binary} "
+        f"--state-dir {state_dir} --seed-demo {seed_demo} {select_arg}--agent none --height 28"
+    )
+    tmux_send(session, command, "C-m")
+    wait_for(session, "browser-use", f"initial-{seed_demo}")
+
+
+def smoke_interactive_terminal(binary: Path) -> None:
+    session = f"but-smoke-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-"))
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "+- working", "initial-running")
+
+        tmux_send(session, "Tab", "Down", "Down", "Down")
+        history = wait_for(session, "browser-use / previous work", "history")
+        assert_count(history, "browser-use / previous work", 1, "history should be live, not appended repeatedly")
+        assert_not_contains(history, "^[[B", "arrow keys should be consumed by the TUI")
+
+        tmux_send(session, "Escape")
+        wait_for(session, "+- working", "main-after-history")
+
+        tmux_send_literal(session, "alpha")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "beta")
+        multiline = wait_for(session, "beta", "shift-enter-newline")
+        assert_contains(multiline, "> alpha", "multiline input first line")
+        assert_contains(multiline, "  beta", "multiline input second line")
+        assert_not_contains(multiline, "Follow-up\n    alpha", "shift-enter must not submit")
+        assert_not_contains(multiline, "alpha|", "composer should use the terminal cursor, not a fake pipe")
+        assert_not_contains(multiline, "beta|", "composer should use the terminal cursor, not a fake pipe")
+        assert_regex_count(multiline, r"^browser-use\b", 1, "multiline edit should not append duplicate app screens")
+
+        tmux_send(session, "C-u", "C-u")
+        line_removed = capture_after_idle(session, "ctrl-u-removes-empty-composer-line", visible_only=True)
+        assert_contains(line_removed, "> alpha", "ctrl-u should keep the previous composer line")
+        assert_not_contains(line_removed, "  beta", "second ctrl-u should remove the cleared composer line")
+
+        tmux_send(session, "C-c")
+        wait_for(session, "+- working", "main-after-clear")
+
+        bracketed = "\x1b[200~paste one\npaste two\x1b[201~"
+        tmux_send_literal(session, bracketed)
+        pasted = wait_for(session, "paste two", "bracketed-paste")
+        assert_contains(pasted, "paste one", "bracketed paste first line")
+        assert_contains(pasted, "paste two", "bracketed paste second line")
+        assert_not_contains(pasted, "^[[200~", "bracketed paste markers should not leak")
+        assert_not_contains(pasted, "paste two|", "paste should use the terminal cursor, not a fake pipe")
+        assert_regex_count(pasted, r"^browser-use\b", 1, "paste should not append duplicate app screens")
+
+        tmux_send(session, "C-c", "/")
+        wait_for(session, "Actions", "actions-open")
+        tmux_send(session, "b", "r", "o")
+        actions = wait_for(session, "filter  bro", "actions-filter")
+        assert_contains(actions, "Open browser", "actions filter should show matching command")
+        assert_not_contains(actions, "filter  b\n", "actions filter should redraw in place")
+        assert_not_contains(actions, "filter  br\n", "actions filter should redraw in place")
+
+        tmux_send(session, "Escape")
+        wait_for(session, "+- working", "main-after-actions")
+        tmux_send(session, "F2")
+        browser = wait_for(session, "Current browser", "browser-panel")
+        assert_count(browser, "browser-use / browser", 1, "browser panel should be live, not appended repeatedly")
+
+        tmux("resize-window", "-t", session, "-x", "100", "-y", "22")
+        resized_small = capture_after_idle(session, "resize-100x22", visible_only=True)
+        assert_contains(resized_small, "Current browser", "resize should keep the live app visible")
+        assert_regex_count(resized_small, r"^  browser-use / browser\b", 1, "resize shrink should redraw in place")
+        assert_not_contains(resized_small, "^[[", "resize shrink should not leak escape sequences")
+
+        tmux("resize-window", "-t", session, "-x", "120", "-y", "28")
+        resized_large = capture_after_idle(session, "resize-120x28", visible_only=True)
+        assert_contains(resized_large, "Current browser", "resize grow should keep the live app visible")
+        assert_regex_count(resized_large, r"^  browser-use / browser\b", 1, "resize grow should redraw in place")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_history_selection_emits_native_transcript(binary: Path) -> None:
+    session = f"but-smoke-history-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-history-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="cancelled",
+            select_latest=False,
+        )
+        wait_for(session, "What should the browser do?", "history-start-ready")
+        tmux_send(session, "Tab")
+        wait_for(session, "browser-use / previous work", "history-open-cancelled")
+        tmux_send(session, "Enter")
+        selected = wait_for(session, "+- stopped", "history-select-cancelled")
+        assert_regex_count(selected, r"^browser-use\b", 1, "history selection should emit one transcript header")
+        assert_contains(selected, "> Find the top 5 Hacker News posts", "selected task should be in native scrollback")
+        assert_contains(selected, "+- stopped", "cancelled task should render as native transcript")
+        assert_not_contains(selected, "\x1b[", "native transcript should not leak escapes")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_tall_terminal_keeps_live_viewport_compact(binary: Path) -> None:
+    session = f"but-smoke-height-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-height-"))
+    try:
+        tmux("kill-session", "-t", session, check=False)
+        tmux("new-session", "-d", "-s", session, "-x", "120", "-y", "40")
+        command = (
+            f"cd {ROOT} && {binary} "
+            f"--state-dir {state_dir} --seed-demo running --select-latest --agent none"
+        )
+        tmux_send(session, command, "C-m")
+        wait_for(session, "+- working", "height-120x40-history")
+        visible = capture_visible(session, "height-120x40")
+        assert_regex_count(visible, r"^browser-use\b", 1, "tall terminal should have one emitted transcript")
+        footer_rows = [
+            idx for idx, line in enumerate(visible.splitlines()) if "enter steer" in line
+        ]
+        if not footer_rows or max(footer_rows) > 24:
+            raise AssertionError(
+                "tall terminal should keep a compact live viewport and leave native scrollback to the terminal\n\n"
+                + visible
+            )
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
+    session = f"but-smoke-long-history-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-long-history-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="long",
+            select_latest=False,
+        )
+        wait_for(session, "What should the browser do?", "long-history-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        selected = wait_for(session, "scroll check line 60", "long-history-selected")
+        visible = capture_after_idle(session, "long-history-selected-visible", visible_only=True)
+        assert_contains(selected, "scroll check line 1", "native transcript should include first result line")
+        assert_contains(selected, "scroll check line 60", "native transcript should include last result line")
+        assert_contains(selected, "+- source", "native transcript should include source section")
+        assert_contains(visible, "Ask a follow-up", "live viewport should redraw the composer after transcript insert")
+        assert_regex_count(selected, r"^browser-use\b", 1, "long selected task should emit one transcript header")
+        assert_not_contains(selected, "earlier steps", "native transcript should not compact activity")
+        assert_not_contains(selected, "\x1b[", "native transcript should not leak escapes")
+
+        tmux_send_literal(session, "continue")
+        tmux_send(session, "Enter")
+        running = wait_for(session, "+- working", "long-history-followup-running")
+        visible_running = capture_after_idle(session, "long-history-followup-visible", visible_only=True)
+        if len(re.findall(r"^browser-use\b", visible_running, flags=re.MULTILINE)) > 1:
+            raise AssertionError(
+                "follow-up should not append duplicate app screens\n\n" + visible_running
+            )
+        assert_not_contains(running, "using browser", "internal browser helper starts should stay hidden")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_main_resize_does_not_duplicate_transcript(binary: Path) -> None:
+    session = f"but-smoke-main-resize-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-main-resize-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="long",
+            select_latest=False,
+        )
+        wait_for(session, "What should the browser do?", "main-resize-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        wait_for(session, "scroll check line 60", "main-resize-selected")
+        tmux("resize-window", "-t", session, "-x", "96", "-y", "24")
+        small = capture_after_idle(session, "main-resize-96x24")
+        tmux("resize-window", "-t", session, "-x", "140", "-y", "34")
+        large = capture_after_idle(session, "main-resize-140x34")
+        for name, text in [("small", small), ("large", large)]:
+            assert_not_contains(text, "^[[", f"main resize {name} should not leak escapes")
+            if len(re.findall(r"^browser-use\b", text, flags=re.MULTILINE)) > 1:
+                raise AssertionError(
+                    f"main resize {name} should not duplicate transcript headers\n\n{text}"
+                )
+            if text.count("scroll check line 60") > 1:
+                raise AssertionError(
+                    f"main resize {name} should not duplicate completed output\n\n{text}"
+                )
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
+    session = f"but-smoke-switch-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-switch-"))
+    transient_task = "temporary switch task should disappear"
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="long",
+            select_latest=False,
+        )
+        wait_for(session, "What should the browser do?", "switch-start-ready")
+        tmux_send_literal(session, transient_task)
+        tmux_send(session, "Enter")
+        wait_for(session, transient_task, "switch-transient-created")
+
+        tmux_send(session, "Tab")
+        wait_for(session, "browser-use / previous work", "switch-history-open")
+        tmux_send(session, "Down", "Enter")
+        selected = wait_for(session, "scroll check line 60", "switch-long-selected")
+        visible = capture_visible(session, "switch-long-selected-visible")
+
+        assert_contains(selected, "scroll check line 1", "selected transcript should be replayed after switch")
+        assert_contains(selected, "scroll check line 60", "selected transcript should include full result after switch")
+        assert_not_contains(visible, transient_task, "session switch should clear the previous visible transcript")
+        assert_contains(visible, "Ask a follow-up", "session switch should redraw the composer after replay")
+        assert_not_contains(visible, "^[[", "session switch clear should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_large_composer_input_is_batched(binary: Path) -> None:
+    session = f"but-smoke-large-input-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-large-input-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="running",
+            select_latest=True,
+        )
+        wait_for(session, "+- working", "large-input-start")
+        large_text = "x" * 1200
+        started = time.time()
+        tmux_send_literal(session, large_text)
+        typed = wait_for(session, "x" * 80, "large-input-typed", timeout=4.0)
+        elapsed = time.time() - started
+        if elapsed > 4.0:
+            raise AssertionError(f"large input took too long to appear: {elapsed:.2f}s")
+        assert_not_contains(typed, "^[[200~", "large input should not leak bracketed paste markers")
+        assert_not_contains(typed, "^[[", "large input should not leak escape sequences")
+        if len(re.findall(r"^browser-use\b", typed, flags=re.MULTILINE)) > 1:
+            raise AssertionError("large input should not duplicate app screens\n\n" + typed)
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_failed_retry_switches_to_live_running(binary: Path) -> None:
+    session = f"but-smoke-failed-retry-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-failed-retry-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="failed",
+            select_latest=False,
+        )
+        wait_for(session, "What should the browser do?", "failed-retry-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        wait_for(session, "+- error", "failed-retry-initial")
+        tmux_send(session, "Enter")
+        running = wait_for(session, "+- working", "failed-retry-running")
+        visible_running = capture_after_idle(session, "failed-retry-visible", visible_only=True)
+        if len(re.findall(r"^browser-use\b", visible_running, flags=re.MULTILINE)) > 1:
+            raise AssertionError(
+                "retry should replace the failure view with one live running viewport\n\n"
+                + visible_running
+            )
+        assert_not_contains(running, "Choose a different model\n    Retry", "retry should not leave the failure action menu live")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_completed_plain_output(binary: Path) -> None:
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-done-"))
+    try:
+        result = run(
+            [
+                str(binary),
+                "--state-dir",
+                str(state_dir),
+                "--seed-demo",
+                "long",
+                "--select-latest",
+                "--agent",
+                "none",
+            ]
+        ).stdout
+        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        (ARTIFACT_DIR / "tui-terminal-smoke-completed-output.txt").write_text(result)
+        assert_contains(result, "scroll check line 60", "completed result should print full plain transcript")
+        assert_contains(result, "+- source", "completed result should include source section")
+        assert_no_ansi(result, "completed result should be selectable plain text")
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-build", action="store_true", help="reuse target/debug/but")
+    args = parser.parse_args()
+
+    if shutil.which("tmux") is None:
+        print("tmux is required for real terminal smoke tests", file=sys.stderr)
+        return 2
+
+    binary = ROOT / "target" / "debug" / "but" if args.skip_build else build_binary()
+    smoke_interactive_terminal(binary)
+    smoke_history_selection_emits_native_transcript(binary)
+    smoke_tall_terminal_keeps_live_viewport_compact(binary)
+    smoke_completed_history_uses_native_scrollback(binary)
+    smoke_main_resize_does_not_duplicate_transcript(binary)
+    smoke_session_switch_clears_previous_transcript(binary)
+    smoke_large_composer_input_is_batched(binary)
+    smoke_failed_retry_switches_to_live_running(binary)
+    smoke_completed_plain_output(binary)
+    print("tui terminal smoke passed")
+    print(f"captures: {ARTIFACT_DIR}/tui-terminal-smoke-*.txt")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
