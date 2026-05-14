@@ -22,6 +22,8 @@ If the task asks for screenshots, images, downloads, uploads, or other files as 
 
 If the task asks for fields "for each" record, run a compact missing-field review before finalizing. Report counts for missing required fields, revisit source/detail pages when many values are blank, and do not present records with missing required fields as fully complete. For large outputs, the final answer should point to the full artifact path first; summaries are useful only if they also identify where the full result is stored.
 
+For large or artifact-heavy outputs, make that review concrete by running an audit in Python before done. Use `audit_artifact(...)` with the actual record list or artifact path, required fields, dedupe fields, per-bucket targets, and any visual files. Inspect `ready_for_done`; if it is false, fix the artifact and rerun the audit when possible, or clearly report the remaining duplicate count, missing-field counts, unmet targets, or invalid visual files in the final answer.
+
 If the task gives fallback instructions, treat them as part of the task. Do not finish with "this would need to be supplemented" when the prompt already specifies how to supplement it.
 
 When the turn budget is nearly exhausted, stop starting new lines of investigation. Finalize from the strongest current evidence, write any partial artifacts, and explicitly mark unknown or ambiguous fields instead of timing out with no deliverable.

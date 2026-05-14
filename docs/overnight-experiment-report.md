@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Second self-review revision verified; focused rerun pending |
+| Recommended branch state | Operational `audit_artifact(...)` helper verified; focused rerun pending |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
 | Latest `real_v14_short` strict/manual score | Cloud run: runner 10/10; manual strict 7 pass / 3 partial / 0 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
 | Most important improvement | Host-side hard timeout for Python worker calls |
 | Worst regression | None yet |
 | Open root-cause clusters | Blank visual artifacts, global dedupe scope, per-record field completeness |
-| Next experiment | Revise general self-review prompt, rerun partial tasks `6,10,16` |
+| Next experiment | Rerun focused tasks `6,10,16` with the audit helper, then run full `real_v8` baseline |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -284,4 +284,83 @@ Decision:
   - `cargo fmt --check`: passed
   - `cargo test`: passed
   - `uv run --with pytest python -m pytest -q`: passed, `15 passed`
+- Decision: Mixed. Keep the visual-artifact clause conceptually, but do not treat this revision as sufficient.
+
+### Focused Rerun: `overnight-real-v14-self-review-r2-focus-20260513-224908`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-self-review-r2-focus-20260513-224908`
+- Manifest: `/tmp/overnight-real-v14-self-review-r2-focus-20260513-224908/state/dataset-runs/overnight-real-v14-self-review-r2-focus-20260513-224908.json`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `0` pass, `3` partial, `0` fail
+- Token usage: `2,575,039` total tokens, cost missing
+
+Manual judging:
+
+| Task | Runner | Manual | Delta vs first focused rerun | Evidence |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | Improved visual artifacts: per-ad creatives are real JPG media with thousands of sampled colors instead of blank crops. Still lacks detailed screenshot evidence for each selected ad and selection evidence remains weak. | `outputs/result.json`, `outputs/ad_*_creative_1.jpg`, `outputs/search_results_overview.png` |
+| 10 | pass | partial | More honest about gaps and better ASPS practice/address extraction for scraped ASPS records. Regressed on coverage: `159` records vs `272`, ASPS `76` vs `173`, and only some specialties reached 40. | `outputs/result.json`, `outputs/result.csv`, DB events around task `10` seq `745-775` |
+| 16 | pass | partial | No improvement. Global duplicate count stayed `78` and store address regressed from requested `94103` to `94110`. | `outputs/result.json`, `outputs/menu_nodes.json` |
+
+Concrete checks:
+
+- Task `6` visual artifacts:
+  - Five `ad_*_creative_1.jpg` files exist and are real media: each had thousands of sampled colors.
+  - The prompt caused the model to fetch media directly instead of trusting blank clips.
+  - Remaining weakness: `search_results_overview.png` and `viewport_verify.png` are not enough to prove detailed per-ad screenshot coverage.
+- Task `10` missing-field / per-bucket audit:
+  - `record_count`: `159`
+  - `topplasticsurgeonreviews_count`: `114`
+  - `asps_unique_scraped`: `76`
+  - Specialty counts: Breast `42`, Rhinoplasty `42`, Face Lift `42`, Facial Reconstruction `42`, Liposuction `47`, Eyelid `42`, Tummy Tuck `33`, Mommy Makeover `20`, Injectors `0`, Cosmetic/Anti-Aging `0`, BBL `0`, Cosmetic Laser `0`, Hair Restoration `0`.
+  - Missing practice count: `83`; missing specialties count: `92`.
+  - Good behavior: final answer explicitly exposed gaps rather than claiming completion.
+  - Bad behavior: the runner still marked it pass because the final answer was honest but incomplete.
+- Task `16` dedupe:
+  - `18` categories, `218` rows, `140` unique item-price pairs, `78` duplicate item-price pairs.
+  - Same duplicate count as first focused rerun.
+  - Store address was output as `302 Potrero Ave, San Francisco, CA 94110`, while the task requested `94103`.
+
+Interpretation:
+
+- More prose in the prompt has diminishing returns.
+- The visual-artifact clause is useful and should stay.
+- The dedupe and missing-field clauses did not become operational. The model needs to compute an explicit pre-final audit summary, not just "remember to check".
+- Runner `ok` remains a weak signal: all three focused reruns passed in the manifest while all three were partial manually.
+
+Decision:
+
+- Keep `629e78b` for now, because it improved task `6` and made task `10` more honest.
+- Next generalizable intervention should not be benchmark-specific validation. It should add a generic pre-final audit convention/tooling:
+  - artifact path;
+  - total records;
+  - duplicate count and dedupe key;
+  - required-field missing counts;
+  - per-bucket target counts;
+  - visual/file artifact validity checks;
+  - explicit `ready_for_done: true/false`.
+
+### Intervention: Operational Pre-Final Artifact Audit Helper
+
+- Hypothesis: Prompt prose alone is too easy for the model to skip or interpret loosely. A generic helper that computes duplicate counts, missing-field counts, bucket targets, and visual-file sanity should make self-review concrete without encoding benchmark answers.
+- Intervention:
+  - Added `audit_artifact(...)` to the Python tool surface.
+  - The helper accepts records or a JSON/CSV artifact path, optional `record_path`, required fields, dedupe fields, bucket targets, and visual files.
+  - It writes `/home/user/outputs/artifact_audit.json` plus an artifact copy, and returns a compact audit with `ready_for_done`.
+  - Updated system/dataset/tool prompts to tell the model to run this audit before finalizing large or artifact-heavy tasks.
+- Why this is generalizable:
+  - It does not know dataset IDs, expected answers, websites, or benchmark strings.
+  - It does not block `done`; the model still decides whether to fix or report gaps.
+  - It turns the model's own task contract into computed evidence that survives context compaction.
+- Expected movement:
+  - Task `16`: if the model calls `audit_artifact(records=[item for category in menu["categories"] for item in category["items"]], dedupe_fields=["item_name","item_price"])`, duplicate count becomes explicit before finalization.
+  - Task `10`: per-specialty target misses and blank required fields become explicit before finalization.
+  - Task `6`: blank/single-color screenshot files become explicit before finalization.
+- Verification:
+  - `uv run --with pytest python -m pytest -q`: passed, `16 passed`
+  - `cargo fmt --check`: passed
+  - `cargo test`: passed
 - Decision: Focused rerun pending.

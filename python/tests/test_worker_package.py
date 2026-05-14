@@ -378,6 +378,44 @@ def test_worker_set_final_answer_persists_metadata_and_compact_result(tmp_path: 
     assert '"stores"' in metadata.read_text()
 
 
+def test_worker_audit_artifact_reports_general_quality_checks(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-audit",
+            "session_id": "task-artifact-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [
+    {'name': 'Big Mac', 'price': '$1', 'category': 'Burgers'},
+    {'name': 'Big Mac', 'price': '$1', 'category': 'Popular'},
+    {'name': '', 'price': '$2', 'category': 'Chicken'},
+]
+audit = audit_artifact(
+    records=rows,
+    required_fields=['name', 'price'],
+    dedupe_fields=['name', 'price'],
+    bucket_field='category',
+    bucket_targets={'Burgers': 2, 'Chicken': 1},
+)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    assert audit["record_count"] == 3
+    assert audit["checks"]["missing_fields"]["name"]["count"] == 1
+    assert audit["checks"]["dedupe"]["duplicate_count"] == 1
+    assert audit["checks"]["buckets"]["unmet_targets"] == {
+        "Burgers": {"count": 1, "target": 2}
+    }
+    assert Path(audit["audit_path"]).exists()
+    assert response["artifacts"][0]["source_path"] == audit["audit_path"]
+
+
 def test_managed_browser_does_not_use_system_chromium_without_opt_in(
     tmp_path: Path, monkeypatch
 ) -> None:

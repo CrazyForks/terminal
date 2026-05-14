@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 
 _namespaces: Dict[str, Dict[str, Any]] = {}
@@ -67,6 +67,98 @@ def _jsonable(value: Any) -> Any:
         return value
     except TypeError:
         return repr(value)
+
+
+def _field_value(record: Any, field: str) -> Any:
+    value = record
+    for part in str(field).split("."):
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            value = getattr(value, part, None)
+        if value is None:
+            return None
+    return value
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _dedupe_key(record: Any, fields: Iterable[str] | None) -> str:
+    if fields:
+        parts = [_field_value(record, field) for field in fields]
+    else:
+        parts = [record]
+    return json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _records_from_path(data: Any, record_path: str | None) -> Any:
+    if not record_path:
+        return data
+    current = [data]
+    for raw_part in record_path.split("."):
+        is_many = raw_part.endswith("[]")
+        part = raw_part[:-2] if is_many else raw_part
+        next_values = []
+        for value in current:
+            if part:
+                if isinstance(value, dict):
+                    value = value.get(part)
+                else:
+                    value = getattr(value, part, None)
+            if is_many:
+                if isinstance(value, list):
+                    next_values.extend(value)
+            else:
+                next_values.append(value)
+        current = next_values
+    return current
+
+
+def _load_json_or_csv(path: Path) -> Any:
+    if path.suffix.lower() == ".csv":
+        import csv
+
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _visual_file_audit(paths: Iterable[Any]) -> list[Dict[str, Any]]:
+    checks: list[Dict[str, Any]] = []
+    for raw_path in paths:
+        path = Path(str(raw_path)).expanduser()
+        record: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
+        if path.exists() and path.is_file():
+            record["bytes"] = path.stat().st_size
+            try:
+                from PIL import Image, ImageStat
+
+                with Image.open(path) as img:
+                    rgb = img.convert("RGB")
+                    small = rgb.resize((min(64, rgb.width), min(64, rgb.height)))
+                    colors = small.getcolors(maxcolors=1_000_000) or []
+                    stat = ImageStat.Stat(rgb)
+                    record.update(
+                        {
+                            "width": rgb.width,
+                            "height": rgb.height,
+                            "sample_unique_colors": len(colors),
+                            "mean_rgb": [round(value, 1) for value in stat.mean],
+                            "appears_blank": len(colors) <= 1,
+                        }
+                    )
+            except Exception as exc:
+                record["image_error"] = str(exc)
+        checks.append(record)
+    return checks
 
 
 def _browser_mode() -> str:
@@ -896,6 +988,140 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         emit_output(f"final answer ready:{count_text}{artifact_text}")
         return summary
 
+    def audit_artifact(
+        data: Any | None = None,
+        path: Any | None = None,
+        records: list[Any] | None = None,
+        record_path: str | None = None,
+        required_fields: list[str] | None = None,
+        dedupe_fields: list[str] | None = None,
+        bucket_field: str | None = None,
+        bucket_targets: Dict[str, int] | None = None,
+        visual_files: list[Any] | None = None,
+        artifact_name: str = "artifact_audit.json",
+    ) -> Dict[str, Any]:
+        """Compute a compact, general pre-final audit for model review.
+
+        This is deliberately not a benchmark validator. It only summarizes
+        quality signals the model asked to check: duplicate rows, missing
+        required fields, per-bucket counts, and visual/file artifact sanity.
+        """
+        source_path = None
+        if records is None:
+            if data is None and path is not None:
+                source = Path(str(path)).expanduser()
+                if not source.is_absolute():
+                    source = Path.cwd() / source
+                source_path = str(source)
+                data = _load_json_or_csv(source)
+            extracted = _records_from_path(data, record_path)
+            if isinstance(extracted, list):
+                records = extracted
+            elif isinstance(extracted, dict):
+                if isinstance(extracted.get("records"), list):
+                    records = extracted["records"]
+                elif isinstance(extracted.get("items"), list):
+                    records = extracted["items"]
+                else:
+                    records = [extracted]
+            elif extracted is None:
+                records = []
+            else:
+                records = [extracted]
+
+        audit: Dict[str, Any] = {
+            "ready_for_done": True,
+            "source_path": source_path or (str(path) if path is not None else None),
+            "record_count": len(records),
+            "checks": {},
+        }
+
+        if required_fields:
+            missing: Dict[str, Any] = {}
+            for field in required_fields:
+                examples = []
+                count = 0
+                for idx, record in enumerate(records):
+                    if _is_missing(_field_value(record, field)):
+                        count += 1
+                        if len(examples) < 5:
+                            examples.append({"index": idx, "record": record})
+                missing[field] = {"count": count, "examples": examples}
+            audit["checks"]["missing_fields"] = missing
+            if any(item["count"] for item in missing.values()):
+                audit["ready_for_done"] = False
+
+        if dedupe_fields is not None:
+            seen: Dict[str, int] = {}
+            duplicate_examples = []
+            for idx, record in enumerate(records):
+                key = _dedupe_key(record, dedupe_fields)
+                if key in seen:
+                    if len(duplicate_examples) < 10:
+                        duplicate_examples.append(
+                            {
+                                "first_index": seen[key],
+                                "duplicate_index": idx,
+                                "key": json.loads(key),
+                                "record": record,
+                            }
+                        )
+                else:
+                    seen[key] = idx
+            duplicate_count = len(records) - len(seen)
+            audit["checks"]["dedupe"] = {
+                "fields": dedupe_fields,
+                "duplicate_count": duplicate_count,
+                "unique_count": len(seen),
+                "examples": duplicate_examples,
+            }
+            if duplicate_count:
+                audit["ready_for_done"] = False
+
+        if bucket_field:
+            counts: Dict[str, int] = {}
+            for record in records:
+                value = _field_value(record, bucket_field)
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    if _is_missing(item):
+                        continue
+                    counts[str(item)] = counts.get(str(item), 0) + 1
+            check: Dict[str, Any] = {"field": bucket_field, "counts": counts}
+            if bucket_targets:
+                unmet = {
+                    bucket: {"count": counts.get(str(bucket), 0), "target": int(target)}
+                    for bucket, target in bucket_targets.items()
+                    if counts.get(str(bucket), 0) < int(target)
+                }
+                check["targets"] = bucket_targets
+                check["unmet_targets"] = unmet
+                if unmet:
+                    audit["ready_for_done"] = False
+            audit["checks"]["buckets"] = check
+
+        if visual_files:
+            visual = _visual_file_audit(visual_files)
+            audit["checks"]["visual_files"] = visual
+            if any(
+                (not item.get("exists")) or item.get("appears_blank") or item.get("image_error")
+                for item in visual
+            ):
+                audit["ready_for_done"] = False
+
+        audit_path = _outputs_dir_path(Path(str(ns.get("cwd") or "."))) / artifact_name
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        audit["audit_path"] = str(audit_path)
+        copy_artifact(audit_path, kind="file", name=artifact_name, mime="application/json")
+        emit_output(
+            "artifact audit ready: "
+            f"ready_for_done={audit['ready_for_done']} "
+            f"records={audit['record_count']} "
+            f"path={audit_path}"
+        )
+        return audit
+
     def get_final_answer() -> Any:
         return ns.get("final_answer")
 
@@ -974,6 +1200,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "screenshot": screenshot,
             "page_info": page_info,
             "set_final_answer": set_final_answer,
+            "audit_artifact": audit_artifact,
             "get_final_answer": get_final_answer,
             "emit_browser_live_url": emit_browser_live_url,
             "emit_browser_state": emit_browser_state,
