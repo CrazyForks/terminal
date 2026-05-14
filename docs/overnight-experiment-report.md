@@ -1121,3 +1121,36 @@ Decision:
   - `cargo test` passed, `58` browser-use-core tests plus the full workspace suite.
   - `uv run --with pytest python -m pytest -q` passed, `28 passed`.
   - `cargo build --bin browser-use-terminal` passed.
+
+### Focused Rerun: `overnight-focused-v8-semantic-20260514-052602`
+
+- Dataset: `real_v8`
+- Tasks: `21`, `51`, `72`, `99`, `100`
+- Root: `/tmp/overnight-focused-v8-semantic-20260514-052602`
+- Commit under test: `59a42b4` (`Add semantic audit and finalization fallback`)
+- Command: `dataset-run-codex real_v8 --task-id 21 --task-id 51 --task-id 72 --task-id 99 --task-id 100 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 5 --browser-mode cloud`
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `5/5` passed.
+
+Focused outcomes:
+
+| Task | Prior issue | Focused outcome | Judgment |
+| ---: | --- | --- | --- |
+| 21 | Returned null Booking prices without proving exact-date unavailability. | Still returns null prices for all 13 dates, with no saved final artifact. | No improvement. Prompt-only null-proofing did not make the model perform the price reveal flow. |
+| 51 | Full 41-row persisted answer existed, but `done` returned only a 3-row preview. | Final result is the full `41`-row JSON list; `session.final_answer_used` fired and `done` used the persisted final answer. | Fixed. The finalization fallback/prompt works for this class. |
+| 72 | Hit max provider turns after writing a partial final answer; strict semantic fail due missing operator ID. | Runner now finishes cleanly with an honest best-available answer. It still says operator ID is unknown/not verified. | Runner failure fixed; semantic task remains fail. This needs better site/search strategy, not finalization. |
+| 99 | Accepted accessories/non-rackets as padel rackets. | Returned `20` racket-like products; visible names are all rackets/paddles rather than balls/grips/bags. | Improved; likely pass or much stronger partial depending product URL/name consistency. |
+| 100 | Correct shape but missing Amazon prices and audit omitted `price`. | Final JSON has `20/20/20` platform buckets and `0` missing `price`, `image_url`, or `supplier`; audit includes `price`. | Improved; targeted missing-field issue fixed. |
+
+Interpretation:
+
+- The harness-level finalization fixes are working: they recover preview finalization and avoid a runner failure when the model reaches a partial deliverable at the end.
+- The prompt-level semantic audit changes helped tasks `99` and `100`, at least on this focused sample.
+- Task `21` shows the limitation of prompt-only guidance: the model needs better action verification for interactive price reveal flows, not just stronger final-review language.
+- Task `72` remains unsolved at the first-principles level. It likely needs a better discovery strategy for ND DMR operator IDs or accepting that the public site may not expose the requested ID.
+
+Next loop:
+
+- Run full `real_v14_short` and `real_v8` again on `59a42b4`.
+- If full v8 confirms improvements on `51`, `99`, and `100` without further regressions, keep this intervention.
+- If task `21` remains a hard fail, investigate interactive action verification and CDP/network event capture for flows where a visible button must be opened before a field can be considered unavailable.
