@@ -81,14 +81,65 @@ def _field_value(record: Any, field: str) -> Any:
     return value
 
 
+_MISSING_STRING_VALUES = {
+    "n a",
+    "na",
+    "nil",
+    "none",
+    "null",
+    "not applicable",
+    "tbd",
+    "to be determined",
+    "unknown",
+}
+
+_MISSING_STRING_PHRASES = (
+    "cannot determine",
+    "could not determine",
+    "not accessible",
+    "not available",
+    "not captured",
+    "not disclosed",
+    "not found",
+    "not listed",
+    "not provided",
+    "not shown",
+    "not specified",
+    "not visible",
+    "unable to determine",
+    "unavailable",
+)
+
+
+def _normalized_missing_text(value: str) -> str:
+    text = re.sub(r"[_/\\|]+", " ", value.strip().lower())
+    text = re.sub(r"[\s.,:;()[\]{}-]+", " ", text)
+    return text.strip()
+
+
 def _is_missing(value: Any) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
-        return not value.strip()
+        normalized = _normalized_missing_text(value)
+        if not normalized:
+            return True
+        if normalized in _MISSING_STRING_VALUES or normalized.startswith("unknown from "):
+            return True
+        return any(phrase in normalized for phrase in _MISSING_STRING_PHRASES)
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) == 0
     return False
+
+
+def _audit_looks_computed(audit: Dict[str, Any]) -> bool:
+    checks = audit.get("checks")
+    return (
+        audit.get("generated_by") == "audit_artifact"
+        and isinstance(audit.get("record_count"), int)
+        and isinstance(checks, dict)
+        and "ready_for_done" in audit
+    )
 
 
 def _dedupe_key(record: Any, fields: Iterable[str] | None) -> str:
@@ -1055,6 +1106,33 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         text = str(data)
         return text[:1000] + ("..." if len(text) > 1000 else "")
 
+    def _audit_readiness_notes(
+        audit: Dict[str, Any],
+        audit_recommendation: Dict[str, Any],
+    ) -> list[str]:
+        if not audit_recommendation.get("recommended"):
+            return []
+        notes: list[str] = []
+        if not _audit_looks_computed(audit):
+            notes.append(
+                "attached audit does not match audit_artifact(...) output "
+                "(expected generated_by='audit_artifact', record_count, checks, and ready_for_done)"
+            )
+            return notes
+        checks = audit.get("checks") or {}
+        if audit_recommendation.get("visual_artifact_path_count", 0) >= 3 and "visual_files" not in checks:
+            notes.append("audit is missing a visual_files check for referenced image artifacts")
+        if (
+            audit_recommendation.get("record_count_estimate", 0) > 20
+            and not any(key in checks for key in ("missing_fields", "dedupe", "buckets"))
+        ):
+            notes.append(
+                "audit is missing structured result checks such as missing_fields, dedupe, or buckets"
+            )
+        if audit_recommendation.get("source_identity_claim_paths") and "source_evidence" not in checks:
+            notes.append("audit is missing source_evidence for claimed source/entity/location fields")
+        return notes
+
     def set_final_answer(
         data: Any,
         artifact_name: str | None = None,
@@ -1083,12 +1161,16 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             artifact = _write_artifact(artifact_name, result_text, mime_type or default_mime)
         count = _final_answer_count(data)
         audit_recommendation = _final_answer_audit_recommendation(data, count)
+        audit_readiness_notes: list[str] = []
         if isinstance(audit, dict):
             ready_for_done = bool(audit.get("ready_for_done"))
             source_claim_paths = audit_recommendation.get("source_identity_claim_paths") or []
             has_source_evidence = bool((audit.get("checks") or {}).get("source_evidence"))
             source_evidence_missing = bool(source_claim_paths and not has_source_evidence)
             if source_evidence_missing:
+                ready_for_done = False
+            audit_readiness_notes = _audit_readiness_notes(audit, audit_recommendation)
+            if audit_readiness_notes:
                 ready_for_done = False
         else:
             ready_for_done = not audit_recommendation["recommended"]
@@ -1107,6 +1189,15 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 "audit_artifact(...) with required fields, dedupe fields, bucket "
                 "targets, and visual files before done. Reasons: "
                 + ", ".join(audit_recommendation["reasons"])
+            )
+        elif audit_readiness_notes:
+            summary["audit_recommendation"] = audit_recommendation
+            summary["audit_note"] = (
+                "The attached artifact audit is not sufficient for this final answer. "
+                + " ".join(audit_readiness_notes)
+                + ". Run audit_artifact(...) with the relevant records/path, required "
+                "fields, dedupe fields, bucket targets, source evidence, and visual files "
+                "before done."
             )
         elif isinstance(audit, dict) and source_evidence_missing:
             summary["audit_recommendation"] = audit_recommendation
@@ -1132,7 +1223,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         count_text = f" count={count}" if count is not None else ""
         artifact_text = f" artifact={artifact['path']}" if artifact else ""
         if isinstance(audit, dict):
-            audit_text = f" audit_ready_for_done={audit.get('ready_for_done')}"
+            audit_text = f" audit_ready_for_done={ready_for_done}"
         elif summary.get("audit_note"):
             audit_text = " audit=missing ready_for_done=False"
         else:
@@ -1184,6 +1275,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 records = [extracted]
 
         audit: Dict[str, Any] = {
+            "generated_by": "audit_artifact",
+            "schema_version": 1,
             "ready_for_done": True,
             "source_path": source_path or (str(path) if path is not None else None),
             "record_count": len(records),

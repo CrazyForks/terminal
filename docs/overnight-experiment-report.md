@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Source-provenance audit protocol implemented; focused rerun pending |
+| Recommended branch state | Placeholder-missing/ad-hoc-audit guard implemented; focused rerun pending |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
-| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; manual 1 pass / 1 partial / 1 fail |
+| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; manual 2 pass / 1 partial / 0 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
-| Most important improvement | Audit guard fixed blank visual artifacts and forced repair before done |
+| Most important improvement | Source-provenance audit fixed the 302 Potrero source-entity failure |
 | Worst regression | None yet |
-| Open root-cause clusters | Source-entity provenance, global dedupe scope, top-k/ranking proof |
-| Next experiment | Rebuild terminal binary, rerun focused tasks 6/10/16, then run full `real_v8`/`real_v14_short` if no regression |
+| Open root-cause clusters | Placeholder values counted as present fields, ad-hoc audit bypass, top-k/ranking proof |
+| Next experiment | Rerun focused tasks 6/10/16 with placeholder/ad-hoc audit guard, then run full `real_v8`/`real_v14_short` if no regression |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -617,4 +617,79 @@ Interpretation:
   - `cargo fmt --check`: passed.
   - `cargo test`: passed, including `browser-use-core` `54` tests.
   - Full Python suite: passed, `21 passed`.
+- Decision: Keep. Focused rerun fixed the task `16` source-entity failure without regressing task `10`.
+
+### Focused Rerun: `overnight-real-v14-source-provenance-focus-20260514-004948`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-source-provenance-focus-20260514-004948`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `2` pass, `1` partial, `0` fail
+- Token usage: `3,352,608` total tokens for the three focused tasks.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Remaining problem |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | Returned 5 relevant SIM/eSIM ads with IDs, copy, and nontrivial creative/detail artifacts. | Required fields were filled with unavailable placeholders: all `deployment_duration` values say "Not visible..." and platforms are generic filter prose, not per-ad platform evidence. Ranking proof is still weak. |
+| 10 | pass | pass | Produced the full TopPlastic ranks `1-114`, `85` ASPS general records, and `40` candidates for each of the 13 specialties via ASPS procedure-filtered evidence. ASPS rows have ABPS noted. | TopPlastic-only records do not have ASPS-derived specialties/ABPS, which is an honest source-coverage caveat rather than a fabricated fill. |
+| 16 | pass | pass | Fixed the prior first-principles failure. `artifact_audit.json` separates requested location from selected source entity and proves `McDonald's (16932-POTRERO HILL)` at `302 Potrero Ave, San Francisco, CA 94110`; output has `13` categories and `128` globally unique item-price rows. | ZIP mismatch remains as a source-data caveat: user text said `94103`, actual source store record reports `94110`. |
+
+Concrete checks:
+
+- Task `6` output `result.json` has 5 ads, but `deployment_duration` is `"Not visible in captured result/detail card; ad status was Active."` for every row and `platforms` is `"Exact per-ad platform icons not visible..."`.
+- Task `6` final answer used a hand-written audit dictionary with `ready_for_done=true`; it did not use the computed `audit_artifact(...)` shape.
+- Task `10` primary `records` contains `167` unique surgeons:
+  - `114` TopPlastic records;
+  - `85` ASPS records;
+  - `32` records present in both sources;
+  - all 13 specialty arrays have count `40`;
+  - ASPS records have ABPS certification noted.
+- Task `16` audit evidence:
+  - `source_url`: `https://mcdonalds.order.online/store/mcdonald-s-san-francisco-653629/?delivery=true`
+  - `source_page_title`: `McDonald's 302 Potrero Avenue - Order pickup and delivery`
+  - `selected_source_entity_name`: `McDonald's (16932-POTRERO HILL)`
+  - `selected_source_entity_address`: `302 Potrero Ave, San Francisco, CA 94110, USA`
+  - duplicate item-price rows: `0`
+
+Interpretation:
+
+- Source provenance was a successful generalizable intervention. It fixed the task `16` wrong-store/source conflation without a McDonald's-specific validator.
+- The remaining task `6` failure is a different generic protocol gap:
+  - unavailable prose such as "not visible" is being treated as a present required value;
+  - a hand-written audit dictionary can bypass computed missing-field/visual-file checks;
+  - the model needs to use `audit_artifact(...)` output, not merely declare an audit passed.
+
+Decision:
+
+- Keep `9549a81`.
+- Implement a general missing-placeholder and computed-audit guard before another focused rerun.
+
+### Intervention: Placeholder Missing Values And Computed Audit Guard
+
+- Hypothesis: Task `6` remains partial because the pre-final audit protocol accepts semantic placeholders and ad-hoc audit dictionaries. A general guard should force real extraction or honest gap reporting without encoding benchmark answers.
+- Intervention:
+  - `_is_missing(...)` now treats common unavailable placeholders as missing values: `unknown`, `n/a`, `not visible`, `not available`, `unavailable`, `could not determine`, `not found`, `not shown`, `not provided`, and related variants.
+  - `audit_artifact(...)` now marks its output with `generated_by: audit_artifact` and `schema_version: 1`.
+  - `set_final_answer(...)` now rejects audit-worthy final answers that attach a hand-written audit dictionary rather than computed `audit_artifact(...)` output.
+  - If a final answer references multiple image artifacts, an attached computed audit must include `visual_files`.
+  - If a final answer has large structured output, the computed audit must include at least one structured check: `missing_fields`, `dedupe`, or `buckets`.
+  - If a final answer claims a source/entity/location, the computed audit must include `source_evidence`.
+  - The Python tool prompt now says unavailable placeholders are gaps, not completed fields, and tells the model not to pass hand-written audit dictionaries for audit-worthy artifacts.
+- Why this is generalizable:
+  - It does not inspect task IDs, websites, expected answers, or benchmark-specific fields.
+  - It enforces the worker's own audit protocol and common data-quality semantics.
+  - It still permits honest explicit completion with stated gaps when a source truly does not expose a field.
+- Expected movement:
+  - Task `6`: `deployment_duration: "Not visible..."` and generic platform prose should cause `audit_artifact(required_fields=[...])` to fail, forcing either deeper extraction or explicit partial completion.
+  - Task `10`: no expected regression; existing successful run used computed bucket/missing/dedupe audit.
+  - Task `16`: no expected regression; existing successful run used computed dedupe plus source-evidence audit.
+- Verification:
+  - Focused worker tests: passed, `23 passed`.
+  - Full Python tests: passed, `23 passed`.
+  - `cargo fmt --check`: passed.
+  - `cargo test`: passed.
+  - `cargo build --bin browser-use-terminal`: passed.
 - Decision: Pending focused rerun.

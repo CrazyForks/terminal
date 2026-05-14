@@ -406,6 +406,7 @@ result = audit
     assert response["ok"] is True
     audit = response["data"]
     assert audit["ready_for_done"] is False
+    assert audit["generated_by"] == "audit_artifact"
     assert audit["record_count"] == 3
     assert audit["checks"]["missing_fields"]["name"]["count"] == 1
     assert audit["checks"]["dedupe"]["duplicate_count"] == 1
@@ -414,6 +415,33 @@ result = audit
     }
     assert Path(audit["audit_path"]).exists()
     assert response["artifacts"][0]["source_path"] == audit["audit_path"]
+
+
+def test_worker_audit_artifact_treats_unavailable_placeholders_as_missing(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-placeholder-audit",
+            "session_id": "task-artifact-placeholder-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [
+    {'duration': 'Not visible in captured result/detail card; ad status was Active.'},
+    {'duration': 'unknown_from_topplastics_source'},
+    {'duration': '12 days'},
+]
+audit = audit_artifact(records=rows, required_fields=['duration'])
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    assert audit["checks"]["missing_fields"]["duration"]["count"] == 2
 
 
 def test_worker_audit_artifact_reports_missing_source_evidence(tmp_path: Path) -> None:
@@ -540,6 +568,42 @@ result = summary
     assert response["data"]["audit_recommendation"]["source_identity_claim_paths"] == [
         "store_address"
     ]
+
+
+def test_worker_set_final_answer_rejects_ad_hoc_audit_for_audit_worthy_output(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-ad-hoc-audit",
+            "session_id": "task-final-answer-ad-hoc-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+ads = [
+    {
+        'advertiser_name': f'Ad {idx}',
+        'deployment_duration': 'Not visible in captured result/detail card',
+        'creative_screenshot': f'/tmp/ad-{idx}.png',
+    }
+    for idx in range(5)
+]
+audit = {
+    'ready_for_done': True,
+    'record_count': 5,
+    'missing_required_counts': {'advertiser_name': 0, 'deployment_duration': 0},
+}
+summary = set_final_answer({'ads': ads}, artifact_name='ads.json', audit=audit)
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert "does not match audit_artifact" in response["data"]["audit_note"]
+    assert response["data"]["audit_recommendation"]["visual_artifact_path_count"] == 5
+    assert "audit_ready_for_done=False" in response["outputs"][-1]["text"]
 
 
 def test_worker_set_final_answer_recommends_audit_for_summary_artifacts_and_images(tmp_path: Path) -> None:
