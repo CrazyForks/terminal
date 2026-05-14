@@ -19,7 +19,7 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 | Most important improvement | Host-side hard timeout for Python worker calls |
 | Worst regression | None yet |
 | Open root-cause clusters | Field-quality validation, over-broad extraction, artifact finalization after output exists |
-| Next experiment | Targeted rerun of stalled task 4, then repeat `real_v14_short` smoke |
+| Next experiment | Repeat `real_v14_short` smoke with `.env` Browser Use cloud credentials present |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -138,3 +138,11 @@ Decision after targeted check:
 
 - Keep the host-side Python hard-timeout change because unit tests reproduce the first-principles hang and the focused eval no longer left a pending scheduler slot.
 - Before running full `real_v8`/`BU_Bench_V1`, fix or document the missing Browser Use cloud API credential so remote browser access is actually available.
+
+### Run Hygiene Fix: Cloud Credential In Worktree
+
+- Finding: the overnight worktree had no `.env`, while the original worktree had a gitignored `.env` containing `BROWSER_USE_API_KEY`.
+- Action: copied the original `.env` into the overnight worktree.
+- Git status: `.env` remains ignored and must not be committed.
+- Expected effect: subsequent cloud-mode runs should have actual browser helpers instead of `browser_harness_error: "Browser Use cloud selected, but BROWSER_USE_API_KEY is not set"`.
+- Next measurement: repeat `real_v14_short` before running larger datasets.
