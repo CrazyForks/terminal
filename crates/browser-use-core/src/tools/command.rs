@@ -12,7 +12,10 @@ use browser_use_store::Store;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 
-const DEFAULT_YIELD_TIME_MS: u64 = 1000;
+const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
+const DEFAULT_WRITE_STDIN_YIELD_TIME_MS: u64 = 250;
+const MIN_YIELD_TIME_MS: u64 = 250;
+const MIN_EMPTY_POLL_YIELD_TIME_MS: u64 = 5_000;
 const MAX_YIELD_TIME_MS: u64 = 30_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const TOKEN_TO_CHAR_APPROX: usize = 4;
@@ -71,7 +74,7 @@ pub(crate) fn exec_command(
         bail!("exec_command requires cmd");
     }
     let cmd = rewrite_virtual_home_in_text(session, raw_cmd);
-    let yield_time = yield_time(&call.arguments);
+    let yield_time = yield_time(&call.arguments, DEFAULT_EXEC_YIELD_TIME_MS);
     let max_chars = max_output_chars(&call.arguments);
     let workdir = resolve_workdir(
         session,
@@ -234,7 +237,7 @@ pub(crate) fn write_stdin(
         .get("chars")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let yield_time = yield_time(&call.arguments);
+    let yield_time = write_stdin_yield_time(&call.arguments, chars);
     let max_chars = max_output_chars(&call.arguments);
     store.append_event(
         &session.id,
@@ -332,6 +335,47 @@ pub(crate) fn write_stdin(
 
 fn commands() -> &'static Mutex<HashMap<String, ManagedCommand>> {
     COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
+    let mut pending = Vec::new();
+    {
+        let mut commands = commands().lock().expect("command registry poisoned");
+        let process_ids = commands
+            .iter()
+            .filter_map(|(process_id, command)| {
+                (command.session_id == session_id).then(|| process_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for process_id in process_ids {
+            if let Some(command) = commands.remove(&process_id) {
+                pending.push(command);
+            }
+        }
+    }
+
+    let count = pending.len();
+    for mut command in pending {
+        let _ = command.process.kill();
+        let _ = command.process.wait();
+        finish_readers(&mut command);
+    }
+    count
+}
+
+pub(crate) fn exec_command_is_known_read_only(arguments: &Value) -> bool {
+    let cmd = arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() || has_shell_mutation_syntax(cmd) {
+        return false;
+    }
+    let Some(words) = rough_shell_words(cmd) else {
+        return false;
+    };
+    command_words_are_known_read_only(&words)
 }
 
 fn spawn_process(
@@ -456,7 +500,6 @@ impl ManagedProcess {
         }
     }
 
-    #[cfg(test)]
     fn wait(&mut self) -> Result<ProcessExit> {
         match self {
             Self::Pipes { child, .. } => {
@@ -476,7 +519,6 @@ impl ManagedProcess {
         }
     }
 
-    #[cfg(test)]
     fn kill(&mut self) -> Result<()> {
         match self {
             Self::Pipes { child, .. } => child.kill().map_err(Into::into),
@@ -652,12 +694,21 @@ fn max_output_chars(arguments: &Value) -> usize {
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS * TOKEN_TO_CHAR_APPROX)
 }
 
-fn yield_time(arguments: &Value) -> Duration {
+fn write_stdin_yield_time(arguments: &Value, chars: &str) -> Duration {
+    let default_ms = if chars.is_empty() {
+        MIN_EMPTY_POLL_YIELD_TIME_MS
+    } else {
+        DEFAULT_WRITE_STDIN_YIELD_TIME_MS
+    };
+    yield_time(arguments, default_ms)
+}
+
+fn yield_time(arguments: &Value, default_ms: u64) -> Duration {
     let millis = arguments
         .get("yield_time_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_YIELD_TIME_MS)
-        .min(MAX_YIELD_TIME_MS);
+        .unwrap_or(default_ms)
+        .clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
     Duration::from_millis(millis)
 }
 
@@ -723,6 +774,131 @@ fn shell_args(shell: &str, login: bool, cmd: &str) -> Vec<String> {
     } else {
         vec!["-c".to_string(), cmd.to_string()]
     }
+}
+
+fn has_shell_mutation_syntax(cmd: &str) -> bool {
+    cmd.contains('\n')
+        || cmd.contains('>')
+        || cmd.contains('<')
+        || cmd.contains('&')
+        || cmd.contains('|')
+        || cmd.contains(';')
+        || cmd.contains('`')
+        || cmd.contains("$(")
+}
+
+fn rough_shell_words(cmd: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in cmd.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn command_words_are_known_read_only(words: &[String]) -> bool {
+    let Some(first) = words.first().map(String::as_str) else {
+        return false;
+    };
+    let command = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first);
+    match command {
+        "cat" | "cut" | "date" | "echo" | "env" | "false" | "grep" | "head" | "id" | "ls"
+        | "nl" | "pwd" | "rg" | "sed" | "stat" | "tail" | "true" | "uname" | "wc" | "which"
+        | "whoami" => read_only_command_args_are_safe(command, &words[1..]),
+        "git" => git_command_is_read_only(&words[1..]),
+        "find" => find_command_is_read_only(&words[1..]),
+        _ => false,
+    }
+}
+
+fn read_only_command_args_are_safe(command: &str, args: &[String]) -> bool {
+    match command {
+        "rg" => !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--pre" | "-z" | "--search-zip" | "--hostname-bin"
+            ) || arg.starts_with("--pre=")
+                || arg.starts_with("--hostname-bin=")
+        }),
+        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
+        _ => true,
+    }
+}
+
+fn git_command_is_read_only(args: &[String]) -> bool {
+    let Some(subcommand) = args.iter().find(|arg| !arg.starts_with('-')) else {
+        return false;
+    };
+    let tail = args
+        .iter()
+        .position(|arg| arg == subcommand)
+        .map(|pos| &args[pos + 1..])
+        .unwrap_or(&[]);
+    match subcommand.as_str() {
+        "diff" | "grep" | "log" | "ls-files" | "rev-parse" | "show" | "status" => true,
+        "branch" => tail.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--show-current"
+                    | "--list"
+                    | "--all"
+                    | "-a"
+                    | "-r"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--color"
+                    | "--no-color"
+            ) || arg.starts_with("--color=")
+        }),
+        "worktree" => {
+            tail.first().is_some_and(|arg| arg == "list")
+                && tail
+                    .iter()
+                    .skip(1)
+                    .all(|arg| matches!(arg.as_str(), "--porcelain" | "-z"))
+        }
+        _ => false,
+    }
+}
+
+fn find_command_is_read_only(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprint0"
+        ) || arg.starts_with("-fprintf")
+    })
 }
 
 #[cfg(test)]
@@ -957,6 +1133,40 @@ mod tests {
                 .as_str()
                 .unwrap_or("cmd_call_exec_closed_stdin"),
         );
+    }
+
+    #[test]
+    fn exec_read_only_detection_matches_common_inspection_commands() {
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "rg -n browser src"})
+        ));
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "sed -n '1,20p' Cargo.toml"})
+        ));
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "git status --short"})
+        ));
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "git branch --show-current"})
+        ));
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "git worktree list --porcelain"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "cargo test"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "git branch -D old"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "git worktree add ../new"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "sed -i s/a/b/ file"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "rg foo > out.txt"})
+        ));
     }
 
     fn stop_for_test(process_id: &str) {
