@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Prompt self-review intervention verified; focused rerun pending |
+| Recommended branch state | Second self-review revision verified; focused rerun pending |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
 | Latest `real_v14_short` strict/manual score | Cloud run: runner 10/10; manual strict 7 pass / 3 partial / 0 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
 | Most important improvement | Host-side hard timeout for Python worker calls |
 | Worst regression | None yet |
-| Open root-cause clusters | Source/selection caveats, explicit count targets, dedupe requirements before finalization |
-| Next experiment | Rerun partial tasks `6,10,16` with cloud browser and judge strict quality |
+| Open root-cause clusters | Blank visual artifacts, global dedupe scope, per-record field completeness |
+| Next experiment | Revise general self-review prompt, rerun partial tasks `6,10,16` |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -214,4 +214,74 @@ Next generalizable hypothesis:
   - `cargo fmt --check`: passed
   - `cargo test`: passed
   - `uv run --with pytest python -m pytest -q`: passed, `15 passed`
-- Decision: Verification passed; focused rerun pending.
+- Decision: Keep as first revision; focused rerun showed improvement but not enough for strict pass.
+
+### Focused Rerun: `overnight-real-v14-self-review-focus-20260513-223203`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-self-review-focus-20260513-223203`
+- Manifest: `/tmp/overnight-real-v14-self-review-focus-20260513-223203/state/dataset-runs/overnight-real-v14-self-review-focus-20260513-223203.json`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `0` pass, `3` partial, `0` fail
+- Token usage: `1,549,556` total tokens, cost missing
+
+Manual judging:
+
+| Task | Runner | Manual | Delta vs previous cloud run | Evidence |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | Improved selection disclosure and duration fields; still failed screenshot artifact validity. | `outputs/result.json`, `outputs/ad_*_creative.png`, `outputs/search_results_top.png` |
+| 10 | pass | partial | Improved ASPS extraction from 12-ish useful ASPS records to `173` ASPS results and reached `40` candidates per specialty; still has blank practice fields and `187/272` combined surgeons without specialties. | `outputs/result.json`, `artifacts/images/shot-3.png` |
+| 16 | pass | partial | Did not fix dedupe. Coverage was lower than previous cloud run: `18` categories / `218` rows / `140` unique item-price pairs vs previous `19` / `271` / `162`. | `outputs/result.json`, `outputs/cache.json` |
+
+Concrete checks:
+
+- Task `6` visual artifacts:
+  - Every per-ad `card` and `creative` PNG was a single solid color, `(240, 242, 245)`, with one sampled color.
+  - Full-page screenshots had hundreds of sampled colors and showed real page content.
+  - Root cause: the model treated file existence and dimensions as sufficient, but did not visually/pixel-check that clipped screenshots contained the target ad.
+- Task `10` source/field completeness:
+  - `topplasticsurgeonreviews_full_list`: `114`
+  - `asps_results`: `173`
+  - `combined_surgeons`: `272`
+  - specialty lists: all `13` specialties had `40` candidates.
+  - `abps_board_certified`: `191` true, `81` null.
+  - Important caveat: many top-review-only records had no specialties, and ASPS practice fields were blank.
+- Task `16` dedupe:
+  - `18` categories, `218` item rows, `140` unique item-price pairs, `78` duplicate item-price pairs.
+  - Duplicates were absent within individual categories but repeated globally across category sections such as `Most Ordered`, `Burgers`, and `Extra Value Meals`.
+
+Interpretation:
+
+- The first self-review prompt moved the model in the right direction for task `6` ranking disclosure and task `10` count targets.
+- It did not make the model inspect visual artifact validity.
+- It did not define dedupe scope strongly enough; the model likely interpreted "no duplicates" as no duplicates within each category, not no duplicate items in the whole returned JSON.
+- It did not force enough per-field coverage review when the task asks "for each surgeon, identify specialties" and practice/ABPS details.
+
+Decision:
+
+- Keep `553b343`, because it improved useful behavior without adding deterministic benchmark logic.
+- Revise the prompt again with general self-review checks for:
+  - visual artifact nonblank/content verification;
+  - global dedupe scope unless the task explicitly scopes dedupe more narrowly;
+  - missing-field counts for per-record required fields;
+  - final answers pointing to the full artifact, not only a summary artifact.
+
+### Intervention: Self-Review Revision For Artifacts, Dedupe, And Missing Fields
+
+- Hypothesis: The first self-review prompt was too abstract. The remaining misses need general but concrete checks for visual artifact content, global dedupe scope, and required-field coverage.
+- Intervention:
+  - Treat `no duplicates` as global across the returned artifact unless explicitly scoped otherwise.
+  - Tell the model to verify screenshots/files contain requested content, not just that a file exists.
+  - Tell the model to report missing-field counts for `for each record` tasks and revisit source/detail pages when many values are blank.
+  - Tell the model to point final answers at the full artifact path first when a summary is also provided.
+- Expected movement:
+  - Task `6`: avoid blank per-ad screenshot crops or report unavailable screenshots.
+  - Task `10`: better caveats and/or deeper per-record field enrichment.
+  - Task `16`: global dedupe across repeated menu sections.
+- Verification:
+  - `cargo fmt --check`: passed
+  - `cargo test`: passed
+  - `uv run --with pytest python -m pytest -q`: passed, `15 passed`
+- Decision: Focused rerun pending.
