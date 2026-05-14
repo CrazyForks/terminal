@@ -15,7 +15,7 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 | Recommended branch state | Latest semantic run improves immediate previous full v8 from 67/29/4 to 71/26/3; next intervention in progress: zero-record audit guard, not-ready final-answer bypass guard, and stronger semantic/frontier prompt |
 | Latest `real_v8` strict/manual score | `71` pass / `26` partial / `3` fail, weighted `84.0/100`, root `/tmp/overnight-real-v8-semantic-20260514-061215` |
 | Latest `real_v14_short` strict/manual score | `7` pass / `3` partial / `0` fail, root `/tmp/overnight-real-v14-semantic-20260514-054705` |
-| Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
+| Latest `BU_Bench_V1` strict/manual score | `74` pass / `9` partial / `17` fail, weighted `78.5/100`, root `/tmp/overnight-bu-bench-v1-20260514-072225` |
 | Most important improvement | Final answer persistence fixed preview/status/max-turn failures; semantic prompt recovered v8 tasks 8, 19, 51, 57, 60 and improved 99/100 |
 | Worst regression | Semantic regressions remain in dynamic-offer/frontier tasks (`47`, `49`, `50`) and source-state tasks (`21`, `40`) |
 | Open root-cause clusters | Stateful page proof, source-route fidelity, zero-record readiness, required-field provenance, full-frontier evidence, visual/lazy section extraction, price/discount semantics |
@@ -1255,3 +1255,74 @@ Decision:
   - Run full verification (`cargo fmt --check`, `cargo test`, Python tests, build).
   - Commit if clean.
   - Focused retest likely failure probes: v8 `9`, `15`, `21`, `27`, `47`, `49`, `50`, `99`, `100`, plus v14 `6`.
+
+## Experiment 20260514-04: BU_Bench_V1 Remote Run And Manual Judging
+
+- Dataset: `BU_Bench_V1`
+- Root: `/tmp/overnight-bu-bench-v1-20260514-072225`
+- Manifest: `/tmp/overnight-bu-bench-v1-20260514-072225/state/dataset-runs/BU_Bench_V1-1778768545971.json`
+- Judge packets: `/tmp/overnight-bu-bench-v1-20260514-072225/judge-packets`
+- Commit under test: `c498a66` (`Add human-readable overnight report`)
+- Browser mode: cloud only. Local CDP env vars were unset, local Chrome auto-open was disabled, and no local browser was opened for judging.
+- Runner result: `95` passed / `5` failed / `0` pending.
+- Manual strict result from five judging agents: `74` pass / `9` partial / `17` fail.
+- Weighted score with partial = 0.5: `78.5/100`.
+
+Manual score by category:
+
+| Category | Pass | Partial | Fail | Weighted | Read |
+| --- | ---: | ---: | ---: | ---: | --- |
+| WebBenchREAD | 15 | 4 | 1 | 17.0 | Mostly strong artifact-backed extraction; one content mismatch and a few weak source/order proofs. |
+| OM2W2 | 17 | 3 | 0 | 18.5 | Strongest general web-research category; partials are factual precision and evidence-depth risks. |
+| InteractionTests | 18 | 2 | 0 | 19.0 | Browser interaction is healthy; partials are weak final evidence (`Done.` without proof), not visible runtime failures. |
+| GAIA | 10 | 0 | 10 | 10.0 | Exact-answer tasks are harsh; many completed but answered the wrong entity/value/count. |
+| BrowseComp | 14 | 0 | 6 | 14.0 | Four failures were max-turn no-answer cases; two completed with wrong entities. |
+
+Runner failures:
+
+| Index | Category | Task ID | Cause |
+| ---: | --- | --- | --- |
+| 63 | GAIA | `d7eea2b1-7d31-425e-977c-b803ffd28250` | Provider rejected invalid image input. |
+| 83 | BrowseComp | `cd22ee34-6f65-4bf2-acb1-34bc32a735af` | Exceeded max provider turns. |
+| 90 | BrowseComp | `8d92dbe1-bf45-4daf-ac05-02d0bd2cf9c8` | Exceeded max provider turns. |
+| 95 | BrowseComp | `71906b5a-577d-48c4-a253-c756790afa64` | Exceeded max provider turns. |
+| 98 | BrowseComp | `55371adf-23f9-4f35-88d4-f342c972bf8e` | Exceeded max provider turns. |
+
+Notable semantic failures despite runner success:
+
+| Index | Category | Expected | Final | Failure mode |
+| ---: | --- | --- | --- | --- |
+| 60 | GAIA | `6` | `3` | Count/reasoning error. |
+| 62 | GAIA | `6` | `79` | Counted occurrence records instead of requested animals. |
+| 66 | GAIA | `2018` | `1987` | Reconstructed wrong stock-price crossing semantics. |
+| 67 | GAIA | `Mapping Human Oriented Information to Software Agents for Online Systems Usage` | `A New Software Agent 'Learning' Algorithm` | Wrong paper/entity. |
+| 72 | GAIA | `mice` | `mice and humans` caveat | Added extra answer beyond requested exact output. |
+| 74 | GAIA | `pears, bananas` | `pears, plums, bananas` | Included extra item. |
+| 76 | GAIA | `Claude Shannon` | `Jerome Wiesner` | Wrong entity. |
+| 78 | GAIA | `17` | `17000` | Unit/format mismatch; answered hours instead of thousands of hours. |
+| 79 | GAIA | `backtick` | `dot` | Wrong symbol. |
+| 82 | BrowseComp | `Mallorca, Spain` | `Brno, Czech Republic` | Wrong location/entity chain. |
+| 94 | BrowseComp | `Galacta: The Battle for Saturn` | `ShadowCaster` | Wrong game. |
+
+Partial clusters:
+
+- Weak final evidence: InteractionTests `41` and `57` likely completed, but final output was only `Done.` with no success text, secret, or artifact proof.
+- Source/order proof: WebBenchREAD `1`, `3`, and `12` returned plausible outputs without enough evidence that they were the requested first results, Review Bytes, or map-view filtered results.
+- Site/access fallback: WebBenchREAD `15` hit VRBO blocking and used Expedia fallback, so the task was useful but not source-faithful.
+- Factual precision/evidence depth: OM2W2 `23`, `29`, and `34` had useful outputs but unresolved factual thresholds, exact model gaps, or weak route/distance proof.
+
+Interpretation:
+
+- BU_Bench is not a pure browser-runtime benchmark. The browser interaction categories did well, but exact-answer reasoning categories exposed substantial model/research quality gaps.
+- The gap between runner success (`95%`) and manual strict pass (`74%`) is large. The harness currently measures task completion/finalization much more than semantic correctness.
+- The main generalizable fixes are not task-specific validators. They are:
+  - stronger answer-shape pressure for exact-answer tasks: final answer should be only the requested unit/entity/value and should not include extra candidates;
+  - better source-chain verification before finalizing answer-heavy research tasks;
+  - invalid image hardening before sending screenshots/images to the provider;
+  - max-turn salvage for BrowseComp-style long searches, where a best current candidate plus evidence may be better than no answer;
+  - final evidence requirement for interaction tasks, so `Done.` carries visible success text or a captured artifact.
+
+Decision:
+
+- Treat BU_Bench as a useful complementary benchmark, not a replacement for `real_v8`/`real_v14`.
+- No immediate code change was made from this judging pass. The next implementation should prioritize general final-answer/evidence discipline and provider image validation, then rerun the failed/partial BU_Bench probes alongside the existing v8/v14 probes.
