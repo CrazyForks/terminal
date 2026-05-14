@@ -944,6 +944,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         data: Any,
         artifact_name: str | None = None,
         mime_type: str | None = None,
+        audit: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Persist the final user-facing answer for a later `done` call.
 
@@ -961,6 +962,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             result_text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
             default_mime = "application/json"
             default_name = "final_answer.json"
+        audit = audit if audit is not None else ns.get("last_artifact_audit")
         artifact = None
         if artifact_name:
             artifact = _write_artifact(artifact_name, result_text, mime_type or default_mime)
@@ -969,8 +971,16 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "ready": True,
             "count": count,
             "artifact": artifact,
+            "audit": audit,
+            "ready_for_done": audit.get("ready_for_done") if isinstance(audit, dict) else None,
             "preview": _final_answer_preview(data),
         }
+        if audit is None and count is not None and count > 20:
+            summary["audit_note"] = (
+                "No artifact audit was attached. For large structured results, run "
+                "audit_artifact(...) with required fields, dedupe fields, bucket "
+                "targets, and visual files before done."
+            )
         metadata = {
             "result": result_text,
             "summary": summary,
@@ -985,7 +995,13 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         ns["result"] = {"final_answer": summary}
         count_text = f" count={count}" if count is not None else ""
         artifact_text = f" artifact={artifact['path']}" if artifact else ""
-        emit_output(f"final answer ready:{count_text}{artifact_text}")
+        if isinstance(audit, dict):
+            audit_text = f" audit_ready_for_done={audit.get('ready_for_done')}"
+        elif summary.get("audit_note"):
+            audit_text = " audit=missing"
+        else:
+            audit_text = ""
+        emit_output(f"final answer ready:{count_text}{artifact_text}{audit_text}")
         return summary
 
     def audit_artifact(
@@ -1114,6 +1130,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         audit["audit_path"] = str(audit_path)
         copy_artifact(audit_path, kind="file", name=artifact_name, mime="application/json")
+        ns["last_artifact_audit"] = audit
         emit_output(
             "artifact audit ready: "
             f"ready_for_done={audit['ready_for_done']} "

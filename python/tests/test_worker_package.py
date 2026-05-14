@@ -416,6 +416,30 @@ result = audit
     assert response["artifacts"][0]["source_path"] == audit["audit_path"]
 
 
+def test_worker_set_final_answer_embeds_last_artifact_audit(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-audit",
+            "session_id": "task-final-answer-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [{'name': 'A'}, {'name': ''}]
+audit = audit_artifact(records=rows, required_fields=['name'])
+summary = set_final_answer({'rows': rows}, artifact_name='rows.json')
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert response["data"]["audit"]["checks"]["missing_fields"]["name"]["count"] == 1
+    assert "audit_ready_for_done=False" in response["outputs"][-1]["text"]
+    metadata = tmp_path / "artifacts" / ".final_answer.json"
+    assert '"ready_for_done": false' in metadata.read_text()
+
+
 def test_managed_browser_does_not_use_system_chromium_without_opt_in(
     tmp_path: Path, monkeypatch
 ) -> None:

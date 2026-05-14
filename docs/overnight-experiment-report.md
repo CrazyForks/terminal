@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Operational `audit_artifact(...)` helper verified; focused rerun pending |
+| Recommended branch state | `0cb4ac7` audit helper exists; adoption failed; final-answer audit surfacing pending commit |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
 | Latest `real_v14_short` strict/manual score | Cloud run: runner 10/10; manual strict 7 pass / 3 partial / 0 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
 | Most important improvement | Host-side hard timeout for Python worker calls |
 | Worst regression | None yet |
 | Open root-cause clusters | Blank visual artifacts, global dedupe scope, per-record field completeness |
-| Next experiment | Rerun focused tasks `6,10,16` with the audit helper, then run full `real_v8` baseline |
+| Next experiment | Commit audit surfacing in `set_final_answer`, rerun focused tasks once, then run full `real_v8` baseline |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -363,4 +363,58 @@ Decision:
   - `uv run --with pytest python -m pytest -q`: passed, `16 passed`
   - `cargo fmt --check`: passed
   - `cargo test`: passed
+- Decision: Helper itself works, but prompt-only adoption failed in the first focused rerun.
+
+### Focused Rerun: `overnight-real-v14-audit-helper-focus-20260513-231435`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-audit-helper-focus-20260513-231435`
+- Manifest: `/tmp/overnight-real-v14-audit-helper-focus-20260513-231435/state/dataset-runs/overnight-real-v14-audit-helper-focus-20260513-231435.json`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict local read: approximately `1` pass, `2` partial, `0` fail
+- Token usage: `3,430,891` total tokens, cost missing
+- Audit adoption: `0` `audit_artifact(...)` calls found; `0` `artifact_audit.json` files produced.
+
+Manual judging:
+
+| Task | Runner | Manual | Delta vs previous focused run | Evidence |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | pass | Visual artifacts stayed fixed and cleaner: 5 selected ad screenshots are nonblank PNGs, plus a full search-results screenshot. | `outputs/result.json`, `outputs/ad_*.png`, `outputs/search_results_full.png` |
+| 10 | pass | partial | Large improvement in coverage: `977` records, `896` ASPS unique, every specialty count above `40`; still has `100` records with empty `specialties_offered` and `81` missing practices. | `outputs/result.json`, `outputs/result.csv` |
+| 16 | pass | partial | Store address corrected back to `94103`, but dedupe still failed: `248` rows, `162` unique item-price pairs, `86` duplicate item-price rows. | `outputs/result.json` |
+
+Concrete checks:
+
+- Task `6`:
+  - 5 ad screenshots had nonblank image content.
+  - `search_results_full.png` existed and had `1009` sampled colors.
+  - This is the first focused rerun where the visual artifact failure appears solved.
+- Task `10`:
+  - Specialty candidate counts: Breast `359`, Rhinoplasty `250`, Face Lift `354`, Facial Reconstruction `402`, Liposuction `199`, Eyelid `238`, Tummy Tuck `239`, Mommy Makeover `130`, Injectors `263`, Cosmetic/Anti-Aging `276`, BBL `134`, Cosmetic Laser `187`, Hair Restoration `82`.
+  - ABPS values: `889` true, `7` false, `81` null.
+  - Missing-field issue remains: `100` records with no specialties and `81` missing practices.
+- Task `16`:
+  - `store_address`: `302 Potrero Ave, San Francisco, CA 94103, USA`
+  - `18` categories, `248` item rows, `162` unique item-price pairs, `86` duplicate item-price pairs.
+  - Dedupe still not global.
+
+Interpretation:
+
+- The audit helper was not used at all. Prompt exposure plus helper availability is not enough.
+- Quality still improved on tasks `6` and `10`, likely due the accumulated prompt language, but task `16` proves the model still skips computed global checks.
+- The next intervention should make audit state visible in the final-answer path. This remains non-blocking and general: `set_final_answer` can embed the last audit if present and emit `audit=missing` for large structured results without one.
+
+### Intervention: Surface Audit State In `set_final_answer`
+
+- Hypothesis: The model ignores optional helper calls unless the finalization path makes audit state visible. If `set_final_answer` embeds audit readiness or reports `audit=missing`, the next model turn has an explicit cue before `done`.
+- Intervention:
+  - `audit_artifact(...)` now stores `last_artifact_audit` in the Python namespace.
+  - `set_final_answer(..., audit=audit)` accepts an explicit audit, and otherwise attaches the last audit if one exists.
+  - For large structured results without an audit, `set_final_answer` includes an `audit_note` and emits `audit=missing`.
+  - Prompt examples now show `audit = audit_artifact(...); set_final_answer(..., audit=audit)`.
+- Verification:
+  - `uv run --with pytest python -m pytest -q`: passed, `17 passed`
+  - `cargo fmt --check && cargo test`: passed
 - Decision: Focused rerun pending.
