@@ -666,7 +666,119 @@ pub fn sanitized_agent_context_from_events(events: &[EventRecord]) -> Value {
             "live_url": browser.live_url,
         },
         "activity": activity,
+        "recent_errors": recent_error_context(events),
+        "recent_artifacts": recent_artifact_context(events),
+        "final_answer": final_answer_context(events),
     })
+}
+
+fn recent_error_context(events: &[EventRecord]) -> Vec<Value> {
+    let mut errors = events
+        .iter()
+        .rev()
+        .filter_map(|event| match event.event_type.as_str() {
+            "tool.failed" => Some(serde_json::json!({
+                "type": "tool.failed",
+                "name": event.payload.get("name").and_then(Value::as_str),
+                "tool_call_id": event.payload.get("tool_call_id").and_then(Value::as_str),
+                "error": event.payload.get("error").and_then(Value::as_str).map(truncate_context_field),
+            })),
+            "model.turn.error" => Some(serde_json::json!({
+                "type": "model.turn.error",
+                "provider": event.payload.get("provider").and_then(Value::as_str),
+                "model": event.payload.get("model").and_then(Value::as_str),
+                "transient": event.payload.get("transient").and_then(Value::as_bool),
+                "error": event.payload.get("error").and_then(Value::as_str).map(truncate_context_field),
+            })),
+            "model.turn.context_overflow" => Some(serde_json::json!({
+                "type": "model.turn.context_overflow",
+                "provider": event.payload.get("provider").and_then(Value::as_str),
+                "model": event.payload.get("model").and_then(Value::as_str),
+                "action": event.payload.get("action").and_then(Value::as_str),
+            })),
+            "browser.cloud_shutdown_failed" | "telemetry.failed" => Some(serde_json::json!({
+                "type": event.event_type.as_str(),
+                "error": event.payload.get("error").and_then(Value::as_str).map(truncate_context_field),
+            })),
+            "session.deadline_warning" => Some(serde_json::json!({
+                "type": "session.deadline_warning",
+                "reason": event.payload.get("reason").and_then(Value::as_str),
+                "remaining_turns": event.payload.get("remaining_turns").and_then(Value::as_u64),
+            })),
+            _ => None,
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    errors.reverse();
+    errors
+}
+
+fn recent_artifact_context(events: &[EventRecord]) -> Vec<Value> {
+    let mut artifacts = events
+        .iter()
+        .rev()
+        .filter_map(|event| match event.event_type.as_str() {
+            "artifact.created" => event.payload.get("artifact").map(|artifact| {
+                serde_json::json!({
+                    "type": "artifact",
+                    "kind": artifact.get("kind").and_then(Value::as_str),
+                    "path": artifact.get("path").and_then(Value::as_str),
+                    "mime": artifact.get("mime").and_then(Value::as_str),
+                    "bytes": artifact.get("bytes").and_then(Value::as_i64),
+                })
+            }),
+            "tool.output_spilled" => event.payload.get("artifact").map(|artifact| {
+                serde_json::json!({
+                    "type": "tool-output",
+                    "tool_name": artifact.get("tool_name").and_then(Value::as_str),
+                    "tool_call_id": artifact.get("tool_call_id").and_then(Value::as_str),
+                    "path": artifact.get("path").and_then(Value::as_str),
+                    "original_tokens_estimate": artifact.get("original_tokens_estimate").and_then(Value::as_u64),
+                })
+            }),
+            "tool.image" => event.payload.get("image").map(|image| {
+                serde_json::json!({
+                    "type": "image",
+                    "path": image.get("path").and_then(Value::as_str),
+                    "label": image.get("label").and_then(Value::as_str),
+                    "mime": image
+                        .get("mime_type")
+                        .or_else(|| image.get("mime"))
+                        .and_then(Value::as_str),
+                    "bytes": image.get("bytes").and_then(Value::as_i64),
+                })
+            }),
+            _ => None,
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    artifacts.reverse();
+    artifacts
+}
+
+fn final_answer_context(events: &[EventRecord]) -> Option<Value> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type == "session.final_answer_ready" {
+            return event.payload.get("final_answer").cloned();
+        }
+        if event.event_type != "tool.output" {
+            return None;
+        }
+        event.payload.get("data")?.get("final_answer").cloned()
+    })
+}
+
+fn truncate_context_field(value: &str) -> String {
+    const MAX_CONTEXT_FIELD_CHARS: usize = 500;
+    if value.chars().count() <= MAX_CONTEXT_FIELD_CHARS {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(MAX_CONTEXT_FIELD_CHARS.saturating_sub(15))
+        .collect::<String>();
+    out.push_str("...[truncated]");
+    out
 }
 
 fn compact_url(url: &str) -> String {
@@ -1377,10 +1489,57 @@ mod tests {
                 event_type: "browser.state".to_string(),
                 payload: json!({"url": "https://example.com", "title": "Example"}),
             },
+            EventRecord {
+                seq: 4,
+                id: "e4".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 4,
+                event_type: "tool.failed".to_string(),
+                payload: json!({
+                    "name": "read_file",
+                    "tool_call_id": "read_missing",
+                    "error": "read missing.txt: No such file or directory",
+                }),
+            },
+            EventRecord {
+                seq: 5,
+                id: "e5".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 5,
+                event_type: "artifact.created".to_string(),
+                payload: json!({
+                    "artifact": {
+                        "kind": "file",
+                        "path": "/tmp/report.csv",
+                        "mime": "text/csv",
+                        "bytes": 123,
+                    },
+                }),
+            },
+            EventRecord {
+                seq: 6,
+                id: "e6".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 6,
+                event_type: "tool.output".to_string(),
+                payload: json!({
+                    "name": "python",
+                    "text": "final output bridge",
+                    "data": {
+                        "final_answer": {
+                            "count": 3,
+                            "artifact": "/tmp/final.json",
+                        },
+                    },
+                }),
+            },
         ];
         let context = sanitized_agent_context_from_events(&events);
         assert_eq!(context["task"], "Book a hotel");
         assert_eq!(context["browser"]["url"], "https://example.com");
+        assert_eq!(context["recent_errors"][0]["name"], "read_file");
+        assert_eq!(context["recent_artifacts"][0]["path"], "/tmp/report.csv");
+        assert_eq!(context["final_answer"]["count"], 3);
         assert!(!context.to_string().contains("SECRET"));
     }
 

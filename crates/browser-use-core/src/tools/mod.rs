@@ -336,7 +336,7 @@ fn done_tool_spec() -> ToolSpec {
                     "description": "Use the final answer persisted by Python set_final_answer(...)."
                 }
             },
-            "required": ["result"],
+            "required": [],
             "additionalProperties": false
         }),
     }

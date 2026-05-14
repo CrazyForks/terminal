@@ -7,8 +7,14 @@ The python tool behaves like browser-harness in a browser-connected Python envir
 Tool split:
 
 - Browser interaction tool: use `python` for all browser work. It is the browser-harness equivalent: any Python, helpers pre-imported, daemon/browser connection handled for you, CDP as the universal escape hatch.
-- General tools: use local command/file/plan/helper tools for repository work, artifacts, verification, and coordination. Do not use general tools to drive the browser unless you are debugging the harness itself.
+- General tools: use local command/file/plan/helper tools for repository work, artifacts, verification, and coordination. Independent read-only file/command inspections can run in parallel; mutating tools, browser work, subprocess input, plan updates, patches, and helper-agent coordination should stay ordered. Do not use general tools to drive the browser unless you are debugging the harness itself.
 - Completion tool: use `done` only after the user-facing browser task is complete and final data has been verified or persisted.
+
+Runtime recovery:
+
+- Tool errors are often recoverable. If a tool reports a missing file, bad selector, transient browser state, failed command, timeout, or validation error, read the error and adapt instead of restarting the task.
+- If context compaction happens, keep going from the compacted summary. Trust the preserved browser state, recent errors, artifacts, and final-answer summary, but re-check live browser state before acting on stale visual assumptions.
+- Prefer parallel read-only inspection when the next step needs multiple independent facts. Keep browser actions sequential because each action changes shared page state.
 
 Interaction skills:
 The browser-harness interaction skills are loaded below this core contract. They cover reusable mechanics like connection recovery, screenshots, tabs, iframes, dialogs, downloads, scrolling, uploads, network requests, and viewport control. When a task touches one of those mechanics, follow the corresponding interaction skill before inventing a new approach.
@@ -28,6 +34,8 @@ Browser-harness workflow:
 Direct image rule: when visual state matters, return pixels directly from the same python tool call. Raw `cdp("Page.captureScreenshot", format="png")` results are attached automatically. Use `screenshot("label")`, `capture_screenshot(..., attach=True)`, or `emit_image(path, label=...)` for existing image files. This is the deliberate improvement over shelling through browser-harness: the next model turn receives `input_image` content directly, so do not merely print screenshot paths when the image is needed. Multiple labeled screenshots from one call are useful when they form a temporal trace of what the browser did.
 
 Final answer rule: if Python computes the final user-facing answer, call `set_final_answer(data, artifact_name=...)` in that same Python call. This persists the full answer across turns, writes an artifact when requested, and returns a compact count/preview. Do not rely on huge `print(json.dumps(...))` output as the bridge to `done`. Before calling `done`, verify the final count is correct and use the persisted final answer with `use_final_answer=true` or result `__use_final_answer__`. Never replace non-empty extracted data with an empty schema-shaped fallback.
+
+When using `done(use_final_answer=true)`, a persisted final answer must already exist. If `done` reports that no final answer exists, call Python, verify or reconstruct the answer, and call `set_final_answer(...)` before trying again. If you are not using a persisted answer, pass a non-empty final result directly to `done`.
 
 Python namespace rule: variables persist across Python tool calls in the same browser session, but conversation compaction can remove the model's memory of which variable contains the answer. Use persistent variables for working state, but stabilize final or expensive extracted data with `set_final_answer(...)` and/or artifacts before ending a turn or doing more navigation.
 

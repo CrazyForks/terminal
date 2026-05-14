@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 mod telemetry;
 mod tools;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
     failure_from_events, result_from_events, sanitized_agent_context_from_events, ModelEvent,
@@ -526,7 +526,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     provider,
                     ProviderTurn {
                         messages: turn_messages,
-                        tools: turn_tools,
+                        tools: turn_tools.clone(),
                     },
                     turn_idx,
                 ) {
@@ -540,9 +540,58 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         events
                     }
                     Err(error) => {
-                        model_span.record_error(error.as_ref());
-                        step_span.record_error(error.as_ref());
-                        return Err(error);
+                        if is_context_overflow_provider_error(&format!("{error:#}")) {
+                            model_span.record_error(error.as_ref());
+                            store.append_event(
+                                &session.id,
+                                "model.turn.context_overflow",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "provider": provider.provider_name(),
+                                    "model": provider.model_name(),
+                                    "error": format!("{error:#}"),
+                                    "action": "compact_and_retry_once",
+                                }),
+                            )?;
+                            force_compact_messages(
+                                store,
+                                &session.id,
+                                &mut messages,
+                                options.max_context_chars,
+                                "provider_context_overflow",
+                            )?;
+                            normalize_provider_messages(&mut messages);
+                            let retry_messages = messages.clone();
+                            match start_provider_turn_with_retries(
+                                store,
+                                &session.id,
+                                provider,
+                                ProviderTurn {
+                                    messages: retry_messages,
+                                    tools: turn_tools,
+                                },
+                                turn_idx,
+                            ) {
+                                Ok(events) => {
+                                    telemetry.record_model_events(
+                                        &model_span,
+                                        provider.provider_name(),
+                                        turn_idx,
+                                        &events,
+                                    );
+                                    events
+                                }
+                                Err(retry_error) => {
+                                    model_span.record_error(retry_error.as_ref());
+                                    step_span.record_error(retry_error.as_ref());
+                                    return Err(retry_error);
+                                }
+                            }
+                        } else {
+                            model_span.record_error(error.as_ref());
+                            step_span.record_error(error.as_ref());
+                            return Err(error);
+                        }
                     }
                 };
                 drop(model_span);
@@ -607,42 +656,17 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     continue;
                 }
 
-                for call in tool_calls {
-                    ensure_not_cancelled(store, &session.id)?;
-                    let tool_span =
-                        telemetry.start_tool_span(&step_span, &session.id, turn_idx, &call);
-                    let outcome = match dispatch_tool_call(
-                        store,
-                        provider,
-                        &session,
-                        &mut worker,
-                        &call,
-                        &options,
-                    ) {
-                        Ok(outcome) => {
-                            telemetry.record_tool_outcome(
-                                &tool_span,
-                                &outcome.messages,
-                                outcome.finished,
-                            );
-                            tool_span.set_attribute(KeyValue::new(
-                                "browser_use.tool.finished_session",
-                                outcome.finished,
-                            ));
-                            tool_span.set_attribute(KeyValue::new(
-                                "browser_use.tool.message_count",
-                                outcome.messages.len() as i64,
-                            ));
-                            tool_span.set_ok();
-                            outcome
-                        }
-                        Err(error) => {
-                            tool_span.record_error(error.as_ref());
-                            step_span.record_error(error.as_ref());
-                            return Err(error);
-                        }
-                    };
-                    drop(tool_span);
+                for outcome in dispatch_tool_calls_for_turn(
+                    store,
+                    provider,
+                    &session,
+                    &mut worker,
+                    tool_calls,
+                    &options,
+                    &telemetry,
+                    &step_span,
+                    turn_idx,
+                )? {
                     messages.extend(outcome.messages);
                     maybe_compact_messages(
                         store,
@@ -681,6 +705,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     )?;
                 }
             }
+        }
+        let cleaned_commands = tools::command::cleanup_session_commands(&session.id);
+        if cleaned_commands > 0 {
+            store.append_event(
+                &session.id,
+                "command.cleaned_up",
+                serde_json::json!({ "count": cleaned_commands }),
+            )?;
         }
         run_result
     })();
@@ -875,6 +907,22 @@ fn is_transient_provider_error(error: &str) -> bool {
     .any(|needle| error.contains(needle))
 }
 
+fn is_context_overflow_provider_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "token limit",
+        "input is too long",
+        "input too long",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
 fn record_model_turn_request<P: ModelProvider>(
     store: &Store,
     session_id: &str,
@@ -1045,10 +1093,61 @@ fn maybe_compact_messages(
     if before_tokens <= max_context_tokens {
         return Ok(());
     }
+    compact_messages(
+        store,
+        session_id,
+        messages,
+        max_context_chars,
+        max_context_tokens,
+        before_chars,
+        before_tokens,
+        "estimated_budget_exceeded",
+    )
+}
+
+fn force_compact_messages(
+    store: &Store,
+    session_id: &str,
+    messages: &mut Vec<Value>,
+    max_context_chars: usize,
+    reason: &str,
+) -> Result<()> {
+    let max_context_chars = if max_context_chars == 0 {
+        80_000
+    } else {
+        max_context_chars
+    };
+    let max_context_tokens = approx_token_count_from_chars(max_context_chars);
+    let before_chars = estimated_context_chars(messages)?;
+    let before_tokens = estimated_context_tokens(messages)?;
+    compact_messages(
+        store,
+        session_id,
+        messages,
+        max_context_chars,
+        max_context_tokens,
+        before_chars,
+        before_tokens,
+        reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_messages(
+    store: &Store,
+    session_id: &str,
+    messages: &mut Vec<Value>,
+    max_context_chars: usize,
+    max_context_tokens: usize,
+    before_chars: usize,
+    before_tokens: usize,
+    reason: &str,
+) -> Result<()> {
     store.append_event(
         session_id,
         "session.compaction_started",
         serde_json::json!({
+            "reason": reason,
             "message_count": messages.len(),
             "chars": before_chars,
             "tokens": before_tokens,
@@ -1086,6 +1185,7 @@ fn maybe_compact_messages(
         session_id,
         "session.compacted",
         serde_json::json!({
+            "reason": reason,
             "message_count": messages.len(),
             "chars": estimated_context_chars(messages)?,
             "tokens": estimated_context_tokens(messages)?,
@@ -1858,6 +1958,315 @@ fn tool_call_message(call: &ToolCall) -> Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_tool_calls_for_turn<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    session: &browser_use_protocol::SessionMeta,
+    worker: &mut PythonWorker,
+    tool_calls: Vec<ToolCall>,
+    options: &AgentRunOptions,
+    telemetry: &AgentTelemetry,
+    step_span: &telemetry::ActiveSpan,
+    turn_idx: usize,
+) -> Result<Vec<ToolDispatchOutcome>> {
+    let registry = ToolRegistry::browser_agent();
+    let mut outcomes = Vec::new();
+    let mut index = 0;
+    while index < tool_calls.len() {
+        ensure_not_cancelled(store, &session.id)?;
+        if tool_call_supports_parallel(&registry, &tool_calls[index]) {
+            let batch_start = index;
+            index += 1;
+            while index < tool_calls.len()
+                && tool_call_supports_parallel(&registry, &tool_calls[index])
+            {
+                index += 1;
+            }
+            let batch = tool_calls[batch_start..index].to_vec();
+            outcomes.extend(dispatch_parallel_tool_batch(
+                store, session, batch, telemetry, step_span, turn_idx,
+            )?);
+            continue;
+        }
+
+        let call = tool_calls[index].clone();
+        index += 1;
+        let outcome = dispatch_serial_tool_call_for_turn(
+            store, provider, session, worker, &call, options, telemetry, step_span, turn_idx,
+        )?;
+        let finished = outcome.finished;
+        outcomes.push(outcome);
+        if finished {
+            break;
+        }
+    }
+    Ok(outcomes)
+}
+
+fn dispatch_parallel_tool_batch(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    batch: Vec<ToolCall>,
+    telemetry: &AgentTelemetry,
+    step_span: &telemetry::ActiveSpan,
+    turn_idx: usize,
+) -> Result<Vec<ToolDispatchOutcome>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    if batch.len() == 1 {
+        let call = batch.into_iter().next().expect("batch not empty");
+        return Ok(vec![dispatch_parallel_tool_call_for_turn(
+            store, session, call, telemetry, step_span, turn_idx,
+        )?]);
+    }
+
+    store.append_event(
+        &session.id,
+        "tool.batch_started",
+        serde_json::json!({
+            "mode": "parallel",
+            "tool_call_ids": batch.iter().map(|call| call.id.clone()).collect::<Vec<_>>(),
+            "tools": batch.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
+        }),
+    )?;
+    let tool_spans = batch
+        .iter()
+        .map(|call| telemetry.start_tool_span(step_span, &session.id, turn_idx, call))
+        .collect::<Vec<_>>();
+    let state_dir = store.state_dir().to_path_buf();
+    let handles = batch
+        .iter()
+        .cloned()
+        .map(|call| {
+            let state_dir = state_dir.clone();
+            let session = session.clone();
+            thread::spawn(move || {
+                let store = Store::open(state_dir)?;
+                dispatch_parallel_tool_call_recoverably(&store, &session, &call)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut outcomes = Vec::with_capacity(batch.len());
+    for ((call, tool_span), handle) in batch.into_iter().zip(tool_spans).zip(handles) {
+        let outcome = match handle.join() {
+            Ok(result) => match result {
+                Ok(outcome) => {
+                    record_tool_success(telemetry, &tool_span, &outcome);
+                    outcome
+                }
+                Err(error) => {
+                    tool_span.record_error(error.as_ref());
+                    return Err(error);
+                }
+            },
+            Err(payload) => {
+                let error = anyhow!(
+                    "parallel tool task panicked: {}",
+                    panic_payload_text(payload)
+                );
+                tool_span.record_error(error.as_ref());
+                return Err(error);
+            }
+        };
+        drop(tool_span);
+        store.append_event(
+            &session.id,
+            "tool.batch_result",
+            serde_json::json!({
+                "mode": "parallel",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "message_count": outcome.messages.len(),
+            }),
+        )?;
+        outcomes.push(outcome);
+    }
+    store.append_event(
+        &session.id,
+        "tool.batch_finished",
+        serde_json::json!({
+            "mode": "parallel",
+            "count": outcomes.len(),
+        }),
+    )?;
+    Ok(outcomes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    session: &browser_use_protocol::SessionMeta,
+    worker: &mut PythonWorker,
+    call: &ToolCall,
+    options: &AgentRunOptions,
+    telemetry: &AgentTelemetry,
+    step_span: &telemetry::ActiveSpan,
+    turn_idx: usize,
+) -> Result<ToolDispatchOutcome> {
+    let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, call);
+    let outcome =
+        match dispatch_tool_call_recoverably(store, provider, session, worker, call, options) {
+            Ok(outcome) => {
+                record_tool_success(telemetry, &tool_span, &outcome);
+                outcome
+            }
+            Err(error) => {
+                tool_span.record_error(error.as_ref());
+                return Err(error);
+            }
+        };
+    drop(tool_span);
+    Ok(outcome)
+}
+
+fn dispatch_parallel_tool_call_for_turn(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: ToolCall,
+    telemetry: &AgentTelemetry,
+    step_span: &telemetry::ActiveSpan,
+    turn_idx: usize,
+) -> Result<ToolDispatchOutcome> {
+    let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, &call);
+    let outcome = match dispatch_parallel_tool_call_recoverably(store, session, &call) {
+        Ok(outcome) => {
+            record_tool_success(telemetry, &tool_span, &outcome);
+            outcome
+        }
+        Err(error) => {
+            tool_span.record_error(error.as_ref());
+            return Err(error);
+        }
+    };
+    drop(tool_span);
+    Ok(outcome)
+}
+
+fn record_tool_success(
+    telemetry: &AgentTelemetry,
+    tool_span: &telemetry::ActiveSpan,
+    outcome: &ToolDispatchOutcome,
+) {
+    telemetry.record_tool_outcome(tool_span, &outcome.messages, outcome.finished);
+    tool_span.set_attribute(KeyValue::new(
+        "browser_use.tool.finished_session",
+        outcome.finished,
+    ));
+    tool_span.set_attribute(KeyValue::new(
+        "browser_use.tool.message_count",
+        outcome.messages.len() as i64,
+    ));
+    tool_span.set_ok();
+}
+
+fn dispatch_tool_call_recoverably<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    session: &browser_use_protocol::SessionMeta,
+    worker: &mut PythonWorker,
+    call: &ToolCall,
+    options: &AgentRunOptions,
+) -> Result<ToolDispatchOutcome> {
+    match dispatch_tool_call(store, provider, session, worker, call, options) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if tool_error_is_recoverable(&error) => {
+            dispatch_recovered_tool_error(store, session, call, error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn dispatch_parallel_tool_call_recoverably(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    match dispatch_parallel_tool_call(store, session, call) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if tool_error_is_recoverable(&error) => {
+            dispatch_recovered_tool_error(store, session, call, error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn dispatch_recovered_tool_error(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    error: anyhow::Error,
+) -> Result<ToolDispatchOutcome> {
+    let error = format!("{error:#}");
+    store.append_event(
+        &session.id,
+        "tool.failed",
+        serde_json::json!({
+            "name": call.name,
+            "tool_call_id": call.id,
+            "error": error,
+            "recovered": true,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            &call.name,
+            &format!("{} failed: {error}", call.name),
+        )?],
+    })
+}
+
+fn tool_error_is_recoverable(error: &anyhow::Error) -> bool {
+    !format!("{error:#}").contains("agent cancelled")
+}
+
+fn dispatch_parallel_tool_call(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    match ToolRegistry::browser_agent().handler_for(&call.name) {
+        Some(ToolHandlerKind::ExecCommand) => dispatch_exec_command_tool(store, session, call),
+        Some(ToolHandlerKind::ReadFile) => dispatch_read_file_tool(store, session, call),
+        Some(ToolHandlerKind::SearchFiles) => dispatch_search_files_tool(store, session, call),
+        Some(ToolHandlerKind::ListFiles) => dispatch_list_files_tool(store, session, call),
+        Some(ToolHandlerKind::ViewImage) => dispatch_view_image_tool(store, session, call),
+        _ => dispatch_unknown_tool(store, session, call),
+    }
+}
+
+fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
+    match registry.handler_for(&call.name) {
+        Some(
+            ToolHandlerKind::ReadFile
+            | ToolHandlerKind::SearchFiles
+            | ToolHandlerKind::ListFiles
+            | ToolHandlerKind::ViewImage,
+        ) => true,
+        Some(ToolHandlerKind::ExecCommand) => {
+            tools::command::exec_command_is_known_read_only(&call.arguments)
+        }
+        _ => false,
+    }
+}
+
+fn panic_payload_text(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 fn dispatch_tool_call<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -2151,7 +2560,7 @@ fn dispatch_done_tool(
         .trim()
         .to_string();
     let final_answer = persisted_final_answer(session)?;
-    let use_final_answer = call
+    let explicit_use_final_answer = call
         .arguments
         .get("use_final_answer")
         .and_then(Value::as_bool)
@@ -2159,17 +2568,54 @@ fn dispatch_done_tool(
         || matches!(
             requested_result.as_str(),
             "__use_final_answer__" | "__final_answer__" | "FINAL_ANSWER"
-        )
-        || final_answer
-            .as_ref()
-            .is_some_and(|answer| should_replace_with_persisted_final(&requested_result, answer));
+        );
+    let should_auto_use_final_answer = final_answer
+        .as_ref()
+        .is_some_and(|answer| should_replace_with_persisted_final(&requested_result, answer));
+    if explicit_use_final_answer && final_answer.is_none() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "done requested use_final_answer=true, but no persisted final answer exists. Call python set_final_answer(...) first, or pass a non-empty result.",
+        );
+    }
+    if requested_result.is_empty() && !explicit_use_final_answer {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "done requires a non-empty result, or use_final_answer=true after python set_final_answer(...)",
+        );
+    }
+    let use_final_answer = explicit_use_final_answer || should_auto_use_final_answer;
+    let final_answer_summary = final_answer
+        .as_ref()
+        .and_then(|answer| answer.get("summary"))
+        .cloned();
     let result = if use_final_answer {
-        final_answer
-            .as_ref()
-            .and_then(|answer| answer.get("result").and_then(Value::as_str))
-            .unwrap_or(&requested_result)
-            .trim()
-            .to_string()
+        let Some(answer) = final_answer.as_ref() else {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "done could not load the persisted final answer",
+            );
+        };
+        let Some(result) = answer
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|result| !result.is_empty())
+        else {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "persisted final answer is missing a non-empty result",
+            );
+        };
+        result.to_string()
     } else {
         requested_result
     };
@@ -2178,6 +2624,7 @@ fn dispatch_done_tool(
         "tool.started",
         serde_json::json!({
             "name": "done",
+            "tool_call_id": call.id,
             "arguments": call.arguments,
         }),
     )?;
@@ -2194,13 +2641,19 @@ fn dispatch_done_tool(
     store.append_event(
         &session.id,
         "tool.finished",
-        serde_json::json!({ "name": "done" }),
+        serde_json::json!({
+            "name": "done",
+            "tool_call_id": call.id,
+        }),
     )?;
-    store.append_event(
-        &session.id,
-        "session.done",
-        serde_json::json!({ "result": result }),
-    )?;
+    let mut done_payload = serde_json::json!({ "result": result });
+    if use_final_answer {
+        done_payload["source"] = Value::String("python.set_final_answer".to_string());
+        if let Some(summary) = final_answer_summary {
+            done_payload["final_answer_summary"] = summary;
+        }
+    }
+    store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
         finished: true,
         messages: Vec::new(),
@@ -3406,6 +3859,16 @@ fn record_python_response_events_inner(
         payload["text_truncated"] = Value::Bool(true);
         payload["text_artifact"] = artifact.clone();
     }
+    if let Some(final_answer) = response.data.get("final_answer") {
+        store.append_event(
+            session_id,
+            "session.final_answer_ready",
+            serde_json::json!({
+                "source": "python.set_final_answer",
+                "final_answer": final_answer,
+            }),
+        )?;
+    }
     store.append_event(session_id, "tool.output", payload)?;
     Ok(text_artifact)
 }
@@ -4086,6 +4549,80 @@ mod tests {
     }
 
     #[test]
+    fn provider_loop_recovers_from_tool_errors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "missing_read".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "missing.txt" }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_missing".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "recovered"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "recover from a missing file",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "missing_read"
+                && event.payload["recovered"] == true
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "recovered"
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_tool_batch_preserves_model_message_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("first.txt"), "first")?;
+        std::fs::write(temp.path().join("second.txt"), "second")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ParallelReadOrderProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "read both files",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.batch_started"
+                && event.payload["tool_call_ids"][0] == "read_second"
+                && event.payload["tool_call_ids"][1] == "read_first"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "parallel reads ok"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_can_update_plan() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -4186,6 +4723,32 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "session.done"
                 && event.payload["result"] == "compacted ok"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_context_overflow_forces_compaction_and_retries_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ContextOverflowRecoveringProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            &format!("compact after provider overflow {}", "x".repeat(2048)),
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "model.turn.context_overflow"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.compaction_started"
+                && event.payload["reason"] == "provider_context_overflow"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "overflow recovered"
+        }));
         Ok(())
     }
 
@@ -4476,10 +5039,112 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "session.final_answer_used"));
         assert!(events.iter().any(|event| {
+            event.event_type == "session.final_answer_ready"
+                && event.payload["final_answer"]["count"] == 1
+        }));
+        assert!(events.iter().any(|event| {
             event.event_type == "session.done"
                 && event.payload["result"]
                     .as_str()
                     .is_some_and(|result| result.contains("\"name\": \"A\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_use_final_answer_requires_persisted_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_missing_final".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "use_final_answer": true,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_missing_final".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "explicit fallback"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish without final answer",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "done_missing_final"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("no persisted final answer"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "explicit fallback"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_can_use_persisted_final_answer_without_dummy_result() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_final_no_dummy".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'items': [1, 2, 3]}, artifact_name='items.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_final_no_dummy".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "use_final_answer": true,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["final_answer_summary"]["count"] == 3
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"items\""))
         }));
         Ok(())
     }
@@ -4869,6 +5534,98 @@ mod tests {
         assert!(spilled.contains("\"metadata\":{\"truncated\":true}"));
         assert!(spilled.contains(&"z".repeat(1024)));
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct ParallelReadOrderProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for ParallelReadOrderProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = if *step == 0 {
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_second".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: serde_json::json!({ "path": "second.txt" }),
+                        },
+                    },
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_first".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: serde_json::json!({ "path": "first.txt" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            } else {
+                let tool_call_ids = turn
+                    .messages
+                    .iter()
+                    .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+                    .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    tool_call_ids.as_slice(),
+                    ["read_second", "read_first"],
+                    "tool outputs must be returned in model call order"
+                );
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_parallel_reads".to_string(),
+                            name: "done".to_string(),
+                            arguments: serde_json::json!({
+                                "result": "parallel reads ok",
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct ContextOverflowRecoveringProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for ContextOverflowRecoveringProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            if *step == 0 {
+                *step += 1;
+                bail!("context_length_exceeded: input is too long");
+            }
+            let joined = turn
+                .messages
+                .iter()
+                .map(message_content_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(joined.contains("Compacted prior browser-agent context"));
+            assert!(joined.contains("compact after provider overflow"));
+            *step += 1;
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_overflow".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "overflow recovered",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ])
+        }
     }
 
     #[derive(Default)]
