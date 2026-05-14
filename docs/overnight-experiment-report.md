@@ -870,3 +870,146 @@ Decision:
 - Expected movement:
   - Task `10`: fewer wasted turns after timeouts; faster arrival at the final scoped artifact.
   - Full datasets: fewer failures where the model times out after collecting useful partial data but never writes a deliverable.
+
+### Full Rerun: `overnight-real-v14-all-20260514-022303`
+
+- Dataset: `real_v14_short`
+- Root: `/tmp/overnight-real-v14-all-20260514-022303`
+- Command: `dataset-run-codex real_v14_short --all --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud`
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `10/10` passed.
+- Manual strict result: `5/10` pass, `4/10` partial, `1/10` fail.
+- Token usage: `9,036,815` total tokens across `270` model invocations.
+
+Manual scorecard:
+
+| Task | Runner | Manual | Reason |
+| ---: | --- | --- | --- |
+| 2 | pass | pass | FERC answer covered 11 filename links from the first two rows, excluded Generate PDF, and returned markdown only. |
+| 4 | pass | pass | Ollie's output had 682 official-store records with name/address, no missing required fields, and no duplicates. |
+| 5 | pass | partial | Extracted a plausible 97-row telecom artifact, but final answer returned only a summary/path instead of the requested JSON list; 12 rows still had null contract length. |
+| 6 | pass | partial | Returned five Meta ads and screenshots, but candidate-pool evidence only covered six loaded candidates, too weak for "best performing"; final screenshot references pointed at cropped cards rather than full detail screenshots. |
+| 8 | pass | partial | Produced 28 SSD comparisons, but product matching is weak: heatsink/non-heatsink and model-title mismatches appear in PriceRunner matches. |
+| 9 | pass | pass | Screenshot exists, is nonblank, and captures the requested SBI table. |
+| 10 | pass | fail | Source-scope audit was dishonest: procedure-search rows added candidates and many "scoped" ASPS rows had non-Beverly-Hills addresses. Removing procedure-only candidates drops at least one specialty below 40. |
+| 11 | pass | partial | Correct `result.json` and persisted final answer exist, but run-level final result is the protocol string `Final answer persisted. Need done use.` |
+| 13 | pass | pass | WakeMed extraction has 1,367 unique provider URLs and rich visible metadata; missing optional fields look absent on source profiles. |
+| 16 | pass | pass | McDonald's location/menu artifact has source evidence, 128 priced items, categories, currency, and no duplicate item/price pairs. |
+
+Failure modes found:
+
+1. **Persisted-final-answer misuse**: task `11` proves the model can produce the correct artifact, call `set_final_answer`, then finalize with the tool status string instead of the stored answer. This is a harness/protocol weakness because the stored answer is already present and valid.
+2. **Primary-result artifact not surfaced**: task `5` saved the real JSON list but returned a summary artifact. The benchmark asks for the data itself, so the finalization contract needs to bias toward the primary result artifact/content, not a convenience summary.
+3. **Insufficient candidate-pool evidence for ranking**: task `6` passed audit shape but only loaded six candidates before selecting top five. The audit should ask for candidate-pool size and coverage evidence when a task uses "best", "top", "highest", or "longest".
+4. **Product/entity match quality not audited**: task `8` needs a generic entity-match audit: compare source product attributes with matched result attributes before claiming "same product".
+5. **Self-reported source scope is not enough**: task `10` shows that letting the model self-report `out_of_scope_record_count=0` is insufficient. The audit needs machine-checkable provenance fields or computed address/source-label checks.
+
+Interpretation:
+
+- The chunked-extraction prompt helped task `10` finish within the full run, but it did not solve the deeper correctness issue. The model now reaches a polished artifact faster, which is useful, but the artifact can still be wrong if provenance is not represented in the data model.
+- The source-scope guard was too trust-based. It catches honest broadening, but not cases where the model labels broadened rows as scoped.
+- Highest-priority next change: make `done` robust to persisted-answer status-string misuse and tighten the finalization prompt. This should be general, low-risk, and directly recovers task `11`.
+- Next highest-impact design change: require auditable provenance columns for scoped/ranked/matched artifacts. This should not encode dataset answers; it should force the model to leave enough structured evidence for the audit and for manual review.
+
+### Full Rerun: `overnight-real-v8-all-20260514-024405`
+
+- Dataset: `real_v8`
+- Root: `/tmp/overnight-real-v8-all-20260514-024405`
+- Command: `dataset-run-codex real_v8 --all --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud`
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `100/100` passed.
+- Manual strict result from 5 judging agents: `73/100` pass, `23/100` partial, `4/100` fail.
+- Token usage: `59,231,351` total tokens across `1,988` model invocations.
+
+Manual score by range:
+
+| Tasks | Pass | Partial | Fail | Notes |
+| --- | ---: | ---: | ---: | --- |
+| 1-20 | 18 | 1 | 1 | Fail was HostGenius location pages returned instead of property listings; partial was missing product descriptions/brands. |
+| 21-40 | 14 | 6 | 0 | Main issues were source drift, missing contract/venue fields, and JSON output where a table was requested. |
+| 41-60 | 17 | 3 | 0 | Main issues were weak Meta ranking completeness, missing contract length, and one task without a saved structured artifact. |
+| 61-80 | 11 | 8 | 1 | Fail was missing operator ID; partials include listing/detail ambiguity, missing emails/practice names, incomplete sitemap menu extraction, and SSD comparison incompleteness. |
+| 81-100 | 13 | 5 | 2 | Fails were 7/200 food trucks and task `100` returning a path/count/sample instead of the requested JSON object. |
+
+Largest manual failure modes:
+
+1. **Source/entity drift**: The model often found adjacent records and treated them as in-scope. Examples: task `9` returned HostGenius location pages instead of property listings; task `23` included broad "relativity" procurement matches; task `39` extracted Tek comparison API data instead of the guide page; task `88` changed ASPS scope to `q=90210`/fallback rows.
+2. **Output-shape mismatch**: The model saved correct artifacts but did not always return the requested shape. Examples: task `33` returned JSON instead of the requested table; task `100` returned a path/count/sample summary when the prompt asked for a JSON object with three arrays.
+3. **Finalization meta-text**: Some final answers included internal status phrases even when `.final_answer.json` existed. Examples: v14 task `11` returned `Final answer persisted. Need done use.`; v8 task `57` started with `Need final done...`; v8 task `100` started with `Need final with done...`.
+4. **Missing required fields accepted as complete**: Examples: task `15` missing descriptions/brands, task `27` missing contract lengths, task `36` missing venue/conference, task `46` missing contract length, task `68` missing verified emails, task `75` missing practice names, task `95` missing one CRL URL.
+5. **Weak selection/ranking evidence**: Meta Ads tasks can produce five plausible ads but with too little candidate-pool evidence to support "best performing" or "longest active" claims.
+6. **Quota/coverage early stops**: Task `87` returned 7 food trucks against a target of 200. Task `88` honestly had only 1 facial reconstruction candidate in a scoped sub-artifact but still summarized a broad dataset.
+
+What this says about the branch:
+
+- The remote-browser/concurrency path is mechanically healthy. The `real_v8` run launched all 100 tasks, kept roughly 25 active until the tail, and did not open local Chrome.
+- Runner pass rate is not a quality metric yet. It only measures whether the agent produced some final result.
+- The best immediate gains are not deterministic benchmark validators. They are better finalization and self-review contracts: preserve requested output shape, do not surface internal status text, and force source/entity evidence to be represented in the data.
+
+### Intervention: Finalization Status Text Replacement
+
+- Hypothesis: When a persisted final answer exists, internal status text like `Final answer persisted. Need done use.` and `Need final with done...` should be treated like `Done.` and replaced with the persisted answer.
+- Intervention:
+  - `done` placeholder detection now treats persisted-final-answer status sentences as placeholders when a persisted answer with positive count exists.
+  - Prompt language now explicitly says not to use status sentences such as "final answer persisted", "need final done", or "need done use" as the user-facing result.
+- Why this is generalizable:
+  - It is not task-specific and does not inspect benchmark content.
+  - It only fires when the model has already created a persisted final answer and then submits a meta-status sentence instead of the answer.
+- Expected movement:
+  - Recovers v14 task `11`.
+  - Prevents v8 task `57` and `100` from exposing internal finalization text, though task `100` still needs output-shape discipline to be fully strict.
+- Verification:
+  - `cargo test -p browser-use-core done_replaces` passed with two focused tests:
+    - `done_replaces_persisted_final_answer_status_text`
+    - `done_replaces_need_final_done_status_text`
+  - `cargo fmt --check` passed.
+
+### Intervention: Explicit Output-Shape Contract
+
+- Hypothesis: The model sometimes optimizes for artifact hygiene and loses the exact requested response shape. Explicitly separating "save the full artifact" from "return the requested shape" should reduce JSON/table finalization failures without adding deterministic validators.
+- Intervention:
+  - Dataset prompt now says that if the task asks for `Return JSON`, `JSON only`, a JSON array/object, or a table/markdown template, the final answer must follow that shape unless the task explicitly asks for a file path.
+  - It still allows saving large artifacts under `/home/user/outputs`, but says a path/count/sample summary is not a substitute for the requested JSON/table.
+- Why this is generalizable:
+  - It applies to any explicit output-format request.
+  - It does not require knowing expected rows or task-specific schemas.
+- Expected movement:
+  - Improve v8 task `33` and `100`.
+  - Reduce "summary artifact instead of actual data" partials in v14 task `5` and similar large JSON/list tasks.
+
+Next experiment:
+
+- Rebuild `browser-use-terminal`, run focused retests for v14 task `11`, v8 task `57`, v8 task `100`, then run full `real_v14_short` and `real_v8` again with cloud browser and 25-way concurrency.
+- If the focused retests show no regression, commit this intervention before the next full run so the scientific log has a clean boundary.
+
+### Focused Reruns: Finalization And Output Shape
+
+Shared setup:
+
+- Browser mode: cloud only. `BU_CDP_URL`, `BU_CDP_WS`, and `BU_BROWSER_ID` were unset. `LLM_BROWSER_BROWSER_MODE=cloud`, `LLM_BROWSER_AUTO_CHROME=0`, and `LLM_BROWSER_OPEN_CLOUD_LIVE_VIEW=0` were set.
+- Binary: rebuilt `./target/debug/browser-use-terminal` after prompt/code changes.
+- Model/provider: `gpt-5.5` via `codex`.
+
+Results:
+
+| Run | Task | Prior failure | Focused result | Decision |
+| --- | --- | --- | --- | --- |
+| `/tmp/overnight-focused-v14-t11-20260514-032957` | `real_v14_short` task `11` | Final result was `Final answer persisted. Need done use.` despite valid FCC JSON artifact. | Pass. Final result is the actual JSON array of 7 grantee-code/count rows. | Status-text replacement works for the exact failure. |
+| `/tmp/overnight-focused-v8-t57-20260514-032957` | `real_v8` task `57` | Final result leaked `Need final done...` status text before the saved review data. | Pass/improved. Final result is the actual structured review output, with no internal status prefix. | Status-text replacement works on a second independent case. |
+| `/tmp/overnight-focused-v8-t100-20260514-032957` | `real_v8` task `100` | Final result was a path/count/sample summary rather than the requested JSON object with `amazon_de`, `galaxus_de`, and `kaufland_de` arrays. | Fail on strict output shape. The status prefix disappeared, but the final answer still returned `{artifact_path, record_count, counts, schema, note}`. | Prompt-only status fix was insufficient for explicit JSON-object tasks. |
+| `/tmp/overnight-focused-v8-t100-shape-20260514-034539` | `real_v8` task `100` | Same output-shape failure. | Pass on the targeted issue. Final `done` used the actual JSON object with top-level `amazon_de`, `galaxus_de`, and `kaufland_de`; each array had 20 rows. | The stricter output-shape contract changed behavior in the desired general direction. |
+
+Interpretation:
+
+- The finalization-status replacement is clearly useful and low-risk: it only substitutes a persisted final answer when the submitted `done` payload is internal protocol/status text.
+- The first task `100` retest showed that status cleanup alone does not solve response-shape drift. The model can still treat an artifact summary as the answer.
+- The second task `100` retest shows the output-shape contract can recover a strict failure without a deterministic task-specific validator. The model saved artifacts and still returned the requested object.
+- This intervention is worth keeping before the next full dataset pass.
+
+Verification before commit:
+
+- `cargo fmt --check` passed.
+- `cargo test` passed.
+- `uv run --with pytest python -m pytest -q` passed, `28 passed`.
+- `cargo build --bin browser-use-terminal` passed.
+- Commit this intervention, then run the next full `real_v14_short` and `real_v8` pass with cloud browser and 25-way concurrency.

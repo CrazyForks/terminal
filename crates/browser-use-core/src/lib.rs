@@ -2817,7 +2817,16 @@ fn looks_like_placeholder_done_result(result: &str) -> bool {
     matches!(
         normalized.as_str(),
         "done" | "complete" | "completed" | "finished"
-    )
+    ) || looks_like_persisted_final_answer_status(&normalized)
+}
+
+fn looks_like_persisted_final_answer_status(normalized: &str) -> bool {
+    (normalized.contains("final answer")
+        && (normalized.contains("persisted")
+            || normalized.contains("stored")
+            || normalized.contains("saved"))
+        && (normalized.contains("use") || normalized.contains("done")))
+        || (normalized.starts_with("need final") && normalized.contains("done"))
 }
 
 fn looks_like_empty_structured_result(result: &str) -> bool {
@@ -5271,6 +5280,112 @@ mod tests {
                 && event.payload["result"]
                     .as_str()
                     .is_some_and(|result| result.contains("\"items\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_replaces_persisted_final_answer_status_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_final_status_text".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'stores': [{'name': 'A', 'address': 'B'}]}, artifact_name='stores.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_status_text".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Final answer persisted. Need done use.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract result counts",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"A\""))
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"] == "Final answer persisted. Need done use."
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_replaces_need_final_done_status_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_final_need_done".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'rows': [{'name': 'A'}]}, artifact_name='rows.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_need_done_text".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Need final with done.The extraction is complete and saved to `/home/user/outputs/result.json`.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract rows",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"A\""))
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("Need final with done"))
         }));
         Ok(())
     }
