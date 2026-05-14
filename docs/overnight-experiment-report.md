@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Placeholder-missing/ad-hoc-audit guard implemented; focused rerun pending |
+| Recommended branch state | Selection/ranking audit guard implemented; focused task 6 rerun improved strict output |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
-| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; manual 2 pass / 1 partial / 0 fail |
+| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; strict manual 1 pass / 1 partial / 1 fail; focused task 6 after selection-audit: runner pass / manual pass |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
-| Most important improvement | Source-provenance audit fixed the 302 Potrero source-entity failure |
+| Most important improvement | Selection audit forced task 6 from first-visible/weak ranking to audited top-by-duration selection over 107 candidates |
 | Worst regression | None yet |
-| Open root-cause clusters | Placeholder values counted as present fields, ad-hoc audit bypass, top-k/ranking proof |
-| Next experiment | Rerun focused tasks 6/10/16 with placeholder/ad-hoc audit guard, then run full `real_v8`/`real_v14_short` if no regression |
+| Open root-cause clusters | Source-scope fallback/locality proof for directory aggregation; exact metric unavailable vs proxy disclosure |
+| Next experiment | Implement general source-scope/locality audit for broadened searches, then rerun task 10 and full `real_v14_short`/`real_v8` |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -692,4 +692,90 @@ Decision:
   - `cargo fmt --check`: passed.
   - `cargo test`: passed.
   - `cargo build --bin browser-use-terminal`: passed.
-- Decision: Pending focused rerun.
+- Decision: Keep, with the next intervention focused on ranking/selection proof.
+
+### Focused Rerun: `overnight-real-v14-audit-tightening-focus-20260514-011412`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-audit-tightening-focus-20260514-011412`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `1` pass, `1` partial, `1` fail
+- Token usage: `3,093,306` total tokens for the three focused tasks.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Remaining problem |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | Placeholder guard worked: `deployment_duration` became real computed durations, screenshot files were nonblank, and audit used computed `audit_artifact`. | Selection was still weak: output chose first visible/result-order eSIM cards, while `raw_cards.json` contained longer-running eSIM candidates later in the loaded pool. Per-ad card screenshots were exact duplicate hashes in the first version, then repaired only after audit pressure. |
+| 10 | pass | fail | Structurally large output: `530` unique records and `40` candidates per specialty. | Strict source-scope failure: the Beverly Hills ASPS URL returned no selected-location results, then the model filled specialty buckets from broad/global ASPS procedure pages. This satisfies counts but not a reliable Beverly Hills surgeon/specialty/ABPS list. |
+| 16 | pass | pass | The first no-source-evidence finalization was blocked. The repair final answer proved `source_url` `https://mcdonalds.order.online/store/-653629?delivery=false`, page title `McDonald's 302 Potrero Avenue`, and source entity `McDonald's (16932-POTRERO HILL)`. | Empty visible categories are preserved; acceptable for "include every visible category." |
+
+Concrete checks:
+
+- Task `6` selected IDs: `634468225627175`, `812639694250559`, `789931336696572`, `1288150293297474`, `1695860041574404`.
+- `raw_cards.json` showed better longest-active candidates in the loaded eSIM-like pool, including multiple `Sparks_esim` ads at `804` days and `SimOptions` at `332` days.
+- Task `6` audit was structurally clean but lacked a check comparing selected rows against the raw candidate pool by the declared metric.
+- Task `10` result included `114` TopPlastic records and broad ASPS specialty buckets. A stricter manual read treats the broadening as a fail because the prompt specifically starts from Beverly Hills sources.
+- Task `16` final result had `19` categories, `138` item rows, `138` unique item-price pairs, and source evidence that matches the requested Potrero store.
+
+Interpretation:
+
+- The placeholder/ad-hoc audit guard was successful for missing-field honesty and source finalization.
+- It exposed the next first-principles failure: a model can pass missing/dedupe/visual audits while making a weak comparative selection.
+- Source scope needs its own protocol. Count targets must not be filled by broadening the source silently when the requested source reports no local results.
+
+### Intervention: Selection/Ranking Audit Guard
+
+- Hypothesis: For comparative tasks, the model needs to compute a compact selection proof against the candidate pool. Otherwise it can claim "top" or "best" based on visible order without proving that selected rows are top by the declared metric.
+- Intervention:
+  - `audit_artifact(...)` now accepts `selection_metric_field`, `selection_order`, `selection_limit`, `selection_pool_records`, and `selection_key_fields`.
+  - The selection check reports missing metric counts, order violations, candidate-pool top preview, missing top candidates, and selected records outside the top pool.
+  - `set_final_answer(...)` detects ranking/selection claims such as `ranking_basis`, `selection_method`, `sort_basis`, or top/best/highest/longest prose. If an audit-worthy final answer has such claims but no `selection` check, `ready_for_done=false`.
+  - `audit_artifact(...)` also supports `unique_visual_files=True` so per-record screenshot deliverables can catch exact duplicate image files.
+  - Prompts now tell the model to prefer an observed numeric metric over result order for top/best/highest/longest selections unless the page visibly labels the current sort.
+- Why this is generalizable:
+  - It does not know Facebook, eSIM, task IDs, expected IDs, or benchmark answers.
+  - It only forces the model to connect its own selection claim to its own candidate pool and metric.
+  - It leaves proxy choice to the model but makes the proxy auditable.
+- Verification:
+  - Focused worker tests: passed, `26 passed`.
+  - Full Python tests: passed, `26 passed`.
+  - `cargo fmt --check`: passed.
+  - `cargo test`: passed.
+  - `cargo build --bin browser-use-terminal`: passed.
+
+### Focused Rerun: `overnight-real-v14-selection-audit-task6-20260514-013345`
+
+- Dataset: `real_v14_short`
+- Task: `6`
+- Root: `/tmp/overnight-real-v14-selection-audit-task6-20260514-013345`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 1 --browser-mode cloud`
+- Runner result: `1/1` passed.
+- Manual strict result: pass.
+- Token usage: `722,411` total tokens.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Remaining problem |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | pass | The model selected five `Sparks_esim` ads all tied at `804` active days from `Mar 1, 2024`, with a `selection` audit over `107` loaded candidate cards. The first finalization had `ready_for_done=false`; the model repaired blank screenshot crops and finalized only after `artifact_audit.json` had `ready_for_done=true`. | Engagement metrics still were not visible, so the answer correctly uses longest active duration as proxy. Country remained United States/default because the UI did not expose a global option in the run. |
+
+Concrete checks:
+
+- Final selected IDs: `812639694250559`, `398867029407187`, `1456501448274040`, `928317988902166`, `934513628063294`.
+- Final audit:
+  - `record_count`: `5`
+  - `candidate_pool_count`: `107`
+  - `candidate_pool_metric_count`: `107`
+  - `missing_top_candidate_count`: `0`
+  - `selected_outside_top_count`: `0`
+  - `visual_file_uniqueness.duplicate_hash_group_count`: `0`
+  - all visual files nonblank.
+- The audit blocked the first result with blank crops (`ready_for_done=false`) and the agent repaired the images before `done`.
+
+Decision:
+
+- Keep and commit. This is a real generalizable improvement: it converted a persistent task `6` partial into an audited pass without encoding task-specific expected IDs.
+- Next intervention should target task `10`: a general source-scope/locality audit that distinguishes "requested source/location returned no local results" from "broadened fallback used to satisfy counts."

@@ -483,6 +483,80 @@ result = audit
     assert "selected_source_entity_address" in source_check["missing_fields"]
 
 
+def test_worker_audit_artifact_can_require_unique_visual_files(tmp_path: Path) -> None:
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.png"
+    image_a.write_bytes(
+        bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+            "de0000000c4944415408d763f8cfc0000003010100c9fe92ef0000000049454e44ae426082"
+        )
+    )
+    image_b.write_bytes(image_a.read_bytes())
+    response = worker._run(
+        {
+            "id": "artifact-unique-visual-audit",
+            "session_id": "task-artifact-unique-visual-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": f"""
+audit = audit_artifact(visual_files={[str(image_a), str(image_b)]!r}, unique_visual_files=True)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    uniqueness = audit["checks"]["visual_file_uniqueness"]
+    assert uniqueness["duplicate_hash_group_count"] == 1
+    assert len(uniqueness["duplicate_hash_groups"][0]["paths"]) == 2
+
+
+def test_worker_audit_artifact_reports_selection_metric_gaps(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-selection-audit",
+            "session_id": "task-artifact-selection-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+selected = [
+    {'id': 'b', 'duration_days': 804},
+    {'id': 'a', 'duration_days': 315},
+    {'id': 'd', 'duration_days': 35},
+]
+pool = [
+    {'id': 'a', 'duration_days': 315},
+    {'id': 'b', 'duration_days': 804},
+    {'id': 'c', 'duration_days': 500},
+    {'id': 'd', 'duration_days': 35},
+]
+audit = audit_artifact(
+    records=selected,
+    selection_metric_field='duration_days',
+    selection_order='desc',
+    selection_limit=3,
+    selection_pool_records=pool,
+    selection_key_fields=['id'],
+)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    selection = audit["checks"]["selection"]
+    assert selection["missing_metric_count"] == 0
+    assert selection["order_violation_count"] == 0
+    assert selection["missing_top_candidate_count"] == 1
+    assert selection["selected_outside_top_count"] == 1
+    assert selection["missing_top_candidate_examples"][0]["record"]["id"] == "c"
+
+
 def test_worker_set_final_answer_embeds_last_artifact_audit(tmp_path: Path) -> None:
     response = worker._run(
         {
@@ -567,6 +641,36 @@ result = summary
     assert "source evidence" in response["data"]["audit_note"]
     assert response["data"]["audit_recommendation"]["source_identity_claim_paths"] == [
         "store_address"
+    ]
+
+
+def test_worker_set_final_answer_requires_selection_audit_for_ranking_claims(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-selection-audit",
+            "session_id": "task-final-answer-selection-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+ads = [{'library_id': str(idx), 'active_duration_days': idx} for idx in range(5)]
+audit = audit_artifact(records=ads, required_fields=['library_id'])
+summary = set_final_answer(
+    {'selection_method': 'top ads by longest active duration', 'ads': ads},
+    artifact_name='ads.json',
+    audit=audit,
+)
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert "selection check" in response["data"]["audit_note"]
+    assert response["data"]["audit_recommendation"]["selection_claim_paths"] == [
+        "selection_method"
     ]
 
 

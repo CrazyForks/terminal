@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import atexit
 import base64
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -148,6 +149,19 @@ def _dedupe_key(record: Any, fields: Iterable[str] | None) -> str:
     else:
         parts = [record]
     return json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _metric_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        normalized = value.replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if match:
+            return float(match.group(0))
+    return None
 
 
 def _records_from_path(data: Any, record_path: str | None) -> Any:
@@ -986,6 +1000,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         visual_paths: list[str] = []
         structured_paths: list[str] = []
         source_identity_claim_paths: list[str] = []
+        selection_claim_paths: list[str] = []
         nested_record_count = 0
         recordish_keys = {
             "ads",
@@ -1031,6 +1046,24 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "store_location",
             "venue_address",
         }
+        ranking_claim_keys = {
+            "ranking_basis",
+            "ranking_method",
+            "selection_metric",
+            "sort_basis",
+            "sort_order",
+        }
+        selection_claim_keys = {
+            "selected_by",
+            "selection_basis",
+            "selection_criteria",
+            "selection_method",
+            "selection_reason",
+        }
+        selection_claim_terms = re.compile(
+            r"\b(best|first|highest|impression|longest|lowest|most|performance|rank|score|sort|top)\b",
+            re.IGNORECASE,
+        )
 
         def normalized_suffix(text: str) -> str:
             lowered = text.strip().lower().split("?", 1)[0].split("#", 1)[0]
@@ -1050,6 +1083,14 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                         and not _is_missing(child)
                     ):
                         source_identity_claim_paths.append(".".join(path + [key]))
+                    if lower_key in ranking_claim_keys and not _is_missing(child):
+                        selection_claim_paths.append(".".join(path + [key]))
+                    elif (
+                        lower_key in selection_claim_keys
+                        and not _is_missing(child)
+                        and selection_claim_terms.search(str(child))
+                    ):
+                        selection_claim_paths.append(".".join(path + [key]))
                     visit(child, path + [key])
                 return
             if isinstance(value, list):
@@ -1081,6 +1122,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             reasons.append(f"external_structured_artifacts={len(structured_paths)}")
         if source_identity_claim_paths and record_count_estimate > 5:
             reasons.append(f"source_identity_claims={len(source_identity_claim_paths)}")
+        if selection_claim_paths:
+            reasons.append(f"selection_or_ranking_claims={len(selection_claim_paths)}")
         return {
             "recommended": bool(reasons),
             "reasons": reasons,
@@ -1091,6 +1134,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "visual_artifact_path_count": len(visual_paths),
             "structured_artifact_path_count": len(structured_paths),
             "source_identity_claim_paths": source_identity_claim_paths[:10],
+            "selection_claim_paths": selection_claim_paths[:10],
             "sample_visual_artifact_paths": visual_paths[:5],
             "sample_structured_artifact_paths": structured_paths[:5],
         }
@@ -1131,6 +1175,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             )
         if audit_recommendation.get("source_identity_claim_paths") and "source_evidence" not in checks:
             notes.append("audit is missing source_evidence for claimed source/entity/location fields")
+        if audit_recommendation.get("selection_claim_paths") and "selection" not in checks:
+            notes.append("audit is missing a selection check for claimed ranking/selection fields")
         return notes
 
     def set_final_answer(
@@ -1241,8 +1287,14 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         bucket_field: str | None = None,
         bucket_targets: Dict[str, int] | None = None,
         visual_files: list[Any] | None = None,
+        unique_visual_files: bool = False,
         source_evidence: Dict[str, Any] | None = None,
         required_source_fields: list[str] | None = None,
+        selection_metric_field: str | None = None,
+        selection_order: str = "desc",
+        selection_limit: int | None = None,
+        selection_pool_records: list[Any] | None = None,
+        selection_key_fields: list[str] | None = None,
         artifact_name: str = "artifact_audit.json",
     ) -> Dict[str, Any]:
         """Compute a compact, general pre-final audit for model review.
@@ -1355,6 +1407,28 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 for item in visual
             ):
                 audit["ready_for_done"] = False
+            if unique_visual_files:
+                groups: Dict[str, list[str]] = {}
+                for item in visual:
+                    path_value = item.get("path")
+                    if not path_value or not item.get("exists") or item.get("image_error"):
+                        continue
+                    path_obj = Path(str(path_value)).expanduser()
+                    if not path_obj.is_file():
+                        continue
+                    digest = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+                    groups.setdefault(digest, []).append(str(path_obj))
+                duplicate_groups = [
+                    {"sha256": digest, "paths": paths}
+                    for digest, paths in groups.items()
+                    if len(paths) > 1
+                ]
+                audit["checks"]["visual_file_uniqueness"] = {
+                    "duplicate_hash_group_count": len(duplicate_groups),
+                    "duplicate_hash_groups": duplicate_groups[:10],
+                }
+                if duplicate_groups:
+                    audit["ready_for_done"] = False
 
         if source_evidence is not None or required_source_fields:
             evidence = source_evidence if isinstance(source_evidence, dict) else {}
@@ -1370,6 +1444,95 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             }
             if missing_source:
                 audit["ready_for_done"] = False
+
+        if selection_metric_field:
+            order = str(selection_order or "desc").strip().lower()
+            descending = order not in {"asc", "ascending", "low_to_high", "lowest"}
+            missing_metric = []
+            selected_metrics: list[tuple[int, float, Any]] = []
+            for idx, record in enumerate(records):
+                metric = _metric_number(_field_value(record, selection_metric_field))
+                if metric is None:
+                    if len(missing_metric) < 5:
+                        missing_metric.append({"index": idx, "record": record})
+                else:
+                    selected_metrics.append((idx, metric, record))
+
+            order_violations = []
+            for left, right in zip(selected_metrics, selected_metrics[1:]):
+                left_idx, left_metric, left_record = left
+                right_idx, right_metric, right_record = right
+                violates = right_metric > left_metric if descending else right_metric < left_metric
+                if violates and len(order_violations) < 10:
+                    order_violations.append(
+                        {
+                            "first_index": left_idx,
+                            "first_metric": left_metric,
+                            "first_record": left_record,
+                            "next_index": right_idx,
+                            "next_metric": right_metric,
+                            "next_record": right_record,
+                        }
+                    )
+
+            check: Dict[str, Any] = {
+                "metric_field": selection_metric_field,
+                "order": "desc" if descending else "asc",
+                "selected_count": len(records),
+                "selection_limit": selection_limit,
+                "missing_metric_count": len(records) - len(selected_metrics),
+                "missing_metric_examples": missing_metric,
+                "order_violation_count": len(order_violations),
+                "order_violation_examples": order_violations,
+            }
+            if missing_metric or order_violations:
+                audit["ready_for_done"] = False
+            if selection_limit is not None and len(records) < int(selection_limit):
+                check["under_limit"] = {"count": len(records), "target": int(selection_limit)}
+                audit["ready_for_done"] = False
+
+            if selection_pool_records is not None:
+                pool_metrics: list[tuple[int, float, Any]] = []
+                pool_missing = 0
+                for idx, record in enumerate(selection_pool_records):
+                    metric = _metric_number(_field_value(record, selection_metric_field))
+                    if metric is None:
+                        pool_missing += 1
+                    else:
+                        pool_metrics.append((idx, metric, record))
+                pool_metrics.sort(key=lambda item: item[1], reverse=descending)
+                desired_count = int(selection_limit or len(records))
+                top_pool = pool_metrics[:desired_count]
+                check["candidate_pool_count"] = len(selection_pool_records)
+                check["candidate_pool_metric_count"] = len(pool_metrics)
+                check["candidate_pool_missing_metric_count"] = pool_missing
+                check["candidate_pool_top_preview"] = [
+                    {"index": idx, "metric": metric, "record": record}
+                    for idx, metric, record in top_pool[:10]
+                ]
+
+                if selection_key_fields:
+                    selected_keys = {_dedupe_key(record, selection_key_fields) for _, _, record in selected_metrics}
+                    top_keys = {_dedupe_key(record, selection_key_fields) for _, _, record in top_pool}
+                    missing_top = [
+                        {"index": idx, "metric": metric, "record": record}
+                        for idx, metric, record in top_pool
+                        if _dedupe_key(record, selection_key_fields) not in selected_keys
+                    ][:10]
+                    selected_outside_top = [
+                        {"index": idx, "metric": metric, "record": record}
+                        for idx, metric, record in selected_metrics
+                        if _dedupe_key(record, selection_key_fields) not in top_keys
+                    ][:10]
+                    check["candidate_pool_key_fields"] = selection_key_fields
+                    check["missing_top_candidate_count"] = max(0, len(top_keys - selected_keys))
+                    check["missing_top_candidate_examples"] = missing_top
+                    check["selected_outside_top_count"] = max(0, len(selected_keys - top_keys))
+                    check["selected_outside_top_examples"] = selected_outside_top
+                    if missing_top or selected_outside_top:
+                        audit["ready_for_done"] = False
+
+            audit["checks"]["selection"] = check
 
         audit_path = _outputs_dir_path(Path(str(ns.get("cwd") or "."))) / artifact_name
         audit_path.parent.mkdir(parents=True, exist_ok=True)
