@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | `0cb4ac7` audit helper exists; adoption failed; final-answer audit surfacing pending commit |
+| Recommended branch state | Source-provenance audit protocol implemented; focused rerun pending |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
-| Latest `real_v14_short` strict/manual score | Cloud run: runner 10/10; manual strict 7 pass / 3 partial / 0 fail |
+| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; manual 1 pass / 1 partial / 1 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
-| Most important improvement | Host-side hard timeout for Python worker calls |
+| Most important improvement | Audit guard fixed blank visual artifacts and forced repair before done |
 | Worst regression | None yet |
-| Open root-cause clusters | Blank visual artifacts, global dedupe scope, per-record field completeness |
-| Next experiment | Commit audit surfacing in `set_final_answer`, rerun focused tasks once, then run full `real_v8` baseline |
+| Open root-cause clusters | Source-entity provenance, global dedupe scope, top-k/ranking proof |
+| Next experiment | Rebuild terminal binary, rerun focused tasks 6/10/16, then run full `real_v8`/`real_v14_short` if no regression |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -558,3 +558,63 @@ Interpretation:
   - `cargo test`: passed, including new missing-audit finalization tests; `browser-use-core` now has `53` tests.
   - `cargo fmt --check`: passed
 - Decision: Accepted for another focused eval iteration before full real_v8.
+
+### Invalid Focused Rerun: `overnight-real-v14-audit-guard-focus-20260514-001823`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-audit-guard-focus-20260514-001823`
+- Result: discarded.
+- Reason: launched after committing `fa72e0c` but before rebuilding `target/debug/browser-use-terminal`, so the run used a stale binary. It accepted `done(use_final_answer=true)` despite `ready_for_done=false`, proving the run was not exercising the committed guard.
+- Decision: Do not use for scoring or regression analysis.
+
+### Focused Rerun: `overnight-real-v14-audit-guard-valid-focus-20260514-002920`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-audit-guard-valid-focus-20260514-002920`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `1` pass, `1` partial, `1` fail
+- Token usage: `2,700,133` total tokens for the three focused tasks.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Remaining problem |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | The model called `audit_artifact`, found blank detail screenshots, repaired them, reran the audit, and finished with `ready_for_done=true`. | Still selected US-default results rather than proven global results; top-5 ranking is only a visible-results proxy; ads 2-5 have card crops rather than full modal details. |
+| 10 | pass | pass | The model produced `293` unique records, complete TopPlastic ranks `1-114`, `211` ASPS candidates, and `45` candidates for each specialty. | `practice` blank for all rows; broad ASPS geography; some ASPS rows without specialty evidence. |
+| 16 | pass | fail | The model produced `19` categories and `225` rows with no category-scoped duplicates. | It conflated delivery destination with restaurant/store source: DoorDash source was `McDonald's (7413-SAN FRAN/BAYSHR)`, store id `662393`, zip `94124`, while the final answer claimed `302 Potrero Ave`. Global item-price duplicates remain (`225` rows, `140` unique item-price pairs). |
+
+Interpretation:
+
+- The finalization guard is valuable: it converted task `6` from blank-image failure to usable visual artifacts.
+- The guard is still too shallow: a shape/file audit can say `ready_for_done=true` while the artifact is semantically tied to the wrong source entity.
+- Task `16` exposes the first-principles issue:
+  - entered/requested locations, delivery destinations, filters, and search text are not the same as the selected source entity;
+  - the model needs to preserve both roles explicitly and verify the selected source before extracting bulk data;
+  - dedupe scope must match user wording, not whatever key makes the audit pass.
+
+### Intervention: Source-Provenance Audit Protocol
+
+- Hypothesis: The next generalizable failure class is not missing artifacts; it is unverified source identity. For entity/location-bound extraction, the model must prove which source entity produced the artifact before finalization.
+- Intervention:
+  - `audit_artifact(...)` now accepts `source_evidence` and `required_source_fields`.
+  - `set_final_answer(...)` detects top-level source/entity/location claims such as `store_address` in nontrivial structured outputs. If an attached audit lacks `source_evidence`, the persisted final answer is marked `ready_for_done=false`.
+  - `done(use_final_answer=true)` and placeholder text finalization now reject any persisted final answer whose summary has `ready_for_done=false`, not only missing-audit cases.
+  - The Python tool prompt now explicitly distinguishes selected source identity from search inputs, delivery destinations, filters, and user-provided claims.
+  - The prompt now tells the model to choose dedupe keys from the user's wording; unqualified "no duplicates" means global entity/item dedupe, not category-scoped dedupe.
+- Why this is generalizable:
+  - It does not know McDonald's, DoorDash, task IDs, addresses, expected menus, or benchmark answers.
+  - It applies to any extraction where a final artifact claims a specific source entity/location.
+  - It still allows honest explicit completion with caveats when source identity cannot be verified.
+- Expected movement:
+  - Task `16` should either select the actual requested store/menu source or refuse to claim the menu belongs to it.
+  - Task `6` may improve modal/source proof if the model treats ad details as source evidence rather than only screenshots.
+  - Task `10` should not regress; its compact final summary has no top-level source address claim, and its existing audit remains focused on fields/buckets.
+- Verification:
+  - Focused Python tests for audit/source evidence: passed, `21 passed`.
+  - `cargo fmt --check`: passed.
+  - `cargo test`: passed, including `browser-use-core` `54` tests.
+  - Full Python suite: passed, `21 passed`.
+- Decision: Pending focused rerun.

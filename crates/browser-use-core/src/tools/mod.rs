@@ -583,6 +583,9 @@ mod tests {
             "attach=True",
             "raw `cdp",
             "Do not import Playwright",
+            "Preserve source provenance",
+            "source_evidence",
+            "Choose dedupe fields from the user's wording",
         ] {
             assert!(
                 description.contains(expected),

@@ -653,7 +653,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         if looks_like_placeholder_done_result(requested_result) {
                             if let Some(final_answer) = persisted_final_answer(&session)? {
                                 if let Some(error) =
-                                    persisted_final_answer_missing_audit_message(&final_answer)
+                                    persisted_final_answer_not_ready_message(&final_answer)
                                 {
                                     store.append_event(
                                         &session.id,
@@ -2657,7 +2657,7 @@ fn dispatch_done_tool(
         .cloned();
     if use_final_answer {
         if let Some(answer) = final_answer.as_ref() {
-            if let Some(error) = persisted_final_answer_missing_audit_message(answer) {
+            if let Some(error) = persisted_final_answer_not_ready_message(answer) {
                 return dispatch_tool_validation_error(store, session, call, &error);
             }
         }
@@ -2745,8 +2745,15 @@ fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn persisted_final_answer_missing_audit_message(final_answer: &Value) -> Option<String> {
+fn persisted_final_answer_not_ready_message(final_answer: &Value) -> Option<String> {
     let summary = final_answer.get("summary")?;
+    if summary
+        .get("ready_for_done")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return None;
+    }
     let audit_missing = summary.get("audit").is_none_or(|audit| audit.is_null());
     let audit_recommended = summary
         .get("audit_recommendation")
@@ -2754,7 +2761,24 @@ fn persisted_final_answer_missing_audit_message(final_answer: &Value) -> Option<
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !(audit_missing && audit_recommended) {
-        return None;
+        if let Some(note) = summary.get("audit_note").and_then(Value::as_str) {
+            return Some(format!(
+                "The persisted final answer is not ready for done. {note} Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+            ));
+        }
+        if let Some(audit_path) = summary
+            .get("audit")
+            .and_then(|audit| audit.get("audit_path"))
+            .and_then(Value::as_str)
+        {
+            return Some(format!(
+                "The persisted final answer is not ready for done because the attached artifact audit did not pass ({audit_path}). Review the audit checks, fix the artifact, and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+            ));
+        }
+        return Some(
+            "The persisted final answer is not ready for done. Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+                .to_string(),
+        );
     }
     let reasons = summary
         .get("audit_recommendation")
@@ -5307,6 +5331,71 @@ mod tests {
                 && event.payload["error"]
                     .as_str()
                     .is_some_and(|error| error.contains("missing an artifact audit"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "Could not complete a verified audit; the artifact needs review."
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_rejects_persisted_final_answer_when_attached_audit_is_not_ready() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_failed_audit_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nset_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_failed_audit".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "use_final_answer": true,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_explicit_gaps".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Could not complete a verified audit; the artifact needs review.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract many items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "done_failed_audit"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("attached artifact audit did not pass"))
         }));
         assert!(events.iter().any(|event| {
             event.event_type == "session.done"

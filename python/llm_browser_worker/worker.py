@@ -934,6 +934,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         explicit_counts: list[Dict[str, Any]] = []
         visual_paths: list[str] = []
         structured_paths: list[str] = []
+        source_identity_claim_paths: list[str] = []
         nested_record_count = 0
         recordish_keys = {
             "ads",
@@ -959,6 +960,26 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "total",
             "total_count",
         }
+        source_identity_keys = {
+            "address",
+            "business_address",
+            "location",
+            "location_address",
+            "restaurant_address",
+            "selected_business",
+            "selected_location",
+            "selected_store",
+            "source_address",
+            "source_business",
+            "source_entity",
+            "source_location",
+            "source_store",
+            "store",
+            "store_address",
+            "store_id",
+            "store_location",
+            "venue_address",
+        }
 
         def normalized_suffix(text: str) -> str:
             lowered = text.strip().lower().split("?", 1)[0].split("#", 1)[0]
@@ -972,6 +993,12 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                     lower_key = key.lower()
                     if lower_key in count_keys and isinstance(child, (int, float)) and child > 0:
                         explicit_counts.append({"path": ".".join(path + [key]), "value": int(child)})
+                    if (
+                        len(path) <= 1
+                        and lower_key in source_identity_keys
+                        and not _is_missing(child)
+                    ):
+                        source_identity_claim_paths.append(".".join(path + [key]))
                     visit(child, path + [key])
                 return
             if isinstance(value, list):
@@ -1001,6 +1028,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             reasons.append(f"visual_artifact_paths={len(visual_paths)}")
         if explicit_record_count > 0 and structured_paths:
             reasons.append(f"external_structured_artifacts={len(structured_paths)}")
+        if source_identity_claim_paths and record_count_estimate > 5:
+            reasons.append(f"source_identity_claims={len(source_identity_claim_paths)}")
         return {
             "recommended": bool(reasons),
             "reasons": reasons,
@@ -1010,6 +1039,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "explicit_record_count": explicit_record_count,
             "visual_artifact_path_count": len(visual_paths),
             "structured_artifact_path_count": len(structured_paths),
+            "source_identity_claim_paths": source_identity_claim_paths[:10],
             "sample_visual_artifact_paths": visual_paths[:5],
             "sample_structured_artifact_paths": structured_paths[:5],
         }
@@ -1055,6 +1085,11 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         audit_recommendation = _final_answer_audit_recommendation(data, count)
         if isinstance(audit, dict):
             ready_for_done = bool(audit.get("ready_for_done"))
+            source_claim_paths = audit_recommendation.get("source_identity_claim_paths") or []
+            has_source_evidence = bool((audit.get("checks") or {}).get("source_evidence"))
+            source_evidence_missing = bool(source_claim_paths and not has_source_evidence)
+            if source_evidence_missing:
+                ready_for_done = False
         else:
             ready_for_done = not audit_recommendation["recommended"]
         summary = {
@@ -1072,6 +1107,15 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 "audit_artifact(...) with required fields, dedupe fields, bucket "
                 "targets, and visual files before done. Reasons: "
                 + ", ".join(audit_recommendation["reasons"])
+            )
+        elif isinstance(audit, dict) and source_evidence_missing:
+            summary["audit_recommendation"] = audit_recommendation
+            summary["audit_note"] = (
+                "The attached artifact audit did not include source evidence for "
+                "claimed entity/location fields. Add source_evidence with the URL, "
+                "page title, selected source entity name/address/id, and any distinct "
+                "search or delivery destination fields before done. Claimed fields: "
+                + ", ".join(source_claim_paths)
             )
         metadata = {
             "result": result_text,
@@ -1106,6 +1150,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         bucket_field: str | None = None,
         bucket_targets: Dict[str, int] | None = None,
         visual_files: list[Any] | None = None,
+        source_evidence: Dict[str, Any] | None = None,
+        required_source_fields: list[str] | None = None,
         artifact_name: str = "artifact_audit.json",
     ) -> Dict[str, Any]:
         """Compute a compact, general pre-final audit for model review.
@@ -1215,6 +1261,21 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 (not item.get("exists")) or item.get("appears_blank") or item.get("image_error")
                 for item in visual
             ):
+                audit["ready_for_done"] = False
+
+        if source_evidence is not None or required_source_fields:
+            evidence = source_evidence if isinstance(source_evidence, dict) else {}
+            missing_source: Dict[str, Any] = {}
+            for field in required_source_fields or []:
+                value = _field_value(evidence, field)
+                if _is_missing(value):
+                    missing_source[field] = {"value": value}
+            audit["checks"]["source_evidence"] = {
+                "required_fields": required_source_fields or [],
+                "missing_fields": missing_source,
+                "evidence": evidence,
+            }
+            if missing_source:
                 audit["ready_for_done"] = False
 
         audit_path = _outputs_dir_path(Path(str(ns.get("cwd") or "."))) / artifact_name

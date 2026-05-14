@@ -416,6 +416,45 @@ result = audit
     assert response["artifacts"][0]["source_path"] == audit["audit_path"]
 
 
+def test_worker_audit_artifact_reports_missing_source_evidence(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-source-audit",
+            "session_id": "task-artifact-source-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [{'item_name': 'Big Mac', 'item_price': '$1', 'currency': 'USD'}]
+audit = audit_artifact(
+    records=rows,
+    required_fields=['item_name', 'item_price', 'currency'],
+    dedupe_fields=['item_name', 'item_price'],
+    source_evidence={
+        'requested_store_address': '302 Potrero Ave',
+        'source_url': 'https://example.invalid/store/123',
+        'source_page_title': 'Store menu',
+    },
+    required_source_fields=[
+        'requested_store_address',
+        'source_url',
+        'source_page_title',
+        'selected_source_entity_name',
+        'selected_source_entity_address',
+    ],
+)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    source_check = audit["checks"]["source_evidence"]
+    assert "selected_source_entity_name" in source_check["missing_fields"]
+    assert "selected_source_entity_address" in source_check["missing_fields"]
+
+
 def test_worker_set_final_answer_embeds_last_artifact_audit(tmp_path: Path) -> None:
     response = worker._run(
         {
@@ -469,6 +508,38 @@ result = summary
     assert "ready_for_done=False" in response["outputs"][-1]["text"]
     metadata = tmp_path / "artifacts" / ".final_answer.json"
     assert "large_structured_result_estimate" in metadata.read_text()
+
+
+def test_worker_set_final_answer_requires_source_evidence_for_source_identity_claims(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-source-evidence",
+            "session_id": "task-final-answer-source-evidence",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+menu = {
+    'store_address': '302 Potrero Ave, San Francisco, CA 94103',
+    'categories': [
+        {'category_name': 'A', 'items': [{'item_name': f'item-{idx}', 'item_price': '$1'} for idx in range(6)]},
+    ],
+}
+rows = [item for category in menu['categories'] for item in category['items']]
+audit = audit_artifact(records=rows, required_fields=['item_name', 'item_price'], dedupe_fields=['item_name', 'item_price'])
+summary = set_final_answer(menu, artifact_name='menu.json', audit=audit)
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert "source evidence" in response["data"]["audit_note"]
+    assert response["data"]["audit_recommendation"]["source_identity_claim_paths"] == [
+        "store_address"
+    ]
 
 
 def test_worker_set_final_answer_recommends_audit_for_summary_artifacts_and_images(tmp_path: Path) -> None:
