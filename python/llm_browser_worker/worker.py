@@ -1053,12 +1053,16 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             artifact = _write_artifact(artifact_name, result_text, mime_type or default_mime)
         count = _final_answer_count(data)
         audit_recommendation = _final_answer_audit_recommendation(data, count)
+        if isinstance(audit, dict):
+            ready_for_done = bool(audit.get("ready_for_done"))
+        else:
+            ready_for_done = not audit_recommendation["recommended"]
         summary = {
-            "ready": True,
+            "ready": ready_for_done,
             "count": count,
             "artifact": artifact,
             "audit": audit,
-            "ready_for_done": audit.get("ready_for_done") if isinstance(audit, dict) else None,
+            "ready_for_done": ready_for_done,
             "audit_recommendation": audit_recommendation if audit is None else None,
             "preview": _final_answer_preview(data),
         }
@@ -1086,7 +1090,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         if isinstance(audit, dict):
             audit_text = f" audit_ready_for_done={audit.get('ready_for_done')}"
         elif summary.get("audit_note"):
-            audit_text = " audit=missing"
+            audit_text = " audit=missing ready_for_done=False"
         else:
             audit_text = ""
         emit_output(f"final answer ready:{count_text}{artifact_text}{audit_text}")

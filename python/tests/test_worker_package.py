@@ -464,7 +464,9 @@ result = summary
     recommendation = response["data"]["audit_recommendation"]
     assert recommendation["recommended"] is True
     assert recommendation["nested_record_count"] >= 30
+    assert response["data"]["ready_for_done"] is False
     assert "audit=missing" in response["outputs"][-1]["text"]
+    assert "ready_for_done=False" in response["outputs"][-1]["text"]
     metadata = tmp_path / "artifacts" / ".final_answer.json"
     assert "large_structured_result_estimate" in metadata.read_text()
 
@@ -497,6 +499,7 @@ result = summary
     assert recommendation["explicit_record_count"] == 410
     assert recommendation["visual_artifact_path_count"] == 3
     assert recommendation["structured_artifact_path_count"] == 1
+    assert response["data"]["ready_for_done"] is False
     assert "audit=missing" in response["outputs"][-1]["text"]
 
 

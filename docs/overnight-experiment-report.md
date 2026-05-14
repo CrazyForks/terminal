@@ -489,3 +489,72 @@ Decision:
   - `uv run --with pytest python -m pytest -q`: passed, `19 passed`
   - `cargo fmt --check && cargo test`: passed
 - Decision: Accepted for the next eval iteration.
+
+### Focused Rerun: `overnight-real-v14-recursive-audit-focus-20260513-235306`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-recursive-audit-focus-20260513-235306`
+- Manifest: `/tmp/overnight-real-v14-recursive-audit-focus-20260513-235306/state/dataset-runs/overnight-real-v14-recursive-audit-focus-20260513-235306.json`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `0` pass, `1` partial, `2` fail
+- Audit adoption: `0` `audit_artifact(...)` calls; `0` `artifact_audit.json` files.
+- Audit surfacing: `audit=missing` surfaced for all three tasks.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Evidence |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | `audit=missing` surfaced, but the model ignored it and finished. Output has 5 ads, but several creative screenshots are blank or almost blank, and the ranking is still a proxy. | `outputs/result.json`, `outputs/ad_*_creative.png`, DB seq `1049-1064` |
+| 10 | pass | fail | `audit=missing` surfaced twice. The model continued once, then ended with plain `Done.`. Output grew to `877` records but failed explicit per-specialty targets for Rhinoplasty (`12`) and Liposuction (`24`), and broadened beyond the scoped source population. | `outputs/result.json`, DB seq `1089`, `1277-1289` |
+| 16 | pass | fail | `audit=missing` surfaced for nested item count, but the model ignored it and finished. Output has correct address text but appears to use DoorDash delivery destination, not proven restaurant source, and still has `81` duplicate item-price rows. | `outputs/result.json`, DB seq `1239-1251` |
+
+Concrete checks:
+
+- Task `6`:
+  - `ad_3_*_creative.png`, `ad_4_*_creative.png`, and `ad_5_*_creative.png` were single-color `(240, 242, 245)` images.
+  - The helper correctly flagged visual-artifact audit need via `visual_artifact_paths=3`.
+  - Failure mode: visible cue was not strong enough to stop finalization.
+- Task `10`:
+  - `records`: `877`; `metadata.asps_unique_count`: `797`.
+  - Missing fields from artifact shape: `rating=877`, `address=877`, `phone=877`, `abps_board_certification=877`, `specialties=82`.
+  - Specialty counts included `Rhinoplasty=12` and `Liposuction=24`, below the requested `40`.
+  - The page evidence showed ASPS was falling back outside the requested location, so volume was inflated by broadening scope.
+  - The model produced plain final text `Done.` at the end; because that path bypassed the `done` tool, it did not use the persisted final answer.
+- Task `16`:
+  - `14` categories, `209` item rows, `128` unique item-price pairs, `81` duplicate item-price rows.
+  - DB/browser evidence showed DoorDash pages for another McDonald's title while `302 Potrero` appeared as delivery address.
+  - Failure mode: confused delivery address with selected restaurant/menu source and preserved repeated recommendation categories.
+
+Interpretation:
+
+- Recursive audit detection works: all three target shapes surfaced `audit=missing` with useful reasons.
+- Prompt-only response to `audit=missing` still fails.
+- There is a second generic bug: direct assistant text `Done.` bypasses the `done` tool's persisted-final-answer replacement logic.
+- The next intervention should keep the general principle but make it operational:
+  - missing audit should set `ready_for_done=false`;
+  - `done(use_final_answer=true)` should reject persisted final answers whose own summary says an audit is missing;
+  - plain placeholder text like `Done.` should not bypass the same missing-audit guard.
+
+### Intervention: Guard Missing-Audit Finalization And Placeholder Done
+
+- Hypothesis: The model needs a hard generic protocol edge only when it tries to finish with a persisted final answer that the worker itself marked audit-missing. This is not benchmark validation; it enforces the artifact protocol.
+- Intervention:
+  - `set_final_answer(...)` now sets `ready_for_done=false` when an audit is recommended but missing, and emits `audit=missing ready_for_done=False`.
+  - The `done` tool rejects `use_final_answer=true` or placeholder replacement when the persisted final answer has `audit_recommendation.recommended=true` and no attached audit.
+  - Direct assistant text placeholders such as `Done.` now go through the same guard when a persisted final answer exists, preventing them from bypassing tool validation.
+  - Prompts now explicitly say not to finish when `audit=missing ready_for_done=False` appears.
+- Why this is generalizable:
+  - It does not inspect task IDs, expected answers, websites, or result values.
+  - It only enforces consistency between the model's own persisted final answer and the generic audit protocol.
+  - It still permits an explicit final result that reports unresolved gaps, so impossible tasks can terminate honestly.
+- Expected movement:
+  - Task `10`: plain `Done.` after an audit-missing artifact should be rejected and force another turn.
+  - Task `16`: `done(use_final_answer=true)` after nested duplicate-prone output should be rejected until an audit is attached or gaps are explicitly reported.
+  - Task `6`: visual screenshot artifacts should require either an audit or explicit caveat.
+- Verification:
+  - `uv run --with pytest python -m pytest -q`: passed, `19 passed`
+  - `cargo test`: passed, including new missing-audit finalization tests; `browser-use-core` now has `53` tests.
+  - `cargo fmt --check`: passed
+- Decision: Accepted for another focused eval iteration before full real_v8.

@@ -649,10 +649,65 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
                 if tool_calls.is_empty() {
                     if !assistant_text.trim().is_empty() {
+                        let requested_result = assistant_text.trim_end();
+                        if looks_like_placeholder_done_result(requested_result) {
+                            if let Some(final_answer) = persisted_final_answer(&session)? {
+                                if let Some(error) =
+                                    persisted_final_answer_missing_audit_message(&final_answer)
+                                {
+                                    store.append_event(
+                                        &session.id,
+                                        "tool.failed",
+                                        serde_json::json!({
+                                            "name": "done",
+                                            "source": "assistant_text_placeholder",
+                                            "error": error,
+                                        }),
+                                    )?;
+                                    messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": error,
+                                    }));
+                                    maybe_compact_messages(
+                                        store,
+                                        &session.id,
+                                        &mut messages,
+                                        options.max_context_chars,
+                                    )?;
+                                    step_span.set_ok();
+                                    continue;
+                                }
+                                if let Some(result) = persisted_final_answer_result(&final_answer) {
+                                    let final_answer_summary = final_answer.get("summary").cloned();
+                                    store.append_event(
+                                        &session.id,
+                                        "session.final_answer_used",
+                                        serde_json::json!({
+                                            "source": "python.set_final_answer",
+                                            "trigger": "assistant_text_placeholder",
+                                        }),
+                                    )?;
+                                    let mut done_payload = serde_json::json!({
+                                        "result": result,
+                                        "source": "python.set_final_answer",
+                                    });
+                                    if let Some(summary) = final_answer_summary {
+                                        done_payload["final_answer_summary"] = summary;
+                                    }
+                                    store.append_event(
+                                        &session.id,
+                                        "session.done",
+                                        done_payload,
+                                    )?;
+                                    step_span.set_ok();
+                                    return Ok(session.id.clone());
+                                }
+                            }
+                        }
                         store.append_event(
                             &session.id,
                             "session.done",
-                            serde_json::json!({ "result": assistant_text.trim_end() }),
+                            serde_json::json!({ "result": requested_result }),
                         )?;
                         step_span.set_ok();
                         return Ok(session.id.clone());
@@ -2600,6 +2655,13 @@ fn dispatch_done_tool(
         .as_ref()
         .and_then(|answer| answer.get("summary"))
         .cloned();
+    if use_final_answer {
+        if let Some(answer) = final_answer.as_ref() {
+            if let Some(error) = persisted_final_answer_missing_audit_message(answer) {
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+        }
+    }
     let result = if use_final_answer {
         let Some(answer) = final_answer.as_ref() else {
             return dispatch_tool_validation_error(
@@ -2609,12 +2671,7 @@ fn dispatch_done_tool(
                 "done could not load the persisted final answer",
             );
         };
-        let Some(result) = answer
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|result| !result.is_empty())
-        else {
+        let Some(result) = persisted_final_answer_result(answer) else {
             return dispatch_tool_validation_error(
                 store,
                 session,
@@ -2677,6 +2734,44 @@ fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result
     let value: Value = serde_json::from_str(&contents)
         .with_context(|| format!("parse persisted final answer {}", path.display()))?;
     Ok(Some(value))
+}
+
+fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
+    final_answer
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|result| !result.is_empty())
+        .map(str::to_string)
+}
+
+fn persisted_final_answer_missing_audit_message(final_answer: &Value) -> Option<String> {
+    let summary = final_answer.get("summary")?;
+    let audit_missing = summary.get("audit").is_none_or(|audit| audit.is_null());
+    let audit_recommended = summary
+        .get("audit_recommendation")
+        .and_then(|recommendation| recommendation.get("recommended"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !(audit_missing && audit_recommended) {
+        return None;
+    }
+    let reasons = summary
+        .get("audit_recommendation")
+        .and_then(|recommendation| recommendation.get("reasons"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|joined| !joined.is_empty())
+        .unwrap_or_else(|| "large or artifact-heavy final answer".to_string());
+    Some(format!(
+        "The persisted final answer is not ready for done because it is missing an artifact audit ({reasons}). Run audit_artifact(...) with the relevant records/path, required fields, dedupe fields, bucket targets, or visual files; then call set_final_answer(..., audit=audit). If the task truly cannot be completed, pass an explicit final result that states the remaining gaps instead of replying only Done."
+    ))
 }
 
 fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Value) -> bool {
@@ -5152,6 +5247,133 @@ mod tests {
                 && event.payload["result"]
                     .as_str()
                     .is_some_and(|result| result.contains("\"items\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_rejects_persisted_final_answer_when_required_audit_is_missing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_large_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'items': list(range(30))}, artifact_name='items.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_missing_audit".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "use_final_answer": true,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_explicit_gaps".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Could not complete a verified audit; the artifact needs review.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract many items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "done_missing_audit"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("missing an artifact audit"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "Could not complete a verified audit; the artifact needs review."
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn placeholder_text_done_does_not_bypass_missing_audit_final_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_large_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'items': list(range(30))}, artifact_name='items.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "Done.".to_string(),
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_explicit_after_reject".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Could not complete a verified audit; the artifact needs review.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract many items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["source"] == "assistant_text_placeholder"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("missing an artifact audit"))
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "Done."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "Could not complete a verified audit; the artifact needs review."
         }));
         Ok(())
     }
