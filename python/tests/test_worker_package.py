@@ -440,6 +440,66 @@ result = summary
     assert '"ready_for_done": false' in metadata.read_text()
 
 
+def test_worker_set_final_answer_recommends_audit_for_nested_records(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-nested-audit",
+            "session_id": "task-final-answer-nested-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+menu = {
+    'categories': [
+        {'category_name': 'A', 'items': [{'item_name': f'item-{idx}', 'price': '$1'} for idx in range(15)]},
+        {'category_name': 'B', 'items': [{'item_name': f'item-{idx}', 'price': '$1'} for idx in range(15, 30)]},
+    ]
+}
+summary = set_final_answer(menu, artifact_name='menu.json')
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    recommendation = response["data"]["audit_recommendation"]
+    assert recommendation["recommended"] is True
+    assert recommendation["nested_record_count"] >= 30
+    assert "audit=missing" in response["outputs"][-1]["text"]
+    metadata = tmp_path / "artifacts" / ".final_answer.json"
+    assert "large_structured_result_estimate" in metadata.read_text()
+
+
+def test_worker_set_final_answer_recommends_audit_for_summary_artifacts_and_images(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-artifact-audit",
+            "session_id": "task-final-answer-artifact-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+summary = set_final_answer({
+    'output_path': '/tmp/result.json',
+    'record_count': 410,
+    'screenshots': {
+        'one': '/tmp/one.png',
+        'two': '/tmp/two.jpg',
+        'three': '/tmp/three.webp',
+    },
+})
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    recommendation = response["data"]["audit_recommendation"]
+    assert recommendation["recommended"] is True
+    assert recommendation["explicit_record_count"] == 410
+    assert recommendation["visual_artifact_path_count"] == 3
+    assert recommendation["structured_artifact_path_count"] == 1
+    assert "audit=missing" in response["outputs"][-1]["text"]
+
+
 def test_managed_browser_does_not_use_system_chromium_without_opt_in(
     tmp_path: Path, monkeypatch
 ) -> None:

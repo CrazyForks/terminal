@@ -418,3 +418,74 @@ Interpretation:
   - `uv run --with pytest python -m pytest -q`: passed, `17 passed`
   - `cargo fmt --check && cargo test`: passed
 - Decision: Focused rerun pending.
+
+### Focused Rerun: `overnight-real-v14-audit-surfacing-focus-20260513-233407`
+
+- Dataset: `real_v14_short`
+- Tasks: `6`, `10`, `16`
+- Root: `/tmp/overnight-real-v14-audit-surfacing-focus-20260513-233407`
+- Manifest: `/tmp/overnight-real-v14-audit-surfacing-focus-20260513-233407/state/dataset-runs/overnight-real-v14-audit-surfacing-focus-20260513-233407.json`
+- Command: `dataset-run-codex real_v14_short --task-id 6 --task-id 10 --task-id 16 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 3 --browser-mode cloud`
+- Runner result: `3/3` passed, `0` failed, `0` pending
+- Manual strict result: `0` pass, `3` partial, `0` fail
+- Audit adoption: `0` `audit_artifact(...)` calls; `0` `artifact_audit.json` files.
+
+Manual judging:
+
+| Task | Runner | Manual | Delta vs previous focused run | Evidence |
+| ---: | --- | --- | --- | --- |
+| 6 | pass | partial | Regressed from the previous local judgment: 5 records exist, but several `*_card.png` files are blank/single-color and the detailed screenshots mostly show grid/detail views rather than each requested creative. | `outputs/result.json`, `outputs/ad_*.png`, `outputs/search_results_page.png` |
+| 10 | pass | partial | Improved vs self-review-r2 and smaller but cleaner than audit-helper run: `410` unique surgeons, all specialty candidate buckets reach `40`, but `26` records still lack specialties, `81` lack address/phone, and `37` lack ABPS status. | `outputs/result.json`, `outputs/result.csv` |
+| 16 | pass | partial | Address is correct and prices are present, but the explicit `no duplicates` requirement still fails: `207` rows, `128` unique item-price pairs, `79` duplicate rows. | `outputs/result.json` |
+
+Concrete checks:
+
+- Task `6` screenshot audit:
+  - `ad_3_*_card.png`, `ad_4_*_card.png`, and `ad_5_*_card.png` were single-color `(240, 242, 245)` images.
+  - `result.json` points to screenshot paths for all 5 ads, so file existence alone is misleading.
+  - This validates the need for visual artifact checks, but the model did not call the helper.
+- Task `10` artifact audit:
+  - `records`: `410`; `unique_names`: `410`
+  - `sources`: `329` ASPS rows, `114` topplastics rows
+  - Missing fields: `address=81`, `phone=81`, `specialties=26`, `abps_board_certification=37`
+  - Specialty counts all exceeded `40`, and `candidates_by_specialty` had exactly `40` each.
+  - Still not strict because the task asks for names/practices/ratings and ABPS certification for each surgeon, not only enough rows per specialty.
+- Task `16` dedupe:
+  - `14` categories, `207` item rows, `128` unique item-price pairs, `79` duplicate item-price rows.
+  - Repeated examples include `Sausage McMuffin® with Egg`, `Sausage Egg McMuffin® Meal`, and `Sausage, Egg and Cheese McGriddles® Meal`.
+  - The model deduped locally or not at all; it did not flatten globally across categories before finalizing.
+
+Interpretation:
+
+- The `set_final_answer` audit surfacing intervention did not activate because the missing-audit heuristic only looked at shallow top-level list counts.
+- Task `10` final data was a compact summary with `record_count: 410` and output paths, so shallow list counting returned `null`.
+- Task `16` had a top-level `categories` list of length `14`; the actual `207` item records were nested under `categories[].items`.
+- Task `6` had only 5 logical records but many visual artifact paths, which should also trigger audit recommendations.
+
+Decision:
+
+- Revise the intervention, not revert it.
+- Keep the non-blocking design: do not reject `done` and do not benchmark-validate answers.
+- Make `set_final_answer` detect audit-worthy outputs through nested records, explicit `record_count`/`item_count` fields, external structured artifact paths, and many visual artifact paths.
+
+### Intervention: Recursive Missing-Audit Recommendation
+
+- Hypothesis: The prior audit-surfacing mechanism was right in spirit but too shallow. The finalization path should recommend an audit when the answer is nested, references a large external artifact, or contains multiple screenshot/media paths.
+- Intervention:
+  - Added recursive final-answer inspection inside `set_final_answer`.
+  - It now estimates record scale from nested record-like lists such as `items`, `rows`, `records`, `surgeons`, `ads`, `stores`, `products`, and `candidates`.
+  - It recognizes explicit count fields such as `record_count`, `item_count`, `row_count`, `total_count`, and `total`.
+  - It counts visual artifact paths (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`) and structured artifact paths (`.json`, `.csv`, `.tsv`, `.xlsx`, `.pdf`, `.txt`).
+  - When no audit is attached and any of these signals are large/artifact-heavy, `set_final_answer` emits `audit=missing` and stores an `audit_recommendation` with reasons.
+- Why this is generalizable:
+  - It still does not block finalization.
+  - It does not know benchmark answers, task IDs, sites, expected counts, or special schemas.
+  - It only gives the model a visible, computed prompt to perform its own audit before calling `done`.
+- Expected movement:
+  - Task `16`: nested `categories[].items` should surface `large_structured_result_estimate=...` before `done`.
+  - Task `10`: compact summaries with `record_count` and `output_path` should surface missing audit state.
+  - Task `6`: multiple screenshot paths should surface visual-artifact audit need even when record count is small.
+- Verification:
+  - `uv run --with pytest python -m pytest -q`: passed, `19 passed`
+  - `cargo fmt --check && cargo test`: passed
+- Decision: Accepted for the next eval iteration.

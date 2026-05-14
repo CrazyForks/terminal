@@ -929,6 +929,91 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 return sum(list_lengths)
         return None
 
+    def _final_answer_audit_recommendation(data: Any, count: int | None) -> Dict[str, Any]:
+        list_lengths: list[Dict[str, Any]] = []
+        explicit_counts: list[Dict[str, Any]] = []
+        visual_paths: list[str] = []
+        structured_paths: list[str] = []
+        nested_record_count = 0
+        recordish_keys = {
+            "ads",
+            "candidates",
+            "items",
+            "packages",
+            "products",
+            "providers",
+            "records",
+            "results",
+            "rows",
+            "stores",
+            "surgeons",
+        }
+        count_keys = {
+            "candidate_count",
+            "count",
+            "item_count",
+            "record_count",
+            "records_count",
+            "result_count",
+            "row_count",
+            "total",
+            "total_count",
+        }
+
+        def normalized_suffix(text: str) -> str:
+            lowered = text.strip().lower().split("?", 1)[0].split("#", 1)[0]
+            return Path(lowered).suffix
+
+        def visit(value: Any, path: list[str]) -> None:
+            nonlocal nested_record_count
+            if isinstance(value, dict):
+                for raw_key, child in value.items():
+                    key = str(raw_key)
+                    lower_key = key.lower()
+                    if lower_key in count_keys and isinstance(child, (int, float)) and child > 0:
+                        explicit_counts.append({"path": ".".join(path + [key]), "value": int(child)})
+                    visit(child, path + [key])
+                return
+            if isinstance(value, list):
+                joined = ".".join(path)
+                list_lengths.append({"path": joined, "length": len(value)})
+                parent = path[-1].lower() if path else ""
+                if parent in recordish_keys or (value and all(isinstance(item, dict) for item in value)):
+                    nested_record_count += len(value)
+                for index, item in enumerate(value[:100]):
+                    visit(item, path + [str(index)])
+                return
+            if isinstance(value, str):
+                suffix = normalized_suffix(value)
+                if suffix in {".gif", ".jpeg", ".jpg", ".png", ".webp"}:
+                    visual_paths.append(value)
+                elif suffix in {".csv", ".json", ".jsonl", ".pdf", ".tsv", ".txt", ".xlsx"}:
+                    structured_paths.append(value)
+
+        visit(data, [])
+        largest_list_count = max((item["length"] for item in list_lengths), default=0)
+        explicit_record_count = max((item["value"] for item in explicit_counts), default=0)
+        record_count_estimate = max(count or 0, nested_record_count, largest_list_count, explicit_record_count)
+        reasons: list[str] = []
+        if record_count_estimate > 20:
+            reasons.append(f"large_structured_result_estimate={record_count_estimate}")
+        if len(visual_paths) >= 3:
+            reasons.append(f"visual_artifact_paths={len(visual_paths)}")
+        if explicit_record_count > 0 and structured_paths:
+            reasons.append(f"external_structured_artifacts={len(structured_paths)}")
+        return {
+            "recommended": bool(reasons),
+            "reasons": reasons,
+            "record_count_estimate": record_count_estimate,
+            "largest_list_count": largest_list_count,
+            "nested_record_count": nested_record_count,
+            "explicit_record_count": explicit_record_count,
+            "visual_artifact_path_count": len(visual_paths),
+            "structured_artifact_path_count": len(structured_paths),
+            "sample_visual_artifact_paths": visual_paths[:5],
+            "sample_structured_artifact_paths": structured_paths[:5],
+        }
+
     def _final_answer_preview(data: Any) -> Any:
         if isinstance(data, list):
             return data[:3]
@@ -967,19 +1052,22 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         if artifact_name:
             artifact = _write_artifact(artifact_name, result_text, mime_type or default_mime)
         count = _final_answer_count(data)
+        audit_recommendation = _final_answer_audit_recommendation(data, count)
         summary = {
             "ready": True,
             "count": count,
             "artifact": artifact,
             "audit": audit,
             "ready_for_done": audit.get("ready_for_done") if isinstance(audit, dict) else None,
+            "audit_recommendation": audit_recommendation if audit is None else None,
             "preview": _final_answer_preview(data),
         }
-        if audit is None and count is not None and count > 20:
+        if audit is None and audit_recommendation["recommended"]:
             summary["audit_note"] = (
                 "No artifact audit was attached. For large structured results, run "
                 "audit_artifact(...) with required fields, dedupe fields, bucket "
-                "targets, and visual files before done."
+                "targets, and visual files before done. Reasons: "
+                + ", ".join(audit_recommendation["reasons"])
             )
         metadata = {
             "result": result_text,
