@@ -779,3 +779,79 @@ Decision:
 
 - Keep and commit. This is a real generalizable improvement: it converted a persistent task `6` partial into an audited pass without encoding task-specific expected IDs.
 - Next intervention should target task `10`: a general source-scope/locality audit that distinguishes "requested source/location returned no local results" from "broadened fallback used to satisfy counts."
+
+### Intervention: Source-Scope Audit Guard
+
+- Hypothesis: Task `10` regressed because the model silently broadened a scoped source/location when the requested ASPS Beverly Hills URL returned fallback/global results. Count targets should not be satisfied by broadening the source unless the user explicitly allows fallback.
+- Intervention:
+  - `set_final_answer(...)` now detects broadened/fallback source-scope claims such as "all locations", "no results found", "selected location", "fallback", "outside scope", and "to meet target".
+  - `audit_artifact(...)` now accepts `source_scope_evidence` and `required_scope_fields`.
+  - The source-scope check records requested scope, actual scope, scope match, fallback-used/allowed flags, and out-of-scope counts.
+  - Unapproved fallback, out-of-scope records, or partial/mismatched scope make `ready_for_done=false`.
+  - Prompts now tell the model to preserve requested source/location/category scope, avoid fallback rows for scoped count targets, and explicitly report remaining scoped gaps.
+- Why this is generalizable:
+  - It does not encode ASPS, Beverly Hills, task IDs, expected specialty counts, or known URLs.
+  - It applies to any source, location, category, directory, product, profile, or account where the website broadens results after a scoped lookup fails.
+  - It still allows honest partial completion when the source cannot satisfy the target.
+- Verification:
+  - Focused worker tests: passed, `28 passed`.
+  - Full Python tests: passed, `28 passed`.
+  - `cargo fmt --check`: passed.
+  - `cargo test`: passed.
+  - `cargo build --bin browser-use-terminal`: passed.
+
+### Focused Rerun: `overnight-real-v14-source-scope-task10-20260514-015107`
+
+- Dataset: `real_v14_short`
+- Task: `10`
+- Root: `/tmp/overnight-real-v14-source-scope-task10-20260514-015107`
+- Command: `dataset-run-codex real_v14_short --task-id 10 --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 1 --browser-mode cloud`
+- Runner result: `1/1` passed.
+- Manual strict result: partial. The run did not satisfy all requested count targets, but it did not fabricate the missing scoped rows.
+- Token usage: `1,893,400` total tokens.
+
+Manual judging:
+
+| Task | Runner | Manual | What changed | Remaining problem |
+| ---: | --- | --- | --- | --- |
+| 10 | pass | partial | The model detected that the requested ASPS `state=CA&city=Beverly Hills` path showed fallback/no-local behavior, switched to scoped Beverly Hills `zip=90210` and procedure-filtered `zip=90210` pages, and refused to broaden to global rows just to force all buckets to 40. | `Facial Reconstruction` only had `17` scoped matches, below the target of `40`. The final answer and audit correctly marked the gap. |
+
+Concrete checks:
+
+- Output files:
+  - `result.json`: `759` combined unique surgeons.
+  - `result.csv`: CSV export of the same artifact.
+  - `artifact_audit.json`: computed `audit_artifact(...)` output.
+- Counts:
+  - TopPlasticSurgeonReviews Beverly Hills rows: `114`.
+  - ASPS scoped/procedure-filtered unique records: `678`.
+  - Combined unique surgeons: `759`.
+  - Specialty target met for `12/13` specialties.
+  - `Facial Reconstruction`: `17/40`.
+- Audit:
+  - `ready_for_done`: `false`.
+  - `record_count`: `1873` flattened specialty candidate rows.
+  - duplicate `(name, specialty)` rows: `0`.
+  - missing `name`/`specialty`: `0`.
+  - source-scope evidence:
+    - requested scope: TopPlastic Beverly Hills plus ASPS Beverly Hills CA directory.
+    - actual scope: TopPlastic Beverly Hills plus ASPS Beverly Hills `zip=90210` directory/procedure filters.
+    - `scope_match`: `partial`.
+    - `fallback_used`: `false`.
+    - `out_of_scope_record_count`: `0`.
+- The model first timed out a monolithic Python extraction and then recovered with a faster chunked script. That is useful evidence for the next general improvement.
+
+Interpretation:
+
+- This was a quality improvement even though the strict target remains unsolved. The previous task `10` run looked structurally complete but was wrong because it filled buckets with broad/global ASPS records. This run preserved source scope and surfaced the real scoped gap.
+- The runner marked it pass because it completed with artifacts and an explicit final answer. Manual strict scoring should keep it partial because one target remains unmet.
+- The next general failure mode is execution discipline for large extraction tasks:
+  - avoid one giant Python tool call that can hit the 180-second cap;
+  - checkpoint partial outputs after each page/source/bucket;
+  - prefer bounded parallel fetch batches with progress summaries;
+  - do not let the model burn many turns debugging shell/process state after a timeout.
+
+Decision:
+
+- Keep the source-scope guard. It prevents a first-principles correctness error and aligns with the user's stated preference to avoid wrong/fabricated rows over forcing benchmark counts.
+- Next intervention: add a general long-extraction/chunking protocol to prompts, then rerun focused task `10` and full `real_v14_short`/`real_v8`.

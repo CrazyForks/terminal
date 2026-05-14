@@ -483,6 +483,49 @@ result = audit
     assert "selected_source_entity_address" in source_check["missing_fields"]
 
 
+def test_worker_audit_artifact_reports_unapproved_source_scope_broadening(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-source-scope-audit",
+            "session_id": "task-artifact-source-scope-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [{'name': 'A', 'specialty': 'Rhinoplasty'}]
+audit = audit_artifact(
+    records=rows,
+    source_scope_evidence={
+        'requested_scope': 'Beverly Hills, CA',
+        'requested_source_status': 'No results found in selected location',
+        'actual_scope': 'showing results for all locations',
+        'scope_match': 'broadened',
+        'fallback_used': True,
+        'fallback_allowed': False,
+        'out_of_scope_record_count': 40,
+    },
+    required_scope_fields=[
+        'requested_scope',
+        'requested_source_status',
+        'actual_scope',
+        'scope_match',
+    ],
+)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    scope = audit["checks"]["source_scope"]
+    assert scope["missing_fields"] == {}
+    assert "fallback_used_without_user_permission" in scope["violations"]
+    assert "out_of_scope_record_count=40" in scope["violations"]
+
+
 def test_worker_audit_artifact_can_require_unique_visual_files(tmp_path: Path) -> None:
     image_a = tmp_path / "a.png"
     image_b = tmp_path / "b.png"
@@ -641,6 +684,41 @@ result = summary
     assert "source evidence" in response["data"]["audit_note"]
     assert response["data"]["audit_recommendation"]["source_identity_claim_paths"] == [
         "store_address"
+    ]
+
+
+def test_worker_set_final_answer_requires_source_scope_audit_for_broadened_claims(
+    tmp_path: Path,
+) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-source-scope",
+            "session_id": "task-final-answer-source-scope",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [{'name': f'Dr {idx}', 'specialty': 'Rhinoplasty'} for idx in range(40)]
+audit = audit_artifact(records=rows, required_fields=['name'])
+summary = set_final_answer(
+    {
+        'metadata': {
+            'note': 'Requested source showed no results found in selected location; used all locations to meet the target.'
+        },
+        'records': rows,
+    },
+    artifact_name='surgeons.json',
+    audit=audit,
+)
+result = summary
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert "source_scope" in response["data"]["audit_note"]
+    assert response["data"]["audit_recommendation"]["source_scope_claim_paths"] == [
+        "metadata.note"
     ]
 
 

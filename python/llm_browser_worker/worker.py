@@ -1000,6 +1000,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         visual_paths: list[str] = []
         structured_paths: list[str] = []
         source_identity_claim_paths: list[str] = []
+        source_scope_claim_paths: list[str] = []
         selection_claim_paths: list[str] = []
         nested_record_count = 0
         recordish_keys = {
@@ -1064,6 +1065,14 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             r"\b(best|first|highest|impression|longest|lowest|most|performance|rank|score|sort|top)\b",
             re.IGNORECASE,
         )
+        source_scope_terms = re.compile(
+            r"\b("
+            r"all locations|broaden(?:ed|ing)?|fallback|no results found|outside scope|"
+            r"requested (?:source|scope|location)|selected location|showing results for all locations|"
+            r"supplement(?:ed|al)?|to meet (?:the )?(?:count|target)"
+            r")\b",
+            re.IGNORECASE,
+        )
 
         def normalized_suffix(text: str) -> str:
             lowered = text.strip().lower().split("?", 1)[0].split("#", 1)[0]
@@ -1108,6 +1117,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                     visual_paths.append(value)
                 elif suffix in {".csv", ".json", ".jsonl", ".pdf", ".tsv", ".txt", ".xlsx"}:
                     structured_paths.append(value)
+                if source_scope_terms.search(value):
+                    source_scope_claim_paths.append(".".join(path))
 
         visit(data, [])
         largest_list_count = max((item["length"] for item in list_lengths), default=0)
@@ -1122,6 +1133,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             reasons.append(f"external_structured_artifacts={len(structured_paths)}")
         if source_identity_claim_paths and record_count_estimate > 5:
             reasons.append(f"source_identity_claims={len(source_identity_claim_paths)}")
+        if source_scope_claim_paths:
+            reasons.append(f"source_scope_claims={len(source_scope_claim_paths)}")
         if selection_claim_paths:
             reasons.append(f"selection_or_ranking_claims={len(selection_claim_paths)}")
         return {
@@ -1134,6 +1147,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "visual_artifact_path_count": len(visual_paths),
             "structured_artifact_path_count": len(structured_paths),
             "source_identity_claim_paths": source_identity_claim_paths[:10],
+            "source_scope_claim_paths": source_scope_claim_paths[:10],
             "selection_claim_paths": selection_claim_paths[:10],
             "sample_visual_artifact_paths": visual_paths[:5],
             "sample_structured_artifact_paths": structured_paths[:5],
@@ -1175,6 +1189,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             )
         if audit_recommendation.get("source_identity_claim_paths") and "source_evidence" not in checks:
             notes.append("audit is missing source_evidence for claimed source/entity/location fields")
+        if audit_recommendation.get("source_scope_claim_paths") and "source_scope" not in checks:
+            notes.append("audit is missing source_scope for broadened/fallback source-scope claims")
         if audit_recommendation.get("selection_claim_paths") and "selection" not in checks:
             notes.append("audit is missing a selection check for claimed ranking/selection fields")
         return notes
@@ -1242,8 +1258,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 "The attached artifact audit is not sufficient for this final answer. "
                 + " ".join(audit_readiness_notes)
                 + ". Run audit_artifact(...) with the relevant records/path, required "
-                "fields, dedupe fields, bucket targets, source evidence, and visual files "
-                "before done."
+                "fields, dedupe fields, bucket targets, source evidence, source scope, "
+                "selection metrics, and visual files before done."
             )
         elif isinstance(audit, dict) and source_evidence_missing:
             summary["audit_recommendation"] = audit_recommendation
@@ -1290,6 +1306,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         unique_visual_files: bool = False,
         source_evidence: Dict[str, Any] | None = None,
         required_source_fields: list[str] | None = None,
+        source_scope_evidence: Dict[str, Any] | None = None,
+        required_scope_fields: list[str] | None = None,
         selection_metric_field: str | None = None,
         selection_order: str = "desc",
         selection_limit: int | None = None,
@@ -1443,6 +1461,77 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
                 "evidence": evidence,
             }
             if missing_source:
+                audit["ready_for_done"] = False
+
+        if source_scope_evidence is not None or required_scope_fields:
+            evidence = source_scope_evidence if isinstance(source_scope_evidence, dict) else {}
+            missing_scope: Dict[str, Any] = {}
+            for field in required_scope_fields or []:
+                value = _field_value(evidence, field)
+                if _is_missing(value):
+                    missing_scope[field] = {"value": value}
+
+            def truthy(value: Any) -> bool:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str):
+                    return value.strip().lower() in {"1", "true", "yes", "y"}
+                return False
+
+            status_value = (
+                evidence.get("scope_match")
+                or evidence.get("scope_status")
+                or evidence.get("requested_scope_status")
+            )
+            normalized_status = _normalized_missing_text(str(status_value)) if status_value is not None else ""
+            bad_status = normalized_status in {
+                "broadened",
+                "fallback",
+                "mismatch",
+                "no local results",
+                "no results",
+                "not matched",
+                "out of scope",
+                "partial",
+                "uncertain",
+            } or any(
+                phrase in normalized_status
+                for phrase in (
+                    "all locations",
+                    "broaden",
+                    "fallback",
+                    "mismatch",
+                    "no results",
+                    "outside scope",
+                    "uncertain",
+                )
+            )
+            fallback_used = truthy(evidence.get("fallback_used")) or truthy(evidence.get("broadened_scope"))
+            fallback_allowed = truthy(evidence.get("fallback_allowed")) or truthy(
+                evidence.get("user_allowed_fallback")
+            )
+            out_of_scope_count = _metric_number(
+                evidence.get("out_of_scope_record_count")
+                or evidence.get("out_of_scope_count")
+                or evidence.get("broadened_record_count")
+            )
+
+            violations: list[str] = []
+            if bad_status:
+                violations.append(f"scope_status={status_value}")
+            if fallback_used and not fallback_allowed:
+                violations.append("fallback_used_without_user_permission")
+            if out_of_scope_count and out_of_scope_count > 0 and not fallback_allowed:
+                violations.append(f"out_of_scope_record_count={int(out_of_scope_count)}")
+            audit["checks"]["source_scope"] = {
+                "required_fields": required_scope_fields or [],
+                "missing_fields": missing_scope,
+                "violations": violations,
+                "evidence": evidence,
+            }
+            if missing_scope or violations:
                 audit["ready_for_done"] = False
 
         if selection_metric_field:
