@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Selection/ranking audit guard implemented; focused task 6 rerun improved strict output |
-| Latest `real_v8` strict/manual score | Not run in this worktree yet |
-| Latest `real_v14_short` strict/manual score | Focus tasks 6/10/16: runner 3/3; strict manual 1 pass / 1 partial / 1 fail; focused task 6 after selection-audit: runner pass / manual pass |
+| Recommended branch state | Latest semantic run improves immediate previous full v8 from 67/29/4 to 71/26/3; next intervention in progress: zero-record audit guard, not-ready final-answer bypass guard, and stronger semantic/frontier prompt |
+| Latest `real_v8` strict/manual score | `71` pass / `26` partial / `3` fail, weighted `84.0/100`, root `/tmp/overnight-real-v8-semantic-20260514-061215` |
+| Latest `real_v14_short` strict/manual score | `7` pass / `3` partial / `0` fail, root `/tmp/overnight-real-v14-semantic-20260514-054705` |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
-| Most important improvement | Selection audit forced task 6 from first-visible/weak ranking to audited top-by-duration selection over 107 candidates |
-| Worst regression | None yet |
-| Open root-cause clusters | Source-scope fallback/locality proof for directory aggregation; exact metric unavailable vs proxy disclosure |
-| Next experiment | Implement general source-scope/locality audit for broadened searches, then rerun task 10 and full `real_v14_short`/`real_v8` |
+| Most important improvement | Final answer persistence fixed preview/status/max-turn failures; semantic prompt recovered v8 tasks 8, 19, 51, 57, 60 and improved 99/100 |
+| Worst regression | Semantic regressions remain in dynamic-offer/frontier tasks (`47`, `49`, `50`) and source-state tasks (`21`, `40`) |
+| Open root-cause clusters | Stateful page proof, source-route fidelity, zero-record readiness, required-field provenance, full-frontier evidence, visual/lazy section extraction, price/discount semantics |
+| Next experiment | Verify/commit zero-record and not-ready bypass guards; focused retest v8 tasks `9`, `15`, `21`, `27`, `47`, `49`, `50`, `99`, `100`, and v14 task `6` |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -1154,3 +1154,104 @@ Next loop:
 - Run full `real_v14_short` and `real_v8` again on `59a42b4`.
 - If full v8 confirms improvements on `51`, `99`, and `100` without further regressions, keep this intervention.
 - If task `21` remains a hard fail, investigate interactive action verification and CDP/network event capture for flows where a visible button must be opened before a field can be considered unavailable.
+
+### Full Rerun: `overnight-real-v14-semantic-20260514-054705`
+
+- Dataset: `real_v14_short`
+- Root: `/tmp/overnight-real-v14-semantic-20260514-054705`
+- Commit under test: `59a42b4` (`Add semantic audit and finalization fallback`)
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `10/10` passed.
+- Manual strict result: `7` pass / `3` partial / `0` fail.
+- Previous full v14 result on `926c0b0`: `6` pass / `4` partial / `0` fail.
+
+Manual deltas:
+
+| Task | Manual | Delta | Notes |
+| ---: | --- | --- | --- |
+| 5 | pass | improved | Direct JSON list, `99` rows, all five source groups, no missing required fields, and the bad `4G forbindelse ikon` rows disappeared. |
+| 6 | partial | regressed | Candidate pool and top-by-duration selection were good, but per-ad screenshot deliverables had null/missing detail artifacts. |
+| 8 | partial | stable | `26` SSDs; eight products have fewer than three offers and same-product/variant matching remains weak. |
+| 10 | partial | stable/improved honesty | `40` per specialty only through ASPS all-location fallback; audit correctly says not ready with out-of-scope rows. |
+| 11 | pass | fixed/stable | Persisted FCC JSON result remains fixed. |
+| 16 | pass | improved | Correct `94103` store address, `128` menu items, `14` categories. |
+
+Interpretation:
+
+- The semantic/finalization intervention is positive on v14: strict score improved from `6/4/0` to `7/3/0`.
+- The most important remaining v14 issue is no longer output shape. It is artifact/content validity: when screenshots are requested per selected entity, each selected row needs a nonblank screenshot that maps to that row.
+- The ASPS task confirms the source-scope audit is doing useful work by marking broad fallback results as partial rather than silently complete.
+
+### Full Rerun: `overnight-real-v8-semantic-20260514-061215`
+
+- Dataset: `real_v8`
+- Root: `/tmp/overnight-real-v8-semantic-20260514-061215`
+- Commit under test: `59a42b4` (`Add semantic audit and finalization fallback`)
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `100/100` passed.
+- Manual strict result from five judging agents: `71` pass / `26` partial / `3` fail.
+- Weighted score with partial = 0.5: `84.0/100`.
+- Previous full v8 result on `926c0b0`: `67` pass / `29` partial / `4` fail, weighted `81.5/100`.
+- Earlier high-water run before final-shape changes: `73` pass / `23` partial / `4` fail, weighted `84.5/100`.
+
+Manual score by range:
+
+| Tasks | Pass | Partial | Fail | Weighted | Read |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1-20 | 18 | 1 | 1 | 18.5 | Recovered tasks `8` and `19`; task `9` is still hard fail but now fails honestly as empty, not wrong entity type. |
+| 21-40 | 14 | 5 | 1 | 16.5 | Task `21` still fails; `27`/`40` show state/frontier regressions; `29` improved. |
+| 41-60 | 14 | 6 | 0 | 17.0 | `51`, `54`, `60` fixed/improved; `47`, `49`, `50` regressed from missing visual/lazy content and incomplete offer frontiers. |
+| 61-80 | 11 | 8 | 1 | 15.0 | Runner reliability fixed, but task `72` remains semantic fail; optional-but-requested fields and field-type checks are weak. |
+| 81-100 | 14 | 6 | 0 | 17.0 | `87` improved from fail to partial; `99`/`100` improved but still have semantic field issues. |
+
+Confirmed wins:
+
+- Finalization mechanics are substantially healthier: tasks `51` and `57` no longer expose previews/status text, and `72` no longer runner-fails after persisting a best-available answer.
+- Semantic prompt changes recovered `8` and `19`, showing the exact-source/entity guidance can improve real behavior.
+- Task `99` moved from accessory pollution to mostly actual padel rackets.
+- Task `100` now has a correct 20/20/20 bucket artifact with Amazon prices present; remaining issues are semantic filtering and rating/review gaps rather than total shape failure.
+
+Persistent and regressed failures:
+
+- `9`: zero-record artifact was treated as ready because missing-field checks passed vacuously. This is a general audit bug.
+- `15`, `34`, `36`, `65`, `75`, `96`, `97`: requested fields remain missing or optional-but-requested fields are skipped in audits/final presentation.
+- `21`, `40`: interactive state is not proven before extraction. The model reaches a relevant page but does not prove requested dates/address/filters are accepted and bound to results.
+- `27`, `49`, `50`: all/load-more/offer-frontier proof is too weak. The model stops after visible primary groups without proving tabs, hidden sections, carousels, or plan families are exhausted.
+- `46`: field-completeness pressure caused a plausible default (`No binding`) instead of source-backed `Not specified`.
+- `47`: lazy/visual product-page sections such as Amazon A+ content were missed after DOM text looked empty.
+- `63`: sitemap/frontier output contains samples/counts but not the full discovered frontier.
+- `72`: returned an identifier without explicit evidence it was an operator ID.
+- `99`: discount semantics are wrong when `discounted_price == price`.
+
+Decision:
+
+- Keep `59a42b4`; it improves the immediately previous full v8 run and v14.
+- The next change should stay general and should not introduce task-specific validators. The highest-value general changes are:
+  - make zero-record record-level audits fail unless the model explicitly proves an empty result is valid;
+  - prevent a clean explicit `done` answer from bypassing a not-ready persisted final answer;
+  - sharpen prompts for interactive state proof, source-route fidelity, full-frontier evidence, semantic field values, and price/discount semantics.
+
+### Intervention In Progress: Audit And Semantic Finalization Guard
+
+- Hypothesis: Many remaining partials are caused by the model presenting a result as complete after its own audit either failed, was vacuous, or did not check the right semantic evidence.
+- Intervention:
+  - `audit_artifact(...)` now marks zero-record record-level audits as not ready unless `allow_empty=True` is explicitly passed after proving a genuine no-match result.
+  - `done` now rejects clean explicit completion text when a persisted final answer exists but its audit is not ready. The model must either fix/rerun `set_final_answer(..., audit=audit)` or finalize with an explicit partial/incomplete answer that names gaps.
+  - The same not-ready bypass guard applies to free-text assistant completions, not only the `done` tool path.
+  - Prompts now call out interactive state proof, source-route fidelity, no guessed normalized fields, full frontier evidence, audit-after-final-write, and price/discount semantics.
+- Why this is generalizable:
+  - It does not know task IDs, URLs, expected counts, or expected answers.
+  - It turns the model's own audit into a real pre-final contract and fixes a vacuous truth bug.
+  - It still allows honest partial completion, which matters when a site genuinely does not expose a requested field or source scope.
+- Expected movement:
+  - Task `9` should no longer treat `[]` as a complete audited extraction unless it proves empty-source evidence.
+  - Tasks `15`, `36`, `88`, `99`, and `100` should be more likely to finalize as explicit partials when their audits are false instead of sounding complete.
+  - Tasks `21`, `27`, `40`, `47`, `49`, and `50` may improve if the prompt makes the model prove state/frontier/visual sections before extraction.
+  - Risk: stricter finalization may turn some runner passes into explicit partials or extra retries. That is acceptable if wrong-complete answers go down.
+- Verification so far:
+  - `uv run --with pytest python -m pytest -q python/tests/test_worker_package.py -q`: passed, `29` tests.
+  - `cargo test -p browser-use-core bypass`: passed, `2` tests.
+- Next:
+  - Run full verification (`cargo fmt --check`, `cargo test`, Python tests, build).
+  - Commit if clean.
+  - Focused retest likely failure probes: v8 `9`, `15`, `21`, `27`, `47`, `49`, `50`, `99`, `100`, plus v14 `6`.

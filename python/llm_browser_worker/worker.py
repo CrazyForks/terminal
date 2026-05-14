@@ -1313,6 +1313,7 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         selection_limit: int | None = None,
         selection_pool_records: list[Any] | None = None,
         selection_key_fields: list[str] | None = None,
+        allow_empty: bool = False,
         artifact_name: str = "artifact_audit.json",
     ) -> Dict[str, Any]:
         """Compute a compact, general pre-final audit for model review.
@@ -1352,6 +1353,27 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "record_count": len(records),
             "checks": {},
         }
+
+        record_level_checks_requested = bool(
+            required_fields
+            or dedupe_fields is not None
+            or bucket_field
+            or bucket_targets
+            or selection_metric_field
+            or selection_limit is not None
+            or selection_pool_records is not None
+        )
+        if not records and record_level_checks_requested and not allow_empty:
+            audit["checks"]["record_count"] = {
+                "allow_empty": False,
+                "minimum": 1,
+                "violation": "zero_records",
+                "note": (
+                    "Record-level checks were requested, but no records were audited. "
+                    "Pass allow_empty=True only after proving the source genuinely has no matching records."
+                ),
+            }
+            audit["ready_for_done"] = False
 
         if required_fields:
             missing: Dict[str, Any] = {}

@@ -689,6 +689,38 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 }
                             }
                         }
+                        if let Some(final_answer) = persisted_final_answer(&session)? {
+                            if let Some(error) =
+                                persisted_final_answer_not_ready_message(&final_answer)
+                            {
+                                if !explicit_result_states_persisted_gaps(requested_result) {
+                                    let error = format!(
+                                        "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
+                                    );
+                                    store.append_event(
+                                        &session.id,
+                                        "tool.failed",
+                                        serde_json::json!({
+                                            "name": "done",
+                                            "source": "assistant_text_final_answer_not_ready",
+                                            "error": error,
+                                        }),
+                                    )?;
+                                    messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": error,
+                                    }));
+                                    maybe_compact_messages(
+                                        store,
+                                        &session.id,
+                                        &mut messages,
+                                        options.max_context_chars,
+                                    )?;
+                                    step_span.set_ok();
+                                    continue;
+                                }
+                            }
+                        }
                         store.append_event(
                             &session.id,
                             "session.done",
@@ -2657,9 +2689,15 @@ fn dispatch_done_tool(
         .as_ref()
         .and_then(|answer| answer.get("summary"))
         .cloned();
-    if use_final_answer {
-        if let Some(answer) = final_answer.as_ref() {
-            if let Some(error) = persisted_final_answer_not_ready_message(answer) {
+    if let Some(answer) = final_answer.as_ref() {
+        if let Some(error) = persisted_final_answer_not_ready_message(answer) {
+            if use_final_answer {
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+            if !explicit_result_states_persisted_gaps(&requested_result) {
+                let error = format!(
+                    "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
+                );
                 return dispatch_tool_validation_error(store, session, call, &error);
             }
         }
@@ -2845,6 +2883,37 @@ fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Va
         && (looks_like_empty_structured_result(requested_result)
             || looks_like_placeholder_done_result(requested_result)
             || looks_like_persisted_preview_result(requested_result, final_answer))
+}
+
+fn explicit_result_states_persisted_gaps(result: &str) -> bool {
+    let normalized = result.to_ascii_lowercase();
+    [
+        "blank",
+        "broadened",
+        "could not",
+        "duplicate",
+        "failed",
+        "fallback",
+        "gap",
+        "incomplete",
+        "invalid",
+        "missing",
+        "mismatch",
+        "not found",
+        "not ready",
+        "not verified",
+        "null",
+        "out of scope",
+        "partial",
+        "remaining",
+        "unavailable",
+        "unable",
+        "unknown",
+        "unmet",
+        "unresolved",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn looks_like_placeholder_done_result(result: &str) -> bool {
@@ -5709,6 +5778,76 @@ mod tests {
             event.event_type == "session.done"
                 && event.payload["result"]
                     == "Could not complete a verified audit; the artifact needs review."
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_explicit_done_cannot_bypass_not_ready_persisted_final_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_failed_audit_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nset_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_clean_bypass".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "The extraction is complete and saved in the artifact.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_explicit_partial".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Partial/incomplete result: the artifact is missing the required name field for one row.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract many items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "done_clean_bypass"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("does not clearly state"))
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "The extraction is complete and saved in the artifact."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "Partial/incomplete result: the artifact is missing the required name field for one row."
         }));
         Ok(())
     }

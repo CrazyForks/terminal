@@ -444,6 +444,47 @@ result = audit
     assert audit["checks"]["missing_fields"]["duration"]["count"] == 2
 
 
+def test_worker_audit_artifact_zero_records_requires_explicit_empty_proof(
+    tmp_path: Path,
+) -> None:
+    blocked = worker._run(
+        {
+            "id": "artifact-zero-record-audit",
+            "session_id": "task-artifact-zero-record-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+audit = audit_artifact(records=[], required_fields=['name', 'url'])
+result = audit
+""",
+        }
+    )
+
+    assert blocked["ok"] is True
+    audit = blocked["data"]
+    assert audit["ready_for_done"] is False
+    assert audit["record_count"] == 0
+    assert audit["checks"]["record_count"]["violation"] == "zero_records"
+    assert audit["checks"]["missing_fields"]["name"]["count"] == 0
+
+    allowed = worker._run(
+        {
+            "id": "artifact-zero-record-audit-allowed",
+            "session_id": "task-artifact-zero-record-audit-allowed",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts2"),
+            "code": """
+audit = audit_artifact(records=[], required_fields=['name', 'url'], allow_empty=True)
+result = audit
+""",
+        }
+    )
+
+    assert allowed["ok"] is True
+    assert allowed["data"]["ready_for_done"] is True
+    assert "record_count" not in allowed["data"]["checks"]
+
+
 def test_worker_audit_artifact_reports_missing_source_evidence(tmp_path: Path) -> None:
     response = worker._run(
         {
