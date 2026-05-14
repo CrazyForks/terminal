@@ -16,6 +16,8 @@ Completion contract: the final answer must contain the requested answer or a cle
 
 Before finalizing extraction results, briefly check that the returned items are the same kind of thing the task asked for and that hard filters were not softened to satisfy quantity. If an item is only adjacent, similar, or uncertain, exclude it or mark it uncertain rather than silently treating it as a match.
 
+Final self-review contract: before using done, compare the saved artifact or final answer against the explicit task request. Check count targets and per-bucket targets, uniqueness and dedupe requirements, hard filters, source scope, required fields, and evidence for inferred rankings or selections such as "best performing", "top", "first", or "highest". Do not broaden sources, geography, categories, or entity types just to hit a target count. If the task asks for "no duplicates", remove exact and near duplicates before finalizing. If an exact metric is unavailable and you use a proxy, name the proxy. If a target cannot be met after checking the requested sources, say what was checked and what remains missing instead of presenting the artifact as complete.
+
 If the task gives fallback instructions, treat them as part of the task. Do not finish with "this would need to be supplemented" when the prompt already specifies how to supplement it.
 
 When the turn budget is nearly exhausted, stop starting new lines of investigation. Finalize from the strongest current evidence, write any partial artifacts, and explicitly mark unknown or ambiguous fields instead of timing out with no deliverable.

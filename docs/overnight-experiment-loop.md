@@ -12,7 +12,7 @@ This loop is inspired by Karpathy's `autoresearch` pattern: the Markdown protoco
 
 ## Objective
 
-Run repeated eval/improvement cycles on the Rust rewrite browser agent until the results converge:
+Run open-ended repeated eval/improvement cycles on the Rust rewrite browser agent until the user manually stops the process. Convergence is a signal to document and reason about, not a stop condition:
 
 - solve as much of `real_v8` and `real_v14_short` as possible;
 - optionally use `BU_Bench_V1` as an additional generalization dataset when `datasets/BU_Bench_V1.json` is available;
@@ -24,7 +24,7 @@ Run repeated eval/improvement cycles on the Rust rewrite browser agent until the
 
 The goal is not to make a benchmark harness that catches known bad answers. The goal is to improve the agent loop so the model naturally produces the correct output sooner, with less context waste, less lost progress, and better source discipline.
 
-The desired output after an unattended run is a readable scientific log: what was tried, why it was tried, what happened, what got better or worse, what was kept or reverted, and what should be tried next.
+The desired output after an unattended run is a readable scientific log: what was tried, why it was tried, what happened, what got better or worse, what was kept or reverted, and what should be tried next. The loop should keep generating and testing generalizable hypotheses until manually interrupted.
 
 ## Hard Constraints
 

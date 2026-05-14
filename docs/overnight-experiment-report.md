@@ -12,14 +12,14 @@ This is the living scientific log for the autonomous eval-and-improve loop. Appe
 
 | Field | Current State |
 | --- | --- |
-| Recommended branch state | Starting baseline at `57af289` |
+| Recommended branch state | Prompt self-review intervention verified; focused rerun pending |
 | Latest `real_v8` strict/manual score | Not run in this worktree yet |
-| Latest `real_v14_short` strict/manual score | Smoke run: runner 8/10 before interruption; manual strict 2 pass / 6 partial / 2 fail |
+| Latest `real_v14_short` strict/manual score | Cloud run: runner 10/10; manual strict 7 pass / 3 partial / 0 fail |
 | Latest `BU_Bench_V1` strict/manual score | Not run in this worktree yet |
 | Most important improvement | Host-side hard timeout for Python worker calls |
 | Worst regression | None yet |
-| Open root-cause clusters | Field-quality validation, over-broad extraction, artifact finalization after output exists |
-| Next experiment | Repeat `real_v14_short` smoke with `.env` Browser Use cloud credentials present |
+| Open root-cause clusters | Source/selection caveats, explicit count targets, dedupe requirements before finalization |
+| Next experiment | Rerun partial tasks `6,10,16` with cloud browser and judge strict quality |
 
 ## Experiment 20260513-01: Baseline Remote-Browser Runs
 
@@ -146,3 +146,72 @@ Decision after targeted check:
 - Git status: `.env` remains ignored and must not be committed.
 - Expected effect: subsequent cloud-mode runs should have actual browser helpers instead of `browser_harness_error: "Browser Use cloud selected, but BROWSER_USE_API_KEY is not set"`.
 - Next measurement: repeat `real_v14_short` before running larger datasets.
+
+### Run: `overnight-real-v14-short-cloud-20260513-220555`
+
+- Dataset: `real_v14_short`
+- Root: `/tmp/overnight-real-v14-short-cloud-20260513-220555`
+- Manifest: `/tmp/overnight-real-v14-short-cloud-20260513-220555/state/dataset-runs/overnight-real-v14-short-cloud-20260513-220555.json`
+- Command: `dataset-run-codex real_v14_short --all --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 2 --concurrency 25 --browser-mode cloud`
+- Runner result: `10/10` passed, `0` failed, `0` pending
+- Manual strict result: `7` pass, `3` partial, `0` fail
+- Browser helper evidence:
+  - Missing API key errors: `0`
+  - `browser.state` events: `184`
+  - `tool.image` events: `73`
+  - Host hard-timeout events: `1`
+  - Python alarm timeout events: `1`
+- Token usage: `8,405,288` total tokens, cost missing
+
+Manual judging:
+
+| Task | Runner | Manual | Notes |
+| ---: | --- | --- | --- |
+| 2 | pass | pass | Covered first two FERC rows and file set with URLs and summaries. |
+| 4 | pass | pass | Extracted `682` unique Ollie's locations; earlier no-key run had `668` and stayed pending. |
+| 5 | pass | pass | Captured all five requested telecom source groups, `103` total records. |
+| 6 | pass | partial | Returned 5 ads and screenshots, but some copy was truncated and "best performing" relied on inference rather than verified engagement. |
+| 8 | pass | pass | 28 SSD records; 4 have fewer than 3 offers, apparently because fewer were available. |
+| 9 | pass | pass | Readable screenshot of full SBI table. |
+| 10 | pass | partial | 126 surgeons, but only 12 from ASPS, 114 ABPS unknown, Hair Restoration only 22 candidates vs requested 40. |
+| 11 | pass | pass | All 7 grantee codes with counts and evidence snippets. |
+| 13 | pass | pass | 1,367 unique WakeMed profile URLs with broad metadata. |
+| 16 | pass | partial | 19 categories and 271 rows, but only 162 unique item/price pairs despite "no duplicates". |
+
+Comparison against no-key smoke:
+
+- Task `4`: pending/pass artifact became runner pass with complete `682` stores.
+- Task `5`: hard fail became pass.
+- Task `6`: improved from partial with missing creative evidence to partial with actual creative/detail screenshots.
+- Task `10`: hard fail/effectively no useful records became partial with a large record set.
+- Task `16`: coverage improved but dedupe still failed.
+
+Interpretation:
+
+- The cloud credential was a major run-hygiene fix. The first smoke was not a trustworthy cloud-browser benchmark.
+- The host-side hard-timeout intervention is working in live runs: hard timeout fired without wedging the scheduler.
+- Remaining short-dataset failures are quality/finalization problems rather than browser/runtime failures.
+
+Next generalizable hypothesis:
+
+- The model needs a stronger pre-final self-review contract that explicitly checks requested count thresholds, uniqueness/dedupe requirements, source/selection caveats, and evidence for inferred ranking criteria before it calls `done`.
+
+### Intervention: General Final Self-Review Contract
+
+- Hypothesis: Remaining `real_v14_short` partials are mostly task-contract failures, not browser failures. A small general prompt intervention should push the model to review count targets, dedupe requirements, hard filters, source scope, and ranking evidence before finalization.
+- Intervention:
+  - Clarify that the overnight loop has no convergence stop condition; convergence is only logged and the user manually stops the loop.
+  - Add a dataset-case final self-review contract covering per-bucket counts, dedupe, hard filters, source scope, ranking proxies, and explicit gap reporting.
+  - Add a system final self-review rule that asks for compact artifact summaries/counts instead of giant JSON output.
+- Expected movement:
+  - Task `6`: better disclosure of the "best performing" proxy or deeper evidence before selecting ads.
+  - Task `10`: stronger pressure to satisfy requested per-specialty/per-source counts or report real source gaps.
+  - Task `16`: fewer duplicate menu items before finalization.
+- Regression risk:
+  - Extra review could consume turns on already-finished tasks.
+  - The prompt may cause conservative partial disclosure instead of confident completion.
+- Verification:
+  - `cargo fmt --check`: passed
+  - `cargo test`: passed
+  - `uv run --with pytest python -m pytest -q`: passed, `15 passed`
+- Decision: Verification passed; focused rerun pending.
