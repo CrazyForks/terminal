@@ -855,3 +855,18 @@ Decision:
 
 - Keep the source-scope guard. It prevents a first-principles correctness error and aligns with the user's stated preference to avoid wrong/fabricated rows over forcing benchmark counts.
 - Next intervention: add a general long-extraction/chunking protocol to prompts, then rerun focused task `10` and full `real_v14_short`/`real_v8`.
+
+### Intervention: Bounded Chunked Extraction Prompt
+
+- Hypothesis: Large extraction tasks waste turns and lose progress when the model puts discovery, full crawl, detail expansion, audit, and finalization into one long Python/shell call. A general prompt rule should make the model checkpoint work and recover from failures without restarting.
+- Intervention:
+  - Python tool prompt now says to split bulk extraction by page/source/bucket, use per-request timeouts, write progress after each chunk, and avoid all-in-one calls that may approach the tool timeout.
+  - Dataset prompt now has a long-extraction contract: discover endpoint/pagination first, fetch in batches, checkpoint under `/home/user/outputs`, print compact progress, and resume from checkpoints after failure.
+  - Browser-agent system prompt now repeats the same rule in the bulk-extraction workflow.
+- Why this is generalizable:
+  - It applies to any large crawl, export, download set, detail-page fanout, or per-bucket extraction.
+  - It does not enforce deterministic tool-specific counting or benchmark-specific URLs.
+  - It changes model strategy rather than adding a hardcoded validator.
+- Expected movement:
+  - Task `10`: fewer wasted turns after timeouts; faster arrival at the final scoped artifact.
+  - Full datasets: fewer failures where the model times out after collecting useful partial data but never writes a deliverable.
