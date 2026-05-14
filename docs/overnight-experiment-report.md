@@ -1013,3 +1013,111 @@ Verification before commit:
 - `uv run --with pytest python -m pytest -q` passed, `28 passed`.
 - `cargo build --bin browser-use-terminal` passed.
 - Commit this intervention, then run the next full `real_v14_short` and `real_v8` pass with cloud browser and 25-way concurrency.
+
+### Full Rerun: `overnight-real-v14-after-finalshape-20260514-040718`
+
+- Dataset: `real_v14_short`
+- Root: `/tmp/overnight-real-v14-after-finalshape-20260514-040718`
+- Commit under test: `926c0b0` (`Harden final answer shape and status handling`)
+- Command: `browser-use-terminal --state-dir <run>/state dataset-run-codex real_v14_short --all --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud`
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `10/10` passed.
+- Manual strict result: `6/10` pass, `4/10` partial, `0/10` fail.
+- Previous strict result: `5/10` pass, `4/10` partial, `1/10` fail.
+
+Manual scorecard:
+
+| Task | Manual | Vs Previous | Reason |
+| ---: | --- | --- | --- |
+| 2 | pass | no-change | FERC markdown covers the first two rows and file links. |
+| 4 | pass | no-change | `682` Ollie's stores with name/address and no duplicate pairs. |
+| 5 | partial | improved | Final answer is now the actual JSON list, `99` rows, and no missing contract length. Still has semantic extraction errors such as provider `4G forbindelse ikon`. |
+| 6 | pass | improved | Candidate pool expanded to `26`; selected top 5 by longest visible active duration; usable screenshots exist. |
+| 8 | partial | no-change/slight regression | `27` SSDs; some products have fewer than 3 offers and variant/heatsink matching remains weak. |
+| 9 | pass | no-change | SBI table screenshot exists and is nonblank. |
+| 10 | partial | improved from fail | Output is now honest about fallback/scope: audit says `ready_for_done=false`, `706` out-of-scope records, and counts rely on broadened ASPS rows. |
+| 11 | pass | improved | Final result is the actual FCC JSON array; the old `Final answer persisted. Need done use.` failure is gone. |
+| 13 | pass | no-change | `1,367` WakeMed provider URLs with rich profile metadata. |
+| 16 | partial | regression | Menu extraction is rich, but selected store address drifted to `302 Potrero Ave, San Francisco, CA 94110` instead of requested `94103`. |
+
+Interpretation:
+
+- The final-answer status/output-shape intervention worked on its intended v14 failures. Task `11` moved from partial to pass, task `5` now returns the JSON list directly, and no status-wrapper final answers were found.
+- The remaining v14 issues are not finalization mechanics. They are semantic correctness: source scope, entity/product matching, field plausibility, and location fidelity.
+
+### Full Rerun: `overnight-real-v8-after-finalshape-20260514-042538`
+
+- Dataset: `real_v8`
+- Root: `/tmp/overnight-real-v8-after-finalshape-20260514-042538`
+- Commit under test: `926c0b0` (`Harden final answer shape and status handling`)
+- Command: `browser-use-terminal --state-dir <run>/state dataset-run-codex real_v8 --all --model gpt-5.5 --max-turns 80 --python-timeout-seconds 180 --max-attempts 1 --concurrency 25 --browser-mode cloud`
+- Browser mode: cloud only. Local CDP env vars were unset and local Chrome auto-open was disabled.
+- Runner result: `99/100` passed, task `72` failed with `agent exceeded maximum provider turns`.
+- Manual strict result from 5 judging agents: `67/100` pass, `29/100` partial, `4/100` fail.
+- Previous manual strict result: `73/100` pass, `23/100` partial, `4/100` fail.
+- Weighted score with partial = 0.5: `81.5/100`, down from `84.5/100`.
+
+Manual score by range:
+
+| Tasks | Pass | Partial | Fail | Delta vs previous |
+| --- | ---: | ---: | ---: | --- |
+| 1-20 | 16 | 3 | 1 | Worse. Task `8` over-pruned an intersection result; task `19` missed newer Japanese official IR docs. |
+| 21-40 | 14 | 5 | 1 | Mixed. Output shape improved on `23`, `24`, `38`, but task `21` remains fail and `27`, `34`, `40` regressed. |
+| 41-60 | 13 | 7 | 0 | Worse. Task `57` fixed, but coverage/finalization issues appeared on `45`, `51`, `54`, `60`. |
+| 61-80 | 11 | 8 | 1 | Same strict shape as previous, but different failures. `71` and `79` improved; `65`, `68`, `69`, `74` regressed. |
+| 81-100 | 13 | 6 | 1 | Slight weighted improvement. Task `100` moved fail to partial; task `87` still fail. |
+
+Confirmed wins from `926c0b0`:
+
+- Output-shape/finalization improved tasks `2`, `5`, `11`, `23`, `24`, `38`, `42`, `57`, `71`, `79`, and `100`.
+- Task `100` no longer returns a path/count/sample summary; it returns the requested object with `amazon_de`, `galaxus_de`, and `kaufland_de` arrays of length `20`.
+- Task `57` no longer leaks `Need final done...`.
+
+Regressions and persistent failures:
+
+- **Entity/page-type drift**: task `9` still returns HostGenius location pages instead of property listings; task `99` accepted balls/grip tape/backpacks as padel rackets.
+- **Exact-source/latest drift**: task `19` stayed on English CellSeed IR pages and missed fresher Japanese official docs; task `91` accepted `KRAS altered` as if it were exact `KRAS G12D`.
+- **Required-field audit gaps**: task `95` omitted `crl_file_url` from the required audit; task `100` omitted `price`; task `34` left developer website URLs null despite visible links.
+- **Nulls without proof**: task `21` returned null Booking prices even though trace evidence showed room rows with "Show prices"; task `36` still finalized with missing venue fields.
+- **Coverage/frontier regressions**: task `45` dropped sitemap coverage from `272` to `236`; task `54` dropped ScrapeCreators docs from `153` to `125`; task `60` included out-of-range/unlabeled vendors.
+- **Preview-vs-full persisted result**: task `51` persisted a full 41-row final answer and audit, but the final `done` result contained only the preview/first rows.
+- **Last-turn finalization**: task `72` wrote a partial final answer with `operator_id: null`, then hit the provider turn limit before calling `done`.
+
+Decision:
+
+- Keep `926c0b0`. It clearly fixes a real class of finalization and output-shape failures, especially on v14.
+- The v8 strict score regression means the next intervention should not add more schema pressure alone. The next change should target general semantic correctness and finalization mechanics:
+  - required fields must be derived from the task/schema, not handpicked;
+  - `null`/unknown values need source evidence or an explicit incomplete status;
+  - entity/page type and exact-source constraints must be checked before extraction/finalization;
+  - load-more/page-range tasks need frontier/exhaustion evidence;
+  - `done` should use the full persisted answer when the model accidentally passes a compact preview;
+  - if a ready persisted final answer exists at max turns, the harness should finish with it instead of failing the run.
+
+### Intervention: Finalization Fallback And Semantic Audit Prompt
+
+- Hypothesis: The finalization fix improved shape but exposed the next bottleneck: the model can still finalize a preview, omit required fields from the audit, accept adjacent entities, stop pagination early, or fail after persisting a last-turn answer.
+- Intervention:
+  - Harness:
+    - If `done` receives a JSON preview/prefix of a persisted final answer, replace it with the full persisted final answer.
+    - If the agent exhausts provider turns after writing a ready persisted final answer, emit `session.done` from that answer instead of failing the run.
+  - Prompts:
+    - Tell the model not to paste `set_final_answer(...)` previews into `done`.
+    - Require `required_fields` to be derived literally from the task/schema.
+    - Treat `null`, `unknown`, `not specified`, and `unavailable` as gaps unless there is source evidence for that exact record.
+    - Require page/entity-type checks before list extraction.
+    - Require frontier/exhaustion evidence for all/load-more/page-range/sitemap tasks.
+- Why this is generalizable:
+  - It is not URL- or dataset-specific.
+  - It targets classes of mistakes seen across both datasets: preview finalization, last-turn loss, source/entity drift, missing-field audit gaps, and early coverage stops.
+- Expected movement:
+  - Recover runner failure on task `72` if a final answer is ready on the last turn.
+  - Recover task `51`-style preview finalization.
+  - Improve tasks `21`, `34`, `36`, `45`, `54`, `60`, `95`, `99`, and `100` if the model follows the stronger audit and provenance contract.
+  - Risk: stricter field/source language may increase honest partials or make the model spend more turns on recovery. This is acceptable if it reduces wrong complete answers.
+- Verification:
+  - `cargo fmt --check` passed.
+  - `cargo test -p browser-use-core persisted_final_answer` passed, including the new preview-replacement and max-turn persisted-answer tests.
+  - `cargo test` passed, `58` browser-use-core tests plus the full workspace suite.
+  - `uv run --with pytest python -m pytest -q` passed, `28 passed`.
+  - `cargo build --bin browser-use-terminal` passed.

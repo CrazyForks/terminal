@@ -677,28 +677,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                     step_span.set_ok();
                                     continue;
                                 }
-                                if let Some(result) = persisted_final_answer_result(&final_answer) {
-                                    let final_answer_summary = final_answer.get("summary").cloned();
-                                    store.append_event(
-                                        &session.id,
-                                        "session.final_answer_used",
-                                        serde_json::json!({
-                                            "source": "python.set_final_answer",
-                                            "trigger": "assistant_text_placeholder",
-                                        }),
-                                    )?;
-                                    let mut done_payload = serde_json::json!({
-                                        "result": result,
-                                        "source": "python.set_final_answer",
-                                    });
-                                    if let Some(summary) = final_answer_summary {
-                                        done_payload["final_answer_summary"] = summary;
-                                    }
-                                    store.append_event(
-                                        &session.id,
-                                        "session.done",
-                                        done_payload,
-                                    )?;
+                                if append_done_from_persisted_final_answer(
+                                    store,
+                                    &session.id,
+                                    &final_answer,
+                                    "assistant_text_placeholder",
+                                    None,
+                                )? {
                                     step_span.set_ok();
                                     return Ok(session.id.clone());
                                 }
@@ -742,6 +727,23 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 step_span.set_ok();
             }
 
+            if let Some(final_answer) = persisted_final_answer(&session)? {
+                if let Some(error) = persisted_final_answer_not_ready_message(&final_answer) {
+                    store.append_event(
+                        &session.id,
+                        "session.final_answer_not_ready_at_max_turns",
+                        serde_json::json!({ "error": error }),
+                    )?;
+                } else if append_done_from_persisted_final_answer(
+                    store,
+                    &session.id,
+                    &final_answer,
+                    "max_turns_exhausted",
+                    None,
+                )? {
+                    return Ok(session.id.clone());
+                }
+            }
             store.append_event(
                 &session.id,
                 "session.failed",
@@ -2693,12 +2695,18 @@ fn dispatch_done_tool(
         }),
     )?;
     if use_final_answer {
+        let trigger = if should_auto_use_final_answer && !explicit_use_final_answer {
+            "assistant_done_result_replaced"
+        } else {
+            "done_use_final_answer"
+        };
         store.append_event(
             &session.id,
             "session.final_answer_used",
             serde_json::json!({
                 "source": "python.set_final_answer",
                 "tool_call_id": call.id,
+                "trigger": trigger,
             }),
         )?;
     }
@@ -2743,6 +2751,35 @@ fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|result| !result.is_empty())
         .map(str::to_string)
+}
+
+fn append_done_from_persisted_final_answer(
+    store: &Store,
+    session_id: &str,
+    final_answer: &Value,
+    trigger: &str,
+    tool_call_id: Option<&str>,
+) -> Result<bool> {
+    let Some(result) = persisted_final_answer_result(final_answer) else {
+        return Ok(false);
+    };
+    let mut used_payload = serde_json::json!({
+        "source": "python.set_final_answer",
+        "trigger": trigger,
+    });
+    if let Some(tool_call_id) = tool_call_id {
+        used_payload["tool_call_id"] = Value::String(tool_call_id.to_string());
+    }
+    store.append_event(session_id, "session.final_answer_used", used_payload)?;
+    let mut done_payload = serde_json::json!({
+        "result": result,
+        "source": "python.set_final_answer",
+    });
+    if let Some(summary) = final_answer.get("summary").cloned() {
+        done_payload["final_answer_summary"] = summary;
+    }
+    store.append_event(session_id, "session.done", done_payload)?;
+    Ok(true)
 }
 
 fn persisted_final_answer_not_ready_message(final_answer: &Value) -> Option<String> {
@@ -2806,7 +2843,8 @@ fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Va
         .unwrap_or(0);
     count > 0
         && (looks_like_empty_structured_result(requested_result)
-            || looks_like_placeholder_done_result(requested_result))
+            || looks_like_placeholder_done_result(requested_result)
+            || looks_like_persisted_preview_result(requested_result, final_answer))
 }
 
 fn looks_like_placeholder_done_result(result: &str) -> bool {
@@ -2827,6 +2865,58 @@ fn looks_like_persisted_final_answer_status(normalized: &str) -> bool {
             || normalized.contains("saved"))
         && (normalized.contains("use") || normalized.contains("done")))
         || (normalized.starts_with("need final") && normalized.contains("done"))
+}
+
+fn looks_like_persisted_preview_result(requested_result: &str, final_answer: &Value) -> bool {
+    let requested_result = requested_result.trim();
+    if requested_result.len() < 64 {
+        return false;
+    }
+    let Some(persisted_result) = persisted_final_answer_result(final_answer) else {
+        return false;
+    };
+    let persisted_result = persisted_result.trim();
+    if persisted_result.len() <= requested_result.len() + 64 {
+        return false;
+    }
+    if persisted_result.starts_with(requested_result) {
+        return true;
+    }
+    let Ok(requested_json) = serde_json::from_str::<Value>(requested_result) else {
+        return false;
+    };
+    let Ok(persisted_json) = serde_json::from_str::<Value>(persisted_result) else {
+        return false;
+    };
+    json_value_is_strict_prefix_of(&requested_json, &persisted_json)
+}
+
+fn json_value_is_strict_prefix_of(requested: &Value, persisted: &Value) -> bool {
+    match (requested, persisted) {
+        (Value::Array(requested_items), Value::Array(persisted_items)) => {
+            !requested_items.is_empty()
+                && requested_items.len() < persisted_items.len()
+                && requested_items
+                    .iter()
+                    .zip(persisted_items.iter())
+                    .all(|(requested_item, persisted_item)| requested_item == persisted_item)
+        }
+        (Value::Object(requested_object), Value::Object(persisted_object)) => {
+            let mut found_truncated_collection = false;
+            for (key, requested_value) in requested_object {
+                let Some(persisted_value) = persisted_object.get(key) else {
+                    return false;
+                };
+                if json_value_is_strict_prefix_of(requested_value, persisted_value) {
+                    found_truncated_collection = true;
+                } else if requested_value != persisted_value {
+                    return false;
+                }
+            }
+            found_truncated_collection
+        }
+        _ => false,
+    }
 }
 
 fn looks_like_empty_structured_result(result: &str) -> bool {
@@ -5386,6 +5476,109 @@ mod tests {
                 && event.payload["result"]
                     .as_str()
                     .is_some_and(|result| result.contains("Need final with done"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_replaces_preview_with_full_persisted_final_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let preview = serde_json::to_string_pretty(&serde_json::json!([
+            {"id": 1, "name": "one"},
+            {"id": 2, "name": "two"}
+        ]))?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_full_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer([{'id': 1, 'name': 'one'}, {'id': 2, 'name': 'two'}, {'id': 3, 'name': 'three'}, {'id': 4, 'name': 'four'}], artifact_name='rows.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_preview".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": preview,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract rows",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.final_answer_used"
+                && event.payload["trigger"] == "assistant_done_result_replaced"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"four\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_uses_ready_persisted_final_answer_at_turn_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "python_final_on_last_turn".to_string(),
+                    name: "python".to_string(),
+                    arguments: serde_json::json!({
+                        "code": "set_final_answer({'operator_name': 'Example', 'operator_id': None}, artifact_name='result.json')",
+                    }),
+                },
+            },
+            ModelEvent::Done,
+        ]]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract operator id",
+            temp.path(),
+            AgentRunOptions {
+                max_turns: 1,
+                max_context_chars: 80_000,
+                browser_mode: None,
+                python_tool_timeout_seconds: 120,
+                python_env: Vec::new(),
+            },
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.failed"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.final_answer_used"
+                && event.payload["trigger"] == "max_turns_exhausted"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("operator_name"))
         }));
         Ok(())
     }
