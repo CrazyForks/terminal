@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overnight Experiment Human Report</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --paper: #ffffff;
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d8dde6;
+      --good: #16794c;
+      --warn: #ad6b00;
+      --bad: #b42318;
+      --blue: #175cd3;
+      --chip: #eef2f7;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+
+    header {
+      margin-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 28px 0 12px;
+      font-size: 18px;
+    }
+
+    h3 {
+      margin: 18px 0 8px;
+      font-size: 15px;
+    }
+
+    p {
+      margin: 0 0 10px;
+    }
+
+    .meta,
+    .muted {
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .metric {
+      font-size: 24px;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .blue { color: var(--blue); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      display: table;
+    }
+
+    th,
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef1f5;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      color: #475467;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      background: var(--chip);
+      padding: 2px 8px;
+      margin: 2px 3px 2px 0;
+      font-size: 12px;
+      color: #344054;
+      white-space: nowrap;
+    }
+
+    .callout {
+      border-left: 4px solid var(--blue);
+      background: var(--paper);
+      padding: 12px 14px;
+      border-radius: 6px;
+      border-top: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      margin: 12px 0;
+    }
+
+    ul {
+      margin: 8px 0 0 18px;
+      padding: 0;
+    }
+
+    code {
+      background: #eef1f5;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-size: 12px;
+    }
+
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      table { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Overnight Experiment: Human Report</h1>
+    <p class="meta">
+      Worktree: <code>/Users/greg/Documents/browser-use/experiments/overnight-experiment</code><br>
+      Branch: <code>overnight-experiment</code> · Current commit: <code>a1a4525 Tighten audit finalization guards</code><br>
+      Full scientific log: <code>docs/overnight-experiment-report.md</code>
+    </p>
+  </header>
+
+  <section class="callout">
+    <h2>TL;DR</h2>
+    <p>
+      The branch got much better at <strong>not losing final answers</strong> and at keeping outputs in the requested shape.
+      The main remaining ceiling is <strong>semantic correctness</strong>: proving the page/source/entity is the right one,
+      proving forms/filters are actually applied, exhausting dynamic result frontiers, and not treating missing fields as done.
+    </p>
+    <p>
+      Latest full score: <strong>real_v14_short = 7 pass / 3 partial / 0 fail</strong>.
+      Latest full score: <strong>real_v8 = 71 pass / 26 partial / 3 fail</strong>, weighted <strong>84.0/100</strong>.
+    </p>
+  </section>
+
+  <section class="grid" aria-label="Current metrics">
+    <div class="card">
+      <div class="metric good">7 / 3 / 0</div>
+      <div class="muted">Latest real_v14_short</div>
+    </div>
+    <div class="card">
+      <div class="metric blue">71 / 26 / 3</div>
+      <div class="muted">Latest real_v8 manual strict</div>
+    </div>
+    <div class="card">
+      <div class="metric warn">84.0</div>
+      <div class="muted">Latest real_v8 weighted score</div>
+    </div>
+    <div class="card">
+      <div class="metric warn">84.5</div>
+      <div class="muted">Best observed real_v8 weighted score</div>
+    </div>
+  </section>
+
+  <h2>Score Timeline</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Run</th>
+        <th>Commit / intervention</th>
+        <th>Dataset</th>
+        <th>Score</th>
+        <th>What it meant</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Initial smoke, May 13</td>
+        <td>Baseline plus early reliability work</td>
+        <td>real_v14_short</td>
+        <td><span class="bad">2 pass / 6 partial / 2 fail</span>, interrupted</td>
+        <td>Not trustworthy as a benchmark. Browser cloud key was missing and a Python tool call could hang forever.</td>
+      </tr>
+      <tr>
+        <td>Cloud hygiene run</td>
+        <td>Copied ignored <code>.env</code> into worktree; hard timeout fix</td>
+        <td>real_v14_short</td>
+        <td><span class="good">7 / 3 / 0</span></td>
+        <td>Remote browser actually worked. This established that connectivity/concurrency were mostly fine.</td>
+      </tr>
+      <tr>
+        <td>Several focused v14 loops</td>
+        <td>Self-review, visual artifact, audit helper, source provenance, selection/source-scope audits</td>
+        <td>real_v14_short focus tasks 6/10/16</td>
+        <td>Mixed: many partials, one task-6 pass</td>
+        <td>Prompt-only guidance was weak. Computed audits were better. Source/ranking audits helped, but did not solve semantic quality alone.</td>
+      </tr>
+      <tr>
+        <td>First full post-audit run</td>
+        <td><code>5f1041d</code> era</td>
+        <td>real_v14_short</td>
+        <td><span class="warn">5 / 4 / 1</span></td>
+        <td>Showed the system could finish, but final-answer status strings and source-scope errors still hurt.</td>
+      </tr>
+      <tr>
+        <td>First full real_v8</td>
+        <td><code>5f1041d</code> era</td>
+        <td>real_v8</td>
+        <td><span class="good">73 / 23 / 4</span>, weighted 84.5</td>
+        <td>Best observed v8 score. Main failures were source/entity drift, output-shape mismatch, missing fields, weak ranking evidence, and early stops.</td>
+      </tr>
+      <tr>
+        <td>Final answer shape run</td>
+        <td><code>926c0b0</code> Harden final answer shape and status handling</td>
+        <td>real_v14_short</td>
+        <td><span class="good">6 / 4 / 0</span></td>
+        <td>Fixed protocol/status final answers and improved JSON shape. One semantic regression: selected wrong McDonald's ZIP/source.</td>
+      </tr>
+      <tr>
+        <td>Final answer shape run</td>
+        <td><code>926c0b0</code></td>
+        <td>real_v8</td>
+        <td><span class="bad">67 / 29 / 4</span>, weighted 81.5</td>
+        <td>Regression versus the 73/23/4 run. Shape/status improved, but semantic/source/frontier behavior got worse on several tasks.</td>
+      </tr>
+      <tr>
+        <td>Semantic/finalization run</td>
+        <td><code>59a42b4</code> Add semantic audit and finalization fallback</td>
+        <td>real_v14_short</td>
+        <td><span class="good">7 / 3 / 0</span></td>
+        <td>Recovered v14 score. Remaining failures were screenshot/artifact validity and source-scope partials, not output shape.</td>
+      </tr>
+      <tr>
+        <td>Semantic/finalization run</td>
+        <td><code>59a42b4</code></td>
+        <td>real_v8</td>
+        <td><span class="good">71 / 26 / 3</span>, weighted 84.0</td>
+        <td>Recovered most of the regression. Still below the 84.5 high-water because some semantic tasks regressed to partial.</td>
+      </tr>
+      <tr>
+        <td>Latest committed change</td>
+        <td><code>a1a4525</code> Tighten audit finalization guards</td>
+        <td>Not fully rerun</td>
+        <td>Verified by tests, not by full eval yet</td>
+        <td>Zero-record audits now fail by default, and clean "complete" final answers cannot bypass a not-ready persisted audit.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Experiment Log, Condensed</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Experiment</th>
+        <th>What I tried</th>
+        <th>Outcome</th>
+        <th>Keep?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1. Run hygiene</td>
+        <td>Force cloud/remote browser mode; disable local CDP/local Chrome; copy ignored cloud API key into the worktree.</td>
+        <td>Turned invalid/no-key runs into real cloud-browser runs. No leftover eval workers currently running.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>2. Host-side Python hard timeout</td>
+        <td>Kill/restart worker process groups when model-written Python hangs past timeout.</td>
+        <td>Fixed the class where one task wedged a dataset slot forever. This is a true runtime reliability fix.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>3. General self-review prompts</td>
+        <td>Prompt model to check counts, dedupe, source scope, required fields, screenshots.</td>
+        <td>Useful language, but prompt-only adoption was weak. It did not reliably cause audits or fixes.</td>
+        <td><span class="warn">Keep, but not enough</span></td>
+      </tr>
+      <tr>
+        <td>4. <code>audit_artifact(...)</code> helper</td>
+        <td>Add computed audits for missing fields, duplicates, buckets, source scope, visual files, selection pools.</td>
+        <td>Good direction. The model needs concrete audit feedback; hand-written "audit passed" was too easy to fake.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>5. Missing-audit / placeholder guards</td>
+        <td>Make <code>set_final_answer</code> surface audit readiness and make <code>done</code> reject placeholder/status completions.</td>
+        <td>Fixed finalization meta-text and preview-loss failures. Strong gains on v14 task 11, v8 tasks 51/57/72.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>6. Source provenance / source-scope guards</td>
+        <td>Require evidence for selected source/entity/location and mark broadened fallbacks as partial unless allowed.</td>
+        <td>Improved honesty. It catches broad fallback rows, but still depends on model extracting enough evidence.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>7. Selection/ranking audit</td>
+        <td>For top/best/highest/longest tasks, audit selected records against a candidate pool and metric.</td>
+        <td>Fixed v14 task 6 in a focused run; later v14 still regressed on screenshot artifacts. Concept is good.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>8. Output-shape contract</td>
+        <td>When task asks for JSON/table, return that shape, not only a path/count/sample wrapper.</td>
+        <td>Fixed several output-shape failures, especially v8 task 100 shape and v14 task 5 direct JSON.</td>
+        <td><span class="good">Keep</span></td>
+      </tr>
+      <tr>
+        <td>9. Semantic audit prompt</td>
+        <td>Stronger language: required fields from task/schema, nulls need evidence, entity/page type checks, frontier evidence.</td>
+        <td>Recovered some tasks but caused/failed to prevent regressions in dynamic offer/frontier tasks.</td>
+        <td><span class="warn">Keep cautiously</span></td>
+      </tr>
+      <tr>
+        <td>10. Latest audit finalization guard</td>
+        <td>Zero-record audits fail by default; clean explicit final answers cannot bypass a failed persisted audit.</td>
+        <td>Tests pass. Full eval not run yet. A focused retest was launched and then intentionally stopped.</td>
+        <td><span class="warn">Promising, unscored</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>What Got Better</h2>
+  <div class="card">
+    <p><span class="pill">final answers</span><span class="pill">output shape</span><span class="pill">runner reliability</span><span class="pill">source honesty</span></p>
+    <ul>
+      <li>Final answers no longer commonly become <code>Done.</code>, <code>Need final done...</code>, or preview-only snippets.</li>
+      <li>If a ready persisted final answer exists at max turns, the harness can finish with it instead of failing the run.</li>
+      <li>Large JSON tasks are more likely to return the requested JSON object/list instead of a path-only summary.</li>
+      <li>Source-scope fallbacks are more often marked partial instead of being counted as complete.</li>
+      <li>Cloud-browser concurrency itself is healthy. The bad local-Chrome behavior was avoided in the later runs.</li>
+    </ul>
+  </div>
+
+  <h2>What Regressed</h2>
+  <div class="card">
+    <p>
+      Yes, there were regressions. The important one: after <code>926c0b0</code>, real_v8 dropped from
+      <strong>73/23/4</strong> to <strong>67/29/4</strong>. The next semantic/finalization change recovered most of it to
+      <strong>71/26/3</strong>, but not all the way back.
+    </p>
+    <ul>
+      <li><strong>Dynamic offer pages:</strong> tasks <code>47</code>, <code>49</code>, <code>50</code> regressed to partial because the agent missed lazy visual content or stopped before hidden offer families were exhausted.</li>
+      <li><strong>Stateful forms:</strong> tasks <code>21</code> and <code>40</code> still fail/partial because the model does not prove dates/address/filter state is actually applied.</li>
+      <li><strong>Coverage/frontier:</strong> some all/load-more/sitemap tasks produce counts/samples but not complete frontier evidence.</li>
+      <li><strong>Semantic field values:</strong> the model sometimes guesses or normalizes fields, e.g. contract length/category/operator ID, instead of requiring source proof.</li>
+    </ul>
+  </div>
+
+  <h2>Did We Overfit?</h2>
+  <div class="card">
+    <p><strong>Short answer:</strong> mostly no, but there is moderate prompt-overfitting risk.</p>
+    <ul>
+      <li><strong>Not overfit:</strong> no deterministic benchmark-answer checks were added. The code changes are general: timeouts, persisted final-answer handling, audit readiness, source evidence, visual artifact validity.</li>
+      <li><strong>Some risk:</strong> prompt wording was shaped by recurring real_v8/real_v14 failures, so it may be too heavy around audits/finalization and could spend more turns or produce more partial answers.</li>
+      <li><strong>Good bitter-pill direction:</strong> the branch mostly teaches the model to verify and represent evidence instead of adding task-specific validators.</li>
+      <li><strong>Watch out:</strong> adding too many audit rules can make the agent conservative. That is better than wrong-complete answers, but it may lower runner pass rate or strict pass rate on tasks where enough data exists but the audit burden distracts the model.</li>
+    </ul>
+  </div>
+
+  <h2>Current Failure Modes</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Failure mode</th>
+        <th>Example tasks</th>
+        <th>First-principles reason</th>
+        <th>Best next fix</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Interactive state not proven</td>
+        <td><code>21</code>, <code>40</code></td>
+        <td>The page looks relevant, but selected dates/address/filter may not be accepted or bound to results.</td>
+        <td>Require state proof in URL/page copy/selected controls/network response before extraction.</td>
+      </tr>
+      <tr>
+        <td>Dynamic frontier not exhausted</td>
+        <td><code>27</code>, <code>49</code>, <code>50</code>, <code>63</code></td>
+        <td>The model stops at visible cards or samples without proving tabs, hidden sections, pages, or load-more are exhausted.</td>
+        <td>Frontier artifact: page/API log, before/after counts, no-next/no-new evidence.</td>
+      </tr>
+      <tr>
+        <td>Visual/lazy content missed</td>
+        <td><code>47</code>, v14 <code>6</code></td>
+        <td>DOM extraction says content absent, but the information is visually rendered, lazy-loaded, or in screenshots/media.</td>
+        <td>Use screenshots/OCR or saved HTML/media checks before declaring required visual sections absent.</td>
+      </tr>
+      <tr>
+        <td>Missing fields treated as acceptable</td>
+        <td><code>15</code>, <code>34</code>, <code>36</code>, <code>65</code>, <code>75</code>, <code>96</code>, <code>97</code></td>
+        <td>Required fields are optional in schema or omitted from audits, then final answer sounds complete.</td>
+        <td>Derive required fields from natural-language task plus schema, not only schema required keys.</td>
+      </tr>
+      <tr>
+        <td>Wrong entity/type/value</td>
+        <td><code>9</code>, <code>72</code>, <code>80</code>, <code>99</code></td>
+        <td>Adjacent pages/items/IDs are treated as matches without explicit source proof.</td>
+        <td>Semantic field-type checks and source evidence; avoid plausible defaults.</td>
+      </tr>
+      <tr>
+        <td>Price/discount semantics</td>
+        <td><code>99</code>, <code>100</code></td>
+        <td>The model duplicates current price into discounted price or mixes accessories/products.</td>
+        <td>Prompt rule already added: discounted price only if separate original/list/strikethrough price exists.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Current Branch State</h2>
+  <div class="card">
+    <p>
+      Current commit: <code>a1a4525 Tighten audit finalization guards</code>.
+      Verification passed before commit:
+    </p>
+    <p>
+      <span class="pill">cargo fmt --check</span>
+      <span class="pill">cargo test</span>
+      <span class="pill">Python tests: 29 passed</span>
+      <span class="pill">cargo build --bin browser-use-terminal</span>
+    </p>
+    <p>
+      This commit has <strong>not</strong> had a full real_v8/real_v14 rerun yet. A focused retest was started after the commit and then stopped on request, so it should not be used as score evidence.
+    </p>
+  </div>
+
+  <h2>Recommendation</h2>
+  <div class="card">
+    <p>
+      Keep the latest commit, but do not claim it improves score until a focused retest or full run confirms it.
+      The most useful next run is a small focused cloud run on:
+      <code>real_v8: 9, 15, 21, 27, 47, 49, 50, 99, 100</code> and <code>real_v14_short: 6</code>.
+    </p>
+    <p>
+      If that does not regress obvious passes, run full <code>real_v14_short</code> and <code>real_v8</code> again.
+      BU_Bench_V1 is still untouched in this worktree.
+    </p>
+  </div>
+</main>
+</body>
+</html>
