@@ -246,14 +246,15 @@ fn main_layout_areas(
 }
 
 fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
-    native_scrollback_active
+    (native_scrollback_active && product_state != ProductState::Result)
         || matches!(
             product_state,
-            ProductState::Running
-                | ProductState::Result
-                | ProductState::Failed
-                | ProductState::Cancelled
+            ProductState::Running | ProductState::Failed | ProductState::Cancelled
         )
+}
+
+pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
+    composer_pane_height(app, ProductState::Ready, width)
 }
 
 fn main_bottom_height_for(

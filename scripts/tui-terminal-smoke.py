@@ -499,18 +499,13 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             8,
             "long completed history should not leave a large blank gap in the visible terminal",
         )
-        assert_row_near_bottom(
-            visible,
-            "Ask a follow-up",
-            8,
-            "native scrollback live composer should stay pinned to the terminal bottom",
-        )
         assert_not_contains(visible, "scroll check line 1", "live viewport should not echo the completed result")
-        assert_row_near_bottom(
+        assert_row_gap_at_most(
             visible,
+            "https://news.ycombinator.com",
             "Ask a follow-up",
-            8,
-            "native scrollback composer should stay pinned to the terminal bottom",
+            3,
+            "native scrollback composer should sit directly after the transcript tail",
         )
         assert_not_contains(selected, "+- source", "native transcript should use simple section labels")
         assert_not_contains(selected, "+- result", "native transcript should use simple section labels")
@@ -550,23 +545,24 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         assert_contains(selected, "Top 5 Hacker News posts", "selected task should be replayed to native scrollback")
         assert_contains(visible, "Top 5 Hacker News posts", "live viewport should not be blank for completed history")
         assert_contains(visible, "https://news.ycombinator.com", "live viewport should show completed source")
-        assert_max_consecutive_blank_lines(
-            visible,
-            8,
-            "short completed history should not leave a large blank gap in the visible terminal",
-        )
         assert_row_gap_at_most(
             visible,
             "https://news.ycombinator.com",
             "Ask a follow-up",
-            8,
+            3,
             "short completed composer should stay attached to the result",
         )
-        assert_row_near_bottom(
-            visible,
-            "Ask a follow-up",
-            8,
-            "short completed composer should stay pinned to the terminal bottom",
+        tmux_send(session, "/")
+        slash = wait_for(session, "/task", "short-done-slash-palette")
+        assert_contains(slash, "Top 5 Hacker News posts", "slash palette should not clear completed transcript")
+        assert_contains(slash, "/history", "slash palette should open on completed history")
+        assert_not_contains(slash, "filter actions", "slash palette should not show a redundant filter prompt")
+        assert_row_gap_at_most(
+            slash,
+            "https://news.ycombinator.com",
+            "> /",
+            3,
+            "slash palette should not push the completed transcript down",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)

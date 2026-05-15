@@ -38,8 +38,8 @@ use palette::PaletteAction;
 #[cfg(test)]
 use render::native_scrollback_event_lines;
 use render::{
-    lines_plain_text, native_scrollback_chronological_event_lines, native_scrollback_lines, render,
-    render_dump,
+    lines_plain_text, main_viewport_height, native_scrollback_chronological_event_lines,
+    native_scrollback_lines, render, render_dump,
 };
 use runtime::run_agent_thread;
 use settings::{
@@ -1711,7 +1711,7 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
 }
 
 fn run_terminal(mut app: App) -> Result<()> {
-    let mut viewport_height = desired_terminal_viewport_height(&app)?;
+    let mut viewport_height = desired_terminal_viewport_height(&mut app)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -1744,7 +1744,7 @@ fn run_terminal(mut app: App) -> Result<()> {
                 }
             }
             if pending_resize_at.is_none() && draw_needed {
-                let desired_height = desired_terminal_viewport_height(&app)?;
+                let desired_height = desired_terminal_viewport_height(&mut app)?;
                 if desired_height != viewport_height {
                     reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
                     terminal = new_inline_terminal(desired_height)?;
@@ -1793,13 +1793,22 @@ fn new_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<io::Stdo
     )?)
 }
 
-fn desired_terminal_viewport_height(app: &App) -> Result<u16> {
-    let terminal_height = crossterm::terminal::size()
-        .map(|(_, height)| height)
-        .unwrap_or(app.args.height);
+fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
+    let (terminal_width, terminal_height) =
+        crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
+    let state = app.workbench_state()?;
+    let product_state = app.product_state(&state);
     let full_height = terminal_height
         .saturating_sub(1)
         .max(app.live_viewport_height());
+    let app_width = terminal_width.saturating_sub(4).max(1);
+    let dock_height = main_viewport_height(app, app_width);
+    let inactive_height = match product_state {
+        ProductState::Failed | ProductState::Cancelled => {
+            dock_height.max(app.live_viewport_height())
+        }
+        _ => dock_height,
+    };
     let selected_status = app.selected_session_id.as_deref().and_then(|id| {
         app.state_cache
             .sessions
@@ -1808,14 +1817,13 @@ fn desired_terminal_viewport_height(app: &App) -> Result<u16> {
             .map(|session| &session.status)
     });
     if app.surface != Surface::Main
-        || app.is_slash_palette_active()
         || app.is_first_run_setup_visible()?
         || app.selected_session_id.is_none()
         || selected_status.is_some_and(SessionStatus::is_active)
     {
         return Ok(full_height);
     }
-    Ok(app.live_viewport_height())
+    Ok(inactive_height)
 }
 
 fn handle_terminal_event(
@@ -1909,9 +1917,14 @@ fn maybe_emit_native_transcript(
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
-    if !app.surface.uses_main_view()
-        || app.is_slash_palette_active()
-        || app.is_first_run_setup_visible()?
+    if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
+        return Ok(());
+    }
+    if app.is_slash_palette_active()
+        && state
+            .current_session
+            .as_ref()
+            .is_none_or(|session| session.status.is_active())
     {
         return Ok(());
     }
@@ -2014,20 +2027,8 @@ fn insert_native_lines(
 
 fn insert_initial_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut lines: Vec<ratatui::text::Line<'static>>,
+    lines: Vec<ratatui::text::Line<'static>>,
 ) -> Result<()> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let viewport_height = terminal.size()?.height;
-    let terminal_height = crossterm::terminal::size()
-        .map(|(_, height)| height)
-        .unwrap_or(viewport_height);
-    let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let filler = terminal_height
-        .saturating_sub(viewport_height)
-        .saturating_sub(line_count);
-    lines.extend((0..filler).map(|_| ratatui::text::Line::from("")));
     insert_native_lines(terminal, lines)
 }
 
