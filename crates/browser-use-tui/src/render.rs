@@ -21,6 +21,11 @@ use crate::theme::*;
 
 use super::{App, ProductState, Surface};
 
+pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 4;
+const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
+pub(crate) const NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN: u16 =
+    APP_HORIZONTAL_MARGIN + CONTENT_HORIZONTAL_MARGIN;
+
 pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     app.drain_store_notifications()?;
     let backend = TestBackend::new(app.args.width, app.args.height);
@@ -137,8 +142,21 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 fn app_surface(area: Rect) -> Rect {
     area.inner(Margin {
         vertical: 0,
-        horizontal: 2,
+        horizontal: APP_HORIZONTAL_MARGIN,
     })
+}
+
+fn content_area(area: Rect) -> Rect {
+    area.inner(Margin {
+        vertical: 0,
+        horizontal: CONTENT_HORIZONTAL_MARGIN,
+    })
+}
+
+fn content_width(width: u16) -> u16 {
+    width
+        .saturating_sub(CONTENT_HORIZONTAL_MARGIN.saturating_mul(2))
+        .max(1)
 }
 
 fn render_main(
@@ -149,7 +167,7 @@ fn render_main(
     product_state: ProductState,
 ) {
     let bottom_h = main_bottom_height_for(app, state, app.surface, area, product_state);
-    let body_width = area.width;
+    let body_width = content_width(area.width);
     let native_scrollback_active =
         app.native_scrollback_is_active() && !app.surface.is_bottom_pane();
     let show_footer = app.surface.is_bottom_pane()
@@ -205,7 +223,7 @@ fn render_main(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        body_render_area,
+        content_area(body_render_area),
     );
     if app.surface.is_bottom_pane() {
         render_bottom_pane(frame, bottom_area, app, state, app.surface);
@@ -491,7 +509,7 @@ fn render_surface(
         Paragraph::new(lines)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        chunks[1],
+        content_area(chunks[1]),
     );
     frame.render_widget(
         Paragraph::new(surface_footer(surface))

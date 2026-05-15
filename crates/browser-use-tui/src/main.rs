@@ -22,7 +22,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Margin, Position, Rect};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -39,7 +39,8 @@ use palette::PaletteAction;
 use render::native_scrollback_event_lines;
 use render::{
     lines_plain_text, main_viewport_height, native_scrollback_chronological_event_lines,
-    native_scrollback_lines, render, render_dump,
+    native_scrollback_lines, render, render_dump, APP_HORIZONTAL_MARGIN,
+    NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
 use runtime::run_agent_thread;
 use settings::{
@@ -1801,7 +1802,9 @@ fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
     let full_height = terminal_height
         .saturating_sub(1)
         .max(app.live_viewport_height());
-    let app_width = terminal_width.saturating_sub(4).max(1);
+    let app_width = terminal_width
+        .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
+        .max(1);
     let dock_height = main_viewport_height(app, app_width);
     let inactive_height = match product_state {
         ProductState::Failed | ProductState::Cancelled => {
@@ -1976,7 +1979,9 @@ fn maybe_emit_native_transcript(
 }
 
 fn native_scrollback_width(terminal_width: u16) -> u16 {
-    terminal_width.saturating_sub(4).max(1)
+    terminal_width
+        .saturating_sub(NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN.saturating_mul(2))
+        .max(1)
 }
 
 fn clear_native_transcript_screen(
@@ -2020,7 +2025,11 @@ fn insert_native_lines(
     }
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
     terminal.insert_before(height, |buf| {
-        Paragraph::new(lines).render(buf.area, buf);
+        let area = buf.area.inner(Margin {
+            vertical: 0,
+            horizontal: NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
+        });
+        Paragraph::new(lines).render(area, buf);
     })?;
     Ok(())
 }

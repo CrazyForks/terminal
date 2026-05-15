@@ -108,6 +108,16 @@ def assert_not_contains(text: str, needle: str, context: str) -> None:
         raise AssertionError(f"{context}: unexpected {needle!r}\n\n{text}")
 
 
+def assert_stripped_line(text: str, expected: str, context: str) -> None:
+    if not any(line.strip() == expected for line in text.splitlines()):
+        raise AssertionError(f"{context}: expected stripped line {expected!r}\n\n{text}")
+
+
+def assert_no_stripped_line(text: str, expected: str, context: str) -> None:
+    if any(line.strip() == expected for line in text.splitlines()):
+        raise AssertionError(f"{context}: unexpected stripped line {expected!r}\n\n{text}")
+
+
 def assert_count(text: str, needle: str, expected: int, context: str) -> None:
     count = text.count(needle)
     if count != expected:
@@ -127,6 +137,26 @@ def assert_row_gap_at_most(text: str, before: str, after: str, max_rows: int, co
     if rows_between > max_rows:
         raise AssertionError(
             f"{context}: expected at most {max_rows} rows between {before!r} and {after!r}, saw {rows_between}\n\n{text}"
+        )
+
+
+def first_text_column(text: str, needle: str, context: str) -> int:
+    for line in text.splitlines():
+        if needle in line:
+            return len(line) - len(line.lstrip())
+    raise AssertionError(f"{context}: missing {needle!r}\n\n{text}")
+
+
+def assert_first_text_columns_close(
+    text: str, before: str, after: str, max_delta: int, context: str
+) -> None:
+    before_column = first_text_column(text, before, context)
+    after_column = first_text_column(text, after, context)
+    delta = abs(before_column - after_column)
+    if delta > max_delta:
+        raise AssertionError(
+            f"{context}: expected first text columns within {max_delta}, "
+            f"saw {before_column} vs {after_column}\n\n{text}"
         )
 
 
@@ -259,8 +289,8 @@ def smoke_interactive_terminal(binary: Path) -> None:
         wait_for(session, "> /stuff", "alt-backspace-slash-token-before")
         tmux_send_alt_backspace(session)
         slash_token = capture_after_idle(session, "alt-backspace-slash-token", visible_only=True)
-        assert_contains(slash_token, "\n    > /\n", "alt-backspace should leave slash separator")
-        assert_not_contains(slash_token, "\n    > /stuff\n", "alt-backspace should delete slash word token")
+        assert_stripped_line(slash_token, "> /", "alt-backspace should leave slash separator")
+        assert_no_stripped_line(slash_token, "> /stuff", "alt-backspace should delete slash word token")
         tmux_send(session, "C-c")
         wait_for(session, "Type to steer the agent", "main-after-alt-backspace-slash-clear")
 
@@ -268,12 +298,12 @@ def smoke_interactive_terminal(binary: Path) -> None:
         wait_for(session, "> something-bla", "alt-backspace-hyphenated-word-before")
         tmux_send_alt_backspace(session)
         hyphenated_word = capture_after_idle(session, "alt-backspace-hyphenated-word", visible_only=True)
-        assert_contains(hyphenated_word, "\n    > something-\n", "alt-backspace should delete trailing word token")
-        assert_not_contains(hyphenated_word, "\n    > something-bla\n", "alt-backspace should delete trailing word token")
+        assert_stripped_line(hyphenated_word, "> something-", "alt-backspace should delete trailing word token")
+        assert_no_stripped_line(hyphenated_word, "> something-bla", "alt-backspace should delete trailing word token")
         tmux_send_alt_backspace(session)
         hyphen = capture_after_idle(session, "alt-backspace-hyphen", visible_only=True)
-        assert_contains(hyphen, "\n    > something\n", "alt-backspace should delete punctuation token separately")
-        assert_not_contains(hyphen, "\n    > something-\n", "alt-backspace should delete punctuation token separately")
+        assert_stripped_line(hyphen, "> something", "alt-backspace should delete punctuation token separately")
+        assert_no_stripped_line(hyphen, "> something-", "alt-backspace should delete punctuation token separately")
         tmux_send_alt_backspace(session)
         wait_for(session, "Type to steer the agent", "main-after-alt-backspace-word-clear")
 
@@ -545,6 +575,13 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         assert_contains(selected, "Top 5 Hacker News posts", "selected task should be replayed to native scrollback")
         assert_contains(visible, "Top 5 Hacker News posts", "live viewport should not be blank for completed history")
         assert_contains(visible, "https://news.ycombinator.com", "live viewport should show completed source")
+        assert_first_text_columns_close(
+            visible,
+            "https://news.ycombinator.com",
+            "Ask a follow-up",
+            1,
+            "completed transcript and composer should share a content gutter",
+        )
         assert_row_gap_at_most(
             visible,
             "https://news.ycombinator.com",
@@ -557,6 +594,13 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         assert_contains(slash, "Top 5 Hacker News posts", "slash palette should not clear completed transcript")
         assert_contains(slash, "/history", "slash palette should open on completed history")
         assert_not_contains(slash, "filter actions", "slash palette should not show a redundant filter prompt")
+        assert_first_text_columns_close(
+            slash,
+            "https://news.ycombinator.com",
+            "> /",
+            1,
+            "slash palette should keep transcript and input aligned",
+        )
         assert_row_gap_at_most(
             slash,
             "https://news.ycombinator.com",
