@@ -26,7 +26,7 @@ Already built:
 - completed-session transcript replay into terminal scrollback;
 - tactical fixes for duplicate output, stable slash palette height, composer newline flicker, padding, and multiline OSC-8 links;
 - tmux smoke coverage for several V1 regressions;
-- deep renderer analysis in `docs/tui-renderer-deep-dive-and-revamp-plan.md`.
+- tmux and deterministic coverage for several renderer regressions.
 
 These are useful, but they are not renderer V2.
 

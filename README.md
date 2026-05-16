@@ -166,13 +166,11 @@ scripts/live-browser-boundary-smoke.sh
 
 That smoke covers browser download artifact indexing and stale-session recovery preserving the same browser target id.
 
-## Migration Docs
+## Current Docs
 
-- `docs/rust-migration-one-page-summary.md`
-- `docs/rust-core-migration-plan.md`
 - `docs/terminal-ui-product-ux.md`
-- `docs/browser-agent-harness-learnings.md`
-- `docs/browser-agent-harness-plan.md`
+- `docs/terminal-ui-testing.md`
 - `docs/rewrite-verification.md`
-- `docs/completion-audit.md`
-- `docs/goal-completion-audit.md`
+- `docs/renderer-v2-complete-build-plan.md`
+- `docs/tui-live-state-cache-plan.md`
+- `docs/plan-pure-rust-browser-harness.md`
