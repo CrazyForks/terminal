@@ -37,6 +37,9 @@ pub(crate) struct TranscriptNode {
 
 #[derive(Clone, Debug)]
 enum TranscriptKind {
+    Stack {
+        nodes: Vec<TranscriptNode>,
+    },
     Prompt {
         text: String,
         followup: bool,
@@ -106,6 +109,7 @@ impl RenderCell for TranscriptNode {
     fn display_lines(&self, width: u16, mode: DisplayMode) -> Vec<Line<'static>> {
         let width = width.max(1);
         match &self.kind {
+            TranscriptKind::Stack { nodes } => cells_to_lines(nodes.iter(), width, mode),
             TranscriptKind::Prompt { text, followup } => prompt_lines(text, *followup, width),
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
@@ -144,6 +148,9 @@ impl RenderCell for TranscriptNode {
 
     fn plain_lines(&self) -> Vec<String> {
         match &self.kind {
+            TranscriptKind::Stack { nodes } => {
+                nodes.iter().flat_map(|node| node.plain_lines()).collect()
+            }
             TranscriptKind::Prompt { text, .. } => prefixed_plain("> ", text),
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
@@ -322,14 +329,18 @@ fn committed_node_for_event(
         // subagent blocks.
         "agent.spawned" => None,
         "agent.completed" => {
-            let label = event
+            let child_id = event
                 .payload
                 .get("child_session_id")
-                .and_then(serde_json::Value::as_str)
+                .and_then(serde_json::Value::as_str);
+            let label = child_id
                 .map(|id| helper_label_for_session(app, id))
                 .unwrap_or_else(|| "subagent".to_string());
             let group = format!("subagent {label}");
-            let mut lines = vec!["finished".to_string()];
+            let mut lines = child_id
+                .map(|id| completed_child_activity_lines(app, state, id, 4))
+                .unwrap_or_default();
+            lines.push("finished".to_string());
             if let Some(result) = event
                 .payload
                 .get("payload")
@@ -363,6 +374,7 @@ fn committed_node_for_event(
             vec!["subagent stopped".to_string()],
             NodeStyle::Muted,
         )),
+        "model.turn.response" => model_turn_response_node(app, event),
         "model.tool_call" => model_tool_call_node(event),
         "tool.started" => tool_started_node(event),
         "tool.output" => tool_output_node(event),
@@ -512,7 +524,6 @@ fn committed_node_for_event(
             NodeStyle::Failed,
         )),
         "model.turn.request"
-        | "model.turn.response"
         | "model.turn.retry"
         | "model.stream_delta"
         | "model.thinking_delta"
@@ -536,9 +547,18 @@ fn active_node_for_session(
         let label = helper_label_for_session(app, &child.id);
         let group = format!("subagent {label}");
         let mut lines = vec!["working".to_string()];
+        if let Some(wait_event) = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "agent.wait.started")
+        {
+            lines.push(wait_agent_started_label(&wait_event.payload));
+        }
         let recent = recent_child_activity_lines(app, state, &child.id, 6);
         if recent.is_empty() {
-            lines.push("waiting for activity".to_string());
+            if lines.len() == 1 {
+                lines.push("waiting for activity".to_string());
+            }
         } else {
             lines.extend(recent);
         }
@@ -551,14 +571,52 @@ fn active_node_for_session(
         ));
     }
 
-    if let Some(text) = state
+    let live_thinking_text = state
+        .transcript
+        .last()
+        .and_then(|turn| turn.thinking_text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let live_streaming_text = state
         .transcript
         .last()
         .and_then(|turn| turn.streaming_text.as_deref())
         .map(str::trim_end)
-        .filter(|text| !text.is_empty())
-    {
-        return Some(TranscriptNode {
+        .filter(|text| !text.is_empty());
+
+    let mut active_nodes = Vec::new();
+
+    let suppress_model_wait = live_streaming_text.is_some() && live_thinking_text.is_none();
+    if let Some(event) = events.iter().rev().find(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "model.turn.request" | "model.turn.retry" | "agent.wait.started"
+        ) && !(suppress_model_wait
+            && matches!(
+                event.event_type.as_str(),
+                "model.turn.request" | "model.turn.retry"
+            ))
+    }) {
+        if let Some(node) = active_node_for_event(root, events, event) {
+            active_nodes.push(node);
+        }
+    }
+
+    if let Some(text) = live_thinking_text {
+        let label = latest_thinking_label(events);
+        active_nodes.push(active_status_node(
+            root,
+            events,
+            &label
+                .map(|label| format!("thought {label}"))
+                .unwrap_or_else(|| "thought".to_string()),
+            preview_lines(text, 5),
+            NodeStyle::Thought,
+        ));
+    }
+
+    if let Some(text) = live_streaming_text {
+        active_nodes.push(TranscriptNode {
             id: format!("{}:active-stream", root.id),
             seq: events.last().map(|event| event.seq).unwrap_or_default(),
             revision: events
@@ -571,32 +629,22 @@ fn active_node_for_session(
         });
     }
 
-    if let Some(text) = state
-        .transcript
-        .last()
-        .and_then(|turn| turn.thinking_text.as_deref())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        return Some(active_status_node(
-            root,
-            events,
-            "thinking",
-            preview_lines(text, 5),
-            NodeStyle::Thought,
-        ));
+    if !active_nodes.is_empty() {
+        let seq = events.last().map(|event| event.seq).unwrap_or_default();
+        return Some(TranscriptNode {
+            id: format!("{}:active-stack", root.id),
+            seq,
+            revision: seq.max(0) as u64,
+            kind: TranscriptKind::Stack {
+                nodes: active_nodes,
+            },
+        });
     }
 
     if let Some(event) = events.iter().rev().find(|event| {
         matches!(
             event.event_type.as_str(),
-            "model.turn.request"
-                | "model.turn.retry"
-                | "command.waiting"
-                | "tool.started"
-                | "browser.page"
-                | "browser.state"
-                | "plan.updated"
+            "command.waiting" | "tool.started" | "browser.page" | "browser.state" | "plan.updated"
         )
     }) {
         return active_node_for_event(root, events, event);
@@ -632,6 +680,13 @@ fn active_node_for_event(
             events,
             "thinking",
             vec!["retrying model request".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.wait.started" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec![wait_agent_started_label(&event.payload)],
             NodeStyle::Muted,
         )),
         "command.waiting" => Some(active_status_node(
@@ -711,6 +766,46 @@ fn model_tool_call_node(event: &EventRecord) -> Option<TranscriptNode> {
         event,
         "tool",
         vec![format!("{name} requested")],
+        NodeStyle::Muted,
+    ))
+}
+
+fn model_turn_response_node(app: &App, event: &EventRecord) -> Option<TranscriptNode> {
+    if model_response_tool_call_count(event) == 0 {
+        return None;
+    }
+
+    let mut text = payload_string(event, "text")
+        .or_else(|| payload_string(event, "content"))
+        .or_else(|| payload_string(event, "message"))
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        let turn_idx = event_turn_idx(event);
+        for candidate in app.cached_events_for_session(&event.session_id) {
+            if candidate.seq > event.seq || candidate.event_type != "model.stream_delta" {
+                continue;
+            }
+            if turn_idx.is_some()
+                && event_turn_idx(candidate).is_some()
+                && event_turn_idx(candidate) != turn_idx
+            {
+                continue;
+            }
+            if let Some(delta) = payload_raw_string(candidate, "text") {
+                append_live_delta_text(&mut text, &delta);
+            }
+        }
+    }
+
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(timeline_node(
+        event,
+        "note",
+        vec![format!("note: {text}")],
         NodeStyle::Muted,
     ))
 }
@@ -953,6 +1048,23 @@ fn payload_string(event: &EventRecord, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn payload_raw_string(event: &EventRecord, key: &str) -> Option<String> {
+    event
+        .payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn payload_i64(event: &EventRecord, key: &str) -> Option<i64> {
+    event.payload.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().map(|value| value as i64))
+    })
+}
+
 fn source_for_state(state: &WorkbenchState) -> Option<String> {
     state
         .browser
@@ -1048,6 +1160,9 @@ fn compact_url(url: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| url.trim().strip_prefix("http://"))
         .unwrap_or_else(|| url.trim());
+    if let Some((prefix, _query)) = compact.split_once('?') {
+        return format!("{prefix}?...");
+    }
     if compact.chars().count() <= MAX {
         return compact.to_string();
     }
@@ -1087,6 +1202,38 @@ fn helper_label_for_session(app: &App, session_id: &str) -> String {
                 .filter(|label| !label.is_empty())
                 .map(ToOwned::to_owned)
         })
+    {
+        return label;
+    }
+
+    if let Some(label) = app
+        .state_cache
+        .events_by_session
+        .values()
+        .flat_map(|events| events.iter())
+        .find(|event| {
+            event.event_type == "agent.spawned"
+                && event
+                    .payload
+                    .get("child_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id)
+        })
+        .and_then(|event| {
+            event
+                .payload
+                .get("nickname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                })
+        })
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
     {
         return label;
     }
@@ -1182,6 +1329,51 @@ fn recent_child_activity_lines(
     lines
 }
 
+fn completed_child_activity_lines(
+    app: &App,
+    state: &WorkbenchState,
+    child_id: &str,
+    limit: usize,
+) -> Vec<String> {
+    let child_events = app.cached_events_for_session(child_id);
+    if !child_session_has_terminal_event(child_events) {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for event in child_events.iter().rev() {
+        if matches!(
+            event.event_type.as_str(),
+            "session.input"
+                | "session.followup"
+                | "session.done"
+                | "session.failed"
+                | "session.cancelled"
+                | "model.thinking_delta"
+                | "model.stream_delta"
+        ) {
+            continue;
+        }
+        if let Some(line) = child_activity_line(event, state) {
+            lines.push(line);
+        }
+        if lines.len() >= limit {
+            break;
+        }
+    }
+    lines.reverse();
+    lines
+}
+
+fn child_session_has_terminal_event(events: &[EventRecord]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.done" | "session.failed" | "session.cancelled"
+        )
+    })
+}
+
 fn child_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<String> {
     match event.event_type.as_str() {
         "session.input" => payload_string(event, "text")
@@ -1257,6 +1449,85 @@ fn child_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<St
         "plan.updated" => Some("updated plan".to_string()),
         _ => None,
     }
+}
+
+fn model_response_tool_call_count(event: &EventRecord) -> u64 {
+    event
+        .payload
+        .get("tool_call_count")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            event
+                .payload
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(|calls| calls.len() as u64)
+        })
+        .unwrap_or(0)
+}
+
+fn event_turn_idx(event: &EventRecord) -> Option<i64> {
+    payload_i64(event, "turn_idx").or_else(|| payload_i64(event, "turn_index"))
+}
+
+fn append_live_delta_text(current: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(incoming);
+    } else if incoming.starts_with(current.as_str()) {
+        current.clear();
+        current.push_str(incoming);
+    } else if current.ends_with(incoming) {
+        return;
+    } else {
+        current.push_str(incoming);
+    }
+}
+
+fn latest_thinking_label(events: &[EventRecord]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == "model.thinking_delta")
+        .find_map(|event| payload_string(event, "label"))
+}
+
+fn wait_agent_started_label(payload: &serde_json::Value) -> String {
+    if let Some(target) = payload
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    {
+        return format!("waiting on {target}");
+    }
+
+    if let Some(targets) = payload.get("targets").and_then(serde_json::Value::as_array) {
+        let labels = targets
+            .iter()
+            .filter_map(|target| {
+                target
+                    .get("nickname")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| target.get("task_name").and_then(serde_json::Value::as_str))
+                    .or_else(|| {
+                        target
+                            .get("child_session_id")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        if !labels.is_empty() {
+            return format!("waiting on {}", labels.join(", "));
+        }
+    }
+
+    "waiting on subagent".to_string()
 }
 
 fn truncate_text(value: &str, max: usize) -> String {
