@@ -1418,8 +1418,9 @@ impl App {
             self.selected_row = 0;
             return;
         }
-        let max = count.saturating_sub(1) as isize;
-        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+        // Wrap around the ends rather than stopping at them.
+        self.selected_row =
+            (self.selected_row as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     fn clamp_slash_palette_selection(&mut self) {
@@ -1456,8 +1457,9 @@ impl App {
             self.selected_row = 0;
             return Ok(());
         }
-        let max = count.saturating_sub(1) as isize;
-        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+        // Wrap around the ends — Down past the last row lands on the first.
+        self.selected_row =
+            (self.selected_row as isize + delta).rem_euclid(count as isize) as usize;
         Ok(())
     }
 
@@ -2480,13 +2482,17 @@ mod redesign_tests {
         assert!(screen.contains("OpenRouter API key"));
         assert!(!screen.contains("[needs]"));
 
-        // Up/Down must navigate the 5 onboarding rows and clamp at edges.
+        // Up/Down navigate the 5 onboarding rows and wrap around the edges.
         assert_eq!(app.selected_row, 0);
-        for _ in 0..50 {
+        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
-        for _ in 0..50 {
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
+        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, 0);
@@ -2976,14 +2982,15 @@ mod redesign_tests {
     fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
         fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
             app.selected_row = 0;
-            for _ in 0..50 {
+            for _ in 0..expected_count - 1 {
                 assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
             }
             assert_eq!(app.selected_row, expected_count - 1);
-            for _ in 0..50 {
-                assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-            }
+            // Down past the last row wraps to the first; Up past the first wraps back.
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
             assert_eq!(app.selected_row, 0);
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.selected_row, expected_count - 1);
             Ok(())
         }
 
@@ -3062,29 +3069,36 @@ mod redesign_tests {
     }
 
     #[test]
-    fn action_and_model_selection_clamp_at_edges() -> Result<()> {
+    fn palette_and_settings_selection_wrap_at_edges() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
 
+        // The slash palette wraps around both ends.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        for _ in 0..50 {
+        let palette_count = app.slash_palette_items().len();
+        for _ in 0..palette_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, app.slash_palette_items().len() - 1);
-        for _ in 0..50 {
-            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        }
+        assert_eq!(app.selected_row, palette_count - 1);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, palette_count - 1);
         app.composer.clear();
         app.selected_row = 0;
 
+        // The model picker wraps the same way.
         app.open_surface(Surface::Model);
-        for _ in 0..50 {
+        for _ in 0..MODEL_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("DeepSeek V4 Pro"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         Ok(())
     }
 
