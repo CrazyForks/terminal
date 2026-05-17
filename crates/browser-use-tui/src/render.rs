@@ -8,7 +8,6 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::composer::composer_rule;
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
@@ -77,8 +76,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
     let product_state = app.product_state(&state);
 
-    if app.is_first_run_setup_visible().unwrap_or(false) && app.surface == Surface::Main {
-        render_surface(frame, area, app, &state, Surface::Setup);
+    if app.is_first_run_setup_visible().unwrap_or(false) {
+        // First-run setup always renders full-screen, whatever step it is on.
+        let surface = if app.surface == Surface::Main {
+            Surface::Setup
+        } else {
+            app.surface
+        };
+        render_surface(frame, area, app, &state, surface);
         return;
     }
 
@@ -117,8 +122,7 @@ fn render_main(
 ) {
     let bottom_h = main_bottom_height_for(app, state, app.surface, area, product_state);
     let body_width = content_width(area.width);
-    let native_scrollback_active =
-        app.native_scrollback_is_active() && !app.surface.is_bottom_pane();
+    let native_scrollback_active = app.native_scrollback_is_active();
     let show_footer = app.surface.is_bottom_pane()
         || app
             .quit_hint_until
@@ -134,9 +138,7 @@ fn render_main(
     } else {
         None
     };
-    let body = if app.surface.is_bottom_pane() {
-        Vec::new()
-    } else if native_scrollback_active {
+    let body = if native_scrollback_active {
         let mut lines =
             transcript::active_viewport_lines(transcript_model.as_ref(), body_width, max_body_h);
         if lines.is_empty() {
@@ -265,11 +267,12 @@ fn main_bottom_height_for(
     }
     let line_count = surface_lines(surface, app, state).len() as u16;
     let max_height = match surface {
-        Surface::Model => area.height.saturating_sub(2).max(4),
-        Surface::BrowserSelect => 18,
-        _ => 14,
+        Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
+        Surface::BrowserSelect => 22,
+        _ => 18,
     };
-    let desired = line_count.saturating_add(2).clamp(4, max_height);
+    // Add room for the surface header (rule + title + description + spacer).
+    let desired = line_count.saturating_add(6).clamp(8, max_height);
     let available = area.height.saturating_sub(2).max(4);
     desired.min(available)
 }
@@ -316,36 +319,19 @@ fn render_bottom_pane(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let header = surface_header_lines(surface, content_width(area.width));
+    let header_h = header.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .constraints([Constraint::Length(header_h), Constraint::Min(1)])
         .split(area);
-    let title = surface_title(surface);
-    let header = pane_header_line(title, chunks[0].width);
-    frame.render_widget(Paragraph::new(header), chunks[0]);
-    let body = chunks[1].inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
+    frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
     frame.render_widget(
         Paragraph::new(surface_lines(surface, app, state))
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        body,
+        content_area(chunks[1]),
     );
-}
-
-fn pane_header_line(title: &str, width: u16) -> Line<'static> {
-    let width = width as usize;
-    let title = format!(" {title} ");
-    let title_len = title.chars().count();
-    if width <= title_len {
-        return Line::from(Span::styled(truncate(&title, width), muted()));
-    }
-    Line::from(vec![
-        Span::styled(title, bold()),
-        Span::styled("-".repeat(width.saturating_sub(title_len)), dim()),
-    ])
 }
 
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
@@ -392,7 +378,8 @@ fn render_surface(
     surface: Surface,
 ) {
     frame.render_widget(Clear, frame.area());
-    let chrome_h: u16 = if surface == Surface::Setup { 0 } else { 2 };
+    let header = surface_header_lines(surface, area.width);
+    let chrome_h = header.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -401,9 +388,7 @@ fn render_surface(
             Constraint::Length(1),
         ])
         .split(area);
-    if chrome_h > 0 {
-        render_header(frame, chunks[0], app, state, surface_title(surface));
-    }
+    frame.render_widget(Paragraph::new(header), chunks[0]);
     let lines = surface_lines(surface, app, state);
     frame.render_widget(
         Paragraph::new(lines)
@@ -419,19 +404,39 @@ fn render_surface(
     );
 }
 
-fn surface_title(surface: Surface) -> &'static str {
+/// Title and one-line description for a dropdown/settings surface header.
+fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
     match surface {
-        Surface::Setup => "browser-use setup",
-        Surface::Account => "browser-use setup / authenticate",
-        Surface::ApiKey => "browser-use setup / authenticate",
-        Surface::Telemetry => "browser-use / Laminar",
-        Surface::Model => "browser-use setup / model",
-        Surface::Browser => "browser-use / browser",
-        Surface::BrowserSelect => "browser-use setup / browser",
-        Surface::History => "browser-use / previous work",
-        Surface::Developer => "browser-use / developer",
-        Surface::Main => "browser-use",
+        Surface::Setup => ("Setup", "Get Browser Use ready to go"),
+        Surface::Account => ("Authenticate", "Sign in to a model provider"),
+        Surface::ApiKey => ("API key", "Enter your provider API key"),
+        Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
+        Surface::Model => ("Model", "Choose the model and provider for this session"),
+        Surface::Browser => ("Browser", "Change the browser backend"),
+        Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::History => ("History", "Browse and resume previous tasks"),
+        Surface::Developer => ("Developer", "Developer tools and diagnostics"),
+        Surface::Main => ("", ""),
     }
+}
+
+/// A surface header: a full-width accent rule, the colored title, and a muted
+/// one-line description — the shared chrome for every dropdown/settings view.
+fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
+    let (title, description) = surface_heading(surface);
+    let indent = " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize);
+    vec![
+        Line::from(Span::styled("─".repeat(width as usize), accent())),
+        Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(title.to_string(), accent()),
+        ]),
+        Line::from(vec![
+            Span::raw(indent),
+            Span::styled(description.to_string(), muted()),
+        ]),
+        Line::from(""),
+    ]
 }
 
 fn surface_footer(surface: Surface) -> &'static str {
@@ -459,54 +464,6 @@ fn surface_lines(surface: Surface, app: &App, state: &WorkbenchState) -> Vec<Lin
         Surface::Developer => developer_lines(app, state),
         Surface::Main => Vec::new(),
     }
-}
-
-fn render_header(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    state: &WorkbenchState,
-    title: &str,
-) {
-    let lines = header_lines(app, state, title, area.width);
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-fn header_lines(app: &App, state: &WorkbenchState, title: &str, width: u16) -> Vec<Line<'static>> {
-    let width = width as usize;
-    if width == 0 {
-        return Vec::new();
-    }
-    let browser = browser_header_label(app, state);
-    let right = format!("{browser}   {}", app.model);
-    let max_left = width.saturating_sub(right.chars().count() + 2).max(10);
-    let left = truncate(title, max_left);
-    let right = truncate(&right, width.saturating_sub(left.chars().count() + 2));
-    let spaces = width.saturating_sub(left.chars().count() + right.chars().count());
-    vec![
-        Line::from(vec![
-            Span::styled(left, bold()),
-            Span::raw(" ".repeat(spaces)),
-            Span::styled(right, muted()),
-        ]),
-        Line::from(composer_rule(width as u16)),
-    ]
-}
-
-fn browser_header_label(app: &App, state: &WorkbenchState) -> String {
-    if cloud_browser_needs_key(app) {
-        return format!("{} needs key", app.browser);
-    }
-    let status = if state.browser.status == "not connected" {
-        if app.browser == BROWSER_USE_CLOUD {
-            "ready"
-        } else {
-            "connected"
-        }
-    } else {
-        state.browser.status.as_str()
-    };
-    format!("{} {status}", app.browser)
 }
 
 fn render_composer(
@@ -541,7 +498,7 @@ fn render_composer(
         .constraints(constraints)
         .split(area);
     frame.render_widget(
-        Paragraph::new(input_box_rule(chunks[0].width)).style(border()),
+        Paragraph::new(input_box_rule(chunks[0].width)).style(input_rule()),
         chunks[0],
     );
     let input_area = chunks[1].inner(Margin {
@@ -549,6 +506,13 @@ fn render_composer(
         horizontal: 2,
     });
     render_composer_input(frame, input_area, app, state.current_session.as_ref());
+    if palette_h == 0 {
+        // Bottom rule, mirroring the rule above the input box.
+        frame.render_widget(
+            Paragraph::new(input_box_rule(chunks[2].width)).style(input_rule()),
+            chunks[2],
+        );
+    }
     let action_chunk = if palette_h > 0 { chunks[2] } else { chunks[3] };
     let action_area = action_chunk.inner(Margin {
         vertical: 0,
@@ -612,7 +576,7 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn input_box_rule(width: u16) -> String {
-    "-".repeat(width as usize)
+    "─".repeat(width as usize)
 }
 
 /// Token budget the context bar fills toward. `browser-use-core` compacts the
@@ -1150,12 +1114,6 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
-    lines.push(header_status_line(
-        "browser-use",
-        &ready_status_label(app, state),
-        width as usize,
-    ));
-    lines.push(Line::from(""));
     lines.extend(config_card_lines(app, state, width as usize));
     lines.push(Line::from(""));
 
@@ -1171,6 +1129,9 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
         for row in rows {
             lines.push(history_plain_row(row, width as usize));
         }
+        // Breathing room between the recent task list and the input box below.
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
     }
     lines
 }
@@ -1207,7 +1168,7 @@ fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Lin
             "/browser",
             inner_w,
         ),
-        card_kv_line("cwd", &cwd_label(), "", inner_w),
+        card_kv_line("directory", &cwd_label(), "", inner_w),
         card_kv_line(
             "telemetry",
             &app.laminar_status()
@@ -1271,25 +1232,16 @@ fn cwd_label() -> String {
     cwd
 }
 
-fn header_status_line(left: &str, right: &str, width: usize) -> Line<'static> {
-    let right = truncate(right, width.saturating_sub(left.chars().count() + 3).max(8));
-    let rule_len = width.saturating_sub(left.chars().count() + right.chars().count() + 2);
-    Line::from(vec![
-        Span::styled(left.to_string(), bold()),
-        Span::raw(" "),
-        Span::styled("-".repeat(rule_len), dim()),
-        Span::raw(" "),
-        Span::styled(right, done()),
-    ])
-}
-
-fn ready_status_label(app: &App, state: &WorkbenchState) -> String {
-    format!(
-        "{} . {} . {}",
-        app.model,
-        compact_account_label(&app.account),
-        browser_ready_label(app, state).replace(" ready", " idle")
-    )
+/// Status marker for a history row — conveys outcome at a glance, paired with
+/// the status color, instead of a bare colon.
+fn status_glyph(status: &str) -> char {
+    match status {
+        "done" => '✓',
+        "failed" => '✗',
+        "running" | "created" => '●',
+        "cancelled" => '○',
+        _ => '·',
+    }
 }
 
 fn history_plain_row(row: &HistoryRow, width: usize) -> Line<'static> {
@@ -1302,7 +1254,7 @@ fn history_plain_row(row: &HistoryRow, width: usize) -> Line<'static> {
         "cancelled" => "stopped",
         _ => status,
     };
-    let prefix = format!(": {status_label:<8}");
+    let prefix = format!("{} {status_label:<8}", status_glyph(status));
     let prefix_len = prefix.chars().count() + 2;
     let time_len = time.chars().count();
     let task_w = width.saturating_sub(prefix_len + time_len + 2).max(12);

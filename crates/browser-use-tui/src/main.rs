@@ -100,11 +100,21 @@ enum Surface {
 
 impl Surface {
     fn is_bottom_pane(self) -> bool {
-        false
+        matches!(
+            self,
+            Self::Account
+                | Self::ApiKey
+                | Self::Telemetry
+                | Self::Model
+                | Self::Browser
+                | Self::BrowserSelect
+                | Self::History
+                | Self::Developer
+        )
     }
 
     fn uses_main_view(self) -> bool {
-        self == Self::Main
+        self == Self::Main || self.is_bottom_pane()
     }
 }
 
@@ -1924,7 +1934,10 @@ fn desired_terminal_viewport_height_for(
         .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
         .max(1);
     let dock_height = main_viewport_height(app, app_width);
-    if app.is_first_run_setup_visible()? || app.selected_session_id.is_none() {
+    if app.is_first_run_setup_visible()?
+        || app.selected_session_id.is_none()
+        || app.surface.is_bottom_pane()
+    {
         return Ok(full_height);
     }
     let state = app.refresh_cached_projection().clone();
@@ -2714,9 +2727,9 @@ mod redesign_tests {
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        assert!(ready_screen.contains("browser-use"));
-        assert!(ready_screen.contains("GPT-5.5 . Codex . Local Chrome idle"));
         assert!(ready_screen.contains("Browser Use"));
+        assert!(ready_screen.contains("GPT-5.5"));
+        assert!(ready_screen.contains("Local Chrome idle"));
         assert!(ready_screen.contains("/model"));
         assert!(ready_screen.contains("/browser"));
         assert!(row_containing(&ready_screen, "recent") <= 14);
@@ -4142,7 +4155,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn selected_session_surfaces_do_not_resize_inline_viewport() -> Result<()> {
+    fn selected_session_surfaces_expand_inline_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4159,13 +4172,16 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         app.drain_store_notifications()?;
 
-        let before = desired_terminal_viewport_height(&mut app)?;
+        // Opening a dropdown surface expands the inline viewport so the panel
+        // has room; every dropdown expands to the same height.
+        let docked = desired_terminal_viewport_height(&mut app)?;
         app.open_surface(Surface::History);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        let expanded = desired_terminal_viewport_height(&mut app)?;
+        assert!(expanded >= docked);
         app.open_surface(Surface::Model);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        assert_eq!(desired_terminal_viewport_height(&mut app)?, expanded);
         app.open_surface(Surface::Browser);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        assert_eq!(desired_terminal_viewport_height(&mut app)?, expanded);
         Ok(())
     }
 
@@ -4342,7 +4358,7 @@ mod redesign_tests {
 
         app.open_surface(Surface::Developer);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("developer"));
+        assert!(screen.contains("Laminar"));
         assert!(screen.contains("Events"));
         Ok(())
     }

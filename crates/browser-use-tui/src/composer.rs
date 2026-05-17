@@ -3,10 +3,6 @@ use ratatui::text::{Line, Span};
 
 use crate::theme::{accent, bold, dim};
 
-pub(crate) fn composer_rule(width: u16) -> String {
-    "-".repeat(width as usize)
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
     text: String,

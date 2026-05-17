@@ -82,6 +82,12 @@ pub(crate) fn border() -> Style {
     Style::default().fg(border_color())
 }
 
+/// Solid rule bracketing the composer input box. A softened white so the
+/// line reads as a thin hairline rather than a bright, heavy bar.
+pub(crate) fn input_rule() -> Style {
+    Style::default().fg(Color::Rgb(176, 179, 173))
+}
+
 pub(crate) fn link() -> Style {
     Style::default()
         .fg(link_color())
