@@ -3037,4 +3037,114 @@ set_final_answer(info, artifact_name="managed-smoke.json")
 
         cleanup_session(session_id);
     }
+
+    #[test]
+    #[ignore = "launches a dedicated local Chromium-family browser and attaches through remote CDP"]
+    fn remote_cdp_smoke_attaches_recovers_and_preserves_target() {
+        if chromium_candidate_paths(true).is_empty() {
+            eprintln!("skipping remote CDP smoke: no Chromium-family browser found");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let source_session = "remote-cdp-source";
+        let remote_session = "remote-cdp-client";
+
+        let connect = run_browser_command(
+            source_session,
+            temp.path(),
+            &artifacts,
+            "browser connect managed --headless",
+        )
+        .unwrap();
+        assert_eq!(connect.content["status"], "connected");
+        let http_url = connect.content["browser"]["endpoint"]["http_url"]
+            .as_str()
+            .expect("managed browser http url")
+            .to_string();
+
+        let script = run_browser_script(
+            source_session,
+            temp.path(),
+            &artifacts,
+            r##"
+goto_url("data:text/html,<title>Remote CDP Smoke</title><h1 id='ok'>Remote CDP Smoke</h1>")
+wait_for_element("#ok")
+set_final_answer(page_info(), artifact_name="remote-source.json")
+"##,
+            30,
+        )
+        .unwrap();
+        assert!(script.ok, "{:?}\n{}", script.error, script.text);
+
+        let connect_remote = run_browser_command(
+            remote_session,
+            temp.path(),
+            &artifacts,
+            &format!("browser connect remote-cdp --url {http_url}"),
+        )
+        .unwrap();
+        assert_eq!(connect_remote.content["status"], "connected");
+        assert_eq!(
+            connect_remote.content["browser"]["owner"],
+            BrowserOwner::External.as_str()
+        );
+        assert_eq!(connect_remote.content["browser"]["mode"], "remote-cdp");
+        let before_target = connect_remote.content["browser"]["page"]["target_id"]
+            .as_str()
+            .expect("target id")
+            .to_string();
+
+        for command in [
+            "browser recover reconnect-websocket",
+            "browser recover reattach-same-target",
+            "browser recover restart-runtime",
+        ] {
+            let recovered =
+                run_browser_command(remote_session, temp.path(), &artifacts, command).unwrap();
+            assert_eq!(
+                recovered.content["browser"]["connection"], "connected",
+                "recovery command failed: {command}: {}",
+                recovered.content
+            );
+            assert_eq!(
+                recovered.content["browser"]["page"]["target_id"], before_target,
+                "target changed after {command}"
+            );
+        }
+
+        let probe = run_browser_script(
+            remote_session,
+            temp.path(),
+            &artifacts,
+            r##"
+info = page_info()
+set_final_answer(info, artifact_name="remote-cdp-smoke.json")
+"##,
+            30,
+        )
+        .unwrap();
+        assert!(probe.ok, "{:?}\n{}", probe.error, probe.text);
+        assert_eq!(
+            probe.data["final_answer"]["result"]["title"],
+            "Remote CDP Smoke"
+        );
+
+        let ownership = run_browser_command(
+            remote_session,
+            temp.path(),
+            &artifacts,
+            "browser runtime ownership --json",
+        )
+        .unwrap();
+        assert_eq!(ownership.content["owner"], BrowserOwner::External.as_str());
+        assert_eq!(
+            ownership.content["safe_actions"]["restart_owned_browser"],
+            false
+        );
+
+        cleanup_session(remote_session);
+        cleanup_session(source_session);
+    }
 }
