@@ -14,9 +14,9 @@ use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
@@ -43,7 +43,7 @@ use composer::Composer;
 use palette::PaletteAction;
 use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
-    session_header_lines, APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
+    APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
 use runtime::run_agent_thread;
 use settings::{
@@ -57,7 +57,7 @@ const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
-const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(70);
+const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -212,7 +212,10 @@ struct App {
     quit_hint_until: Option<Instant>,
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
-    startup_instant: Instant,
+    welcome_anim: welcome::WelcomeAnim,
+    /// Last-rendered logo bounding box on screen (terminal cells). Set by
+    /// render.rs each frame and read by the mouse click handler.
+    welcome_logo_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Whether the slash command palette popup is currently open. Independent
     /// of the composer's content — `/` opens it, Esc closes it, and the
     /// composer is never touched.
@@ -591,7 +594,8 @@ impl App {
             quit_hint_until: None,
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
-            startup_instant: Instant::now(),
+            welcome_anim: welcome::WelcomeAnim::new(),
+            welcome_logo_rect: std::cell::Cell::new(None),
             palette_open: false,
             palette_filter: String::new(),
         };
@@ -1887,6 +1891,7 @@ fn run_terminal(mut app: App) -> Result<()> {
         Clear(ClearType::All),
         MoveTo(0, 0),
         EnableBracketedPaste,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -1917,19 +1922,25 @@ fn run_terminal(mut app: App) -> Result<()> {
                 terminal_driver.draw(&mut app)?;
                 draw_needed = false;
             }
-            let poll_interval = pending_resize_at
+            let mut poll_interval = pending_resize_at
                 .map(|resize_at| {
                     RESIZE_DEBOUNCE_INTERVAL
                         .saturating_sub(resize_at.elapsed())
                         .min(INPUT_POLL_INTERVAL)
                 })
                 .unwrap_or(INPUT_POLL_INTERVAL);
+            // While the welcome animation is running, don't block on input
+            // longer than one anim frame — otherwise the redraw rate is
+            // capped by INPUT_POLL_INTERVAL instead of ANIM_TICK_INTERVAL.
+            if app.is_welcome_surface() {
+                poll_interval = poll_interval.min(ANIM_TICK_INTERVAL);
+            }
             if !event::poll(poll_interval)? {
-                // Animate the welcome-screen logo by triggering a redraw every
-                // ~70ms when idle. Only ticks when the welcome surface is up
-                // (Workbench surface, no active task) so we don't burn CPU on
-                // an active session.
+                // Animate the welcome-screen logo by advancing the anim and
+                // triggering a redraw every ~70ms while the welcome surface
+                // is up. No-op on other surfaces.
                 if app.is_welcome_surface() && last_anim_tick.elapsed() >= ANIM_TICK_INTERVAL {
+                    app.welcome_anim.tick();
                     draw_needed = true;
                     last_anim_tick = Instant::now();
                 }
@@ -2060,6 +2071,24 @@ fn handle_terminal_event(
             app.handle_paste(&text);
             Ok(false)
         }
+        TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(_),
+            column,
+            row,
+            ..
+        }) if app.is_welcome_surface() => {
+            // Only throw if the click lands inside the logo's bounding box.
+            if let Some(rect) = app.welcome_logo_rect.get() {
+                if column >= rect.x
+                    && column < rect.x.saturating_add(rect.width)
+                    && row >= rect.y
+                    && row < rect.y.saturating_add(rect.height)
+                {
+                    app.welcome_anim.throw();
+                }
+            }
+            Ok(false)
+        }
         TermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
@@ -2139,8 +2168,9 @@ fn maybe_emit_native_transcript(
     let _model_revision = model.revision;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let mut lines = session_header_lines(app, &state, width);
-        lines.extend(transcript::all_terminal_scrollback_lines(&model, width));
+        // No session header card — the transcript starts straight with
+        // the conversation content.
+        let lines = transcript::all_terminal_scrollback_lines(&model, width);
         insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, model.last_event_seq, None);
@@ -2405,6 +2435,7 @@ fn restore_terminal(mut target: impl io::Write) -> Result<()> {
         ResetKeyboardEnhancementFlags,
         DisableModifyOtherKeys,
         DisableBracketedPaste,
+        DisableMouseCapture,
     )?;
     Ok(())
 }
