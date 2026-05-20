@@ -4890,6 +4890,7 @@ mod redesign_tests {
         let prompt_only_screen = render_dump(&mut app)?;
         assert!(prompt_only_screen.contains("> yo"));
         assert!(prompt_only_screen.contains("sending"));
+        assert!(same_line_gap(&prompt_only_screen, "> yo", "sending").is_some_and(|gap| gap <= 6));
         assert!(prompt_only_screen.contains("Type to steer the agent"));
 
         let state = app.workbench_state()?;
@@ -4908,6 +4909,10 @@ mod redesign_tests {
         let waiting_screen = render_dump(&mut app)?;
         assert!(waiting_screen.contains("> yo"));
         assert!(waiting_screen.contains("waiting for GPT-5.5"));
+        assert!(
+            same_line_gap(&waiting_screen, "> yo", "waiting for GPT-5.5")
+                .is_some_and(|gap| gap <= 6)
+        );
 
         app.store.append_event(
             &session.id,
@@ -4925,6 +4930,14 @@ mod redesign_tests {
         let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
         assert!(lines_plain_text(&emission.lines).contains("> yo"));
         Ok(())
+    }
+
+    fn same_line_gap(text: &str, before: &str, after: &str) -> Option<usize> {
+        text.lines().find_map(|line| {
+            let before_idx = line.find(before)?;
+            let after_idx = line.find(after)?;
+            after_idx.checked_sub(before_idx.saturating_add(before.len()))
+        })
     }
 
     #[test]

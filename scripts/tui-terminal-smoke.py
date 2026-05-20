@@ -145,6 +145,21 @@ def assert_row_gap_at_most(text: str, before: str, after: str, max_rows: int, co
         )
 
 
+def assert_same_line_gap_at_most(
+    text: str, before: str, after: str, max_gap: int, context: str
+) -> None:
+    for line in text.splitlines():
+        if before not in line or after not in line:
+            continue
+        gap = line.index(after) - (line.index(before) + len(before))
+        if 0 <= gap <= max_gap:
+            return
+        raise AssertionError(
+            f"{context}: expected {after!r} within {max_gap} cells after {before!r}, saw {gap}\n\n{text}"
+        )
+    raise AssertionError(f"{context}: missing same line {before!r} and {after!r}\n\n{text}")
+
+
 def first_text_column(text: str, needle: str, context: str) -> int:
     for line in text.splitlines():
         if needle in line:
@@ -594,6 +609,13 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             "sending",
             "prompt-only long follow-up should show a pending indicator immediately",
         )
+        assert_same_line_gap_at_most(
+            visible_running,
+            "> continue",
+            "sending",
+            6,
+            "prompt-only long follow-up indicator should sit near submitted text",
+        )
         first_line = next((line.strip() for line in visible_running.splitlines() if line.strip()), "")
         if first_line == "> continue":
             raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible_running)
@@ -646,6 +668,13 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "sending",
             "prompt-only follow-up should show a pending indicator immediately",
         )
+        assert_same_line_gap_at_most(
+            visible,
+            "> yo",
+            "sending",
+            6,
+            "prompt-only follow-up indicator should sit near submitted text",
+        )
         first_line = next((line.strip() for line in visible.splitlines() if line.strip()), "")
         if first_line == "> yo":
             raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible)
@@ -687,6 +716,13 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
                 live_visible,
                 "waiting for GPT-5.5",
                 "follow-up live activity should keep the waiting indicator visible",
+            )
+            assert_same_line_gap_at_most(
+                live_visible,
+                "> yo",
+                "waiting for GPT-5.5",
+                6,
+                "follow-up waiting indicator should sit near submitted text",
             )
             first_line = next((line.strip() for line in live_visible.splitlines() if line.strip()), "")
             if first_line == "> yo":

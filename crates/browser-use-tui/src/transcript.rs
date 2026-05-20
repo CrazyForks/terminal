@@ -1381,14 +1381,14 @@ fn prompt_lines_with_status(
             if idx == last_idx && can_fit_status {
                 let status = status.unwrap_or_default();
                 let content_used = display_width(&wrapped);
-                let status_width = display_width(status).saturating_add(2);
-                let gap = content_width.saturating_sub(content_used + status_width);
+                let status_gap = 2usize;
+                let status_width = display_width(status);
+                let tail_gap =
+                    content_width.saturating_sub(content_used + status_gap + status_width);
                 spans.push(Span::styled(wrapped, user_prompt_text()));
-                spans.push(Span::styled(
-                    " ".repeat(gap.saturating_add(2)),
-                    user_prompt_text(),
-                ));
+                spans.push(Span::styled(" ".repeat(status_gap), user_prompt_text()));
                 spans.push(Span::styled(status.to_string(), user_prompt_muted()));
+                spans.push(Span::styled(" ".repeat(tail_gap), user_prompt_text()));
             } else {
                 spans.push(Span::styled(pad_to_width(&wrapped), user_prompt_text()));
             }
