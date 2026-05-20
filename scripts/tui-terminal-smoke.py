@@ -589,6 +589,11 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             "> continue",
             "prompt-only long follow-up should show the submitted prompt immediately",
         )
+        assert_contains(
+            visible_running,
+            "sending",
+            "prompt-only long follow-up should show a pending indicator immediately",
+        )
         first_line = next((line.strip() for line in visible_running.splitlines() if line.strip()), "")
         if first_line == "> continue":
             raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible_running)
@@ -636,6 +641,11 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "> yo",
             "prompt-only follow-up should show the submitted prompt immediately",
         )
+        assert_contains(
+            visible,
+            "sending",
+            "prompt-only follow-up should show a pending indicator immediately",
+        )
         first_line = next((line.strip() for line in visible.splitlines() if line.strip()), "")
         if first_line == "> yo":
             raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible)
@@ -647,6 +657,7 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "model.turn.request",
             {"model": "GPT-5.5", "provider": "codex"},
         )
+        wait_for(session, "waiting for GPT-5.5", "prompt-only-followup-live-waiting")
         live_frames = []
         for idx in range(40):
             live_visible = capture_after_idle(
@@ -672,9 +683,42 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
                 "> yo",
                 "follow-up live activity should keep the submitted prompt visible",
             )
+            assert_contains(
+                live_visible,
+                "waiting for GPT-5.5",
+                "follow-up live activity should keep the waiting indicator visible",
+            )
             first_line = next((line.strip() for line in live_visible.splitlines() if line.strip()), "")
             if first_line == "> yo":
                 raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + live_visible)
+
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.stream_delta",
+            {"text": "streaming now"},
+        )
+        wait_for(session, "streaming now", "prompt-only-followup-streaming")
+        streaming_visible = capture_after_idle(
+            session,
+            "prompt-only-followup-streaming-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            streaming_visible,
+            "> yo",
+            "streaming follow-up should first commit the submitted prompt into native scrollback",
+        )
+        assert_contains(
+            streaming_visible,
+            "streaming now",
+            "streaming follow-up should replace the pending indicator with live output",
+        )
+        assert_not_contains(
+            streaming_visible,
+            "waiting for GPT-5.5",
+            "streaming follow-up should no longer show the prompt-only waiting indicator",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)

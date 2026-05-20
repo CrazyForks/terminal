@@ -96,6 +96,10 @@ pub(crate) fn user_prompt_text() -> Style {
     text_style().bg(user_prompt_background_color())
 }
 
+pub(crate) fn user_prompt_muted() -> Style {
+    muted().bg(user_prompt_background_color())
+}
+
 /// The accent-colored `>` prefix on a user prompt, sharing the prompt's
 /// highlight background.
 pub(crate) fn user_prompt_accent() -> Style {

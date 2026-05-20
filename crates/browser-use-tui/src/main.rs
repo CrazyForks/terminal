@@ -64,6 +64,7 @@ const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
+const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT: u16 = 1;
 
 #[derive(Debug, Parser)]
@@ -220,6 +221,7 @@ struct App {
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
     welcome_anim: welcome::WelcomeAnim,
+    live_spinner_frame: usize,
     /// Last-rendered logo bounding box on screen (terminal cells). Set by
     /// render.rs each frame and read by the mouse click handler.
     welcome_logo_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
@@ -602,6 +604,7 @@ impl App {
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
             welcome_anim: welcome::WelcomeAnim::new(),
+            live_spinner_frame: 0,
             welcome_logo_rect: std::cell::Cell::new(None),
             palette_open: false,
             palette_filter: String::new(),
@@ -1599,6 +1602,19 @@ impl App {
                 .is_active_for(self.selected_session_id.as_deref())
     }
 
+    fn should_animate_live_spinner(&mut self) -> bool {
+        if !self.native_scrollback_is_active() {
+            return false;
+        }
+        let state = self.refresh_cached_projection().clone();
+        let model = transcript::transcript_model(self, &state);
+        transcript::has_pending_followup_indicator(model.as_ref())
+    }
+
+    fn tick_live_spinner(&mut self) {
+        self.live_spinner_frame = self.live_spinner_frame.wrapping_add(1);
+    }
+
     #[cfg(test)]
     fn set_input(&mut self, value: String) {
         self.composer.set_input(value);
@@ -1950,6 +1966,7 @@ fn run_terminal(mut app: App) -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
         let mut last_anim_tick = Instant::now();
+        let mut last_live_spinner_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             draw_needed |= app.drain_store_notifications()?;
@@ -1982,6 +1999,9 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.is_welcome_surface() {
                 poll_interval = poll_interval.min(ANIM_TICK_INTERVAL);
             }
+            if app.should_animate_live_spinner() {
+                poll_interval = poll_interval.min(LIVE_SPINNER_TICK_INTERVAL);
+            }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
                 // triggering a redraw every ~70ms while the welcome surface
@@ -1990,6 +2010,13 @@ fn run_terminal(mut app: App) -> Result<()> {
                     app.welcome_anim.tick();
                     draw_needed = true;
                     last_anim_tick = Instant::now();
+                }
+                if app.should_animate_live_spinner()
+                    && last_live_spinner_tick.elapsed() >= LIVE_SPINNER_TICK_INTERVAL
+                {
+                    app.tick_live_spinner();
+                    draw_needed = true;
+                    last_live_spinner_tick = Instant::now();
                 }
                 continue;
             }
@@ -4862,6 +4889,7 @@ mod redesign_tests {
         assert_eq!(prompt_only, docked);
         let prompt_only_screen = render_dump(&mut app)?;
         assert!(prompt_only_screen.contains("> yo"));
+        assert!(prompt_only_screen.contains("sending"));
         assert!(prompt_only_screen.contains("Type to steer the agent"));
 
         let state = app.workbench_state()?;
@@ -4879,6 +4907,23 @@ mod redesign_tests {
         assert_eq!(waiting, docked);
         let waiting_screen = render_dump(&mut app)?;
         assert!(waiting_screen.contains("> yo"));
+        assert!(waiting_screen.contains("waiting for GPT-5.5"));
+
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "streaming now"}),
+        )?;
+        app.drain_store_notifications()?;
+        let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(streaming, docked);
+        let streaming_screen = render_dump(&mut app)?;
+        assert!(streaming_screen.contains("streaming now"));
+        assert!(!streaming_screen.contains("waiting for GPT-5.5"));
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
+        assert!(lines_plain_text(&emission.lines).contains("> yo"));
         Ok(())
     }
 

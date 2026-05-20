@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::markdown::{highlight_code_line_spans, render_markdown_lines};
 use crate::theme::{
     dim, failed, link, muted, path_reference, running, text_style, thought, user_prompt_accent,
-    user_prompt_text,
+    user_prompt_muted, user_prompt_text,
 };
 
 use super::App;
@@ -50,6 +50,10 @@ enum TranscriptKind {
     Prompt {
         text: String,
         followup: bool,
+    },
+    PendingPrompt {
+        text: String,
+        status: String,
     },
     Assistant {
         markdown: String,
@@ -102,6 +106,9 @@ impl TranscriptNode {
         match &self.kind {
             TranscriptKind::Stack { nodes } => cells_to_lines(nodes.iter(), width, mode),
             TranscriptKind::Prompt { text, followup } => prompt_lines(text, *followup, width),
+            TranscriptKind::PendingPrompt { text, status } => {
+                prompt_lines_with_status(text, true, width, Some(status))
+            }
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
                 if let Some(source) = source.as_deref() {
@@ -142,7 +149,9 @@ impl TranscriptNode {
             TranscriptKind::Stack { nodes } => {
                 nodes.iter().flat_map(|node| node.plain_lines()).collect()
             }
-            TranscriptKind::Prompt { text, .. } => prefixed_plain("> ", text),
+            TranscriptKind::Prompt { text, .. } | TranscriptKind::PendingPrompt { text, .. } => {
+                prefixed_plain("> ", text)
+            }
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
                 if let Some(source) = source.as_ref() {
@@ -192,6 +201,10 @@ impl TranscriptNode {
                 .all(TranscriptNode::is_active_viewport_placeholder),
             _ => false,
         }
+    }
+
+    fn is_pending_followup_indicator(&self) -> bool {
+        matches!(self.kind, TranscriptKind::PendingPrompt { .. })
     }
 
     fn is_prompt(&self) -> bool {
@@ -273,6 +286,13 @@ pub(crate) fn terminal_scrollback_emission_since(
 }
 
 fn pending_prompt_seq(model: &TranscriptModel) -> Option<i64> {
+    if !model
+        .active
+        .as_ref()
+        .is_some_and(TranscriptNode::is_pending_followup_indicator)
+    {
+        return None;
+    }
     let latest_prompt_idx = latest_followup_prompt_over_scrollback_idx(model)?;
     let has_non_prompt_after = model
         .committed
@@ -326,6 +346,12 @@ pub(crate) fn active_viewport_has_live_content(model: Option<&TranscriptModel>) 
     model
         .and_then(|model| model.active.as_ref())
         .is_some_and(|active| !active.is_active_viewport_placeholder())
+}
+
+pub(crate) fn has_pending_followup_indicator(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::is_pending_followup_indicator)
 }
 
 pub(crate) fn model_plain_text(model: &TranscriptModel) -> String {
@@ -1002,16 +1028,61 @@ fn pending_followup_active_node(
     if has_committed_output_after {
         return None;
     }
+    let has_live_output_after = events
+        .iter()
+        .filter(|event| event.seq > latest_followup.seq)
+        .any(is_live_output_event);
+    if has_live_output_after {
+        return None;
+    }
     let text = payload_string(latest_followup, "text")?;
+    let status = pending_followup_status(app, events, latest_followup.seq);
     Some(TranscriptNode {
         id: format!("{}:active-followup:{}", root.id, latest_followup.seq),
         seq: latest_followup.seq,
         revision: latest_followup.seq.max(0) as u64,
-        kind: TranscriptKind::Prompt {
-            text,
-            followup: true,
-        },
+        kind: TranscriptKind::PendingPrompt { text, status },
     })
+}
+
+fn is_live_output_event(event: &EventRecord) -> bool {
+    match event.event_type.as_str() {
+        "model.stream_delta" | "model.thinking_delta" => event
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        "agent.wait.started" | "command.waiting" | "tool.started" | "browser.page"
+        | "browser.state" | "plan.updated" => true,
+        _ => false,
+    }
+}
+
+fn pending_followup_status(app: &App, events: &[EventRecord], after_seq: i64) -> String {
+    let label = events
+        .iter()
+        .filter(|event| event.seq > after_seq)
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "model.turn.request" => {
+                let model = payload_string(event, "model").unwrap_or_else(|| "model".to_string());
+                Some(format!("waiting for {model}"))
+            }
+            "model.turn.retry" => Some("retrying model request".to_string()),
+            "agent.wait.started" => Some("waiting for subagent".to_string()),
+            "command.waiting" => Some("running command".to_string()),
+            "tool.started" => payload_string(event, "name")
+                .map(|name| format!("running {name}"))
+                .or_else(|| Some("running tool".to_string())),
+            _ => None,
+        })
+        .unwrap_or_else(|| "sending".to_string());
+    format!("{} {label}", live_spinner_frame(app.live_spinner_frame))
+}
+
+fn live_spinner_frame(frame: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    FRAMES[frame % FRAMES.len()]
 }
 
 fn current_turn_events(events: &[EventRecord]) -> &[EventRecord] {
@@ -1268,34 +1339,66 @@ fn timeline_node(
     }
 }
 
-fn prompt_lines(text: &str, _followup: bool, width: u16) -> Vec<Line<'static>> {
+fn prompt_lines(text: &str, followup: bool, width: u16) -> Vec<Line<'static>> {
+    prompt_lines_with_status(text, followup, width, None)
+}
+
+fn prompt_lines_with_status(
+    text: &str,
+    _followup: bool,
+    width: u16,
+    status: Option<&str>,
+) -> Vec<Line<'static>> {
     let content_width = width.saturating_sub(2).max(1) as usize;
     // Pad the content to the full width so the highlight background reads as a
     // solid block rather than only wrapping the glyphs.
     let pad_to_width = |value: &str| -> String {
-        let used: usize = value.chars().map(|ch| ch.width().unwrap_or(0).max(1)).sum();
+        let used = display_width(value);
         let mut out = value.to_string();
         out.extend(std::iter::repeat(' ').take(content_width.saturating_sub(used)));
         out
     };
-    let mut lines = Vec::new();
+    let mut rows = Vec::new();
     for (idx, source) in text.lines().enumerate() {
         let prefix = if idx == 0 { "> " } else { "  " };
         for (wrap_idx, wrapped) in wrap_plain(source, content_width as u16) {
             let visible_prefix = if wrap_idx == 0 { prefix } else { "  " };
-            lines.push(Line::from(vec![
-                Span::styled(visible_prefix.to_string(), user_prompt_accent()),
-                Span::styled(pad_to_width(&wrapped), user_prompt_text()),
-            ]));
+            rows.push((visible_prefix.to_string(), wrapped));
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("> ", user_prompt_accent()),
-            Span::styled(pad_to_width(""), user_prompt_text()),
-        ]));
+    if rows.is_empty() {
+        rows.push(("> ".to_string(), String::new()));
     }
-    lines
+    let last_idx = rows.len().saturating_sub(1);
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, (prefix, wrapped))| {
+            let mut spans = vec![Span::styled(prefix, user_prompt_accent())];
+            let can_fit_status = status.is_some_and(|status| {
+                let status_width = display_width(status).saturating_add(2);
+                display_width(&wrapped).saturating_add(status_width) <= content_width
+            });
+            if idx == last_idx && can_fit_status {
+                let status = status.unwrap_or_default();
+                let content_used = display_width(&wrapped);
+                let status_width = display_width(status).saturating_add(2);
+                let gap = content_width.saturating_sub(content_used + status_width);
+                spans.push(Span::styled(wrapped, user_prompt_text()));
+                spans.push(Span::styled(
+                    " ".repeat(gap.saturating_add(2)),
+                    user_prompt_text(),
+                ));
+                spans.push(Span::styled(status.to_string(), user_prompt_muted()));
+            } else {
+                spans.push(Span::styled(pad_to_width(&wrapped), user_prompt_text()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().map(|ch| ch.width().unwrap_or(0).max(1)).sum()
 }
 
 fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Line<'static>> {
