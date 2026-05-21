@@ -13,6 +13,24 @@ tasks:
     cmds:
       - cargo run -p browser-use-tui -- {{.CLI_ARGS}}
 
+  reset:onboarding:
+    aliases:
+      - onboarding:reset
+      - reset-onboarding
+    desc: Reset TUI onboarding without clearing saved auth or sessions
+    silent: true
+    cmds:
+      - |
+        set -eu
+
+        state_dir="${STATE_DIR:-.browser-use-terminal}"
+        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set setup.complete 0 >/dev/null
+        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set browser "Local Chrome" >/dev/null
+
+        echo "onboarding reset: $state_dir/state.db"
+        echo "saved auth and sessions left unchanged"
+        echo "launch onboarding: cargo run -q -p browser-use-tui -- --state-dir \"$state_dir\""
+
   auth:clear:
     aliases:
       - clear-auth
