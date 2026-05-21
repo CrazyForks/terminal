@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 .llm-browser/
+.browser-use/
 .browser-use-terminal/
 artifacts/
 *.egg-info/
