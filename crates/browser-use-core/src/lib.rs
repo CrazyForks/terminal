@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -23,17 +23,32 @@ use browser_use_providers::{
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{now_ms, AgentSummary, Store};
 use opentelemetry::KeyValue;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{ToolHandlerKind, ToolRegistry};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MAX_TOOL_OUTPUT_TEXT_TOKENS: usize = 4_000;
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
+const BROWSER_PREF_MODE: &str = "browser.preference.mode";
+const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+struct DoneResultFile {
+    requested_path: String,
+    path: PathBuf,
+    bytes: u64,
+    mime: &'static str,
+}
 
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
+}
+
+pub fn install_process_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,12 +162,34 @@ impl AgentRunOptions {
     }
 }
 
-fn is_cloud_browser_mode(mode: Option<&str>) -> bool {
-    mode.map(|value| {
-        let normalized = value.to_ascii_lowercase().replace(['_', ' '], "-");
-        normalized == "cloud"
-    })
-    .unwrap_or(false)
+fn browser_mode_instruction(mode: &str) -> String {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => concat!(
+            "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
+            "This attaches to the user's already-open browser after remote debugging is enabled. ",
+            "If connection is blocked, run `browser local setup` and wait for the user to approve remote debugging."
+        )
+        .to_string(),
+        "headless" | "headless-chromium" | "managed-headless" => concat!(
+            "Selected browser mode: Headless Chromium. Use `browser connect managed --headless` before page work. ",
+            "This starts a Rust-owned managed browser with an isolated automation profile."
+        )
+        .to_string(),
+        "managed" | "managed-headed" => concat!(
+            "Selected browser mode: managed headed browser. Use `browser connect managed --headed` before page work. ",
+            "This starts a Rust-owned visible browser with an isolated automation profile."
+        )
+        .to_string(),
+        "cloud" | "browser-use-cloud" => concat!(
+            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+        )
+        .to_string(),
+        other => format!(
+            "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
+        ),
+    }
 }
 
 pub fn run_fake_agent(
@@ -567,6 +604,15 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         }
     };
     let task_text = task_text_from_provider_messages(&messages);
+    if let Some(browser_mode) = options.browser_mode.as_deref() {
+        messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": browser_mode_instruction(browser_mode),
+            }),
+        );
+    }
     let agent_span = telemetry.start_agent_span(
         &session.id,
         session.parent_id.as_deref(),
@@ -785,77 +831,6 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 if tool_calls.is_empty() {
                     if !assistant_text.trim().is_empty() {
                         let requested_result = assistant_text.trim_end();
-                        if looks_like_placeholder_done_result(requested_result) {
-                            if let Some(final_answer) = persisted_final_answer(&session)? {
-                                if let Some(error) =
-                                    persisted_final_answer_not_ready_message(&final_answer)
-                                {
-                                    store.append_event(
-                                        &session.id,
-                                        "tool.failed",
-                                        serde_json::json!({
-                                            "name": "done",
-                                            "source": "assistant_text_placeholder",
-                                            "error": error,
-                                        }),
-                                    )?;
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": error,
-                                    }));
-                                    maybe_compact_messages(
-                                        store,
-                                        &session.id,
-                                        &mut messages,
-                                        options.max_context_chars,
-                                    )?;
-                                    step_span.set_ok();
-                                    continue;
-                                }
-                                if append_done_from_persisted_final_answer(
-                                    store,
-                                    &session.id,
-                                    &final_answer,
-                                    "assistant_text_placeholder",
-                                    None,
-                                )? {
-                                    step_span.set_ok();
-                                    return Ok(session.id.clone());
-                                }
-                            }
-                        }
-                        if let Some(final_answer) = persisted_final_answer(&session)? {
-                            if let Some(error) =
-                                persisted_final_answer_not_ready_message(&final_answer)
-                            {
-                                if !explicit_result_states_persisted_gaps(requested_result) {
-                                    let error = format!(
-                                        "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
-                                    );
-                                    store.append_event(
-                                        &session.id,
-                                        "tool.failed",
-                                        serde_json::json!({
-                                            "name": "done",
-                                            "source": "assistant_text_final_answer_not_ready",
-                                            "error": error,
-                                        }),
-                                    )?;
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": error,
-                                    }));
-                                    maybe_compact_messages(
-                                        store,
-                                        &session.id,
-                                        &mut messages,
-                                        options.max_context_chars,
-                                    )?;
-                                    step_span.set_ok();
-                                    continue;
-                                }
-                            }
-                        }
                         if let Some(error) = guard_or_close_active_descendants(
                             store,
                             &session.id,
@@ -921,23 +896,6 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 step_span.set_ok();
             }
 
-            if let Some(final_answer) = persisted_final_answer(&session)? {
-                if let Some(error) = persisted_final_answer_not_ready_message(&final_answer) {
-                    store.append_event(
-                        &session.id,
-                        "session.final_answer_not_ready_at_max_turns",
-                        serde_json::json!({ "error": error }),
-                    )?;
-                } else if append_done_from_persisted_final_answer(
-                    store,
-                    &session.id,
-                    &final_answer,
-                    "max_turns_exhausted",
-                    None,
-                )? {
-                    return Ok(session.id.clone());
-                }
-            }
             store.append_event(
                 &session.id,
                 "session.failed",
@@ -945,23 +903,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
             bail!("agent exceeded maximum provider turns");
         })();
-        if is_cloud_browser_mode(options.browser_mode.as_deref()) {
-            match worker.shutdown_owned_cloud_browser() {
-                Ok(Some(summary)) => {
-                    if summary.get("stopped").and_then(Value::as_bool) == Some(true) {
-                        store.append_event(&session.id, "browser.cloud_shutdown", summary)?;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    store.append_event(
-                        &session.id,
-                        "browser.cloud_shutdown_failed",
-                        serde_json::json!({ "error": format!("{error:#}") }),
-                    )?;
-                }
-            }
-        }
+        // Browser state is session-level, not run-level. Keep local, managed, and
+        // remote browser ownership alive across normal task completion so follow-ups
+        // can inspect/recover the same browser. Explicit close/stop actions own
+        // teardown.
         let cleaned_commands = tools::command::cleanup_session_commands(&session.id);
         if cleaned_commands > 0 {
             store.append_event(
@@ -2607,10 +2552,7 @@ fn dispatch_parallel_tool_call(
 fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
     match registry.handler_for(&call.name) {
         Some(
-            ToolHandlerKind::ReadFile
-            | ToolHandlerKind::SearchFiles
-            | ToolHandlerKind::ListFiles
-            | ToolHandlerKind::ViewImage,
+            ToolHandlerKind::ReadFile | ToolHandlerKind::SearchFiles | ToolHandlerKind::ListFiles,
         ) => true,
         Some(ToolHandlerKind::ExecCommand) => {
             tools::command::exec_command_is_known_read_only(&call.arguments)
@@ -2638,11 +2580,18 @@ fn dispatch_tool_call<P: ModelProvider>(
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     let registry = ToolRegistry::browser_agent();
-    let Some(handler) = registry.handler_for(&call.name) else {
+    let Some(handler) = registry
+        .handler_for(&call.name)
+        .or_else(|| (call.name == "python").then_some(ToolHandlerKind::Python))
+    else {
         return dispatch_unknown_tool(store, session, call);
     };
     match handler {
         ToolHandlerKind::Done => dispatch_done_tool(store, session, call),
+        ToolHandlerKind::Browser => dispatch_browser_tool(store, session, call),
+        ToolHandlerKind::BrowserScript => {
+            dispatch_browser_script_tool(store, session, call, options.python_tool_timeout_seconds)
+        }
         ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
@@ -2814,6 +2763,401 @@ fn dispatch_view_image_tool(
     })
 }
 
+fn dispatch_browser_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let cmd = call
+        .arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() {
+        return dispatch_tool_validation_error(store, session, call, "browser requires cmd");
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let output = if let Some(content) = dispatch_browser_preference_command(store, session, cmd)? {
+        browser_use_browser::BrowserCommandOutput {
+            content,
+            events: Vec::new(),
+        }
+    } else {
+        let resolved_cmd = resolve_browser_connect_command(store, cmd)?;
+        browser_use_browser::run_browser_command(
+            &session.id,
+            &session.cwd,
+            &session.artifact_root,
+            &resolved_cmd,
+        )?
+    };
+    for event in &output.events {
+        record_python_browser_event(store, &session.id, event)?;
+    }
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "browser",
+            "tool_call_id": call.id,
+            "output": output.content,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser",
+            output.content,
+        )?],
+    })
+}
+
+fn dispatch_browser_preference_command(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    cmd: &str,
+) -> Result<Option<Value>> {
+    let argv = browser_command_words(cmd);
+    let args = strip_browser_prefix(&argv);
+    let Some(first) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match first {
+        "preference" | "preferences" => Ok(Some(dispatch_browser_preference(store, &args)?)),
+        "profile" | "profiles"
+            if args.get(1).is_some_and(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "suggest" | "use" | "remember" | "forget" | "current"
+                )
+            }) =>
+        {
+            Ok(Some(dispatch_browser_profile_preference(
+                store, session, &args,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn dispatch_browser_preference(store: &Store, args: &[String]) -> Result<Value> {
+    match args.get(1).map(String::as_str) {
+        None | Some("--json") | Some("show") => browser_preference_json(store),
+        Some("use") => {
+            let mode = args.get(2).map(String::as_str).ok_or_else(|| {
+                anyhow!("browser preference use requires <local|cloud|managed-headless>")
+            })?;
+            let normalized = normalize_browser_preference_mode(mode)?;
+            store.set_setting(BROWSER_PREF_MODE, normalized)?;
+            store.set_setting("browser", browser_display_name(normalized))?;
+            Ok(json!({
+                "status": "ok",
+                "preference": browser_preference_json(store)?,
+                "next_step": "browser connect",
+            }))
+        }
+        Some(other) => bail!("unknown browser preference command: {other}"),
+    }
+}
+
+fn dispatch_browser_profile_preference(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    args: &[String],
+) -> Result<Value> {
+    match args.get(1).map(String::as_str) {
+        Some("current") => browser_preference_json(store),
+        Some("use") => {
+            let profile_id = args
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow!("browser profile use requires <profile-id>"))?;
+            store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
+            Ok(json!({
+                "status": "ok",
+                "profile_id": profile_id,
+                "next_step": "browser connect",
+            }))
+        }
+        Some("remember") => {
+            let domain = option_value_core(args, "--domain")
+                .ok_or_else(|| anyhow!("browser profile remember requires --domain <domain>"))?;
+            let profile_id = option_value_core(args, "--profile")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| {
+                    anyhow!("browser profile remember requires --profile <profile-id>")
+                })?;
+            let mode = option_value_core(args, "--mode")
+                .map(|mode| normalize_browser_preference_mode(&mode).map(ToOwned::to_owned))
+                .transpose()?
+                .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
+                .unwrap_or_else(|| "local".to_string());
+            let value = json!({
+                "domain": normalize_domain(&domain),
+                "mode": mode,
+                "profile_id": profile_id,
+            });
+            store.set_setting(
+                &browser_domain_profile_key(&domain),
+                &serde_json::to_string(&value)?,
+            )?;
+            store.set_setting(BROWSER_PREF_MODE, value["mode"].as_str().unwrap_or("local"))?;
+            store.set_setting(
+                BROWSER_PREF_PROFILE,
+                value["profile_id"].as_str().unwrap_or(""),
+            )?;
+            store.set_setting(
+                "browser",
+                browser_display_name(value["mode"].as_str().unwrap_or("local")),
+            )?;
+            Ok(json!({
+                "status": "ok",
+                "remembered": value,
+                "next_step": "browser connect",
+            }))
+        }
+        Some("forget") => {
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile forget requires --domain <domain>"))?;
+            store.delete_setting(&browser_domain_profile_key(&domain))?;
+            Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
+        }
+        Some("suggest") => {
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
+            let remembered = remembered_domain_profile(store, &domain)?;
+            let profiles = browser_use_browser::run_browser_command(
+                &session.id,
+                &session.cwd,
+                &session.artifact_root,
+                "browser local profiles --json",
+            )
+            .map(|output| output.content)
+            .unwrap_or_else(|error| {
+                json!({
+                    "status": "failed",
+                    "error": format!("{error:#}"),
+                    "profiles": [],
+                })
+            });
+            Ok(json!({
+                "status": "ok",
+                "domain": normalize_domain(&domain),
+                "remembered": remembered,
+                "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
+                "next_step": if remembered.is_some() { "browser connect" } else { "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>" },
+            }))
+        }
+        Some(other) => bail!("unknown browser profile command: {other}"),
+        None => browser_preference_json(store),
+    }
+}
+
+fn resolve_browser_connect_command(store: &Store, cmd: &str) -> Result<String> {
+    let argv = browser_command_words(cmd);
+    let args = strip_browser_prefix(&argv);
+    if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
+        let mode = store
+            .get_setting(BROWSER_PREF_MODE)?
+            .unwrap_or_else(|| "local".to_string());
+        let command = match normalize_browser_preference_mode(&mode)? {
+            "cloud" => "browser remote start",
+            "managed-headless" => "browser connect managed --headless",
+            "managed-headed" => "browser connect managed --headed",
+            "local" => "browser connect local",
+            _ => "browser connect local",
+        };
+        Ok(command.to_string())
+    } else {
+        Ok(cmd.to_string())
+    }
+}
+
+fn browser_preference_json(store: &Store) -> Result<Value> {
+    let mode = store
+        .get_setting(BROWSER_PREF_MODE)?
+        .or_else(|| {
+            store
+                .get_setting("browser")
+                .ok()
+                .flatten()
+                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+    let domain_profiles = store
+        .list_settings()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
+                .and_then(|domain| {
+                    serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .map(|value| (domain.to_string(), value))
+                })
+        })
+        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "mode": normalize_browser_preference_mode(&mode)?,
+        "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
+        "profile_id": profile_id,
+        "domain_profiles": domain_profiles,
+        "connect_command": match normalize_browser_preference_mode(&mode)? {
+            "cloud" => "browser remote start",
+            "managed-headless" => "browser connect managed --headless",
+            "managed-headed" => "browser connect managed --headed",
+            _ => "browser connect local",
+        },
+    }))
+}
+
+fn remembered_domain_profile(store: &Store, domain: &str) -> Result<Option<Value>> {
+    store
+        .get_setting(&browser_domain_profile_key(domain))?
+        .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
+        .transpose()
+}
+
+fn browser_command_words(cmd: &str) -> Vec<String> {
+    cmd.split_whitespace().map(ToOwned::to_owned).collect()
+}
+
+fn strip_browser_prefix(argv: &[String]) -> Vec<String> {
+    if argv.first().is_some_and(|arg| arg == "browser") {
+        argv[1..].to_vec()
+    } else {
+        argv.to_vec()
+    }
+}
+
+fn option_value_core(argv: &[String], flag: &str) -> Option<String> {
+    argv.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn browser_domain_profile_key(domain: &str) -> String {
+    format!(
+        "{BROWSER_DOMAIN_PROFILE_PREFIX}{}",
+        normalize_domain(domain)
+    )
+}
+
+fn normalize_browser_preference_mode(mode: &str) -> Result<&'static str> {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => Ok("local"),
+        "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
+        "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
+        other => bail!("unknown browser preference mode: {other}"),
+    }
+}
+
+fn browser_display_name(mode: &str) -> &'static str {
+    match mode {
+        "cloud" => "Browser Use cloud",
+        "managed-headless" => "Headless Chromium",
+        "managed-headed" => "Managed Chromium",
+        _ => "Local Chrome",
+    }
+}
+
+fn display_browser_to_mode(display: &str) -> Option<&'static str> {
+    match display {
+        "Browser Use cloud" => Some("cloud"),
+        "Headless Chromium" => Some("managed-headless"),
+        "Managed Chromium" => Some("managed-headed"),
+        "Local Chrome" => Some("local"),
+        _ => None,
+    }
+}
+
+fn dispatch_browser_script_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    timeout_seconds: u64,
+) -> Result<ToolDispatchOutcome> {
+    let code = call
+        .arguments
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser_script",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let response = browser_use_browser::run_browser_script(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        code,
+        timeout_seconds,
+    )?;
+    record_browser_script_response_events(store, &session.id, &response)?;
+    if response.ok {
+        store.append_event(
+            &session.id,
+            "tool.finished",
+            serde_json::json!({
+                "name": "browser_script",
+                "tool_call_id": call.id,
+            }),
+        )?;
+    } else {
+        store.append_event(
+            &session.id,
+            "tool.failed",
+            serde_json::json!({
+                "name": "browser_script",
+                "tool_call_id": call.id,
+                "error": response.error,
+            }),
+        )?;
+    }
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_script",
+            browser_script_tool_message_content_value(&response)?,
+        )?],
+    })
+}
+
 fn dispatch_update_plan_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
@@ -2921,74 +3265,41 @@ fn dispatch_done_tool(
         .unwrap_or("")
         .trim()
         .to_string();
-    let final_answer = persisted_final_answer(session)?;
-    let explicit_use_final_answer = call
+    let requested_result_file = call
         .arguments
-        .get("use_final_answer")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .get("result_file")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let result_file = requested_result_file
+        .map(|path| done_result_file_info(session, path))
+        .transpose()?;
+    if call.arguments.get("use_final_answer").is_some()
         || matches!(
             requested_result.as_str(),
             "__use_final_answer__" | "__final_answer__" | "FINAL_ANSWER"
-        );
-    let should_auto_use_final_answer = final_answer
-        .as_ref()
-        .is_some_and(|answer| should_replace_with_persisted_final(&requested_result, answer));
-    if explicit_use_final_answer && final_answer.is_none() {
+        )
+    {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "done requested use_final_answer=true, but no persisted final answer exists. Call python set_final_answer(...) first, or pass a non-empty result.",
+            "done no longer supports persisted final-answer state. Pass result_file for saved browser_script output, or pass a non-empty result.",
         );
     }
-    if requested_result.is_empty() && !explicit_use_final_answer {
+    if requested_result.is_empty() && result_file.is_none() {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "done requires a non-empty result, or use_final_answer=true after python set_final_answer(...)",
+            "done requires a non-empty result or result_file",
         );
     }
     if let Some(error) = guard_or_close_active_descendants(store, &session.id, &call.arguments)? {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
-    let use_final_answer = explicit_use_final_answer || should_auto_use_final_answer;
-    let final_answer_summary = final_answer
-        .as_ref()
-        .and_then(|answer| answer.get("summary"))
-        .cloned();
-    if let Some(answer) = final_answer.as_ref() {
-        if let Some(error) = persisted_final_answer_not_ready_message(answer) {
-            if use_final_answer {
-                return dispatch_tool_validation_error(store, session, call, &error);
-            }
-            if !explicit_result_states_persisted_gaps(&requested_result) {
-                let error = format!(
-                    "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
-                );
-                return dispatch_tool_validation_error(store, session, call, &error);
-            }
-        }
-    }
-    let result = if use_final_answer {
-        let Some(answer) = final_answer.as_ref() else {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                "done could not load the persisted final answer",
-            );
-        };
-        let Some(result) = persisted_final_answer_result(answer) else {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                "persisted final answer is missing a non-empty result",
-            );
-        };
-        result.to_string()
+    let result = if let Some(result_file) = result_file.as_ref() {
+        done_result_file_message(result_file)
     } else {
         requested_result
     };
@@ -3001,22 +3312,6 @@ fn dispatch_done_tool(
             "arguments": call.arguments,
         }),
     )?;
-    if use_final_answer {
-        let trigger = if should_auto_use_final_answer && !explicit_use_final_answer {
-            "assistant_done_result_replaced"
-        } else {
-            "done_use_final_answer"
-        };
-        store.append_event(
-            &session.id,
-            "session.final_answer_used",
-            serde_json::json!({
-                "source": "python.set_final_answer",
-                "tool_call_id": call.id,
-                "trigger": trigger,
-            }),
-        )?;
-    }
     store.append_event(
         &session.id,
         "tool.finished",
@@ -3026,17 +3321,127 @@ fn dispatch_done_tool(
         }),
     )?;
     let mut done_payload = serde_json::json!({ "result": result });
-    if use_final_answer {
-        done_payload["source"] = Value::String("python.set_final_answer".to_string());
-        if let Some(summary) = final_answer_summary {
-            done_payload["final_answer_summary"] = summary;
-        }
+    if let Some(result_file) = result_file.as_ref() {
+        let directory = result_file
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let artifact = serde_json::json!({
+            "kind": "file",
+            "path": result_file.path.display().to_string(),
+            "mime": result_file.mime,
+            "bytes": result_file.bytes,
+            "source": "done.result_file",
+        });
+        record_tool_artifact(store, &session.id, "done", &artifact)?;
+        done_payload["source"] = Value::String("done.result_file".to_string());
+        done_payload["result_file"] = Value::String(result_file.requested_path.clone());
+        done_payload["result_file_path"] = Value::String(result_file.path.display().to_string());
+        done_payload["result_file_url"] = Value::String(file_url(&result_file.path));
+        done_payload["result_file_directory"] = Value::String(directory.display().to_string());
+        done_payload["result_file_directory_url"] = Value::String(file_url(&directory));
+        done_payload["result_file_bytes"] = Value::from(result_file.bytes);
+        done_payload["result_file_mime"] = Value::String(result_file.mime.to_string());
     }
     store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
         finished: true,
         messages: Vec::new(),
     })
+}
+
+fn done_result_file_info(
+    session: &browser_use_protocol::SessionMeta,
+    requested_path: &str,
+) -> Result<DoneResultFile> {
+    let path = resolve_done_result_file(session, requested_path);
+    let path = path
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow!("done result_file does not exist or is not a file: {requested_path}")
+        })?;
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("read metadata {}", path.display()))?;
+    if metadata.len() == 0 {
+        bail!("done result_file is empty: {}", path.display());
+    }
+    Ok(DoneResultFile {
+        requested_path: requested_path.to_string(),
+        mime: guess_mime_from_path(&path),
+        path,
+        bytes: metadata.len(),
+    })
+}
+
+fn done_result_file_message(result_file: &DoneResultFile) -> String {
+    let directory = result_file.path.parent().unwrap_or_else(|| Path::new("."));
+    format!(
+        "Saved result file.\n\nFile:\n{}\n\nDirectory:\n{}\n\nLocal path:\n{}\nSize: {} bytes\nMIME: {}\n\nThe full result is in the file above. It is not inlined here so the terminal stays responsive.",
+        file_url(&result_file.path),
+        file_url(directory),
+        result_file.path.display(),
+        result_file.bytes,
+        result_file.mime,
+    )
+}
+
+fn guess_mime_from_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "md" => "text/markdown",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "txt" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_url(path: &Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
+    let prefix = if path.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    };
+    format!("{prefix}{}", encode_file_url_path(&path))
+}
+
+fn encode_file_url_path(path: &str) -> String {
+    let mut out = String::new();
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn resolve_done_result_file(
+    session: &browser_use_protocol::SessionMeta,
+    requested_path: &str,
+) -> Vec<PathBuf> {
+    let path = Path::new(requested_path);
+    if path.is_absolute() {
+        return vec![path.to_path_buf()];
+    }
+    vec![
+        Path::new(&session.cwd).join(path),
+        Path::new(&session.artifact_root).join(path),
+        path.to_path_buf(),
+    ]
 }
 
 fn guard_or_close_active_descendants(
@@ -3115,217 +3520,6 @@ fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result
         }
     }
     Ok(())
-}
-
-fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result<Option<Value>> {
-    let path = Path::new(&session.artifact_root).join(".final_answer.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("read persisted final answer {}", path.display()))?;
-    let value: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("parse persisted final answer {}", path.display()))?;
-    Ok(Some(value))
-}
-
-fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
-    final_answer
-        .get("result")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|result| !result.is_empty())
-        .map(str::to_string)
-}
-
-fn append_done_from_persisted_final_answer(
-    store: &Store,
-    session_id: &str,
-    final_answer: &Value,
-    trigger: &str,
-    tool_call_id: Option<&str>,
-) -> Result<bool> {
-    let Some(result) = persisted_final_answer_result(final_answer) else {
-        return Ok(false);
-    };
-    let mut used_payload = serde_json::json!({
-        "source": "python.set_final_answer",
-        "trigger": trigger,
-    });
-    if let Some(tool_call_id) = tool_call_id {
-        used_payload["tool_call_id"] = Value::String(tool_call_id.to_string());
-    }
-    store.append_event(session_id, "session.final_answer_used", used_payload)?;
-    let mut done_payload = serde_json::json!({
-        "result": result,
-        "source": "python.set_final_answer",
-    });
-    if let Some(summary) = final_answer.get("summary").cloned() {
-        done_payload["final_answer_summary"] = summary;
-    }
-    store.append_event(session_id, "session.done", done_payload)?;
-    Ok(true)
-}
-
-fn persisted_final_answer_not_ready_message(final_answer: &Value) -> Option<String> {
-    let summary = final_answer.get("summary")?;
-    if summary
-        .get("ready_for_done")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    if let Some(note) = summary.get("audit_note").and_then(Value::as_str) {
-        return Some(format!(
-            "The persisted final answer is not ready for done. {note} Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-        ));
-    }
-    if let Some(audit_path) = summary
-        .get("audit")
-        .and_then(|audit| audit.get("audit_path"))
-        .and_then(Value::as_str)
-    {
-        return Some(format!(
-            "The persisted final answer is not ready for done because the attached artifact audit did not pass ({audit_path}). Review the audit checks, fix the artifact, and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-        ));
-    }
-    Some(
-        "The persisted final answer is not ready for done. Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-            .to_string(),
-    )
-}
-
-fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Value) -> bool {
-    let count = final_answer
-        .get("summary")
-        .and_then(|summary| summary.get("count"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    count > 0
-        && (looks_like_empty_structured_result(requested_result)
-            || looks_like_placeholder_done_result(requested_result)
-            || looks_like_persisted_preview_result(requested_result, final_answer))
-}
-
-fn explicit_result_states_persisted_gaps(result: &str) -> bool {
-    let normalized = result.to_ascii_lowercase();
-    [
-        "blank",
-        "could not",
-        "duplicate",
-        "failed",
-        "gap",
-        "incomplete",
-        "invalid",
-        "missing",
-        "not found",
-        "not ready",
-        "not verified",
-        "null",
-        "partial",
-        "remaining",
-        "unavailable",
-        "unable",
-        "unknown",
-        "unmet",
-        "unresolved",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn looks_like_placeholder_done_result(result: &str) -> bool {
-    let trimmed = result.trim();
-    let normalized = trimmed
-        .trim_matches(|ch: char| ch == '.' || ch == '!' || ch.is_whitespace())
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "done" | "complete" | "completed" | "finished"
-    ) || looks_like_persisted_final_answer_status(&normalized)
-}
-
-fn looks_like_persisted_final_answer_status(normalized: &str) -> bool {
-    (normalized.contains("final answer")
-        && (normalized.contains("persisted")
-            || normalized.contains("stored")
-            || normalized.contains("saved"))
-        && (normalized.contains("use") || normalized.contains("done")))
-        || (normalized.starts_with("need final") && normalized.contains("done"))
-}
-
-fn looks_like_persisted_preview_result(requested_result: &str, final_answer: &Value) -> bool {
-    let requested_result = requested_result.trim();
-    if requested_result.len() < 64 {
-        return false;
-    }
-    let Some(persisted_result) = persisted_final_answer_result(final_answer) else {
-        return false;
-    };
-    let persisted_result = persisted_result.trim();
-    if persisted_result.len() <= requested_result.len() + 64 {
-        return false;
-    }
-    if persisted_result.starts_with(requested_result) {
-        return true;
-    }
-    let Ok(requested_json) = serde_json::from_str::<Value>(requested_result) else {
-        return false;
-    };
-    let Ok(persisted_json) = serde_json::from_str::<Value>(persisted_result) else {
-        return false;
-    };
-    json_value_is_strict_prefix_of(&requested_json, &persisted_json)
-}
-
-fn json_value_is_strict_prefix_of(requested: &Value, persisted: &Value) -> bool {
-    match (requested, persisted) {
-        (Value::Array(requested_items), Value::Array(persisted_items)) => {
-            !requested_items.is_empty()
-                && requested_items.len() < persisted_items.len()
-                && requested_items
-                    .iter()
-                    .zip(persisted_items.iter())
-                    .all(|(requested_item, persisted_item)| requested_item == persisted_item)
-        }
-        (Value::Object(requested_object), Value::Object(persisted_object)) => {
-            let mut found_truncated_collection = false;
-            for (key, requested_value) in requested_object {
-                let Some(persisted_value) = persisted_object.get(key) else {
-                    return false;
-                };
-                if json_value_is_strict_prefix_of(requested_value, persisted_value) {
-                    found_truncated_collection = true;
-                } else if requested_value != persisted_value {
-                    return false;
-                }
-            }
-            found_truncated_collection
-        }
-        _ => false,
-    }
-}
-
-fn looks_like_empty_structured_result(result: &str) -> bool {
-    let trimmed = result.trim();
-    if trimmed.is_empty() || matches!(trimmed, "{}" | "[]" | "null") {
-        return true;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return false;
-    };
-    json_value_is_empty(&value)
-}
-
-fn json_value_is_empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(text) => text.trim().is_empty(),
-        Value::Array(items) => items.is_empty(),
-        Value::Object(map) => map.values().all(json_value_is_empty),
-        _ => false,
-    }
 }
 
 fn dispatch_python_tool(
@@ -4620,6 +4814,80 @@ fn python_tool_image_output_parts(response: &RunPythonResponse) -> Result<Option
     Ok(Some(parts))
 }
 
+fn browser_script_tool_message_content(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> String {
+    if response.ok {
+        let mut parts = Vec::new();
+        if !response.text.trim().is_empty() {
+            parts.push(response.text.trim().to_string());
+        }
+        if !response.data.is_null() && response.data != serde_json::json!({}) {
+            parts.push(format!("data: {}", response.data));
+        }
+        if parts.is_empty() {
+            "browser_script completed".to_string()
+        } else {
+            parts.join("\n")
+        }
+    } else {
+        format!(
+            "browser_script failed: {}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("unknown browser_script error")
+        )
+    }
+}
+
+fn browser_script_tool_message_content_value(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<Value> {
+    let text = browser_script_tool_message_content(response);
+    let Some(image_parts) = browser_script_image_output_parts(response)? else {
+        return Ok(Value::String(text));
+    };
+    let mut parts = vec![serde_json::json!({
+        "type": "output_text",
+        "text": text,
+    })];
+    parts.extend(image_parts);
+    Ok(Value::Array(parts))
+}
+
+fn browser_script_image_output_parts(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<Option<Vec<Value>>> {
+    if !response.ok || response.images.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    for image in &response.images {
+        let Some(path) = image.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let bytes = std::fs::read(path).with_context(|| format!("read image artifact {path}"))?;
+        let mime_type = image
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .or_else(|| image.get("mime").and_then(Value::as_str))
+            .unwrap_or("image/png");
+        parts.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime_type};base64,{}", general_purpose::STANDARD.encode(bytes)),
+            "detail": image
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("auto"),
+        }));
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts))
+}
+
 pub fn record_python_response_events(
     store: &Store,
     session_id: &str,
@@ -4634,6 +4902,47 @@ pub fn record_python_response_final_event(
     response: &RunPythonResponse,
 ) -> Result<Option<Value>> {
     record_python_response_events_inner(store, session_id, response, false)
+}
+
+fn record_browser_script_response_events(
+    store: &Store,
+    session_id: &str,
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<()> {
+    for browser_event in &response.browser_events {
+        record_python_browser_event(store, session_id, browser_event)?;
+    }
+    let image_paths = response
+        .images
+        .iter()
+        .filter_map(|image| image.get("path").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    for image in &response.images {
+        record_tool_image(store, session_id, "browser_script", image)?;
+    }
+    for artifact in &response.artifacts {
+        let Some(path) = artifact.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if image_paths.contains(path) {
+            continue;
+        }
+        record_tool_artifact(store, session_id, "browser_script", artifact)?;
+    }
+    store.append_event(
+        session_id,
+        "tool.output",
+        serde_json::json!({
+            "name": "browser_script",
+            "ok": response.ok,
+            "text": response.text,
+            "data": response.data,
+            "images": response.images,
+            "artifacts": response.artifacts,
+            "error": response.error,
+        }),
+    )?;
+    Ok(())
 }
 
 pub fn record_python_worker_event(
@@ -4700,16 +5009,6 @@ fn record_python_response_events_inner(
         payload["text_truncated"] = Value::Bool(true);
         payload["text_artifact"] = artifact.clone();
     }
-    if let Some(final_answer) = response.data.get("final_answer") {
-        store.append_event(
-            session_id,
-            "session.final_answer_ready",
-            serde_json::json!({
-                "source": "python.set_final_answer",
-                "final_answer": final_answer,
-            }),
-        )?;
-    }
     store.append_event(session_id, "tool.output", payload)?;
     Ok(text_artifact)
 }
@@ -4758,11 +5057,15 @@ fn record_python_browser_event(
 }
 
 fn record_python_image(store: &Store, session_id: &str, image: &Value) -> Result<()> {
+    record_tool_image(store, session_id, "python", image)
+}
+
+fn record_tool_image(store: &Store, session_id: &str, name: &str, image: &Value) -> Result<()> {
     let event = store.append_event(
         session_id,
         "tool.image",
         serde_json::json!({
-            "name": "python",
+            "name": name,
             "image": image,
         }),
     )?;
@@ -4780,6 +5083,15 @@ fn record_python_image(store: &Store, session_id: &str, image: &Value) -> Result
 }
 
 fn record_python_artifact(store: &Store, session_id: &str, artifact: &Value) -> Result<()> {
+    record_tool_artifact(store, session_id, "python", artifact)
+}
+
+fn record_tool_artifact(
+    store: &Store,
+    session_id: &str,
+    name: &str,
+    artifact: &Value,
+) -> Result<()> {
     let Some(path) = artifact.get("path").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -4791,7 +5103,7 @@ fn record_python_artifact(store: &Store, session_id: &str, artifact: &Value) -> 
         session_id,
         "artifact.created",
         serde_json::json!({
-            "name": "python",
+            "name": name,
             "artifact": artifact,
         }),
     )?;
@@ -4809,6 +5121,50 @@ fn record_python_artifact(store: &Store, session_id: &str, artifact: &Value) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_preference_commands_persist_mode_and_domain_profile() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let output =
+            dispatch_browser_preference_command(&store, &session, "browser preference use cloud")?
+                .expect("preference command");
+        assert_eq!(output["status"], "ok");
+        assert_eq!(
+            store.get_setting(BROWSER_PREF_MODE)?.as_deref(),
+            Some("cloud")
+        );
+        assert_eq!(
+            store.get_setting("browser")?.as_deref(),
+            Some("Browser Use cloud")
+        );
+        assert_eq!(
+            resolve_browser_connect_command(&store, "browser connect")?,
+            "browser remote start"
+        );
+
+        let output = dispatch_browser_preference_command(
+            &store,
+            &session,
+            "browser profile remember --domain https://www.gusto.com/ --profile google-chrome:Profile-2 --mode local",
+        )?
+        .expect("profile command");
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["remembered"]["domain"], "gusto.com");
+        assert_eq!(
+            remembered_domain_profile(&store, "gusto.com")?
+                .and_then(|value| value["profile_id"].as_str().map(ToOwned::to_owned))
+                .as_deref(),
+            Some("google-chrome:Profile-2")
+        );
+        assert_eq!(
+            resolve_browser_connect_command(&store, "connect")?,
+            "browser connect local"
+        );
+        Ok(())
+    }
 
     #[test]
     fn fake_agent_can_run_python_and_finish() -> Result<()> {
@@ -5699,6 +6055,7 @@ mod tests {
         );
         assert!(message.contains("Raw CDP is the center"));
         assert!(message.contains("Do not call `screenshot` repeatedly on an unchanged viewport"));
+        assert!(message.contains("The user does not see the pixels inline in the terminal"));
         assert!(message.contains("Loaded Browser-Harness Interaction Skills"));
         assert!(message.contains("interaction-skills/screenshots.md"));
         assert!(message.contains("interaction-skills/tabs.md"));
@@ -5880,374 +6237,64 @@ mod tests {
     }
 
     #[test]
-    fn done_can_use_persisted_python_final_answer() -> Result<()> {
+    fn done_can_use_result_file_from_artifact_root() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'stores': [{'name': 'A', 'address': 'B'}]}, artifact_name='stores.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "{\"stores\":[]}",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract stores",
-            temp.path(),
-            AgentRunOptions::default(),
+        let session = store.create_session(None, temp.path())?;
+        std::fs::write(
+            Path::new(&session.artifact_root).join("answer.json"),
+            r#"{"items":[{"id":1},{"id":2}]}"#,
         )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "session.final_answer_used"));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_ready"
-                && event.payload["final_answer"]["count"] == 1
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"A\""))
-        }));
-        Ok(())
-    }
 
-    #[test]
-    fn done_use_final_answer_requires_persisted_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_missing_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_after_missing_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({"result": "explicit fallback"}),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
+        let outcome = dispatch_done_tool(
             &store,
-            &provider,
-            "finish without final answer",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "tool.failed"
-                && event.payload["tool_call_id"] == "done_missing_final"
-                && event.payload["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("no persisted final answer"))
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done" && event.payload["result"] == "explicit fallback"
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_can_use_persisted_final_answer_without_dummy_result() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final_no_dummy".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'items': [1, 2, 3]}, artifact_name='items.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_final_no_dummy".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract items",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["final_answer_summary"]["count"] == 3
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"items\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_replaces_final_answer_status_text_with_full_persisted_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final_status_text".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'items': [{'name': 'A', 'value': 'B'}]}, artifact_name='items.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_status_text".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "Final answer persisted. Need done use.",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract result counts",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"A\""))
-        }));
-        assert!(!events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"] == "Final answer persisted. Need done use."
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_replaces_preview_with_full_persisted_final_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let preview = serde_json::to_string_pretty(&serde_json::json!([
-            {"id": 1, "name": "one"},
-            {"id": 2, "name": "two"}
-        ]))?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_full_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer([{'id': 1, 'name': 'one'}, {'id': 2, 'name': 'two'}, {'id': 3, 'name': 'three'}, {'id': 4, 'name': 'four'}], artifact_name='rows.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_preview".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": preview,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract rows",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_used"
-                && event.payload["trigger"] == "assistant_done_result_replaced"
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"four\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn provider_loop_uses_ready_persisted_final_answer_at_turn_budget() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![vec![
-            ModelEvent::ToolCall {
-                call: ToolCall {
-                    id: "python_final_on_last_turn".to_string(),
-                    name: "python".to_string(),
-                    arguments: serde_json::json!({
-                        "code": "set_final_answer({'answer': 'Example', 'items': [1, 2]}, artifact_name='result.json')",
-                    }),
-                },
-            },
-            ModelEvent::Done,
-        ]]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract result",
-            temp.path(),
-            AgentRunOptions {
-                max_turns: 1,
-                max_context_chars: 80_000,
-                browser_mode: None,
-                python_tool_timeout_seconds: 120,
-                python_env: Vec::new(),
-                child_agent_runner: None,
+            &session,
+            &ToolCall {
+                id: "done_result_file".to_string(),
+                name: "done".to_string(),
+                arguments: serde_json::json!({
+                    "result_file": "answer.json",
+                }),
             },
         )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(!events
+        assert!(outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "done.result_file"
+                && event.payload["result_file"] == "answer.json"
+        }));
+        let done = events
             .iter()
-            .any(|event| event.event_type == "session.failed"));
+            .find(|event| event.event_type == "session.done")
+            .context("missing session.done")?;
+        let result = done.payload["result"].as_str().context("result text")?;
+        assert!(result.contains("Saved result file."));
+        assert!(result.contains("answer.json"));
+        assert!(!result.contains("\"id\":2"));
+        assert!(done.payload["result_file_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("answer.json")));
+        assert!(done.payload["result_file_url"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("file://")));
+        assert!(done.payload["result_file_directory_url"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("file://")));
+        assert!(
+            done.payload["result_file_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert_eq!(done.payload["result_file_mime"], "application/json");
         assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_used"
-                && event.payload["trigger"] == "max_turns_exhausted"
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
+            event.event_type == "artifact.created"
+                && event.payload["name"] == "done"
+                && event.payload["artifact"]["source"] == "done.result_file"
+                && event.payload["artifact"]["path"]
                     .as_str()
-                    .is_some_and(|result| result.contains("\"answer\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_rejects_persisted_final_answer_when_attached_audit_is_not_ready() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_failed_audit_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nset_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_failed_audit".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_explicit_gaps".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "Partial/incomplete result: the artifact is missing the required name field for one row.",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract many items",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "tool.failed"
-                && event.payload["tool_call_id"] == "done_failed_audit"
-                && event.payload["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("attached artifact audit did not pass"))
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"]
-                    == "Partial/incomplete result: the artifact is missing the required name field for one row."
+                    .is_some_and(|path| path.ends_with("answer.json"))
         }));
         Ok(())
     }
@@ -7361,5 +7408,11 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[test]
+    fn rustls_crypto_provider_install_is_idempotent() {
+        install_process_crypto_provider();
+        install_process_crypto_provider();
     }
 }

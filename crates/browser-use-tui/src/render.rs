@@ -1565,8 +1565,8 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     };
     let descriptions = [
         cloud_description,
-        "visible browser on this machine",
-        "background browser",
+        "attach to already-open browser",
+        "Rust-owned background browser",
     ];
     for (idx, browser) in BROWSER_CHOICES.iter().enumerate() {
         lines.push(selected(
@@ -1622,7 +1622,9 @@ fn work_lines(
                 let active = transcript::active_viewport_lines(Some(&model), width, u16::MAX);
                 if !active.is_empty() {
                     if !lines.is_empty() {
-                        lines.push(Line::from(""));
+                        for _ in 0..transcript::gap_before_active(&model) {
+                            lines.push(Line::from(""));
+                        }
                     }
                     lines.extend(active);
                 }

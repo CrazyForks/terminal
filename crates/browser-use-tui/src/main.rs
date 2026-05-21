@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use browser_use_core::install_process_crypto_provider;
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
-use browser_use_store::{Store, StoreNotification};
+use browser_use_store::{Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
@@ -827,10 +829,21 @@ impl App {
         thread::Builder::new()
             .name(format!("browser-use-agent-{session_id}"))
             .spawn(move || {
-                if let Err(error) =
+                let failure_state_dir = state_dir.clone();
+                let failure_session_id = session_id.clone();
+                let failure_notifier = notifier.clone();
+                let result = catch_unwind(AssertUnwindSafe(|| {
                     run_agent_thread(state_dir, session_id, backend, model, browser, notifier)
-                {
-                    eprintln!("agent thread failed: {error:#}");
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("agent thread failed: {error:#}"),
+                    Err(panic) => record_agent_panic(
+                        failure_state_dir,
+                        failure_session_id,
+                        failure_notifier,
+                        panic_payload_message(panic),
+                    ),
                 }
             })
             .context("spawn agent thread")?;
@@ -1872,7 +1885,51 @@ impl Command for DisableModifyOtherKeys {
     }
 }
 
+static AGENT_PANIC_HOOK: Once = Once::new();
+
+fn install_agent_panic_hook() {
+    AGENT_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_agent_thread = thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("browser-use-agent-"));
+            if !is_agent_thread {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn record_agent_panic(
+    state_dir: PathBuf,
+    session_id: String,
+    notifier: Option<StoreNotifier>,
+    message: String,
+) {
+    let error = format!("agent thread panicked: {message}");
+    if let Ok(store) = Store::open_with_optional_notifier(state_dir, notifier) {
+        let _ = store.append_event(
+            &session_id,
+            "session.failed",
+            serde_json::json!({ "error": error }),
+        );
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
 fn main() -> Result<()> {
+    install_process_crypto_provider();
+    install_agent_panic_hook();
     load_dotenv()?;
     let args = Args::parse();
     if args.dump_screen {
@@ -2619,7 +2676,7 @@ fn line_has_only_link_text(line: &Line<'static>) -> bool {
 }
 
 fn looks_like_clickable_url(value: &str) -> bool {
-    value.starts_with("https://") || value.starts_with("http://")
+    value.starts_with("https://") || value.starts_with("http://") || value.starts_with("file://")
 }
 
 fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyperlinkSegment]) {
@@ -4138,6 +4195,144 @@ mod redesign_tests {
     }
 
     #[test]
+    fn tool_call_note_does_not_reuse_text_from_prior_turn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "first question"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Old answer should not become a note.", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"turn_idx": 0, "tool_call_count": 0, "text_delta_chars": 36}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "now use a tool"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"turn_idx": 0, "tool_call_count": 1, "text_delta_chars": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({"name": "browser", "arguments": {"cmd": "browser status --json"}}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Done."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Done."));
+        assert!(
+            !screen.contains("Old answer should not become a note."),
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_artifact_rows_show_the_saved_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        let image_path = Path::new(&session.artifact_root).join("latest_screenshot.png");
+        std::fs::write(&image_path, b"not a real png; path rendering only")?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "latest screenshot pls"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.image",
+            serde_json::json!({
+                "name": "browser_script",
+                "image": {
+                    "path": image_path,
+                    "mime_type": "image/png",
+                    "label": "latest_screenshot",
+                }
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "I captured the screenshot at the path above."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("image "));
+        assert!(screen.contains("latest_screenshot.png"), "{screen}");
+        assert!(!screen.contains("received image artifact"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn completed_result_file_renders_pointer_not_file_body() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        let result_path = Path::new(&session.artifact_root).join("hn_top10_comments.json");
+        std::fs::write(&result_path, r#"{"marker":"real file body"}"#)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "save hacker news comments"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({
+                "source": "done.result_file",
+                "result_file": "hn_top10_comments.json",
+                "result": format!("SHOULD_NOT_RENDER {}", "x".repeat(5000)),
+            }),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Saved result file"), "{screen}");
+        assert!(screen.contains("File"), "{screen}");
+        assert!(screen.contains("Folder"), "{screen}");
+        assert!(screen.contains("comments.json"), "{screen}");
+        assert!(
+            screen.contains("Full contents are saved on disk"),
+            "{screen}"
+        );
+        assert!(!screen.contains("file://"), "{screen}");
+        assert!(!screen.contains("SHOULD_NOT_RENDER"), "{screen}");
+        assert!(!screen.contains("real file body"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
     fn completed_final_stream_does_not_duplicate_session_done_answer() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -4172,6 +4367,31 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Canonical final answer."));
         assert!(!screen.contains("Draft answer that should not replay."));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_session_done_payload_dedupes_repeated_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let answer = "\"\"Please open Chrome with remote debugging enabled, then I can go to Gusto. If you want, run the suggested setup flow: browser local setup.";
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "go to gusto"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": format!("{answer}{answer}")}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+
+        assert_eq!(screen.matches("Please open Chrome").count(), 1, "{screen}");
+        assert!(!screen.contains("setup.\"\"Please open Chrome"));
         Ok(())
     }
 
@@ -4243,6 +4463,28 @@ mod redesign_tests {
         assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
         assert_eq!(hyperlinks[0].line, 0);
         assert_eq!(hyperlinks[1].line, 1);
+    }
+
+    #[test]
+    fn file_native_links_use_the_full_url_for_each_visible_fragment() {
+        let lines = vec![
+            Line::from(ratatui::text::Span::styled(
+                "file:///Users/greg/Documents/browser-use/experiments/llm-",
+                theme::link(),
+            )),
+            Line::from(ratatui::text::Span::styled(
+                "browser/.browser-use-terminal/artifacts/session/result.json",
+                theme::link(),
+            )),
+        ];
+
+        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        assert_eq!(hyperlinks.len(), 2);
+        assert_eq!(
+            hyperlinks[0].target,
+            "file:///Users/greg/Documents/browser-use/experiments/llm-browser/.browser-use-terminal/artifacts/session/result.json"
+        );
+        assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
     }
 
     #[test]
@@ -5183,6 +5425,43 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Laminar"));
         assert!(screen.contains("Events"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_panic_records_failed_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, std::env::current_dir()?)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "panic"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.status",
+            serde_json::json!({"status": "running"}),
+        )?;
+
+        record_agent_panic(
+            temp.path().to_path_buf(),
+            session.id.clone(),
+            None,
+            "test panic".to_string(),
+        );
+
+        let session = store.load_session(&session.id)?.context("session")?;
+        assert_eq!(session.status, SessionStatus::Failed);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.failed"
+                && event
+                    .payload
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|error| error.contains("test panic"))
+        }));
         Ok(())
     }
 
