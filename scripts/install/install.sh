@@ -3,7 +3,6 @@
 set -eu
 
 RELEASE="latest"
-NO_LAUNCH=0
 REPO="${BUT_RELEASE_REPO:-browser-use/terminal}"
 BIN_DIR="${BUT_INSTALL_DIR:-$HOME/.local/bin}"
 BUT_HOME_DIR="${BUT_HOME:-$HOME/.browser-use-terminal}"
@@ -56,7 +55,7 @@ parse_args() {
         shift
         ;;
       --no-launch)
-        NO_LAUNCH=1
+        :
         ;;
       --help | -h)
         cat <<EOF
@@ -438,33 +437,6 @@ current_installed_version() {
   return 0
 }
 
-prompt_yes_no() {
-  prompt="$1"
-
-  if ( : </dev/tty ) 2>/dev/null; then
-    printf '%s [y/N] ' "$prompt" >/dev/tty
-    if ! IFS= read -r answer </dev/tty; then
-      return 1
-    fi
-  elif [ -t 0 ]; then
-    printf '%s [y/N] ' "$prompt"
-    if ! IFS= read -r answer; then
-      return 1
-    fi
-  else
-    return 1
-  fi
-
-  case "$answer" in
-    y | Y | yes | YES)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 print_launch_instructions() {
   case "$path_action" in
     added)
@@ -487,17 +459,6 @@ print_launch_instructions() {
       step "Future terminals: run browser, browser-use, browser-use-terminal, or but"
       ;;
   esac
-}
-
-maybe_launch_now() {
-  if [ "$NO_LAUNCH" -eq 1 ]; then
-    return
-  fi
-
-  if prompt_yes_no "Start browser-use terminal now?"; then
-    step "Launching browser-use terminal"
-    "$BIN_DIR/browser-use"
-  fi
 }
 
 payload_root() {
@@ -845,4 +806,3 @@ case "$path_action" in
 esac
 
 printf 'browser-use terminal %s installed successfully.\n' "$resolved_version"
-maybe_launch_now
