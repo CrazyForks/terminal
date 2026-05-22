@@ -23,4 +23,4 @@ Important limits:
 - Local real profiles are used by attaching to an already-open browser with `browser connect local`.
 - Do not launch the user's real default Chrome profile with remote-debugging flags.
 - Do not copy a real Chrome profile and assume cookies will work; Chrome profile locks and cookie encryption make that unreliable.
-- Local-to-cloud sync is follow-up work for ENG-4739.
+- Local-to-cloud sync is follow-up work outside the current terminal release.

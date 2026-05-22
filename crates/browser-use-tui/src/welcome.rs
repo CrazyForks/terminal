@@ -326,7 +326,7 @@ pub fn welcome_lines(
 }
 
 /// Current working directory as a friendly short label. Replaces the home
-/// prefix with `~` so paths like `/Users/foo/projects/bar` render as
+/// prefix with `~` so paths like `/home/foo/projects/bar` render as
 /// `~/projects/bar`.
 fn short_cwd() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -352,16 +352,16 @@ mod tests {
 
     #[test]
     fn cwd_shortening_only_applies_to_real_home_children() {
-        let home = Path::new("/Users/reagan");
+        let home = Path::new("/home/alex");
 
         assert_eq!(
-            shorten_cwd(Path::new("/Users/reagan/project"), Some(home)),
+            shorten_cwd(Path::new("/home/alex/project"), Some(home)),
             "~/project"
         );
         assert_eq!(shorten_cwd(home, Some(home)), "~");
         assert_eq!(
-            shorten_cwd(Path::new("/Users/reaganomics/project"), Some(home)),
-            "/Users/reaganomics/project"
+            shorten_cwd(Path::new("/home/alexandra/project"), Some(home)),
+            "/home/alexandra/project"
         );
     }
 }

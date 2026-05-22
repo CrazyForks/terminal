@@ -28,7 +28,7 @@ Python owns:
 - CDP/session/target identity through browser harness
 - scraping, image, PDF, table, and browser helper libraries
 
-The old Python product runtime has been removed from the package surface. The only Python package left is `llm_browser_worker`, which is launched by Rust for browser/tool execution.
+The only Python package in the public surface is `llm_browser_worker`, which is launched by Rust for browser/tool execution.
 
 ## Repository Shape
 
@@ -146,13 +146,7 @@ It writes deterministic dumps to `/tmp/but-design-loop/` and drives the TUI thro
 
 ## Browser Boundary
 
-The Python worker tries to load local browser-harness helpers from:
-
-```text
-/Users/greg/Developer/browser-harness/src
-```
-
-or from `BROWSER_HARNESS_SRC`.
+The Python worker can load browser-harness helpers from `BROWSER_HARNESS_SRC` when a local browser-harness checkout is available.
 
 When browser harness is available, browser actions run through that Python daemon shape. Rust records browser-visible facts as events, but Rust does not own CDP target ids, session ids, runtime object ids, or reconnect recovery.
 
@@ -170,7 +164,4 @@ That smoke covers browser download artifact indexing and stale-session recovery 
 
 - `docs/terminal-ui-product-ux.md`
 - `docs/terminal-ui-testing.md`
-- `docs/rewrite-verification.md`
 - `docs/terminal-renderer-architecture.md`
-- `docs/tui-live-state-cache-plan.md`
-- `docs/plan-pure-rust-browser-harness.md`

@@ -5849,7 +5849,7 @@ mod redesign_tests {
     fn file_native_links_use_the_full_url_for_each_visible_fragment() {
         let lines = vec![
             Line::from(ratatui::text::Span::styled(
-                "file:///Users/greg/Documents/browser-use/experiments/llm-",
+                "file:///home/alex/projects/browser-use/experiments/llm-",
                 theme::link(),
             )),
             Line::from(ratatui::text::Span::styled(
@@ -5862,7 +5862,7 @@ mod redesign_tests {
         assert_eq!(hyperlinks.len(), 2);
         assert_eq!(
             hyperlinks[0].target,
-            "file:///Users/greg/Documents/browser-use/experiments/llm-browser/.browser-use-terminal/artifacts/session/result.json"
+            "file:///home/alex/projects/browser-use/experiments/llm-browser/.browser-use-terminal/artifacts/session/result.json"
         );
         assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
     }

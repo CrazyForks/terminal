@@ -357,7 +357,7 @@ If the user asks to save something, the result can show the saved path inline:
 
 ```text
 Saved
-  /Users/greg/Desktop/hn_posts.json
+  ~/Desktop/hn_posts.json
 ```
 
 We do not need an artifact system to expose that.
