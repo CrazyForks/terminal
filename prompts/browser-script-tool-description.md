@@ -67,6 +67,6 @@ Usage guidance:
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
-- For large structured results, write the full JSON/CSV/text to a file and finish with `done(result_file=path)`.
+- For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.

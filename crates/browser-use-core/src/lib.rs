@@ -3298,10 +3298,11 @@ fn dispatch_done_tool(
     if let Some(error) = guard_or_close_active_descendants(store, &session.id, &call.arguments)? {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
-    let result = if let Some(result_file) = result_file.as_ref() {
-        done_result_file_message(result_file)
-    } else {
-        requested_result
+    let result_uses_file = requested_result.is_empty();
+    let result = match (result_uses_file, result_file.as_ref()) {
+        (false, _) => requested_result,
+        (true, Some(result_file)) => done_result_file_message(result_file),
+        (true, None) => unreachable!("done validation requires result or result_file"),
     };
     store.append_event(
         &session.id,
@@ -3335,7 +3336,9 @@ fn dispatch_done_tool(
             "source": "done.result_file",
         });
         record_tool_artifact(store, &session.id, "done", &artifact)?;
-        done_payload["source"] = Value::String("done.result_file".to_string());
+        if result_uses_file {
+            done_payload["source"] = Value::String("done.result_file".to_string());
+        }
         done_payload["result_file"] = Value::String(result_file.requested_path.clone());
         done_payload["result_file_path"] = Value::String(result_file.path.display().to_string());
         done_payload["result_file_url"] = Value::String(file_url(&result_file.path));
@@ -6287,6 +6290,44 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.event_type == "artifact.created"
                 && event.payload["name"] == "done"
+                && event.payload["artifact"]["source"] == "done.result_file"
+                && event.payload["artifact"]["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("answer.json"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_inline_result_takes_precedence_over_result_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        std::fs::write(Path::new(&session.cwd).join("answer.json"), r#"{"id":1}"#)?;
+
+        let outcome = dispatch_done_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "done_result_and_file".to_string(),
+                name: "done".to_string(),
+                arguments: serde_json::json!({
+                    "result": r#"{"id":2}"#,
+                    "result_file": "answer.json",
+                }),
+            },
+        )?;
+        assert!(outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        let done = events
+            .iter()
+            .find(|event| event.event_type == "session.done")
+            .context("missing session.done")?;
+        assert_eq!(done.payload["result"], r#"{"id":2}"#);
+        assert!(done.payload.get("source").is_none());
+        assert_eq!(done.payload["result_file"], "answer.json");
+        assert!(events.iter().any(|event| {
+            event.event_type == "artifact.created"
                 && event.payload["artifact"]["source"] == "done.result_file"
                 && event.payload["artifact"]["path"]
                     .as_str()

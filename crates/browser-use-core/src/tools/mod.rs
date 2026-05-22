@@ -357,11 +357,11 @@ fn done_tool_spec() -> ToolSpec {
             "properties": {
                 "result": {
                     "type": "string",
-                    "description": "Final answer for the user. Use result_file when the answer was written to a file."
+                    "description": "Final answer for the user. If the task requests an exact inline format such as JSON, CSV, a table, markdown, or a schema-shaped response, put that content here. When both result and result_file are supplied, result remains the final answer."
                 },
                 "result_file": {
                     "type": "string",
-                    "description": "Path to a text/JSON/CSV result file to use as the final answer. Relative paths resolve against the current working directory; prefer this for large browser_script outputs saved under outputs_dir()."
+                    "description": "Optional path to a text/JSON/CSV result file saved as an artifact. Relative paths resolve against the current working directory. Use this by itself only when a file pointer or artifact summary is an acceptable final answer."
                 },
                 "finish_and_close_children": {
                     "type": "boolean",
