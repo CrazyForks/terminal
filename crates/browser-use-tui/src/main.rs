@@ -1,8 +1,14 @@
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(not(test))]
+use std::io::Read;
 use std::io::{self, Write};
+#[cfg(not(test))]
+use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{mpsc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +17,16 @@ use anyhow::{Context, Result};
 use browser_use_core::install_process_crypto_provider;
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
+};
+use browser_use_providers::{
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
+    ClaudeCodeOAuthCredential, CodexAuth,
+};
+#[cfg(not(test))]
+use browser_use_providers::{
+    exchange_claude_code_authorization_code, parse_claude_code_authorization_input,
+    ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH,
+    CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_store::{Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
@@ -33,7 +49,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
@@ -57,8 +73,8 @@ use runtime::run_agent_thread;
 use settings::{
     browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
     AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
-    MODEL_CHOICES,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -67,7 +83,7 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
-const NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT: u16 = 1;
+const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -78,7 +94,7 @@ struct Args {
     model: String,
     #[arg(long, default_value = "Codex login")]
     account: String,
-    #[arg(long, default_value = "Browser Use cloud")]
+    #[arg(long, default_value = "Local Chrome")]
     browser: String,
     #[arg(long)]
     dump_screen: bool,
@@ -100,6 +116,8 @@ struct Args {
 enum Surface {
     Main,
     Setup,
+    SetupConfirm,
+    SetupResult,
     Account,
     ApiKey,
     Telemetry,
@@ -179,6 +197,67 @@ enum ProductState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum SetupResultKind {
+    Pending,
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SetupResult {
+    kind: SetupResultKind,
+    account: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct ClaudeCodeOAuthEvent {
+    account: String,
+    result: Result<ClaudeCodeOAuthCredential, String>,
+}
+
+#[derive(Debug)]
+struct ClaudeCodeOAuthFlow {
+    account: String,
+    url: String,
+    started_at: Instant,
+    stop_tx: mpsc::Sender<()>,
+    rx: mpsc::Receiver<ClaudeCodeOAuthEvent>,
+    browser_open_error: Option<String>,
+    #[cfg(test)]
+    event_tx_guard: Option<mpsc::Sender<ClaudeCodeOAuthEvent>>,
+}
+
+impl Drop for ClaudeCodeOAuthFlow {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[derive(Debug)]
+enum CodexLoginEvent {
+    Output(String),
+    Finished(Result<CodexAuth, String>),
+}
+
+#[derive(Debug)]
+struct CodexLoginFlow {
+    account: String,
+    output: String,
+    started_at: Instant,
+    stop_tx: mpsc::Sender<()>,
+    rx: mpsc::Receiver<CodexLoginEvent>,
+    #[cfg(test)]
+    event_tx_guard: Option<mpsc::Sender<CodexLoginEvent>>,
+}
+
+impl Drop for CodexLoginFlow {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
     SendFollowup { session_id: String, text: String },
@@ -216,6 +295,10 @@ struct App {
     browser: String,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<usize>,
+    setup_pending_account: Option<String>,
+    setup_result: Option<SetupResult>,
+    claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
+    codex_login: Option<CodexLoginFlow>,
     browser_notice: Option<String>,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
@@ -504,6 +587,15 @@ struct NativeHistoryState {
     last_seq: i64,
     last_group: Option<String>,
     clear_before_replay: bool,
+    live_stream: Option<NativeLiveStreamState>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeLiveStreamState {
+    session_id: String,
+    width: u16,
+    emitted_lines: usize,
+    emitted_text_lines: Vec<String>,
 }
 
 impl NativeHistoryState {
@@ -512,6 +604,7 @@ impl NativeHistoryState {
         self.last_seq = 0;
         self.last_group = None;
         self.clear_before_replay = false;
+        self.live_stream = None;
     }
 
     fn reset_with_clear(&mut self) {
@@ -538,6 +631,40 @@ impl NativeHistoryState {
 
     fn is_active_for(&self, session_id: Option<&str>) -> bool {
         self.session_id.as_deref().is_some() && self.session_id.as_deref() == session_id
+    }
+
+    fn live_stream_emitted_lines_for(&self, session_id: &str, width: u16) -> usize {
+        self.live_stream
+            .as_ref()
+            .filter(|stream| stream.session_id == session_id && stream.width == width)
+            .map(|stream| stream.emitted_lines)
+            .unwrap_or(0)
+    }
+
+    fn live_stream_emitted_text_for(&self, session_id: &str, width: u16) -> Option<&[String]> {
+        self.live_stream
+            .as_ref()
+            .filter(|stream| stream.session_id == session_id && stream.width == width)
+            .map(|stream| stream.emitted_text_lines.as_slice())
+    }
+
+    fn set_live_stream_emitted_lines(
+        &mut self,
+        session_id: &str,
+        width: u16,
+        emitted_lines: usize,
+        emitted_text_lines: Vec<String>,
+    ) {
+        self.live_stream = Some(NativeLiveStreamState {
+            session_id: session_id.to_string(),
+            width,
+            emitted_lines,
+            emitted_text_lines,
+        });
+    }
+
+    fn clear_live_stream(&mut self) {
+        self.live_stream = None;
     }
 
     fn take_clear_before_replay(&mut self) -> bool {
@@ -599,6 +726,10 @@ impl App {
             browser,
             api_key_account: None,
             pending_model_after_auth: None,
+            setup_pending_account: None,
+            setup_result: None,
+            claude_code_oauth: None,
+            codex_login: None,
             browser_notice: None,
             status_notice: None,
             agent_backend,
@@ -643,6 +774,95 @@ impl App {
         Ok(changed)
     }
 
+    fn drain_oauth_notifications(&mut self) -> Result<bool> {
+        let event = match self.claude_code_oauth.as_ref() {
+            Some(flow) => match flow.rx.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(ClaudeCodeOAuthEvent {
+                    account: flow.account.clone(),
+                    result: Err(
+                        "OAuth callback listener stopped before sign-in completed.".to_string()
+                    ),
+                }),
+            },
+            None => None,
+        };
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.claude_code_oauth = None;
+        match event.result {
+            Ok(credential) => {
+                self.store_claude_code_oauth(&credential)?;
+                self.account = event.account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    event.account,
+                    "Connected to Claude Code.".to_string(),
+                );
+            }
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    event.account,
+                    format!("Claude Code login failed: {error}"),
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    fn drain_codex_login_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(flow) = self.codex_login.as_ref() {
+            while let Ok(event) = flow.rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        for event in events {
+            match event {
+                CodexLoginEvent::Output(text) => {
+                    if let Some(flow) = self.codex_login.as_mut() {
+                        flow.output.push_str(&strip_ansi(&text));
+                    }
+                }
+                CodexLoginEvent::Finished(result) => {
+                    let account = self
+                        .codex_login
+                        .as_ref()
+                        .map(|flow| flow.account.clone())
+                        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
+                    self.codex_login = None;
+                    match result {
+                        Ok(auth) => {
+                            self.store_codex_auth(&auth)?;
+                            self.account = account.clone();
+                            self.persist_runtime_settings()?;
+                            self.show_setup_result(
+                                SetupResultKind::Success,
+                                account,
+                                "Connected with Codex auth.".to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.show_setup_result(
+                                SetupResultKind::Failure,
+                                account,
+                                format!("Codex login failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let changed = self.state_cache.refresh_all(&self.store)?;
         if changed {
@@ -666,6 +886,7 @@ impl App {
     }
 
     fn open_surface(&mut self, surface: Surface) {
+        self.close_slash_palette();
         self.surface = surface;
         self.selected_row = 0;
         if surface != Surface::Browser {
@@ -674,6 +895,13 @@ impl App {
     }
 
     fn close_surface(&mut self) {
+        self.close_slash_palette();
+        if matches!(self.surface, Surface::SetupConfirm | Surface::SetupResult) {
+            self.setup_pending_account = None;
+            self.setup_result = None;
+            self.claude_code_oauth = None;
+            self.codex_login = None;
+        }
         self.surface = Surface::Main;
         self.selected_row = 0;
         self.browser_notice = None;
@@ -739,7 +967,7 @@ impl App {
         }
         if let Some(notice) = self.browser_notice()? {
             self.status_notice = Some(notice);
-            self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
+            self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(false);
         }
         self.status_notice = None;
@@ -967,6 +1195,19 @@ impl App {
                 self.close_surface();
             }
             KeyEvent {
+                code: KeyCode::Up, ..
+            } if self.is_first_run_setup_visible()? => self.move_selection(-1)?,
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } if self.is_first_run_setup_visible()? => self.move_selection(1)?,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
+            _ if self.is_first_run_setup_visible()? => {}
+            KeyEvent {
                 code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
             KeyEvent {
@@ -987,13 +1228,6 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } if self.surface == Surface::History => self.resume_selected_history()?,
-            KeyEvent {
-                code: KeyCode::Up, ..
-            } if self.is_first_run_setup_visible()? => self.move_selection(-1)?,
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            } if self.is_first_run_setup_visible()? => self.move_selection(1)?,
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.is_slash_palette_active() => self.move_slash_palette_selection(-1),
@@ -1045,11 +1279,6 @@ impl App {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
             } if self.surface != Surface::Main => self.execute_surface_selection()?,
             KeyEvent {
                 code: KeyCode::Enter,
@@ -1058,14 +1287,16 @@ impl App {
             } => self.submit()?,
             _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
                 && self.handle_api_key_key(key) => {}
-            // `/` opens the slash palette popup. The slash itself is not
-            // typed into the composer — the popup owns its own filter
-            // buffer, separate from the composer.
+            // A leading `/` opens the slash palette popup. Once the composer
+            // has text, slash is regular prompt input.
             KeyEvent {
                 code: KeyCode::Char('/'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.surface == Surface::Main && !self.palette_open => {
+            } if self.surface == Surface::Main
+                && self.composer.is_empty()
+                && !self.palette_open =>
+            {
                 self.open_slash_palette();
             }
             // While the palette is open every typed character is appended
@@ -1116,6 +1347,9 @@ impl App {
             self.clamp_slash_palette_selection();
             return;
         }
+        if self.is_first_run_setup_visible().unwrap_or(false) {
+            return;
+        }
         match self.surface {
             Surface::Main => {
                 self.composer.insert_paste(text);
@@ -1132,8 +1366,7 @@ impl App {
         Ok(!self.setup_complete
             && self.surface == Surface::Main
             && self.selected_session_id.is_none()
-            && self.composer.is_empty()
-            && self.state_cache.sessions.is_empty())
+            && self.composer.is_empty())
     }
 
     /// True when the centered welcome screen is showing — drives the
@@ -1179,6 +1412,8 @@ impl App {
                 }
             }
             Surface::Setup => self.execute_first_run_setup_selection()?,
+            Surface::SetupConfirm => self.execute_setup_confirm_selection()?,
+            Surface::SetupResult => self.execute_setup_result_selection()?,
             Surface::Account => {
                 let account = ACCOUNT_CHOICES
                     .get(
@@ -1230,7 +1465,147 @@ impl App {
             .selected_row
             .min(ACCOUNT_CHOICES.len().saturating_sub(1));
         let account = ACCOUNT_CHOICES[idx].to_string();
-        self.dispatch(AppCommand::SaveAccount(account))
+        self.setup_pending_account = Some(account);
+        self.setup_result = None;
+        self.open_surface(Surface::SetupConfirm);
+        Ok(())
+    }
+
+    fn execute_setup_confirm_selection(&mut self) -> Result<()> {
+        if self.selected_row.min(1) == 1 {
+            self.setup_pending_account = None;
+            self.close_surface();
+            return Ok(());
+        }
+        let Some(account) = self.setup_pending_account.clone() else {
+            self.close_surface();
+            return Ok(());
+        };
+        if account == ACCOUNT_CODEX {
+            self.start_codex_auth(account)?;
+        } else if is_claude_code_account(&account) {
+            self.account = account.clone();
+            self.persist_runtime_settings()?;
+            if self.account_ready(&account)? {
+                self.show_claude_code_setup_result(account)?;
+            } else {
+                self.start_claude_code_oauth(account)?;
+            }
+        } else {
+            self.start_auth_flow(account)?;
+        }
+        Ok(())
+    }
+
+    fn execute_setup_result_selection(&mut self) -> Result<()> {
+        let Some(result) = self.setup_result.clone() else {
+            self.close_surface();
+            return Ok(());
+        };
+        match result.kind {
+            SetupResultKind::Success => self.continue_after_setup_success(result.account),
+            SetupResultKind::Failure if self.selected_row.min(1) == 0 => {
+                if result.account == ACCOUNT_CODEX {
+                    self.start_codex_auth(result.account)?;
+                } else if is_claude_code_account(&result.account) {
+                    self.start_claude_code_oauth(result.account)?;
+                } else {
+                    self.start_auth_flow(result.account)?;
+                }
+                Ok(())
+            }
+            SetupResultKind::Pending if self.selected_row.min(1) == 0 => {
+                if result.account == ACCOUNT_CODEX {
+                    self.reopen_codex_device_auth_url();
+                } else {
+                    self.reopen_claude_code_oauth_url();
+                }
+                Ok(())
+            }
+            SetupResultKind::Pending => {
+                self.claude_code_oauth = None;
+                self.codex_login = None;
+                self.setup_result = None;
+                self.setup_pending_account = None;
+                self.close_surface();
+                Ok(())
+            }
+            SetupResultKind::Failure => {
+                self.setup_result = None;
+                self.setup_pending_account = None;
+                self.close_surface();
+                Ok(())
+            }
+        }
+    }
+
+    fn show_claude_code_setup_result(&mut self, account: String) -> Result<()> {
+        if self.account_ready(&account)? {
+            self.show_setup_result(
+                SetupResultKind::Success,
+                account,
+                "Connected to Claude Code.".to_string(),
+            );
+        } else {
+            self.show_setup_result(
+                SetupResultKind::Failure,
+                account,
+                "Could not find a Claude Code login.".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn start_codex_auth(&mut self, account: String) -> Result<()> {
+        if self.account_ready(&account)? {
+            self.show_codex_setup_result(account)?;
+        } else {
+            self.start_codex_device_login(account)?;
+        }
+        Ok(())
+    }
+
+    fn show_codex_setup_result(&mut self, account: String) -> Result<()> {
+        match self.ensure_codex_auth_imported() {
+            Ok(()) => {
+                self.account = account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    account,
+                    "Connected with Codex auth.".to_string(),
+                );
+            }
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    account,
+                    format!("Could not find a Codex login: {error:#}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn show_setup_result(&mut self, kind: SetupResultKind, account: String, message: String) {
+        self.setup_result = Some(SetupResult {
+            kind,
+            account: account.clone(),
+            message,
+        });
+        self.setup_pending_account = Some(account);
+        self.status_notice = None;
+        self.open_surface(Surface::SetupResult);
+    }
+
+    fn continue_after_setup_success(&mut self, account: String) -> Result<()> {
+        self.setup_result = None;
+        self.setup_pending_account = None;
+        self.account = account;
+        if let Some(index) = self.pending_model_after_auth.take() {
+            return self.save_model(index);
+        }
+        self.advance_after_auth()
     }
 
     fn resume_selected_history(&mut self) -> Result<()> {
@@ -1285,14 +1660,12 @@ impl App {
     }
 
     fn save_account(&mut self, account: String) -> Result<()> {
-        self.account = account.clone();
-        if self.account == ACCOUNT_CODEX {
-            self.persist_runtime_settings()?;
-            self.status_notice = Some("Codex login selected.".to_string());
-            self.advance_after_auth()?;
+        if account == ACCOUNT_CODEX {
+            self.start_codex_auth(account)?;
             return Ok(());
         }
-        self.start_auth_entry(account);
+        self.account = account.clone();
+        self.start_auth_flow(account)?;
         Ok(())
     }
 
@@ -1305,10 +1678,13 @@ impl App {
             .collect()
     }
 
+    fn default_model_for_account(account: &str) -> Option<usize> {
+        Self::models_for_account(account).into_iter().next()
+    }
+
     fn advance_after_auth(&mut self) -> Result<()> {
-        let indices = Self::models_for_account(&self.account);
-        if indices.len() == 1 {
-            return self.save_model(indices[0]);
+        if let Some(index) = Self::default_model_for_account(&self.account) {
+            return self.save_model(index);
         }
         self.selected_row = 0;
         self.open_surface(Surface::Model);
@@ -1324,22 +1700,33 @@ impl App {
         self.provider_model = choice.provider_model.to_string();
         self.agent_backend = choice.backend;
         self.model_configured = true;
+        if self.account == ACCOUNT_CODEX {
+            if let Err(error) = self.ensure_codex_auth_imported() {
+                self.pending_model_after_auth = Some(index);
+                self.start_codex_device_login(self.account.clone())
+                    .with_context(|| {
+                        format!("start Codex login after auth import failed: {error:#}")
+                    })?;
+                return Ok(());
+            }
+        }
         self.persist_runtime_settings()?;
         if !self.account_ready(&self.account)? {
             self.pending_model_after_auth = Some(index);
-            self.start_auth_entry(self.account.clone());
+            self.start_auth_flow(self.account.clone())?;
             return Ok(());
         }
-        self.status_notice = Some(format!("Model set to {}.", self.model));
-        if !self.setup_complete {
-            if let Some(notice) = self.browser_notice()? {
-                self.status_notice = Some(notice);
-                self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
-                return Ok(());
+        let completing_setup = !self.setup_complete;
+        if completing_setup {
+            if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
+                self.browser = BROWSER_LOCAL_CHROME.to_string();
             }
             self.setup_complete = true;
             self.store.set_setting("setup.complete", "1")?;
             self.persist_runtime_settings()?;
+            self.status_notice = None;
+        } else {
+            self.status_notice = Some(format!("Model set to {}.", self.model));
         }
         self.close_surface();
         Ok(())
@@ -1355,7 +1742,7 @@ impl App {
             self.status_notice = Some(
                 "Browser Use cloud key is required before cloud browser tasks can run.".to_string(),
             );
-            self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
+            self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
         }
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
@@ -1402,11 +1789,42 @@ impl App {
         self.account = account.clone();
         self.persist_runtime_settings()?;
         self.api_key_account = None;
+        if !self.setup_complete && self.setup_pending_account.as_deref() == Some(account.as_str()) {
+            self.show_setup_result(
+                SetupResultKind::Success,
+                account.clone(),
+                format!("Saved {}.", auth_secret_label(&account)),
+            );
+            return Ok(());
+        }
         self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
         if let Some(index) = self.pending_model_after_auth.take() {
             return self.save_model(index);
         }
         self.advance_after_auth()
+    }
+
+    fn start_auth_flow(&mut self, account: String) -> Result<()> {
+        if account == ACCOUNT_CODEX {
+            self.start_codex_auth(account)?;
+            return Ok(());
+        }
+        if is_claude_code_account(&account) {
+            if self.account_ready(&account)? {
+                self.account = account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    account,
+                    "Connected to Claude Code.".to_string(),
+                );
+            } else {
+                self.start_claude_code_oauth(account)?;
+            }
+            return Ok(());
+        }
+        self.start_auth_entry(account);
+        Ok(())
     }
 
     fn start_auth_entry(&mut self, account: String) {
@@ -1415,9 +1833,113 @@ impl App {
         self.open_surface(Surface::ApiKey);
     }
 
+    fn start_claude_code_oauth(&mut self, account: String) -> Result<()> {
+        self.api_key_account = None;
+        self.composer.clear();
+        self.claude_code_oauth = None;
+        let mut flow = match start_claude_code_oauth_flow(account.clone()) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    account,
+                    format!("Could not start Claude Code OAuth: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
+        if let Err(error) = open_external_url(&flow.url) {
+            flow.browser_open_error = Some(error.to_string());
+        }
+        self.claude_code_oauth = Some(flow);
+        self.show_setup_result(
+            SetupResultKind::Pending,
+            account,
+            "Waiting for Claude Code OAuth sign-in.".to_string(),
+        );
+        Ok(())
+    }
+
+    fn reopen_claude_code_oauth_url(&mut self) {
+        let Some(url) = self.claude_code_oauth.as_ref().map(|flow| flow.url.clone()) else {
+            return;
+        };
+        let message = match open_external_url(&url) {
+            Ok(()) => "Waiting for Claude Code OAuth sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        if let Some(result) = self.setup_result.as_mut() {
+            result.message = message;
+        }
+    }
+
+    fn start_codex_device_login(&mut self, account: String) -> Result<()> {
+        self.api_key_account = None;
+        self.composer.clear();
+        self.codex_login = None;
+        let flow = match start_codex_login_flow(account.clone()) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    account,
+                    format!("Could not start Codex login: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
+        self.codex_login = Some(flow);
+        self.show_setup_result(
+            SetupResultKind::Pending,
+            account,
+            "Waiting for Codex device sign-in.".to_string(),
+        );
+        Ok(())
+    }
+
+    fn reopen_codex_device_auth_url(&mut self) {
+        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
+            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        if let Some(result) = self.setup_result.as_mut() {
+            result.message = message;
+        }
+    }
+
+    fn store_claude_code_oauth(&self, credential: &ClaudeCodeOAuthCredential) -> Result<()> {
+        self.store.set_setting(
+            "auth.claude_code.access_token",
+            credential.access_token.trim(),
+        )?;
+        if credential.refresh_token.trim().is_empty() {
+            self.store
+                .delete_setting("auth.claude_code.refresh_token")?;
+        } else {
+            self.store.set_setting(
+                "auth.claude_code.refresh_token",
+                credential.refresh_token.trim(),
+            )?;
+        }
+        if credential.expires_ms > 0 {
+            self.store.set_setting(
+                "auth.claude_code.expires_ms",
+                &credential.expires_ms.to_string(),
+            )?;
+        } else {
+            self.store.delete_setting("auth.claude_code.expires_ms")?;
+        }
+        self.store.delete_setting("auth.claude_code.auth_token")?;
+        Ok(())
+    }
+
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
+        if !self.setup_complete {
+            self.setup_pending_account = None;
+            self.setup_result = None;
+        }
         self.cancel_secret_entry();
     }
 
@@ -1515,6 +2037,8 @@ impl App {
                 }
             }
             Surface::Setup => self.setup_row_count(),
+            Surface::SetupConfirm => 2,
+            Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Model => MODEL_CHOICES.len(),
@@ -1527,6 +2051,13 @@ impl App {
 
     fn is_slash_palette_active(&self) -> bool {
         self.surface == Surface::Main && self.palette_open
+    }
+
+    fn setup_result_row_count(&self) -> usize {
+        match self.setup_result.as_ref().map(|result| &result.kind) {
+            Some(SetupResultKind::Failure) => 2,
+            _ => 1,
+        }
     }
 
     pub(crate) fn palette_filter(&self) -> &str {
@@ -1621,7 +2152,7 @@ impl App {
         }
         let state = self.refresh_cached_projection().clone();
         let model = transcript::transcript_model(self, &state);
-        transcript::has_pending_followup_indicator(model.as_ref())
+        transcript::has_shimmering_live_status(model.as_ref())
     }
 
     fn tick_live_spinner(&mut self) {
@@ -1682,7 +2213,7 @@ impl App {
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
             account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
-            ACCOUNT_CODEX => true,
+            ACCOUNT_CODEX => self.has_codex_login()?,
             _ => false,
         })
     }
@@ -1695,7 +2226,7 @@ impl App {
                     &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
                 )? =>
             {
-                Some("OpenAI API key is missing. Authenticate here before retrying.")
+                Some("OpenAI API key is missing. Authenticate here before retrying.".to_string())
             }
             AgentBackend::Openrouter
                 if !self.has_stored_or_env(
@@ -1703,13 +2234,21 @@ impl App {
                     &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
                 )? =>
             {
-                Some("OpenRouter API key is missing. Authenticate here before retrying.")
+                Some(
+                    "OpenRouter API key is missing. Authenticate here before retrying.".to_string(),
+                )
             }
+            AgentBackend::Codex if !self.has_codex_login()? => Some(
+                "Codex login is missing. Select Codex login to import local Codex auth."
+                    .to_string(),
+            ),
             AgentBackend::Anthropic
-                if is_claude_code_account(&self.account)
-                    && !self.has_claude_code_oauth()? =>
+                if is_claude_code_account(&self.account) && !self.has_claude_code_oauth()? =>
             {
-                Some("Claude Code login is missing. Run `browser-use-terminal auth login claude-code`.")
+                Some(
+                    "Claude Code login is missing. Open Claude Code sign-in here before retrying."
+                        .to_string(),
+                )
             }
             AgentBackend::Anthropic
                 if !is_claude_code_account(&self.account)
@@ -1718,11 +2257,11 @@ impl App {
                         &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
                     )? =>
             {
-                Some("Anthropic API key is missing. Authenticate here before retrying.")
+                Some("Anthropic API key is missing. Authenticate here before retrying.".to_string())
             }
             _ => None,
         };
-        Ok(notice.map(str::to_string))
+        Ok(notice)
     }
 
     fn browser_notice(&self) -> Result<Option<String>> {
@@ -1760,6 +2299,45 @@ impl App {
             .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
     }
 
+    fn has_codex_login(&self) -> Result<bool> {
+        if self
+            .store
+            .get_setting("auth.codex.access_token")?
+            .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .store
+                .get_setting("auth.codex.account_id")?
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(true);
+        }
+        Ok(load_codex_auth().is_ok())
+    }
+
+    fn ensure_codex_auth_imported(&self) -> Result<()> {
+        if self
+            .store
+            .get_setting("auth.codex.access_token")?
+            .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .store
+                .get_setting("auth.codex.account_id")?
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(());
+        }
+        let auth = load_codex_auth().context("load local Codex auth")?;
+        self.store_codex_auth(&auth)
+    }
+
+    fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
+        self.store
+            .set_setting("auth.codex.access_token", auth.access_token.trim())?;
+        self.store
+            .set_setting("auth.codex.account_id", auth.account_id.trim())?;
+        Ok(())
+    }
+
     fn has_claude_code_oauth(&self) -> Result<bool> {
         Ok(self.has_stored_or_env(
             "auth.claude_code.access_token",
@@ -1771,6 +2349,45 @@ impl App {
                 "ANTHROPIC_AUTH_TOKEN",
             ],
         )? || self.has_stored_or_env("auth.claude_code.auth_token", &[])?)
+    }
+
+    pub(crate) fn claude_code_oauth_url(&self) -> Option<&str> {
+        self.claude_code_oauth
+            .as_ref()
+            .map(|flow| flow.url.as_str())
+    }
+
+    pub(crate) fn claude_code_oauth_open_error(&self) -> Option<&str> {
+        self.claude_code_oauth
+            .as_ref()
+            .and_then(|flow| flow.browser_open_error.as_deref())
+    }
+
+    pub(crate) fn claude_code_oauth_elapsed_seconds(&self) -> Option<u64> {
+        self.claude_code_oauth
+            .as_ref()
+            .map(|flow| flow.started_at.elapsed().as_secs())
+    }
+
+    pub(crate) fn codex_login_elapsed_seconds(&self) -> Option<u64> {
+        self.codex_login
+            .as_ref()
+            .map(|flow| flow.started_at.elapsed().as_secs())
+    }
+
+    pub(crate) fn codex_login_output_lines(&self) -> Vec<String> {
+        self.codex_login
+            .as_ref()
+            .map(|flow| {
+                flow.output
+                    .lines()
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        (!line.is_empty()).then(|| line.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn laminar_status(&self) -> Result<String> {
@@ -1827,6 +2444,235 @@ fn open_external_url(target: &str) -> Result<()> {
         anyhow::bail!("browser target is empty");
     }
     Ok(())
+}
+
+#[cfg(not(test))]
+fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> {
+    let (verifier, challenge) = claude_code_oauth_pkce();
+    let url = claude_code_oauth_authorize_url(&verifier, &challenge);
+    let listener = TcpListener::bind((CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PORT))
+        .with_context(|| {
+            format!(
+                "bind Claude Code OAuth callback on {CLAUDE_CODE_CALLBACK_HOST}:{CLAUDE_CODE_CALLBACK_PORT}"
+            )
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Claude Code OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    let flow_account = account.clone();
+    thread::Builder::new()
+        .name("browser-use-claude-code-oauth".to_string())
+        .spawn(move || {
+            let result = wait_for_claude_code_oauth_credential(listener, verifier.clone(), stop_rx)
+                .map_err(|error| format!("{error:#}"));
+            let _ = event_tx.send(ClaudeCodeOAuthEvent { account, result });
+        })
+        .context("spawn Claude Code OAuth callback listener")?;
+    Ok(ClaudeCodeOAuthFlow {
+        account: flow_account,
+        url,
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+        browser_open_error: None,
+    })
+}
+
+#[cfg(test)]
+fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> {
+    let (verifier, challenge) = claude_code_oauth_pkce();
+    let url = claude_code_oauth_authorize_url(&verifier, &challenge);
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    Ok(ClaudeCodeOAuthFlow {
+        account,
+        url,
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+        browser_open_error: None,
+        event_tx_guard: Some(event_tx),
+    })
+}
+
+#[cfg(not(test))]
+fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+    let mut child = ProcessCommand::new("codex")
+        .args(["login", "--device-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start `codex login --device-auth`")?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    if let Some(stdout) = stdout {
+        spawn_codex_output_reader(stdout, event_tx.clone());
+    }
+    if let Some(stderr) = stderr {
+        spawn_codex_output_reader(stderr, event_tx.clone());
+    }
+    thread::Builder::new()
+        .name("browser-use-codex-login".to_string())
+        .spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
+                    "Codex device sign-in was cancelled".to_string(),
+                )));
+                return;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let result = if status.success() {
+                        load_codex_auth()
+                            .context("load Codex auth after device sign-in")
+                            .map_err(|error| format!("{error:#}"))
+                    } else {
+                        Err(format!("`codex login --device-auth` exited with {status}"))
+                    };
+                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
+                        "wait for Codex login process: {error}"
+                    ))));
+                    return;
+                }
+            }
+        })
+        .context("spawn Codex device login watcher")?;
+    Ok(CodexLoginFlow {
+        account,
+        output: String::new(),
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+    })
+}
+
+#[cfg(not(test))]
+fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => {
+                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let _ = event_tx.send(CodexLoginEvent::Output(text));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    Ok(CodexLoginFlow {
+        account,
+        output: String::new(),
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+        event_tx_guard: Some(event_tx),
+    })
+}
+
+#[cfg(not(test))]
+fn wait_for_claude_code_oauth_credential(
+    listener: TcpListener,
+    verifier: String,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<ClaudeCodeOAuthCredential> {
+    let parsed = wait_for_claude_code_callback(listener, verifier.as_str(), stop_rx)?;
+    let auth_code = parsed
+        .code
+        .context("Claude Code authorization code was missing")?;
+    let state = parsed.state.unwrap_or_default();
+    if state != verifier {
+        anyhow::bail!("Claude Code OAuth state mismatch");
+    }
+    exchange_claude_code_authorization_code(&auth_code, &state, &verifier)
+}
+
+#[cfg(not(test))]
+fn wait_for_claude_code_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<ClaudeCodeAuthorization> {
+    let deadline = Instant::now() + Duration::from_secs(900);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            anyhow::bail!("Claude Code OAuth sign-in was cancelled");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for Anthropic browser callback");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                return handle_claude_code_callback(&mut stream, expected_state);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("accept Claude Code OAuth callback"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_claude_code_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<ClaudeCodeAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Claude Code OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Claude Code OAuth callback request")?;
+    let parsed = parse_claude_code_authorization_input(path);
+    let status = if !path.starts_with(CLAUDE_CODE_CALLBACK_PATH) {
+        404
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Anthropic authentication completed. You can close this window.",
+        400 => "Anthropic authentication failed: missing code or state mismatch.",
+        _ => "Anthropic callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        anyhow::bail!("{text}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1987,6 +2833,26 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            output.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    output
+}
+
 fn print_native_transcript(app: &mut App) -> Result<()> {
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
@@ -2027,6 +2893,8 @@ fn run_terminal(mut app: App) -> Result<()> {
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             draw_needed |= app.drain_store_notifications()?;
+            draw_needed |= app.drain_oauth_notifications()?;
+            draw_needed |= app.drain_codex_login_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -2194,9 +3062,7 @@ fn desired_terminal_viewport_height_for(
     terminal_width: u16,
     terminal_height: u16,
 ) -> Result<u16> {
-    let full_height = terminal_height
-        .saturating_sub(1)
-        .max(app.live_viewport_height());
+    let full_height = terminal_height.max(app.live_viewport_height());
     let app_width = terminal_width
         .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
         .max(1);
@@ -2207,29 +3073,36 @@ fn desired_terminal_viewport_height_for(
     {
         return Ok(full_height);
     }
+
     let state = app.refresh_cached_projection().clone();
-    let selected_is_active = state
+    let transcript_model = transcript::transcript_model(app, &state);
+    let body_width = app_width.saturating_sub(4).max(1);
+    let stream_skip_lines = state
         .current_session
         .as_ref()
-        .is_some_and(|session| session.status.is_active());
-    let transcript_model = transcript::transcript_model(app, &state);
-    let active_viewport_has_live_content =
-        transcript::active_viewport_has_live_content(transcript_model.as_ref());
-    let suppress_followup_resize =
-        transcript::has_followup_over_scrollback(transcript_model.as_ref());
-    let stable_followup_reserve = if app.native_scrollback_is_active() {
-        NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT
+        .map(|session| {
+            app.native_history
+                .live_stream_emitted_lines_for(&session.id, body_width)
+        })
+        .unwrap_or(0);
+    let stream_skip_lines = stream_skip_lines.max(
+        transcript::active_streaming_lines(transcript_model.as_ref(), body_width)
+            .len()
+            .saturating_sub(1),
+    );
+    let active_lines = transcript::active_viewport_lines_with_stream_skip(
+        transcript_model.as_ref(),
+        body_width,
+        u16::MAX,
+        stream_skip_lines,
+    );
+    let active_line_count = if app.selected_session_id.is_some() && app.surface.uses_main_view() {
+        active_lines.len().max(1)
     } else {
-        0
+        active_lines.len()
     };
-    let active_body_reserve =
-        if selected_is_active && active_viewport_has_live_content && !suppress_followup_resize {
-            full_height.saturating_sub(dock_height)
-        } else {
-            stable_followup_reserve
-        };
     Ok(dock_height
-        .saturating_add(active_body_reserve)
+        .saturating_add(active_line_count.try_into().unwrap_or(u16::MAX))
         .min(full_height))
 }
 
@@ -2474,26 +3347,93 @@ fn maybe_emit_native_transcript(
         }
         app.native_history
             .reset_for_session_with_group(session_id, emission.last_seq, None);
+        maybe_emit_native_live_stream(terminal, app, &model, width)?;
         return Ok(());
     }
 
     let after_seq = app.native_history.last_seq;
-    if model.last_event_seq <= after_seq {
-        return Ok(());
+    if model.last_event_seq > after_seq {
+        let live_stream_prefix = app
+            .native_history
+            .live_stream_emitted_text_for(&session_id, width)
+            .map(|lines| lines.to_vec());
+        let mut emission = transcript::terminal_scrollback_emission_since(
+            &model,
+            after_seq,
+            width,
+            defer_pending_prompt,
+        );
+        if let Some(prefix) = live_stream_prefix.as_deref() {
+            emission.lines = strip_live_stream_prefix(emission.lines, prefix);
+        }
+        if emission.last_seq > after_seq {
+            app.native_history.last_seq = emission.last_seq;
+            app.native_history.last_group = None;
+            app.native_history.clear_live_stream();
+        }
+        if !emission.lines.is_empty() {
+            insert_native_lines(terminal, emission.lines)?;
+        }
     }
-    let emission = transcript::terminal_scrollback_emission_since(
-        &model,
-        after_seq,
-        width,
-        defer_pending_prompt,
-    );
-    if emission.lines.is_empty() {
-        return Ok(());
-    }
-    app.native_history.last_seq = emission.last_seq;
-    app.native_history.last_group = None;
-    insert_native_lines(terminal, emission.lines)?;
+    maybe_emit_native_live_stream(terminal, app, &model, width)?;
     Ok(())
+}
+
+fn maybe_emit_native_live_stream(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    model: &transcript::TranscriptModel,
+    width: u16,
+) -> Result<()> {
+    let lines = transcript::active_streaming_lines(Some(model), width);
+    let emit_count = lines.len().saturating_sub(1);
+    if emit_count == 0 {
+        app.native_history.clear_live_stream();
+        return Ok(());
+    }
+    let already = app
+        .native_history
+        .live_stream_emitted_lines_for(&model.session_id, width)
+        .min(emit_count);
+    if emit_count <= already {
+        return Ok(());
+    }
+    insert_native_lines(terminal, lines[already..emit_count].to_vec())?;
+    let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
+    app.native_history.set_live_stream_emitted_lines(
+        &model.session_id,
+        width,
+        emit_count,
+        emitted_text_lines,
+    );
+    Ok(())
+}
+
+fn strip_live_stream_prefix(
+    lines: Vec<Line<'static>>,
+    live_stream_prefix: &[String],
+) -> Vec<Line<'static>> {
+    if live_stream_prefix.is_empty() || lines.is_empty() {
+        return lines;
+    }
+    let line_text = plain_text_lines(&lines);
+    let skip = line_text
+        .iter()
+        .zip(live_stream_prefix.iter())
+        .take_while(|(line, prefix)| line.trim_end() == prefix.trim_end())
+        .count();
+    if skip == 0 {
+        lines
+    } else {
+        lines.into_iter().skip(skip).collect()
+    }
+}
+
+fn plain_text_lines(lines: &[Line<'static>]) -> Vec<String> {
+    lines_plain_text(lines)
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn native_scrollback_width(terminal_width: u16) -> u16 {
@@ -2541,6 +3481,7 @@ fn insert_native_lines(
     if lines.is_empty() {
         return Ok(());
     }
+    clear_inline_viewport_for_native_insert(terminal)?;
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
     let hyperlinks = collect_native_hyperlink_segments(&lines);
     terminal.insert_before(height, |buf| {
@@ -2550,6 +3491,15 @@ fn insert_native_lines(
         });
         Paragraph::new(lines).render(area, buf);
         apply_native_hyperlinks(buf, area, &hyperlinks);
+    })?;
+    Ok(())
+}
+
+fn clear_inline_viewport_for_native_insert(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    terminal.draw(|frame| {
+        frame.render_widget(RatatuiClear, frame.area());
     })?;
     Ok(())
 }
@@ -2755,6 +3705,7 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
     if !store.list_sessions()?.is_empty() {
         return Ok(());
     }
+    store.set_setting("setup.complete", "1")?;
     let session = store.create_session(None, std::env::current_dir()?)?;
     store.append_event(
         &session.id,
@@ -2836,7 +3787,7 @@ mod redesign_tests {
             state_dir: temp.path().to_path_buf(),
             model: "GPT-5.5".to_string(),
             account: "Codex login".to_string(),
-            browser: "Browser Use cloud".to_string(),
+            browser: BROWSER_LOCAL_CHROME.to_string(),
             dump_screen: true,
             width: 100,
             height: 28,
@@ -2883,6 +3834,39 @@ mod redesign_tests {
             rect.y.saturating_add(rect.height / 2),
         ));
         assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_logo_click_spins_inside_onboarding_rect() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        let screen = render_dump(&mut app)?;
+        let rect = app.welcome_logo_rect.get().context("setup logo rect")?;
+
+        assert!(screen.contains("click me!"));
+        assert!(!screen.contains("click logo"));
+        assert!(app.should_capture_welcome_mouse());
+        let initial_vy = app.welcome_anim.vy;
+        assert!(app.handle_welcome_logo_click(
+            rect.x.saturating_add(rect.width / 2),
+            rect.y.saturating_add(rect.height / 2),
+        ));
+        assert!(app.welcome_anim.vy > initial_vy);
+
+        let after_click = (app.welcome_anim.vx, app.welcome_anim.vy);
+        assert!(!app.handle_welcome_logo_click(rect.x.saturating_add(rect.width), rect.y));
+        assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+
+        let mut narrow_args = args(&temp);
+        narrow_args.width = 70;
+        let mut narrow_app = App::new(narrow_args)?;
+        let narrow_screen = render_dump(&mut narrow_app)?;
+        let click_line = narrow_screen
+            .lines()
+            .find(|line| line.contains("click me!"))
+            .context("narrow setup click label")?;
+        assert!(click_line.contains("⣿"));
         Ok(())
     }
 
@@ -2949,7 +3933,7 @@ mod redesign_tests {
             Surface::Developer => "Developer",
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
-            Surface::Setup => "Setup",
+            Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
             Surface::Main => "",
         }
     }
@@ -2993,14 +3977,34 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("step 1/3"));
-        assert!(screen.contains("CHOOSE ACCOUNT"));
+        assert!(screen.contains("Welcome to Browser Use Terminal"));
+        assert!(screen.contains("Choose a provider below."));
+        assert!(screen.contains("PROVIDERS"));
+        assert!(!screen.contains("CHOOSE PROVIDER"));
         assert!(screen.contains("Codex login"));
         assert!(screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
+        assert!(screen.contains("click me!"));
+        assert!(!screen.contains("click logo"));
+        assert!(!screen.contains("CHOOSE MODEL"));
+        assert!(!screen.contains("CHOOSE ACCOUNT"));
+        assert!(!screen.contains("with ChatGPT plan"));
+        assert!(!screen.contains("with subscription"));
+        assert!(!screen.contains("Qwen, Kimi, DeepSeek"));
+        assert!(!screen.contains("step 1/3"));
         assert!(!screen.contains("[needs]"));
 
-        // Up/Down navigate the 5 onboarding rows and wrap around the edges.
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?);
+        assert!(app.composer.is_empty());
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("PROVIDERS"));
+        assert!(!screen.contains("Tell the browser what to do"));
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+
+        // Up/Down navigate the provider rows and wrap around the edges.
         assert_eq!(app.selected_row, 0);
         for _ in 0..ACCOUNT_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
@@ -3015,15 +4019,79 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, 0);
 
-        // Default row 0 = Codex login -> single-model account -> auto-pick GPT-5.5,
-        // then ask for the selected cloud browser's key before setup is complete.
+        // Default row 0 = Codex login / GPT-5.5. Enter first opens a
+        // confirmation surface instead of completing setup immediately.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use Codex login?"));
         assert!(!app.setup_complete);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupResult);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Connected with Codex auth."));
+        assert!(!app.setup_complete);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
         assert_eq!(app.account, "Codex login");
         assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert!(app.status_notice.is_none());
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Browser Use cloud key"));
+        assert!(screen.contains("Tell the browser what to do"));
+        assert!(!screen.contains("Model set to"));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_onboarding_shows_setup_even_with_existing_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.set_setting("setup.complete", "1")?;
+        let session = store.create_session(None, std::env::current_dir()?)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "previous task"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "previous result"}),
+        )?;
+        store.set_setting("setup.complete", "0")?;
+        drop(store);
+
+        let mut app = App::new(args(&temp))?;
+        assert!(!app.state_cache.sessions.is_empty());
+        assert!(app.is_first_run_setup_visible()?);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("PROVIDERS"));
+        assert!(screen.contains("Codex login"));
+        assert!(!screen.contains("Tell the browser what to do"));
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_demo_state_stays_out_of_onboarding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_args = Args {
+            seed_demo: Some("done".to_string()),
+            browser: "Local Chrome".to_string(),
+            ..args(&temp)
+        };
+        let mut app = App::new(app_args)?;
+
+        assert!(!app.state_cache.sessions.is_empty());
+        assert!(!app.is_first_run_setup_visible()?);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Tell the browser what to do"));
+        assert!(!screen.contains("step 1/3"));
         Ok(())
     }
 
@@ -3038,6 +4106,7 @@ mod redesign_tests {
             let mut app = App::new(args(&temp))?;
             app.setup_complete = true;
             app.model_configured = true;
+            app.browser = BROWSER_USE_CLOUD.to_string();
             app.store.set_setting("setup.complete", "1")?;
 
             let _screen = render_dump(&mut app)?;
@@ -3070,6 +4139,7 @@ mod redesign_tests {
             let mut app = App::new(args(&temp))?;
             app.setup_complete = true;
             app.model_configured = true;
+            app.browser = BROWSER_USE_CLOUD.to_string();
             app.store.set_setting("setup.complete", "1")?;
 
             app.set_input("open example.com".to_string());
@@ -3147,7 +4217,10 @@ mod redesign_tests {
             app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
             Some("sk-or-v1-test")
         );
-        assert_eq!(app.surface, Surface::Model);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+        assert_eq!(app.model, "Qwen3.6 Plus");
         Ok(())
     }
 
@@ -3195,8 +4268,8 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("inspect cart"));
-        assert!(screen.contains(": browser"));
-        assert!(!screen.contains(": answer"));
+        assert!(screen.contains("• browser"));
+        assert!(!screen.contains("• answer"));
         assert!(screen.contains("source https://example.com/cart"));
         assert!(screen.contains("Your cart has 14 items."));
         assert!(screen.contains("Example item (https://example.com/item)"));
@@ -3226,8 +4299,8 @@ mod redesign_tests {
         app.selected_session_id = Some(running_session.id);
         let running_screen = render_dump(&mut app)?;
         assert!(running_screen.contains("> run near the top"));
-        assert!(running_screen.contains(": browser"));
-        assert!(!running_screen.contains(": thought"));
+        assert!(running_screen.contains("• browser"));
+        assert!(!running_screen.contains("• thought"));
         let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
         assert!(!running_screen.contains("Processing browser task"));
         assert!(!running_screen.contains("AI ENGINE"));
@@ -3267,13 +4340,25 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let completed_screen = render_dump(&mut app)?;
         assert!(completed_screen.contains("inspect top alignment"));
-        assert!(!completed_screen.contains(": answer"));
-        assert!(!completed_screen.contains(": done"));
+        assert!(!completed_screen.contains("• answer"));
+        assert!(!completed_screen.contains("• done"));
         // Footer status bar surfaces the active model and a context-fill bar.
         assert!(completed_screen.contains("24.5k/60k"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
+        Ok(())
+    }
+
+    #[test]
+    fn composer_border_shows_current_browser() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains(BROWSER_USE_CLOUD));
         Ok(())
     }
 
@@ -3310,14 +4395,11 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("whats happening"));
-        assert!(screen.contains(": subagent repo-explorer"));
-        assert!(!screen.contains(": answer"));
-        assert!(screen.contains("Purpose: Rust-first terminal workbench"));
-        assert!(screen.contains("crates/browser-use-tui"));
-        assert!(screen.contains(": subagent repo-explorer"));
-        assert!(screen.contains("finished"));
-        assert!(!screen.contains("repo-explorer started"));
-        assert!(!screen.contains("repo-explorer finished"));
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer finished"));
+        assert!(!screen.contains("• answer"));
+        assert!(!screen.contains("Purpose: Rust-first terminal workbench"));
+        assert!(!screen.contains("crates/browser-use-tui"));
         assert!(!screen.contains("helper finished: Repository summary"));
         assert!(!screen.contains("**Purpose:**"));
         Ok(())
@@ -3377,6 +4459,37 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("/task"));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_in_non_empty_composer_is_prompt_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        for ch in "open http:".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+
+        assert!(!app.is_slash_palette_active());
+        assert_eq!(app.composer.input(), "open http:/");
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_closes_when_switching_surfaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        assert!(app.is_slash_palette_active());
+
+        app.open_surface(Surface::Model);
+        assert!(!app.palette_open);
+        app.close_surface();
+        assert_eq!(app.surface, Surface::Main);
+        assert!(!app.is_slash_palette_active());
         Ok(())
     }
 
@@ -3537,18 +4650,17 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("OpenRouter API key"));
 
-        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
-        assert_eq!(app.surface, Surface::ApiKey);
+        app.start_auth_flow(settings::ACCOUNT_CLAUDE_CODE.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
         assert_eq!(
-            app.api_key_account.as_deref(),
-            Some(settings::ACCOUNT_CLAUDE_CODE)
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
         );
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Claude Code OAuth token"));
-        assert!(screen.contains("Claude Code uses Browser Use's Anthropic OAuth login"));
-        assert!(screen.contains("browser-use-terminal auth login claude-code"));
-        assert!(screen.contains("refreshable Claude Code credential"));
-        assert!(screen.contains("optional legacy access token"));
+        assert!(screen.contains("Waiting for Claude Code OAuth sign-in."));
+        assert!(screen.contains("OAuth link:"));
+        assert!(screen.contains("https://claude.ai/oauth/authorize?"));
+        assert!(!screen.contains("Run this in"));
         Ok(())
     }
 
@@ -3557,7 +4669,7 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
 
-        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
+        app.start_auth_entry(settings::ACCOUNT_OPENROUTER.to_string());
         assert_eq!(app.surface, Surface::ApiKey);
         assert_eq!(app.selected_row, 0);
         let screen = render_dump(&mut app)?;
@@ -3580,10 +4692,7 @@ mod redesign_tests {
         assert_eq!(app.surface, Surface::Main);
         assert_eq!(app.api_key_account, None);
         assert!(app.composer.is_empty());
-        assert_eq!(
-            app.store.get_setting("auth.claude_code.access_token")?,
-            None
-        );
+        assert_eq!(app.store.get_setting("auth.openrouter.api_key")?, None);
 
         app.open_surface(Surface::Developer);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -3598,7 +4707,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn setup_surface_enter_matches_visible_account_choice() -> Result<()> {
+    fn setup_surface_enter_matches_visible_provider_choice() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.open_surface(Surface::Setup);
@@ -3608,11 +4717,267 @@ mod redesign_tests {
         assert!(screen.contains("Claude Code subscription"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
 
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        assert_eq!(
+            app.setup_pending_account.as_deref(),
+            Some(settings::ACCOUNT_CLAUDE_CODE)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use Claude Code subscription?"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::SetupResult);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Waiting for Claude Code OAuth sign-in."));
+        assert!(screen.contains("OAuth link:"));
+        assert!(!screen.contains("Run this in"));
+
+        app.open_surface(Surface::Setup);
+        app.selected_row = 2;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        assert_eq!(
+            app.setup_pending_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         assert_eq!(
             app.api_key_account.as_deref(),
-            Some(settings::ACCOUNT_CLAUDE_CODE)
+            Some(settings::ACCOUNT_OPENAI)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_oauth_callback_stores_credential_and_confirms() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.start_auth_flow(settings::ACCOUNT_CLAUDE_CODE.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .claude_code_oauth
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test OAuth sender")
+            .clone();
+        tx.send(ClaudeCodeOAuthEvent {
+            account: settings::ACCOUNT_CLAUDE_CODE.to_string(),
+            result: Ok(ClaudeCodeOAuthCredential {
+                access_token: "sk-ant-oat-test".to_string(),
+                refresh_token: "refresh-test".to_string(),
+                expires_ms: 1234,
+            }),
+        })
+        .expect("send test OAuth result");
+
+        assert!(app.drain_oauth_notifications()?);
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Success)
+        );
+        assert_eq!(
+            app.store.get_setting("auth.claude_code.access_token")?,
+            Some("sk-ant-oat-test".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.claude_code.refresh_token")?,
+            Some("refresh-test".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.claude_code.expires_ms")?,
+            Some("1234".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+
+        app.start_codex_device_login(settings::ACCOUNT_CODEX.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .codex_login
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test Codex login sender")
+            .clone();
+        tx.send(CodexLoginEvent::Output(
+            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
+                .to_string(),
+        ))
+        .expect("send test Codex output");
+
+        assert!(app.drain_codex_login_notifications()?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("https://auth.openai.com/codex/device"));
+        assert!(screen.contains("ABCD-EFGH"));
+        assert!(!screen.contains("\u{1b}[94m"));
+
+        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
+            access_token: "codex-access".to_string(),
+            account_id: "codex-account".to_string(),
+        })))
+        .expect("send test Codex auth result");
+        assert!(app.drain_codex_login_notifications()?);
+        assert_eq!(
+            app.store.get_setting("auth.codex.access_token")?,
+            Some("codex-access".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.account_id")?,
+            Some("codex-account".to_string())
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Connected with Codex auth."));
+        assert!(screen.contains("A default model will be selected automatically."));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_CODEX);
+        assert_eq!(app.model, "GPT-5.5");
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_claude_code_oauth_uses_default_model_without_model_modal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.selected_row = 1;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+
+        let tx = app
+            .claude_code_oauth
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test OAuth sender")
+            .clone();
+        tx.send(ClaudeCodeOAuthEvent {
+            account: settings::ACCOUNT_CLAUDE_CODE.to_string(),
+            result: Ok(ClaudeCodeOAuthCredential {
+                access_token: "sk-ant-oat-onboarding".to_string(),
+                refresh_token: "refresh-onboarding".to_string(),
+                expires_ms: 5678,
+            }),
+        })
+        .expect("send test OAuth result");
+
+        assert!(app.drain_oauth_notifications()?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Connected to Claude Code."));
+        assert!(screen.contains("A default model will be selected automatically."));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_CLAUDE_CODE);
+        assert_eq!(app.model, "Claude Sonnet 4.6");
+        assert_eq!(app.provider_model, "claude-sonnet-4-6");
+        Ok(())
+    }
+
+    #[test]
+    fn model_selector_claude_code_uses_oauth_and_keeps_selected_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_surface(Surface::Model);
+        app.selected_row = 2;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(app.pending_model_after_auth, Some(2));
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OAuth link:"));
+        assert!(screen.contains("https://claude.ai/oauth/authorize?"));
+
+        let tx = app
+            .claude_code_oauth
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test OAuth sender")
+            .clone();
+        tx.send(ClaudeCodeOAuthEvent {
+            account: settings::ACCOUNT_CLAUDE_CODE.to_string(),
+            result: Ok(ClaudeCodeOAuthCredential {
+                access_token: "sk-ant-oat-model".to_string(),
+                refresh_token: "refresh-model".to_string(),
+                expires_ms: 9012,
+            }),
+        })
+        .expect("send test OAuth result");
+
+        assert!(app.drain_oauth_notifications()?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Continue applies the selected model."));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(app.account, settings::ACCOUNT_CLAUDE_CODE);
+        assert_eq!(app.model, "Claude Opus 4.7");
+        assert_eq!(app.provider_model, "claude-opus-4-7");
+        Ok(())
+    }
+
+    #[test]
+    fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.selected_row = 2;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use OpenAI API key?"));
+        assert!(screen.contains("API key modal"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+        app.handle_paste("sk-test-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert!(!app.setup_complete);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Saved OpenAI API key."));
+        assert!(screen.contains("OpenAI API key"));
+        assert_eq!(
+            app.store.get_setting("auth.openai.api_key")?.as_deref(),
+            Some("sk-test-key")
+        );
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "GPT-5.5");
         Ok(())
     }
 
@@ -3655,7 +5020,7 @@ mod redesign_tests {
             assert_nav(&mut app, count)?;
         }
 
-        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
+        app.start_auth_entry(settings::ACCOUNT_OPENROUTER.to_string());
         assert_nav(&mut app, 2)?;
         app.cancel_auth_entry();
         app.start_telemetry_entry();
@@ -3959,7 +5324,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn model_waits_are_visible_as_thinking_activity() -> Result<()> {
+    fn model_waits_do_not_render_as_transcript_activity() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -3976,14 +5341,14 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": thinking"));
-        assert!(!screen.contains(": thought"));
-        assert!(screen.contains("waiting for GPT-5.5"));
+        assert!(!screen.contains("• thinking"));
+        assert!(!screen.contains("• thought"));
+        assert!(!screen.contains("waiting for GPT-5.5"));
         Ok(())
     }
 
     #[test]
-    fn provider_thinking_deltas_render_as_thought_not_status() -> Result<()> {
+    fn provider_thinking_deltas_do_not_replace_streaming_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4015,16 +5380,17 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": thinking"));
-        assert!(screen.contains("Checking the repository structure."));
+        assert!(!screen.contains("• thinking"));
+        assert!(!screen.contains("• thought inspecting context"));
+        assert!(!screen.contains("Checking the repository structure."));
         assert!(!screen.contains("Checking \n"));
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         assert!(screen.contains("This is the answer draft."));
         Ok(())
     }
 
     #[test]
-    fn live_thinking_uses_available_viewport_before_summarizing() -> Result<()> {
+    fn live_thinking_renders_compact_shimmer_status() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4049,10 +5415,22 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
 
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("thinking line 1"));
-        assert!(screen.contains("thinking line 12"));
-        assert!(!screen.contains("... +"));
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let lines = transcript::active_viewport_lines(Some(&model), 100, 20);
+        let text = lines_plain_text(&lines);
+
+        assert!(text.contains("Thinking..."), "{text}");
+        assert!(!text.contains("thinking line 1"), "{text}");
+        assert!(!text.contains("thinking line 12"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style == theme::accent()),
+            "live thinking status should include a moving shimmer highlight"
+        );
         Ok(())
     }
 
@@ -4084,7 +5462,7 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         assert!(screen.contains("Streaming draft answer"));
         assert!(!screen.contains("Streaming \n"));
         Ok(())
@@ -4115,12 +5493,13 @@ mod redesign_tests {
 
         let terminal_width = 120_u16;
         let terminal_height = 80_u16;
-        let full_height = terminal_height
-            .saturating_sub(1)
-            .max(app.live_viewport_height());
+        let full_height = terminal_height.max(app.live_viewport_height());
         let initial_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert_eq!(initial_desired, full_height);
+        assert!(
+            initial_desired < full_height,
+            "live stream rows should move to native scrollback instead of expanding the widget to full height"
+        );
 
         let streamed = (1..=18)
             .map(|idx| format!("line {idx:02}"))
@@ -4140,7 +5519,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn pre_tool_streaming_text_renders_as_model_note_not_answer() -> Result<()> {
+    fn pre_tool_streaming_text_is_hidden_after_tool_call_response() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4187,15 +5566,15 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": note"));
-        assert!(screen.contains("note: Need more targeted."));
+        assert!(!screen.contains("• note"));
+        assert!(!screen.contains("Need more targeted."));
         assert!(screen.contains("Final answer from session.done."));
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         Ok(())
     }
 
     #[test]
-    fn tool_call_note_does_not_reuse_text_from_prior_turn() -> Result<()> {
+    fn tool_call_response_does_not_render_prior_turn_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4248,6 +5627,7 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Done."));
+        assert!(!screen.contains("• note"));
         assert!(
             !screen.contains("Old answer should not become a note."),
             "{screen}"
@@ -4433,10 +5813,10 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("write as it streams"));
-        assert!(!text.contains("repo-explorer started"));
+        assert!(text.contains("repo-explorer started"));
         assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!text.contains("start repo-explorer helper"));
-        assert!(!text.contains(": answer draft"));
+        assert!(!text.contains("• answer draft"));
         assert!(!text.contains("Live draft chunk"));
         Ok(())
     }
@@ -4513,7 +5893,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn child_agent_progress_is_summarized_in_parent_live_view() -> Result<()> {
+    fn child_agent_progress_commits_only_lifecycle_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4567,21 +5947,21 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent"));
-        assert!(screen.contains("repo-explorer"));
-        assert!(screen.contains(": subagent repo-explorer"));
-        assert!(screen.contains("working"));
-        assert!(screen.contains("read /repo/README.md"));
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(!screen.contains("subagents  repo-explorer starting"));
+        assert!(!screen.contains("read /repo/README.md"));
         assert!(!screen.contains("writing Mapping the main crates."));
         assert!(!screen.contains("Mapping the main crates."));
         assert!(!screen.contains("spawn_agent requested"));
         assert!(!screen.contains("spawn_agent started"));
+        assert!(screen.contains("Working..."));
+        assert!(screen.contains("(1 subagent running)"));
         assert!(!screen.contains("parent is waiting"));
         Ok(())
     }
 
     #[test]
-    fn transcript_active_child_owns_live_view() -> Result<()> {
+    fn active_child_keeps_child_progress_out_but_keeps_parent_live_view() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4631,20 +6011,27 @@ mod redesign_tests {
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
-        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+        let lines = transcript::active_viewport_lines(Some(&model), 100, 20);
+        let text = lines_plain_text(&lines);
 
-        assert!(text.contains(": subagent repo-explorer"));
-        assert!(text.contains("working"));
-        assert!(text.contains("read /repo/README.md"));
+        assert!(text.contains("Working..."), "{text}");
+        assert!(text.contains("(1 subagent running)"), "{text}");
+        assert!(!text.contains("parent is waiting"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style == theme::accent()),
+            "parent live status should include a moving shimmer highlight"
+        );
         assert!(!text.contains("writing Mapping the main crates."));
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
-        assert!(!text.contains("parent is waiting"));
         Ok(())
     }
 
     #[test]
-    fn active_child_progress_uses_available_viewport_before_summarizing() -> Result<()> {
+    fn active_child_progress_stays_out_of_parent_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4680,9 +6067,11 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("read /repo/file-1.rs"));
-        assert!(screen.contains("read /repo/file-12.rs"));
-        assert!(screen.contains("waiting for gpt-5.5"));
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(!screen.contains("subagents  repo-explorer starting"));
+        assert!(!screen.contains("read /repo/file-1.rs"));
+        assert!(!screen.contains("read /repo/file-12.rs"));
+        assert!(!screen.contains("waiting for gpt-5.5"));
         Ok(())
     }
 
@@ -4800,13 +6189,12 @@ mod redesign_tests {
         let terminal_text =
             lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 120));
 
-        assert!(text.contains(": explored"));
-        assert_eq!(text.matches(": explored").count(), 1, "{text}");
-        assert!(text.contains("read README.md"));
-        assert!(text.contains("read Cargo.toml"));
+        assert!(text.contains("• explored"));
+        assert_eq!(text.matches("• explored").count(), 1, "{text}");
+        assert!(text.contains("read README.md, Cargo.toml"));
         assert!(text.contains("list "));
         assert!(text.contains("search \"renderer\" (7 matches)"));
-        assert!(text.contains(": edit"));
+        assert!(text.contains("• edit"));
         assert!(text.contains("changed README.md"));
         assert!(text.contains("Repository inspected."));
         assert!(!text.contains("read_file requested"));
@@ -4823,7 +6211,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn parent_live_view_shows_subagent_wait_target() -> Result<()> {
+    fn parent_live_view_hides_subagent_wait_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4866,8 +6254,8 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent"));
-        assert!(screen.contains("waiting on repo_explorer"));
+        assert!(screen.contains("• subagent repo_explorer started"));
+        assert!(!screen.contains("waiting on repo_explorer"));
         Ok(())
     }
 
@@ -4924,12 +6312,10 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("explain this repo"));
-        assert!(!text.contains("repo-explorer started"));
-        assert!(text.contains("subagent repo-explorer"));
-        assert!(text.contains("read /repo/README.md"));
-        assert!(text.contains("finished"));
-        assert!(!text.contains("subagent finished"));
-        assert!(text.contains("Short helper summary"));
+        assert!(text.contains("subagent repo-explorer started"));
+        assert!(text.contains("subagent repo-explorer finished"));
+        assert!(!text.contains("read /repo/README.md"));
+        assert!(!text.contains("Short helper summary"));
         assert!(!text.contains("read every repo file"));
         assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
         Ok(())
@@ -5095,7 +6481,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn followup_over_native_scrollback_keeps_viewport_docked_through_live_activity() -> Result<()> {
+    fn followup_over_native_scrollback_keeps_full_transcript_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5128,17 +6514,18 @@ mod redesign_tests {
             Some(SessionStatus::Running)
         );
         let prompt_only = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(prompt_only, docked);
+        assert_eq!(prompt_only, docked.saturating_add(1));
+        let native_prompt = lines_plain_text(&native_scrollback_lines(&mut app, 120)?);
+        assert!(native_prompt.contains("> yo"));
         let prompt_only_screen = render_dump(&mut app)?;
-        assert!(prompt_only_screen.contains("> yo"));
         assert!(prompt_only_screen.contains("sending"));
-        assert!(same_line_gap(&prompt_only_screen, "> yo", "sending").is_some_and(|gap| gap <= 6));
+        assert!(!prompt_only_screen.contains("> yo  - sending"));
         assert!(prompt_only_screen.contains("Type to steer the agent"));
 
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         assert!(transcript::active_viewport_has_live_content(Some(&model)));
-        assert!(transcript::has_followup_over_scrollback(Some(&model)));
+        assert_eq!(prompt_only, docked.saturating_add(1));
 
         app.store.append_event(
             &session.id,
@@ -5147,14 +6534,10 @@ mod redesign_tests {
         )?;
         app.drain_store_notifications()?;
         let waiting = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(waiting, docked);
+        assert_eq!(waiting, prompt_only);
         let waiting_screen = render_dump(&mut app)?;
-        assert!(waiting_screen.contains("> yo"));
-        assert!(waiting_screen.contains("waiting for GPT-5.5"));
-        assert!(
-            same_line_gap(&waiting_screen, "> yo", "waiting for GPT-5.5")
-                .is_some_and(|gap| gap <= 6)
-        );
+        assert!(waiting_screen.contains("thinking"));
+        assert!(!waiting_screen.contains("> yo  - thinking"));
 
         app.store.append_event(
             &session.id,
@@ -5163,10 +6546,11 @@ mod redesign_tests {
         )?;
         app.drain_store_notifications()?;
         let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(streaming, docked);
+        assert_eq!(streaming, prompt_only.saturating_sub(1));
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
-        assert!(!streaming_screen.contains("waiting for GPT-5.5"));
+        assert!(!streaming_screen.contains("thinking"));
+        assert!(!streaming_screen.contains("Working..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
@@ -5174,12 +6558,359 @@ mod redesign_tests {
         Ok(())
     }
 
-    fn same_line_gap(text: &str, before: &str, after: &str) -> Option<usize> {
-        text.lines().find_map(|line| {
-            let before_idx = line.find(before)?;
-            let after_idx = line.find(after)?;
-            after_idx.checked_sub(before_idx.saturating_add(before.len()))
-        })
+    #[test]
+    fn wrapped_pending_followup_keeps_full_transcript_viewport_height() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), last_seq);
+
+        let docked = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
+        let long_prompt =
+            "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm can you yell me about this repo";
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: long_prompt.to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
+        assert_eq!(measured, docked.saturating_add(1));
+        app.args.width = 80;
+        app.args.height = measured;
+        let native_prompt = lines_plain_text(&native_scrollback_lines(&mut app, 80)?);
+        assert!(native_prompt.contains("> mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"));
+        assert!(native_prompt.contains("yell me about this repo"));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("thinking"));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapped_streaming_followup_keeps_full_transcript_viewport_height() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), last_seq);
+
+        let docked = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "tell me more".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "This is a Rust-first browser agent terminal/workbench named browser-use terminal. The core design keeps active output redrawable until it is final."}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
+        assert_eq!(measured, docked);
+        app.args.width = 80;
+        app.args.height = measured;
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Type to steer the agent"));
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let streaming_lines = lines_plain_text(&transcript::active_streaming_lines(
+            Some(&model),
+            80_u16.saturating_sub(8).max(1),
+        ));
+        assert!(streaming_lines.contains("This is a Rust-first browser agent"));
+        assert!(streaming_lines.contains("browser-use"));
+        assert!(streaming_lines.contains("core design"));
+        assert!(!screen.contains("thinking"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_followup_streaming_crops_to_transcript_body_without_resizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "summarize"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Previous completed answer."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), last_seq);
+
+        let docked = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "continue".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "live output line 01"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let initial = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
+        assert_eq!(initial, docked);
+
+        let streamed = (1..=24)
+            .map(|idx| format!("live output line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": streamed}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let grown = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
+        assert_eq!(grown, initial);
+        app.args.width = 100;
+        app.args.height = grown;
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("live output line 24"));
+        assert!(!screen.contains("live output line 01"));
+        assert!(!screen.contains("Working..."));
+        assert!(screen.contains("Type to steer the agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_response_hides_committed_stream_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "can you tell me about this repo?".to_string(),
+        })?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> can you tell me about this repo?"));
+        assert!(!prompt_text.contains("• note"));
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Yoooo! What can I help you with?\nNo worries.", "turn_idx": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"tool_call_count": 1, "turn_idx": 1}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let note_emission = transcript::terminal_scrollback_emission_since(
+            &model,
+            prompt_emission.last_seq,
+            120,
+            true,
+        );
+        let note_text = lines_plain_text(&note_emission.lines);
+        assert!(!note_text.contains("> can you tell me about this repo?"));
+        assert!(!note_text.contains("• note"));
+        assert!(!note_text.contains("Yoooo! What can I help you with?"));
+        let replay_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let replay_text = lines_plain_text(&replay_emission.lines);
+        let replay_lines = replay_text.lines().collect::<Vec<_>>();
+        assert!(
+            replay_lines
+                .iter()
+                .any(|line| line.contains("> can you tell me about this repo?")),
+            "{replay_text}"
+        );
+        assert!(!replay_text.contains("• note"));
+        assert!(!replay_text.contains("Yoooo! What can I help you with?"));
+
+        app.args.width = 120;
+        app.args.height = 28;
+        let active_screen = render_dump(&mut app)?;
+        assert_eq!(
+            active_screen.matches("Yoooo! What can I help you with?").count(),
+            0,
+            "stream text committed as a note should not be duplicated in the active viewport\n{active_screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_activity_tail_grows_in_active_view_until_next_block() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "inspect repo".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> inspect repo"));
+        assert!(!prompt_text.contains("README.md"), "{prompt_text}");
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(active_text.contains("• explored"), "{active_text}");
+        assert!(active_text.contains("read README.md"), "{active_text}");
+
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let deferred = transcript::terminal_scrollback_emission_since(
+            &model,
+            prompt_emission.last_seq,
+            120,
+            true,
+        );
+        assert!(
+            lines_plain_text(&deferred.lines).trim().is_empty(),
+            "{}",
+            lines_plain_text(&deferred.lines)
+        );
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_text.contains("read README.md, Cargo.toml"),
+            "{active_text}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "command.started",
+            serde_json::json!({"cmd": "git status --short"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let flushed = transcript::terminal_scrollback_emission_since(
+            &model,
+            prompt_emission.last_seq,
+            120,
+            true,
+        );
+        let flushed_text = lines_plain_text(&flushed.lines);
+        assert!(
+            flushed_text.contains("read README.md, Cargo.toml"),
+            "{flushed_text}"
+        );
+        assert!(
+            !flushed_text.contains("git status --short"),
+            "{flushed_text}"
+        );
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(active_text.contains("git status --short"), "{active_text}");
+        assert!(!active_text.contains("README.md"), "{active_text}");
+        Ok(())
     }
 
     #[test]
@@ -5297,10 +7028,9 @@ mod redesign_tests {
         let model = transcript::transcript_model(&app, &state).expect("model");
         let text = lines_plain_text(&transcript::all_scrollback_lines(&model, 100));
 
-        assert!(text.contains("subagent repo-explorer"));
-        assert!(text.contains("finished"));
-        assert!(!text.contains("repo-explorer started"));
-        assert!(text.contains("Repository inspected read-only."));
+        assert!(text.contains("subagent repo-explorer started"));
+        assert!(text.contains("subagent repo-explorer finished"));
+        assert!(!text.contains("Repository inspected read-only."));
         assert!(text.contains("This repo is a Rust terminal workbench."));
         assert!(!text.contains("SECRET_CHILD_ONLY.md"));
         Ok(())
@@ -5333,7 +7063,7 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": answer"));
+        assert!(!screen.contains("• answer"));
         assert!(screen.contains("Cargo.toml"));
         Ok(())
     }

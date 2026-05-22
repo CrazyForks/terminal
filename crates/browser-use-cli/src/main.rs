@@ -1051,7 +1051,7 @@ fn default_settings() -> Vec<(&'static str, &'static str)> {
         ("account", "Codex login"),
         ("model", "GPT-5.5"),
         ("provider.model", "gpt-5.5"),
-        ("browser", "Browser Use cloud"),
+        ("browser", "Local Chrome"),
         ("agent.backend", "codex"),
         ("setup.complete", "0"),
     ]

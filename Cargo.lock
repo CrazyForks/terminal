@@ -274,6 +274,7 @@ dependencies = [
  "anyhow",
  "browser-use-core",
  "browser-use-protocol",
+ "browser-use-providers",
  "browser-use-store",
  "clap",
  "crossterm",

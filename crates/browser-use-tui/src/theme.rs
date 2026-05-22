@@ -1,63 +1,63 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub(crate) fn text() -> Color {
-    Color::Rgb(236, 238, 232)
+    Color::Rgb(205, 214, 244)
 }
 
 fn muted_color() -> Color {
-    Color::Rgb(138, 144, 136)
+    Color::Rgb(166, 173, 200)
 }
 
 fn dim_color() -> Color {
-    Color::Rgb(84, 91, 84)
+    Color::Rgb(108, 112, 134)
 }
 
 fn accent_color() -> Color {
-    Color::Rgb(126, 158, 255)
+    Color::Rgb(137, 180, 250)
 }
 
 fn link_color() -> Color {
-    Color::Rgb(119, 196, 255)
+    Color::Rgb(137, 220, 235)
 }
 
 fn path_reference_color() -> Color {
-    Color::Rgb(197, 177, 116)
+    Color::Rgb(250, 179, 135)
 }
 
 fn code_color() -> Color {
-    Color::Rgb(173, 215, 190)
+    Color::Rgb(180, 190, 254)
 }
 
 fn code_background_color() -> Color {
-    Color::Rgb(39, 47, 42)
+    Color::Rgb(49, 50, 68)
 }
 
 fn heading_color() -> Color {
-    Color::Rgb(220, 171, 78)
+    Color::Rgb(250, 179, 135)
 }
 
 fn quote_color() -> Color {
-    Color::Rgb(154, 160, 151)
+    Color::Rgb(147, 153, 178)
 }
 
 fn border_color() -> Color {
-    Color::Rgb(53, 61, 52)
+    Color::Rgb(69, 71, 90)
 }
 
 fn done_color() -> Color {
-    Color::Rgb(142, 202, 129)
+    Color::Rgb(166, 227, 161)
 }
 
 fn running_color() -> Color {
-    Color::Rgb(220, 171, 78)
+    Color::Rgb(250, 179, 135)
 }
 
 fn failed_color() -> Color {
-    Color::Rgb(255, 112, 132)
+    Color::Rgb(243, 139, 168)
 }
 
 fn thought_color() -> Color {
-    Color::Rgb(178, 141, 255)
+    Color::Rgb(203, 166, 247)
 }
 
 pub(crate) fn text_style() -> Style {
@@ -87,7 +87,7 @@ pub(crate) fn border() -> Style {
 }
 
 fn user_prompt_background_color() -> Color {
-    Color::Rgb(38, 42, 38)
+    Color::Rgb(49, 50, 68)
 }
 
 /// Background fill for a user prompt block in the transcript, so the message
@@ -123,7 +123,7 @@ pub(crate) fn markdown_code() -> Style {
 }
 
 pub(crate) fn markdown_code_block() -> Style {
-    Style::default().fg(Color::Rgb(206, 213, 201))
+    Style::default().fg(Color::Rgb(186, 194, 222))
 }
 
 pub(crate) fn markdown_emphasis() -> Style {
@@ -163,8 +163,42 @@ pub(crate) fn failed() -> Style {
 }
 
 pub(crate) fn thought() -> Style {
+    Style::default().fg(thought_color())
+}
+
+pub(crate) fn activity_group() -> Style {
     Style::default()
-        .fg(thought_color())
+        .fg(Color::Rgb(166, 227, 161))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn activity_read() -> Style {
+    Style::default()
+        .fg(Color::Rgb(137, 180, 250))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn activity_run() -> Style {
+    Style::default()
+        .fg(Color::Rgb(250, 179, 135))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn activity_list() -> Style {
+    Style::default()
+        .fg(Color::Rgb(148, 226, 213))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn activity_search() -> Style {
+    Style::default()
+        .fg(Color::Rgb(249, 226, 175))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn activity_task() -> Style {
+    Style::default()
+        .fg(Color::Rgb(180, 190, 254))
         .add_modifier(Modifier::BOLD)
 }
 
@@ -176,7 +210,7 @@ pub(crate) fn status_style(status: &str) -> Style {
     match status {
         "done" => done(),
         "failed" => failed(),
-        "running" | "created" => running(),
+        "running" | "created" | "starting" => running(),
         _ => muted(),
     }
 }

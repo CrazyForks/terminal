@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Terminal Colorway Compare</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        background: #11111b;
+        --fixed-terminal-bg: #151111;
+        color: #cdd6f4;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at 12% 0%, rgba(137, 180, 250, 0.12), transparent 28rem),
+          linear-gradient(180deg, #181825 0%, #11111b 100%);
+      }
+
+      main {
+        width: min(1520px, calc(100vw - 40px));
+        margin: 0 auto;
+        padding: 36px 0 48px;
+      }
+
+      header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 24px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        font-weight: 650;
+        letter-spacing: 0;
+      }
+
+      .intro {
+        max-width: 840px;
+        margin: 0;
+        color: #a6adc8;
+        line-height: 1.55;
+      }
+
+      .recommendation {
+        flex: 0 0 auto;
+        max-width: 360px;
+        border: 1px solid rgba(205, 214, 244, 0.14);
+        border-radius: 8px;
+        padding: 12px 14px;
+        background: rgba(30, 30, 46, 0.74);
+        color: #cdd6f4;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .card {
+        border: 1px solid color-mix(in srgb, var(--border), var(--text) 12%);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--fixed-terminal-bg);
+        box-shadow:
+          0 18px 50px rgba(0, 0, 0, 0.22),
+          inset 0 1px rgba(255, 255, 255, 0.03);
+      }
+
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        background: var(--surface);
+        border-bottom: 1px solid color-mix(in srgb, var(--border), var(--text) 10%);
+      }
+
+      .title-block {
+        min-width: 0;
+      }
+
+      .name {
+        margin: 0;
+        color: var(--text);
+        font-size: 15px;
+        font-weight: 650;
+      }
+
+      .note {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .swatches {
+        display: flex;
+        gap: 5px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .swatch {
+        width: 16px;
+        height: 16px;
+        border-radius: 999px;
+        background: var(--swatch);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+      }
+
+      .legend {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        padding: 12px 16px;
+        background: var(--fixed-terminal-bg);
+        border-bottom: 1px solid color-mix(in srgb, var(--border), var(--text) 10%);
+      }
+
+      .legend-item {
+        min-width: 0;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 6px;
+        padding: 7px 8px;
+        background: rgba(255, 255, 255, 0.025);
+      }
+
+      .legend-label {
+        display: block;
+        margin-bottom: 3px;
+        color: var(--muted);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        font-size: 10px;
+        letter-spacing: 0;
+      }
+
+      .legend-sample {
+        display: block;
+        font-family:
+          "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo,
+          monospace;
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .terminal {
+        min-height: 780px;
+        padding: 18px 18px 22px;
+        background: var(--fixed-terminal-bg);
+        color: var(--text);
+        font-family:
+          "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo,
+          monospace;
+        font-size: 13px;
+        line-height: 1.34;
+        overflow: auto;
+      }
+
+      .line {
+        min-height: 17px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .indent {
+        color: var(--dim);
+      }
+
+      .prompt-mark,
+      .group-colon {
+        color: var(--dim);
+      }
+
+      .prompt-text {
+        color: var(--text);
+      }
+
+      .group {
+        color: var(--group);
+      }
+
+      .action-run,
+      .action-read,
+      .action-list,
+      .action-search,
+      .action-command {
+        color: var(--run);
+      }
+
+      .action-task,
+      .action-follow-up {
+        color: var(--accent);
+        font-weight: 650;
+      }
+
+      .action-working,
+      .action-waiting {
+        color: var(--thought);
+      }
+
+      .action-note {
+        color: var(--muted);
+      }
+
+      .path {
+        color: var(--path);
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .text {
+        color: var(--text);
+      }
+
+      .role-text {
+        color: var(--text);
+      }
+
+      .role-run {
+        color: var(--run);
+      }
+
+      .role-path {
+        color: var(--path);
+      }
+
+      .role-accent {
+        color: var(--accent);
+        font-weight: 650;
+      }
+
+      .role-thought {
+        color: var(--thought);
+      }
+
+      .role-group {
+        color: var(--group);
+      }
+
+      .role-muted {
+        color: var(--muted);
+      }
+
+      .role-dim {
+        color: var(--dim);
+      }
+
+      .sources {
+        margin-top: 24px;
+        color: #a6adc8;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .sources a {
+        color: #89b4fa;
+        text-decoration: none;
+      }
+
+      .sources a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 1100px) {
+        header {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .recommendation {
+          max-width: none;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Terminal Transcript Colorways</h1>
+          <p class="intro">
+            Same transcript sample, same semantic roles. The options focus on
+            muted and pastel palettes that are already familiar in terminal and
+            editor themes.
+          </p>
+        </div>
+        <div class="recommendation">
+          These are intentionally different families now. The terminal
+          background stays fixed; only the semantic role colors change, so each
+          option should have a distinct temperature and accent system.
+        </div>
+      </header>
+
+      <section id="grid" class="grid" aria-label="Colorway comparisons"></section>
+
+      <p class="sources">
+        Palette references:
+        <a href="https://catppuccin.com/palette/">Catppuccin</a>,
+        <a href="https://www.nordtheme.com/">Nord</a>,
+        <a href="https://rosepinetheme.com/palette/ingredients/">Ros&eacute; Pine</a>,
+        <a href="https://github.com/sainnhe/gruvbox-material">Gruvbox Material</a>,
+        <a href="https://everforest.vercel.app/palette">Everforest</a>,
+        and
+        <a href="https://github.com/rebelot/kanagawa.nvim">Kanagawa</a>.
+      </p>
+    </main>
+
+    <script>
+      const transcript = String.raw`    > tell me about this repo
+    : explored
+      list . (100 items)
+
+    : run
+      pwd && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200
+
+    : run
+      /Users/reagan/.superset/projects/browser-use-terminal
+      .browser-use-terminal/state.db
+      .browser-use-terminal/state.db-shm
+      .browser-use-terminal/state.db-wal
+      .env.example
+      ... +51 lines
+
+    : note
+      note: ""
+
+    : explored
+      read README.md
+      read AGENTS.md
+      read Cargo.toml
+      read pyproject.toml
+
+    : note
+      note: Need inspect crates.
+
+    : explored
+      read python/llm_browser_worker/worker.py
+      read crates/browser-use-cli/src/main.rs
+      read crates/browser-use-protocol/src/lib.rs
+      read crates/browser-use-core/src/lib.rs
+
+    : note
+      note: Need more perhaps package names. wait explorer.
+    : subagent repo explorer
+      working
+      waiting on repo_explorer
+      task Read-only exploration of the repository. Identify project purpose, structure, main technologi...
+      list .
+      run pwd && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200
+      read AGENTS.md
+      read pyproject.toml
+      read README.md
+      read Taskfile.yml
+      read Cargo.toml
+      run for f in crates/*/Cargo.toml; do echo '---' $f; sed -n '1,180p' $f; done
+      run find crates -maxdepth 3 -type f \( -name '*.rs' -o -name '*.sql' \) | sort
+      run find python -maxdepth 3 -type f | sort && echo '--- scripts' && find scripts -maxdepth 1 -typ...
+      read crates/browser-use-cli/src/main.rs
+      read python/llm_browser_worker/rust_cli.py
+      read crates/browser-use-tui/src/main.rs
+      read python/llm_browser_worker/worker.py
+      search "#\\[test\\]|#\\[cfg\\(test\\)\\]|fn main|enum Commands|struct Cli|pub fn|pub struct|pub enum" (80 matches)
+      read crates/browser-use-browser/src/lib.rs
+      read crates/browser-use-python-worker/src/lib.rs
+      read crates/browser-use-core/src/lib.rs
+      read crates/browser-use-store/src/lib.rs
+      read crates/browser-use-providers/src/lib.rs`;
+
+      const palettes = [
+        {
+          name: "Catppuccin Frappé",
+          note: "Pastel lavender / soft blue. Current app-theme candidate.",
+          vars: {
+            surface: "#292c3c",
+            border: "#414559",
+            text: "#c6d0f5",
+            muted: "#a5adce",
+            dim: "#737994",
+            group: "#a6d189",
+            run: "#e5c890",
+            path: "#e5c890",
+            accent: "#8caaee",
+            thought: "#ca9ee6",
+          },
+          swatches: ["#8caaee", "#e5c890", "#a6d189", "#81c8be", "#ca9ee6", "#e78284"],
+        },
+        {
+          name: "Nord",
+          note: "Cool arctic blue-gray. Restrained and conventional.",
+          vars: {
+            surface: "#3b4252",
+            border: "#434c5e",
+            text: "#d8dee9",
+            muted: "#88c0d0",
+            dim: "#4c566a",
+            group: "#a3be8c",
+            run: "#ebcb8b",
+            path: "#ebcb8b",
+            accent: "#81a1c1",
+            thought: "#b48ead",
+          },
+          swatches: ["#81a1c1", "#ebcb8b", "#a3be8c", "#8fbcbb", "#b48ead", "#bf616a"],
+        },
+        {
+          name: "Rosé Pine Moon",
+          note: "Rose / violet. Soft, dusky, less blue than Catppuccin.",
+          vars: {
+            surface: "#2a273f",
+            border: "#44415a",
+            text: "#e0def4",
+            muted: "#908caa",
+            dim: "#6e6a86",
+            group: "#3e8fb0",
+            run: "#f6c177",
+            path: "#f6c177",
+            accent: "#9ccfd8",
+            thought: "#c4a7e7",
+          },
+          swatches: ["#9ccfd8", "#f6c177", "#3e8fb0", "#ea9a97", "#c4a7e7", "#eb6f92"],
+        },
+        {
+          name: "Gruvbox Material Soft",
+          note: "Warm earth / ochre. The least pastel, but very low-fatigue.",
+          vars: {
+            surface: "#3c3836",
+            border: "#504945",
+            text: "#ddc7a1",
+            muted: "#a89984",
+            dim: "#7c6f64",
+            group: "#a9b665",
+            run: "#d8a657",
+            path: "#d8a657",
+            accent: "#7daea3",
+            thought: "#d3869b",
+          },
+          swatches: ["#7daea3", "#d8a657", "#a9b665", "#89b482", "#d3869b", "#ea6962"],
+        },
+        {
+          name: "Everforest Soft",
+          note: "Forest green / sage. Muted and organic without going beige.",
+          vars: {
+            surface: "#3a464c",
+            border: "#4f5b58",
+            text: "#d3c6aa",
+            muted: "#859289",
+            dim: "#7a8478",
+            group: "#a7c080",
+            run: "#dbbc7f",
+            path: "#dbbc7f",
+            accent: "#7fbbb3",
+            thought: "#d699b6",
+          },
+          swatches: ["#7fbbb3", "#dbbc7f", "#a7c080", "#83c092", "#d699b6", "#e67e80"],
+        },
+        {
+          name: "Kanagawa Wave",
+          note: "Ink / washi / muted teal. Darker and more Japanese-print inspired.",
+          vars: {
+            surface: "#2a2a37",
+            border: "#363646",
+            text: "#dcd7ba",
+            muted: "#c8c093",
+            dim: "#727169",
+            group: "#98bb6c",
+            run: "#e6c384",
+            path: "#e6c384",
+            accent: "#7e9cd8",
+            thought: "#957fb8",
+          },
+          swatches: ["#7e9cd8", "#e6c384", "#98bb6c", "#6a9589", "#957fb8", "#e82424"],
+        },
+      ];
+
+      const actions = new Set([
+        "read",
+        "run",
+        "list",
+        "search",
+        "task",
+        "working",
+        "waiting",
+        "note",
+      ]);
+
+      function escapeHtml(value) {
+        return value
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      function styleVars(vars) {
+        return Object.entries(vars)
+          .map(([key, value]) => `--${key}: ${value}`)
+          .join("; ");
+      }
+
+      function pathish(token) {
+        const core = token.replace(/^[("'`[{<]+|[)"'`\]},;:>]+$/g, "");
+        return (
+          core.startsWith("/") ||
+          core.startsWith("./") ||
+          core.startsWith("../") ||
+          core.startsWith(".browser-use-terminal/") ||
+          /[A-Za-z0-9_-]+\/[A-Za-z0-9_.\/-]+/.test(core) ||
+          /\.(rs|py|toml|md|yml|yaml|db|sql|json|txt)$/.test(core)
+        );
+      }
+
+      function renderRest(rest) {
+        return rest
+          .split(/(\s+)/)
+          .map((part) => {
+            if (!part) return "";
+            if (/^\s+$/.test(part)) return escapeHtml(part);
+            if (pathish(part)) {
+              return `<span class="path">${escapeHtml(part)}</span>`;
+            }
+            return `<span class="text">${escapeHtml(part)}</span>`;
+          })
+          .join("");
+      }
+
+      function renderLine(line) {
+        if (line.length === 0) return '<div class="line"></div>';
+        const indentMatch = line.match(/^(\s*)(.*)$/);
+        const indent = indentMatch[1];
+        const body = indentMatch[2];
+        const prefix = `<span class="indent">${escapeHtml(indent)}</span>`;
+
+        if (body.startsWith(">")) {
+          return `<div class="line">${prefix}<span class="prompt-mark">&gt;</span><span class="prompt-text">${escapeHtml(body.slice(1))}</span></div>`;
+        }
+
+        if (body.startsWith(": ")) {
+          return `<div class="line">${prefix}<span class="group-colon">:</span><span class="group"> ${escapeHtml(body.slice(2))}</span></div>`;
+        }
+
+        const parts = body.match(/^([^\s]+)(\s*)(.*)$/);
+        if (!parts) {
+          return `<div class="line">${prefix}<span class="text">${escapeHtml(body)}</span></div>`;
+        }
+
+        const action = parts[1];
+        if (!actions.has(action)) {
+          return `<div class="line">${prefix}${renderRest(body)}</div>`;
+        }
+
+        const normalized = action === "follow-up" ? "follow-up" : action;
+        const rest = parts[2] + parts[3];
+        return `<div class="line">${prefix}<span class="action-${normalized}">${escapeHtml(action)}</span>${renderRest(rest)}</div>`;
+      }
+
+      function renderPalette(palette) {
+        const card = document.createElement("article");
+        card.className = "card";
+        card.setAttribute("style", styleVars(palette.vars));
+        card.innerHTML = `
+          <div class="card-header">
+            <div class="title-block">
+              <p class="name">${escapeHtml(palette.name)}</p>
+              <p class="note">${escapeHtml(palette.note)}</p>
+            </div>
+            <div class="swatches" aria-hidden="true">
+              ${palette.swatches.map((swatch) => `<span class="swatch" style="--swatch:${swatch}"></span>`).join("")}
+            </div>
+          </div>
+          <div class="legend">
+            ${renderLegendItem("body", "repo text", "role-text")}
+            ${renderLegendItem("actions", "read / run", "role-run")}
+            ${renderLegendItem("paths", "crates/.../lib.rs", "role-path")}
+            ${renderLegendItem("task", "task", "role-accent")}
+            ${renderLegendItem("status", "working", "role-thought")}
+            ${renderLegendItem("groups", ": subagent", "role-group")}
+            ${renderLegendItem("muted", "note / meta", "role-muted")}
+            ${renderLegendItem("indent", "guides", "role-dim")}
+          </div>
+          <div class="terminal">
+            ${transcript.split("\n").map(renderLine).join("")}
+          </div>
+        `;
+        return card;
+      }
+
+      function renderLegendItem(label, sample, className) {
+        return `
+          <div class="legend-item">
+            <span class="legend-label">${escapeHtml(label)}</span>
+            <span class="legend-sample ${className}">${escapeHtml(sample)}</span>
+          </div>
+        `;
+      }
+
+      const grid = document.getElementById("grid");
+      palettes.forEach((palette) => grid.appendChild(renderPalette(palette)));
+    </script>
+  </body>
+</html>
