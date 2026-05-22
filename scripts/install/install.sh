@@ -738,12 +738,14 @@ update_visible_commands() {
   write_hybrid_wrapper browser-use-terminal
 }
 
-verify_visible_command() {
-  BUT_AUTO_UPDATE=0 "$BIN_DIR/but" --version >/dev/null
-  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser" --version >/dev/null
-  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser-use" --version >/dev/null
-  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser-use-terminal" --version >/dev/null
-}
+verify_visible_command() (
+  BUT_AUTO_UPDATE=0
+  export BUT_AUTO_UPDATE
+  "$BIN_DIR/but" --version >/dev/null
+  "$BIN_DIR/browser" --version >/dev/null
+  "$BIN_DIR/browser-use" --version >/dev/null
+  "$BIN_DIR/browser-use-terminal" --version >/dev/null
+)
 
 parse_args "$@"
 
