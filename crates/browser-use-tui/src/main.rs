@@ -6546,7 +6546,7 @@ mod redesign_tests {
         )?;
         app.drain_store_notifications()?;
         let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(streaming, prompt_only);
+        assert_eq!(streaming, prompt_only.saturating_sub(1));
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
         assert!(!streaming_screen.contains("thinking"));

@@ -235,6 +235,17 @@ impl TranscriptNode {
         }
     }
 
+    fn needs_leading_status_padding(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::PendingStatus { .. } => true,
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .find(|node| !node.is_active_viewport_placeholder())
+                .is_some_and(TranscriptNode::needs_leading_status_padding),
+            _ => false,
+        }
+    }
+
     fn is_prompt(&self) -> bool {
         matches!(self.kind, TranscriptKind::Prompt { .. })
     }
@@ -418,6 +429,9 @@ pub(crate) fn active_viewport_lines(
         None,
         false,
     );
+    if active.needs_leading_status_padding() && !lines.is_empty() {
+        lines.insert(0, Line::from(""));
+    }
     if lines.len() > height as usize {
         let start = lines.len().saturating_sub(height as usize);
         lines = lines.into_iter().skip(start).collect();
@@ -444,6 +458,9 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
         Some(&mut skip),
         false,
     );
+    if active.needs_leading_status_padding() && !lines.is_empty() {
+        lines.insert(0, Line::from(""));
+    }
     if lines.len() > height as usize {
         let start = lines.len().saturating_sub(height as usize);
         lines = lines.into_iter().skip(start).collect();
