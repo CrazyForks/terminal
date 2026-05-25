@@ -4207,12 +4207,12 @@ fn parse_responses_sse_stream(
 ) -> Result<()> {
     let mut stream_state = CodexSseStreamState::default();
     emit_responses_header_events(response.headers(), &mut stream_state, on_event)?;
-    let is_event_stream = response
+    let is_json_response = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| content_type.contains("text/event-stream"));
-    if !is_event_stream {
+        .is_some_and(|content_type| content_type.contains("application/json"));
+    if is_json_response {
         let body_text = response.text().context("read Responses JSON body")?;
         let body: Value = serde_json::from_str(&body_text).map_err(|error| {
             ProviderError::retryable(format!("parse Responses JSON: {error}"), None)
@@ -7467,6 +7467,46 @@ mod tests {
         assert!(events.contains(&ModelEvent::ResponseCompleted {
             response_id: Some("resp_123".to_string()),
             end_turn: Some(false),
+        }));
+        assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_parses_sse_without_content_type_like_codex_backend() -> Result<()> {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_no_content_type\",\"output\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Paris\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_content_type\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![MockHttpResponse::new(
+            200,
+            "OK",
+            sse,
+            "text/event-stream",
+        )
+        .without_content_type()])?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Paris".to_string(),
         }));
         assert!(events.contains(&ModelEvent::Done));
         Ok(())
@@ -10762,7 +10802,7 @@ mod tests {
         status: u16,
         reason: &'static str,
         body: String,
-        content_type: &'static str,
+        content_type: Option<&'static str>,
         headers: Vec<(&'static str, &'static str)>,
     }
 
@@ -10777,9 +10817,14 @@ mod tests {
                 status,
                 reason,
                 body: body.into(),
-                content_type,
+                content_type: Some(content_type),
                 headers: Vec::new(),
             }
+        }
+
+        fn without_content_type(mut self) -> Self {
+            self.content_type = None;
+            self
         }
 
         fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
@@ -10789,16 +10834,20 @@ mod tests {
     }
 
     fn mock_http_response_bytes(response: &MockHttpResponse) -> String {
+        let content_type_header = response
+            .content_type
+            .map(|content_type| format!("Content-Type: {content_type}\r\n"))
+            .unwrap_or_default();
         let extra_headers = response
             .headers
             .iter()
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect::<String>();
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.status,
             response.reason,
-            response.content_type,
+            content_type_header,
             extra_headers,
             response.body.len(),
             response.body

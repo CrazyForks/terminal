@@ -452,10 +452,12 @@ pub struct AgentRunOptions {
     pub browser_mode: Option<String>,
     pub collaboration_mode: CollaborationModeKind,
     pub include_environment_context: bool,
+    pub include_permissions_instructions: bool,
     pub environment_context_environments: Vec<EnvironmentContextEnvironment>,
     pub environment_context_network: Option<EnvironmentNetworkContext>,
     pub config_profile: Option<String>,
     pub config_overrides: ConfigOverrides,
+    pub session_thread_config: Option<toml::Value>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
     pub model_provider_id: Option<String>,
@@ -478,10 +480,12 @@ impl Default for AgentRunOptions {
             browser_mode: None,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
+            include_permissions_instructions: true,
             environment_context_environments: Vec::new(),
             environment_context_network: None,
             config_profile: None,
             config_overrides: Vec::new(),
+            session_thread_config: None,
             base_instructions: None,
             developer_instructions: None,
             model_provider_id: None,
@@ -514,6 +518,11 @@ impl AgentRunOptions {
         self
     }
 
+    pub fn with_include_permissions_instructions(mut self, include: bool) -> Self {
+        self.include_permissions_instructions = include;
+        self
+    }
+
     pub fn with_environment_context_environments(
         mut self,
         environments: Vec<EnvironmentContextEnvironment>,
@@ -534,6 +543,19 @@ impl AgentRunOptions {
 
     pub fn with_config_overrides(mut self, overrides: Vec<(String, toml::Value)>) -> Self {
         self.config_overrides = overrides;
+        self
+    }
+
+    pub fn with_session_thread_config(mut self, config: toml::Value) -> Self {
+        self.session_thread_config = Some(config);
+        self
+    }
+
+    pub fn with_session_thread_config_overrides(
+        mut self,
+        overrides: Vec<(String, toml::Value)>,
+    ) -> Self {
+        self.session_thread_config = Some(build_config_overrides_layer(&overrides));
         self
     }
 
@@ -746,11 +768,9 @@ pub fn append_workspace_context_event_with_options(
     };
     let latest_environment_snapshot = || latest_environment_snapshot_from_events(&events);
     let agents_context = if !has_context_kind(WORKSPACE_CONTEXT_AGENTS_KIND) {
-        let config_profile = options.config_profile.as_deref();
-        Some(load_agents_md_context_for_cwd_with_options(
+        Some(load_agents_md_context_for_cwd_with_run_options(
             Path::new(&session.cwd),
-            config_profile,
-            &options.config_overrides,
+            options,
         )?)
     } else {
         None
@@ -769,6 +789,10 @@ pub fn append_workspace_context_event_with_options(
     let config_include_environment_context = agents_context
         .as_ref()
         .is_none_or(|load| load.include_environment_context);
+    let config_include_permissions_instructions = options.include_permissions_instructions
+        && agents_context
+            .as_ref()
+            .is_none_or(|load| load.include_permissions_instructions);
     let config_include_collaboration_mode_instructions = agents_context
         .as_ref()
         .is_none_or(|load| load.include_collaboration_mode_instructions);
@@ -777,16 +801,23 @@ pub fn append_workspace_context_event_with_options(
     let multi_agent_v2_usage_hint =
         if !has_context_kind(WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND) {
             if let Some(agents_context) = agents_context.as_ref() {
-                multi_agent_v2_usage_hint_text_for_session(session, &agents_context.multi_agent_v2)
+                multi_agent_v2_usage_hint_text_for_session(
+                    session,
+                    agents_context.multi_agent_enabled,
+                    &agents_context.multi_agent_v2,
+                )
             } else {
                 let mut warnings = Vec::new();
-                let config = load_agents_md_config(
+                let config = load_agents_md_config_for_options(
                     Path::new(&session.cwd),
                     &mut warnings,
-                    options.config_profile.as_deref(),
-                    &options.config_overrides,
+                    options,
                 )?;
-                multi_agent_v2_usage_hint_text_for_session(session, &config.multi_agent_v2)
+                multi_agent_v2_usage_hint_text_for_session(
+                    session,
+                    config.multi_agent_enabled,
+                    &config.multi_agent_v2,
+                )
             }
         } else {
             None
@@ -803,21 +834,29 @@ pub fn append_workspace_context_event_with_options(
         appended = true;
     }
     if !has_context_kind(WORKSPACE_CONTEXT_PERMISSIONS_KIND) {
-        let mut developer_sections = vec![default_permissions_instructions().to_string()];
+        let mut developer_sections = Vec::new();
+        if config_include_permissions_instructions {
+            developer_sections.push(default_permissions_instructions().to_string());
+        }
         if let Some(developer_instructions) = config_developer_instructions {
             developer_sections.push(developer_instructions);
         }
         if let Some(collaboration_context) = collaboration_context.as_ref() {
             developer_sections.push(collaboration_context.clone());
         }
-        store.append_event(
-            &session.id,
-            "workspace.context",
+        let payload = if developer_sections.is_empty() {
+            serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
+                "suppressed": true,
+            })
+        } else {
             serde_json::json!({
                 "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
                 "content": developer_sections.join("\n\n"),
-            }),
-        )?;
+                "permissions_instructions_included": config_include_permissions_instructions,
+            })
+        };
+        store.append_event(&session.id, "workspace.context", payload)?;
         appended = true;
     } else if let Some(collaboration_context) = collaboration_context.as_ref() {
         let latest_collaboration_context = events.iter().rev().find_map(|event| {
@@ -959,8 +998,12 @@ pub fn append_workspace_context_event_with_options(
 
 fn multi_agent_v2_usage_hint_text_for_session(
     session: &SessionMeta,
+    multi_agent_enabled: bool,
     config: &MultiAgentV2Config,
 ) -> Option<String> {
+    if !multi_agent_enabled {
+        return None;
+    }
     let hint = if session.parent_id.is_some() {
         config.subagent_usage_hint_text.as_deref()
     } else {
@@ -1316,12 +1359,8 @@ fn load_provider_config_for_session(
     options: &AgentRunOptions,
 ) -> Result<AgentsMdConfig> {
     let mut warnings = Vec::new();
-    let mut config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let mut config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let selected_provider_id = options
         .model_provider_id
         .as_deref()
@@ -2316,12 +2355,8 @@ fn codex_beta_features_header_for_session(
     options: &AgentRunOptions,
 ) -> Result<Option<String>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config.beta_features_header())
 }
 
@@ -4189,12 +4224,8 @@ fn provider_base_instructions_for_session(
     model: &str,
 ) -> Result<Option<String>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let events = store.events_for_session(&session.id)?;
     let persisted = session_base_instructions_from_events(&events);
 
@@ -4536,10 +4567,46 @@ fn append_session_config_snapshot_event(
 }
 
 fn config_has_any_override(options: &AgentRunOptions, keys: &[&str], prefixes: &[String]) -> bool {
-    options.config_overrides.iter().any(|(key, _)| {
-        keys.iter().any(|candidate| key == candidate)
-            || prefixes.iter().any(|prefix| key.starts_with(prefix))
+    config_override_pairs_have_any_override(&options.config_overrides, keys, prefixes)
+        || options
+            .session_thread_config
+            .as_ref()
+            .is_some_and(|value| toml_value_has_any_override(value, "", keys, prefixes))
+}
+
+fn config_override_pairs_have_any_override(
+    overrides: &[(String, toml::Value)],
+    keys: &[&str],
+    prefixes: &[String],
+) -> bool {
+    overrides
+        .iter()
+        .any(|(key, _)| config_path_matches(key, keys, prefixes))
+}
+
+fn toml_value_has_any_override(
+    value: &toml::Value,
+    prefix: &str,
+    keys: &[&str],
+    prefixes: &[String],
+) -> bool {
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    table.iter().any(|(key, value)| {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        config_path_matches(&path, keys, prefixes)
+            || toml_value_has_any_override(value, &path, keys, prefixes)
     })
+}
+
+fn config_path_matches(key: &str, keys: &[&str], prefixes: &[String]) -> bool {
+    keys.iter().any(|candidate| key == *candidate)
+        || prefixes.iter().any(|prefix| key.starts_with(prefix))
 }
 
 fn should_use_snapshot_model_settings(
@@ -4582,12 +4649,11 @@ fn should_use_snapshot_provider_runtime_config(options: &AgentRunOptions) -> boo
 fn run_config_has_model_resume_override(config: &ProviderRunConfig) -> bool {
     config.model_source == RunConfigValueSource::Explicit
         || config.options.model_provider_id_source == RunConfigValueSource::Explicit
-        || config.options.config_overrides.iter().any(|(key, _)| {
-            matches!(
-                key.as_str(),
-                "model" | "model_provider" | "model_reasoning_effort"
-            )
-        })
+        || config_has_any_override(
+            &config.options,
+            &["model", "model_provider", "model_reasoning_effort"],
+            &[],
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5641,12 +5707,8 @@ fn model_switch_context_for_session(
         return Ok(None);
     }
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let Some(model_instructions) = config.default_base_instructions_for_model(next_model) else {
         return Ok(None);
     };
@@ -5670,12 +5732,8 @@ fn personality_context_for_session(
     }
 
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let Some(personality_message) =
         default_personality_message_for_model_and_personality_with_catalog(
             next_model,
@@ -5721,12 +5779,8 @@ fn provider_model_request_settings_for_session(
     options: &AgentRunOptions,
 ) -> Result<ModelRequestSettings> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let mut settings = config.model_request_settings;
     if options.collaboration_mode == CollaborationModeKind::Plan {
         settings.reasoning_effort = Some(
@@ -5744,12 +5798,8 @@ fn resolved_model_request_info_for_session(
     model: &str,
 ) -> Result<browser_use_providers::ModelRequestInfo> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(resolved_model_request_info_from_config(&config, model))
 }
 
@@ -5791,12 +5841,8 @@ fn provider_request_max_retries_for_session(
     model_provider_id: &str,
 ) -> Result<Option<usize>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config
         .provider_request_max_retries
         .get(model_provider_id)
@@ -5810,12 +5856,8 @@ fn provider_stream_config_for_session(
     model_provider_id: &str,
 ) -> Result<(Option<usize>, Option<u64>)> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok((
         config
             .provider_stream_max_retries
@@ -5834,12 +5876,8 @@ fn provider_personality_for_session(
     options: &AgentRunOptions,
 ) -> Result<ModelPersonality> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config.personality)
 }
 
@@ -6816,6 +6854,16 @@ where
         let Some(kind) = event.payload.get("kind").and_then(Value::as_str) else {
             continue;
         };
+        if kind == WORKSPACE_CONTEXT_PERMISSIONS_KIND
+            && event
+                .payload
+                .get("suppressed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            saw_permissions = true;
+            continue;
+        }
         let Some(content) = event.payload.get("content").and_then(Value::as_str) else {
             continue;
         };
@@ -7608,13 +7656,12 @@ fn browser_tool_registry_for_session(
     namespace_tools_supported: bool,
 ) -> Result<ToolRegistry> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let mut multi_agent_tool_config = config.multi_agent_v2.tool_spec_config();
+    if !config.multi_agent_enabled {
+        multi_agent_tool_config.family = MultiAgentToolFamily::Disabled;
+    }
     if multi_agent_tool_config.family == MultiAgentToolFamily::V1 || !namespace_tools_supported {
         multi_agent_tool_config.tool_namespace = None;
     }
@@ -8705,8 +8752,10 @@ struct AgentsMdLoad {
     sources: Vec<String>,
     warnings: Vec<String>,
     developer_instructions: Option<String>,
+    include_permissions_instructions: bool,
     include_collaboration_mode_instructions: bool,
     include_environment_context: bool,
+    multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
     #[allow(dead_code)]
     base_instructions: Option<String>,
@@ -8968,13 +9017,41 @@ fn agents_md_context_for_cwd_with_options(
     Ok(load_agents_md_context_for_cwd_with_options(cwd, config_profile, config_overrides)?.context)
 }
 
+#[cfg(test)]
 fn load_agents_md_context_for_cwd_with_options(
     cwd: &Path,
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<AgentsMdLoad> {
+    load_agents_md_context_for_cwd_with_thread_config(cwd, config_profile, config_overrides, None)
+}
+
+fn load_agents_md_context_for_cwd_with_run_options(
+    cwd: &Path,
+    options: &AgentRunOptions,
+) -> Result<AgentsMdLoad> {
+    load_agents_md_context_for_cwd_with_thread_config(
+        cwd,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+        options.session_thread_config.as_ref(),
+    )
+}
+
+fn load_agents_md_context_for_cwd_with_thread_config(
+    cwd: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    session_thread_config: Option<&toml::Value>,
+) -> Result<AgentsMdLoad> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(cwd, &mut warnings, config_profile, config_overrides)?;
+    let config = load_agents_md_config_with_thread_config(
+        cwd,
+        &mut warnings,
+        config_profile,
+        config_overrides,
+        session_thread_config,
+    )?;
     let mut sources = Vec::new();
     let mut parts = Vec::new();
     if let Some((path, text)) = load_global_agents_md(&mut warnings) {
@@ -9016,8 +9093,10 @@ fn load_agents_md_context_for_cwd_with_options(
         warnings,
         base_instructions,
         developer_instructions: config.developer_instructions,
+        include_permissions_instructions: config.include_permissions_instructions,
         include_collaboration_mode_instructions: config.include_collaboration_mode_instructions,
         include_environment_context: config.include_environment_context,
+        multi_agent_enabled: config.multi_agent_enabled,
         multi_agent_v2: config.multi_agent_v2,
     })
 }
@@ -9089,8 +9168,10 @@ struct AgentsMdConfig {
     model_instructions_file: Option<PathBuf>,
     developer_instructions: Option<String>,
     agent_roles: BTreeMap<String, AgentRoleDefinition>,
+    multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
     personality: ModelPersonality,
+    include_permissions_instructions: bool,
     include_collaboration_mode_instructions: bool,
     include_environment_context: bool,
     model_request_settings: ModelRequestSettings,
@@ -9120,8 +9201,10 @@ impl Default for AgentsMdConfig {
             model_instructions_file: None,
             developer_instructions: None,
             agent_roles: BTreeMap::new(),
+            multi_agent_enabled: true,
             multi_agent_v2: MultiAgentV2Config::default(),
             personality: ModelPersonality::Pragmatic,
+            include_permissions_instructions: true,
             include_collaboration_mode_instructions: true,
             include_environment_context: true,
             model_request_settings: ModelRequestSettings::default(),
@@ -9286,6 +9369,30 @@ fn load_agents_md_config(
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<AgentsMdConfig> {
+    load_agents_md_config_with_thread_config(cwd, warnings, config_profile, config_overrides, None)
+}
+
+fn load_agents_md_config_for_options(
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+    options: &AgentRunOptions,
+) -> Result<AgentsMdConfig> {
+    load_agents_md_config_with_thread_config(
+        cwd,
+        warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+        options.session_thread_config.as_ref(),
+    )
+}
+
+fn load_agents_md_config_with_thread_config(
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    session_thread_config: Option<&toml::Value>,
+) -> Result<AgentsMdConfig> {
     let mut config = AgentsMdConfig::default();
     let Some(base) = codex_home_dir() else {
         return Ok(config);
@@ -9375,6 +9482,10 @@ fn load_agents_md_config(
         )?;
     }
 
+    if let Some(session_thread_config) = session_thread_config {
+        apply_session_thread_config_layer(&mut config, session_thread_config, cwd, warnings)?;
+    }
+
     let managed_config_path = managed_codex_config_path(&base);
     if let Some(managed_config) = read_codex_config_toml(&managed_config_path)? {
         apply_agents_md_config_layer(
@@ -9418,6 +9529,50 @@ fn build_config_overrides_layer(config_overrides: &[(String, toml::Value)]) -> t
         apply_toml_override(&mut root, path, value.clone());
     }
     root
+}
+
+fn apply_session_thread_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        bail!("Invalid session thread config: expected a TOML table.");
+    };
+    validate_session_thread_config_features(value)?;
+    let mut layer = toml::map::Map::new();
+    for key in ["model_provider", "model_providers", "features"] {
+        if let Some(value) = table.get(key) {
+            layer.insert(key.to_string(), value.clone());
+        }
+    }
+    if layer.is_empty() {
+        return Ok(());
+    }
+    apply_agents_md_config_layer(
+        config,
+        &toml::Value::Table(layer),
+        Path::new("session thread config"),
+        cwd,
+        ConfigLayerKind::NonProject,
+        warnings,
+    )
+}
+
+fn validate_session_thread_config_features(value: &toml::Value) -> Result<()> {
+    let Some(features) = value.get("features") else {
+        return Ok(());
+    };
+    let Some(features) = features.as_table() else {
+        bail!("Invalid session thread config `features`: expected a table.");
+    };
+    for (key, value) in features {
+        if !value.is_bool() {
+            bail!("Invalid session thread config `features.{key}`: expected a boolean.");
+        }
+    }
+    Ok(())
 }
 
 fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
@@ -9868,6 +10023,11 @@ fn apply_agents_md_config_layer(
     {
         config.include_environment_context = include_environment_context;
     }
+    if let Some(include_permissions_instructions) =
+        toml_optional_bool(value, "include_permissions_instructions", path)?
+    {
+        config.include_permissions_instructions = include_permissions_instructions;
+    }
     if let Some(include_collaboration_mode_instructions) =
         toml_optional_bool(value, "include_collaboration_mode_instructions", path)?
     {
@@ -9946,6 +10106,11 @@ fn apply_codex_features_config_layer(
             path.display()
         );
     };
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "multi_agent"], path)?
+    {
+        config.multi_agent_enabled = enabled;
+    }
     for (key, value) in features {
         if !config.advertised_beta_features.contains_key(key.as_str()) {
             continue;
@@ -20269,6 +20434,129 @@ command = "print-token"
     }
 
     #[test]
+    fn workspace_context_can_disable_permissions_but_keep_developer_and_collaboration_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\ndeveloper_instructions = \"Stay focused.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert_eq!(messages[0]["role"], "developer");
+        assert!(!developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("Stay focused."));
+        assert!(developer_text.contains("<collaboration_mode># Collaboration Mode: Default"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_parses_include_permissions_instructions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\n",
+        )?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+        assert!(!config.include_permissions_instructions);
+
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = \"false\"\n",
+        )?;
+        let error = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })
+        .expect_err("non-bool include_permissions_instructions should fail");
+        assert!(error.to_string().contains("expected a boolean"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_runtime_option_can_disable_permissions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_include_permissions_instructions(false);
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(!developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("<collaboration_mode># Collaboration Mode: Default"));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_does_not_reinject_suppressed_permissions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\ninclude_collaboration_mode_instructions = false\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event.payload["kind"] == WORKSPACE_CONTEXT_PERMISSIONS_KIND
+                && event.payload["suppressed"] == true
+        }));
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(2000),
+        })];
+
+        maybe_compact_messages(&store, &session.id, &mut messages, 500)?;
+
+        assert!(messages
+            .iter()
+            .all(|message| !message_content_text(message).contains("<permissions instructions>")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("name").and_then(Value::as_str)
+                == Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)));
+        Ok(())
+    }
+
+    #[test]
     fn workspace_context_can_disable_collaboration_mode_instructions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -22003,6 +22291,117 @@ command = "print-token"
         assert!(error.to_string().contains(
             "Failed to decode Codex managed preferences `com.openai.codex:config_toml_base64`"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_config_overrides_request_provider_and_features_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let request_overrides = vec![
+            (
+                "model_provider".to_string(),
+                toml::Value::String("request".to_string()),
+            ),
+            (
+                "model_providers.request.name".to_string(),
+                toml::Value::String("Request".to_string()),
+            ),
+            (
+                "features.remote_compaction_v2".to_string(),
+                toml::Value::Boolean(false),
+            ),
+            (
+                "features.multi_agent".to_string(),
+                toml::Value::Boolean(true),
+            ),
+        ];
+        let thread_config: toml::Value = r#"
+model_provider = "thread"
+
+[features]
+remote_compaction_v2 = true
+multi_agent = false
+
+[model_providers.thread]
+name = "Thread"
+request_max_retries = 7
+"#
+        .parse()?;
+        let options = AgentRunOptions::default()
+            .with_config_overrides(request_overrides)
+            .with_session_thread_config(thread_config);
+
+        let (config, headers, specs) = with_codex_home(&codex_home, || -> Result<_> {
+            let config = load_provider_config_for_session(&session, &options)?;
+            let headers = codex_responses_extra_headers(&store, &session, &options, None)?;
+            let specs = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?;
+            Ok((config, headers, specs))
+        })?;
+
+        assert_eq!(config.model_provider_id.as_deref(), Some("thread"));
+        assert_eq!(
+            config.provider_request_max_retries.get("thread").copied(),
+            Some(7)
+        );
+        assert!(headers
+            .get(CODEX_BETA_FEATURES_HEADER)
+            .is_some_and(|features| features.contains("remote_compaction_v2")));
+        assert!(!config.multi_agent_enabled);
+        assert!(!specs.iter().any(|spec| spec.name == "spawn_agent"));
+        assert!(!specs.iter().any(|spec| spec.name == "tool_search"));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_config_loses_to_managed_config_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            r#"
+model_provider = "managed"
+
+[features]
+remote_compaction_v2 = false
+multi_agent = false
+
+[model_providers.managed]
+name = "Managed"
+"#,
+        )?;
+        let thread_config: toml::Value = r#"
+model_provider = "thread"
+
+[features]
+remote_compaction_v2 = true
+multi_agent = true
+
+[model_providers.thread]
+name = "Thread"
+"#
+        .parse()?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config_with_thread_config(
+                temp.path(),
+                &mut warnings,
+                None,
+                &[],
+                Some(&thread_config),
+            )
+        })?;
+
+        assert_eq!(config.model_provider_id.as_deref(), Some("managed"));
+        assert!(!config
+            .beta_features_header()
+            .unwrap_or_default()
+            .contains("remote_compaction_v2"));
+        assert!(!config.multi_agent_enabled);
+        assert!(config.model_providers.contains_key("managed"));
         Ok(())
     }
 

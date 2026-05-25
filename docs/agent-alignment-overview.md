@@ -61,6 +61,12 @@ using a subagent with Codex auth whenever the behavior can be exercised through
 Codex. That reference check is part of the acceptance gate, not optional
 research.
 
+Each loop that can affect provider transport, request shaping, tool runtime, or
+subagent behavior also runs a cheap Codex-auth health smoke: a direct root
+`run-codex` prompt and a spawned child `run-codex-session` reading a tiny local
+file. If the smoke fails, fixing that blocker takes priority over more parity
+work.
+
 The working rule is simple: if a difference can affect agent quality, it stays
 open until it is either fixed or deliberately rejected with evidence. If several
 related differences can be fixed in the same loop, fix all of them in that loop.
@@ -181,7 +187,41 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch intentionally took a larger step and closed two separate
+The latest batch took the next high-impact G-032 cluster and added a represented
+Codex effective-config/session-thread-config layer plus permission/feature
+gating behavior that directly affects model-visible context and tool choice. A
+mandatory Codex-auth smoke then exposed a G-026 provider blocker, which was
+fixed in the same loop: the ChatGPT Codex backend can return a valid SSE body
+without a `Content-Type` header, so the local parser now treats only explicit
+`application/json` responses as whole JSON and otherwise stays on the SSE path.
+
+- `AgentRunOptions` now accepts a session-thread-config layer that mirrors
+  Codex `SessionThreadConfig`: `model_provider`, `model_providers`, and boolean
+  `features`.
+- That layer is applied after ordinary request/session config overrides and
+  before managed config, matching Codex equal-precedence insertion order. It now
+  drives provider selection, beta-feature headers, model request metadata, tool
+  schemas, base/personality context, and snapshot invalidation consistently.
+- `include_permissions_instructions = false` now suppresses only the default
+  permissions block. Runtime developer instructions and collaboration-mode
+  instructions still reach the model, and a non-model-visible suppression marker
+  prevents compaction from reintroducing default permissions later.
+- Runtime options can also suppress permissions instructions for the current
+  run.
+- `features.multi_agent = false` now disables the multi-agent tool family,
+  including deferred v1 tool search, while leaving the rest of the terminal tool
+  surface intact.
+- The Codex-auth health smoke is now documented as a standing gate. After the
+  provider fix, the root smoke completed with `Paris`, and the spawned child
+  smoke read `/tmp/but-codex-subagent-smoke.txt` and completed with
+  `subagent-smoke-ok`.
+- Focused tests cover thread-config precedence over request overrides,
+  managed-config precedence over thread config, permission suppression with
+  developer/collaboration preservation, compaction replay, multi-agent gating,
+  and headerless Codex SSE parsing. Full Rust/Python verification and the
+  Codex-auth root/subagent smokes passed after the provider fix.
+
+The previous batch intentionally took a larger step and closed two separate
 agent-quality clusters: G-033 typed input production/replay across top-level
 CLI/TUI/multi-agent paths, and the next G-028 unified-exec completion/drain
 contract.
@@ -212,11 +252,12 @@ contract.
 - Full terminal verification passed through `scripts/verify-terminal-ui.sh`,
   including Rust/Python suites, deterministic dumps, real tmux terminal smoke,
   and artifact inspection under `/tmp/but-design-loop`.
-- Read-only subagent audits kept the next high-impact G-032 cluster open:
-  Codex-style effective config/thread-config layering and
-  `include_permissions_instructions` gating.
+- Read-only subagent audits kept the remaining G-032 provenance/product
+  surfaces open: full app-server thread-config protocol, effective-config
+  display/provenance, hosted web-search/image-generation feature surfaces, and
+  `shell_tool`/`unified_exec` feature gates.
 
-The previous batch closed two model-visible parity slices: G-032 typed runtime
+The batch before that closed two model-visible parity slices: G-032 typed runtime
 instruction overrides and a G-028 unified-exec response/shell fidelity cluster.
 
 - `AgentRunOptions` now has typed `base_instructions` and

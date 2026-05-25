@@ -93,6 +93,7 @@ pub(crate) struct MultiAgentToolSpecConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultiAgentToolFamily {
+    Disabled,
     V1,
     V2,
 }
@@ -191,6 +192,7 @@ impl ToolRegistry {
         registry.register(browser_script_tool_spec(), ToolHandlerKind::BrowserScript);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         match multi_agent_config.family {
+            MultiAgentToolFamily::Disabled => {}
             MultiAgentToolFamily::V1 => {
                 registry.register_with_exposure(
                     spawn_agent_v1_tool_spec(
