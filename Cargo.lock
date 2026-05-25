@@ -637,6 +637,7 @@ name = "browser-use-cli"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "browser-use-browser",
  "browser-use-core",
  "browser-use-protocol",
  "browser-use-providers",

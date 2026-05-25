@@ -8331,7 +8331,7 @@ fn dispatch_browser_preference_command(
     session: &browser_use_protocol::SessionMeta,
     cmd: &str,
 ) -> Result<Option<Value>> {
-    let argv = browser_command_words(cmd);
+    let argv = browser_command_words(cmd)?;
     let args = strip_browser_prefix(&argv);
     let Some(first) = args.first().map(String::as_str) else {
         return Ok(None);
@@ -8390,7 +8390,7 @@ fn dispatch_browser_profile_preference(
             Ok(json!({
                 "status": "ok",
                 "profile_id": profile_id,
-                "next_step": "browser connect",
+                "next_step": browser_profile_connect_next_step("local", Some(profile_id)),
             }))
         }
         Some("remember") => {
@@ -8424,10 +8424,14 @@ fn dispatch_browser_profile_preference(
                 "browser",
                 browser_display_name(value["mode"].as_str().unwrap_or("local")),
             )?;
+            let next_step = browser_profile_connect_next_step(
+                value["mode"].as_str().unwrap_or("local"),
+                value["profile_id"].as_str(),
+            );
             Ok(json!({
                 "status": "ok",
                 "remembered": value,
-                "next_step": "browser connect",
+                "next_step": next_step,
             }))
         }
         Some("forget") => {
@@ -8456,12 +8460,21 @@ fn dispatch_browser_profile_preference(
                     "profiles": [],
                 })
             });
+            let next_step = remembered.as_ref().map_or_else(
+                || "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>".to_string(),
+                |remembered| {
+                    browser_profile_connect_next_step(
+                        remembered["mode"].as_str().unwrap_or("local"),
+                        remembered["profile_id"].as_str(),
+                    )
+                },
+            );
             Ok(json!({
                 "status": "ok",
                 "domain": normalize_domain(&domain),
                 "remembered": remembered,
                 "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
-                "next_step": if remembered.is_some() { "browser connect" } else { "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>" },
+                "next_step": next_step,
             }))
         }
         Some(other) => bail!("unknown browser profile command: {other}"),
@@ -8470,14 +8483,23 @@ fn dispatch_browser_profile_preference(
 }
 
 fn resolve_browser_connect_command(store: &Store, cmd: &str) -> Result<String> {
-    let argv = browser_command_words(cmd);
+    let argv = browser_command_words(cmd)?;
     let args = strip_browser_prefix(&argv);
     if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
         let mode = store
             .get_setting(BROWSER_PREF_MODE)?
             .unwrap_or_else(|| "local".to_string());
+        let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
         let command = match normalize_browser_preference_mode(&mode)? {
-            "cloud" => "browser remote start",
+            "cloud" => {
+                if let Some(profile_id) = profile_id.as_deref().filter(|value| !value.is_empty()) {
+                    return Ok(format!(
+                        "browser remote start --profile-id {}",
+                        shell_quote_browser_arg(profile_id)
+                    ));
+                }
+                "browser remote start"
+            }
             "managed-headless" => "browser connect managed --headless",
             "managed-headed" => "browser connect managed --headed",
             "local" => "browser connect local",
@@ -8535,8 +8557,41 @@ fn remembered_domain_profile(store: &Store, domain: &str) -> Result<Option<Value
         .transpose()
 }
 
-fn browser_command_words(cmd: &str) -> Vec<String> {
-    cmd.split_whitespace().map(ToOwned::to_owned).collect()
+fn browser_command_words(cmd: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = cmd.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        bail!("unterminated quote in browser command");
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
 }
 
 fn strip_browser_prefix(argv: &[String]) -> Vec<String> {
@@ -8551,6 +8606,17 @@ fn option_value_core(argv: &[String], flag: &str) -> Option<String> {
     argv.windows(2)
         .find(|window| window[0] == flag)
         .map(|window| window[1].clone())
+}
+
+fn shell_quote_browser_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '/' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn normalize_domain(domain: &str) -> String {
@@ -8568,6 +8634,32 @@ fn browser_domain_profile_key(domain: &str) -> String {
         "{BROWSER_DOMAIN_PROFILE_PREFIX}{}",
         normalize_domain(domain)
     )
+}
+
+fn browser_profile_connect_next_step(mode: &str, profile_id: Option<&str>) -> String {
+    let profile_id = profile_id.filter(|value| !value.is_empty());
+    match normalize_browser_preference_mode(mode).unwrap_or("local") {
+        "cloud" => profile_id.map_or_else(
+            || "browser remote start".to_string(),
+            |profile_id| {
+                format!(
+                    "browser remote start --profile-id {}",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+        "managed-headless" => "browser connect managed --headless".to_string(),
+        "managed-headed" => "browser connect managed --headed".to_string(),
+        _ => profile_id.map_or_else(
+            || "browser connect local".to_string(),
+            |profile_id| {
+                format!(
+                    "If this profile is already open with remote debugging, run `browser connect local`; otherwise run `browser local setup --profile {}` and then `browser connect local`.",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+    }
 }
 
 fn normalize_browser_preference_mode(mode: &str) -> Result<&'static str> {
@@ -15019,7 +15111,7 @@ fn record_python_response_final_event_with_budget(
     )
 }
 
-fn record_browser_script_response_events(
+pub fn record_browser_script_response_events(
     store: &Store,
     session_id: &str,
     response: &browser_use_browser::BrowserScriptOutput,
@@ -15764,7 +15856,7 @@ x-env = "CORP_HEADER"
         let output = dispatch_browser_preference_command(
             &store,
             &session,
-            "browser profile remember --domain https://www.gusto.com/ --profile google-chrome:Profile-2 --mode local",
+            "browser profile remember --domain https://www.gusto.com/ --profile 'google-chrome:Profile 2' --mode local",
         )?
         .expect("profile command");
         assert_eq!(output["status"], "ok");
@@ -15773,11 +15865,26 @@ x-env = "CORP_HEADER"
             remembered_domain_profile(&store, "gusto.com")?
                 .and_then(|value| value["profile_id"].as_str().map(ToOwned::to_owned))
                 .as_deref(),
-            Some("google-chrome:Profile-2")
+            Some("google-chrome:Profile 2")
         );
+        assert!(output["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("browser local setup --profile 'google-chrome:Profile 2'"));
         assert_eq!(
             resolve_browser_connect_command(&store, "connect")?,
             "browser connect local"
+        );
+
+        dispatch_browser_preference_command(
+            &store,
+            &session,
+            "browser profile remember --domain browser-use.com --profile 'cloud profile id' --mode cloud",
+        )?
+        .expect("cloud profile command");
+        assert_eq!(
+            resolve_browser_connect_command(&store, "browser connect")?,
+            "browser remote start --profile-id 'cloud profile id'"
         );
         Ok(())
     }

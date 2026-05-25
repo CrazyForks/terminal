@@ -10,12 +10,16 @@ import gzip
 import json
 import math
 import os
+import pathlib
 import sys
 import time
+import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+__last_domain_skills = []
 
 
 def _send_meta(meta, **params):
@@ -181,8 +185,133 @@ def js(expression, target_id=None, returnByValue=True):
     )
 
 
+def _truthy_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _domain_skill_roots():
+    roots = []
+    configured = os.environ.get("BH_DOMAIN_SKILLS_ROOT") or os.environ.get("BH_DOMAIN_SKILLS_DIR")
+    if configured:
+        roots.extend(pathlib.Path(part).expanduser() for part in configured.split(os.pathsep) if part.strip())
+    for root in globals().get("DOMAIN_SKILL_ROOTS", []):
+        roots.append(pathlib.Path(root).expanduser())
+    try:
+        roots.append(pathlib.Path(agent_workspace()) / "domain-skills")
+    except Exception:
+        pass
+
+    seen = set()
+    out = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.is_dir():
+            out.append(resolved)
+    return out
+
+
+def _domain_from_url(value):
+    value = str(value or "").strip()
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = (parsed.hostname or value.split("/", 1)[0]).strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _domain_skill_aliases(url_or_domain):
+    host = _domain_from_url(url_or_domain)
+    aliases = {host, host.replace(".", "-")}
+    labels = [part for part in host.split(".") if part]
+    if labels:
+        aliases.add(labels[0])
+    if len(labels) >= 2:
+        aliases.add(labels[-2])
+        aliases.add(f"{labels[-2]}-{labels[-1]}")
+    if len(labels) >= 3:
+        aliases.add(f"{labels[-2]}-{labels[0]}")
+        aliases.add(f"{labels[0]}-{labels[-2]}")
+    return {alias.lower().replace("_", "-") for alias in aliases if alias}
+
+
+def _domain_skills_enabled():
+    if os.environ.get("BH_DOMAIN_SKILLS") is not None:
+        return _truthy_env("BH_DOMAIN_SKILLS")
+    return bool(_domain_skill_roots())
+
+
+def domain_skills_for_url(url_or_domain, include_content=False, max_files=10, max_bytes=120000):
+    """Return matching browser-harness domain-skill files for a URL/domain.
+
+    Set include_content=True when the task is site-specific and the model needs
+    the playbook before inventing selectors, private API routes, or flows.
+    """
+    aliases = _domain_skill_aliases(url_or_domain)
+    matches = []
+    remaining = int(max_bytes)
+    for root in _domain_skill_roots():
+        try:
+            entries = sorted(root.iterdir(), key=lambda path: path.name.lower())
+        except OSError:
+            continue
+        for site_dir in entries:
+            if not site_dir.is_dir():
+                continue
+            site_key = site_dir.name.lower().replace("_", "-")
+            if site_key not in aliases:
+                continue
+            files = []
+            for path in sorted(site_dir.rglob("*")):
+                if not path.is_file() or path.suffix.lower() not in (".md", ".py"):
+                    continue
+                rel = path.relative_to(site_dir).as_posix()
+                item = {"name": rel, "path": str(path)}
+                if include_content and remaining > 0:
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError as exc:
+                        content = f"[failed to read domain skill: {exc}]"
+                    encoded = content[:remaining]
+                    item["content"] = encoded
+                    item["truncated"] = len(encoded) < len(content)
+                    remaining -= len(encoded)
+                files.append(item)
+                if len(files) >= max_files:
+                    break
+            if files:
+                matches.append({"site": site_dir.name, "root": str(root), "files": files})
+    return matches
+
+
+def last_domain_skills(include_content=False):
+    if not __last_domain_skills:
+        return []
+    if include_content:
+        url = __last_domain_skills[0].get("url") if isinstance(__last_domain_skills[0], dict) else None
+        if url:
+            return domain_skills_for_url(url, include_content=True)
+    return __last_domain_skills
+
+
 def goto_url(url):
+    global __last_domain_skills
     result = cdp("Page.navigate", url=url)
+    __last_domain_skills = []
+    if _domain_skills_enabled():
+        skills = domain_skills_for_url(url, include_content=False)
+        if skills:
+            __last_domain_skills = [{"url": url, **skill} for skill in skills]
+            result = {**result, "domain_skills": __last_domain_skills}
     wait_for_load(timeout=15)
     return result
 
@@ -476,6 +605,8 @@ def press_key(key, modifiers=0):
         "nativeVirtualKeyCode": vk,
     }
     cdp("Input.dispatchKeyEvent", type="keyDown", **base, **({"text": text} if text else {}))
+    if text and len(text) == 1:
+        cdp("Input.dispatchKeyEvent", type="char", text=text, **{k: v for k, v in base.items() if k != "text"})
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
     return True
 
@@ -541,15 +672,43 @@ def upload_file(selector, path):
     cdp("DOM.setFileInputFiles", files=files, nodeId=node_id)
 
 
-def http_get(url, headers=None, timeout=20.0):
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    """Pure HTTP fetch for static pages and APIs.
+
+    When BROWSER_USE_API_KEY is set and fetch_use is installed, route through
+    fetch-use like browser-harness. Otherwise fall back to local urllib with a
+    browser-like UA and gzip handling. Pass binary=True for bytes.
+    """
+    if os.environ.get("BROWSER_USE_API_KEY"):
+        try:
+            from fetch_use import fetch_sync
+
+            return fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000)).text
+        except ImportError:
+            pass
     request_headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     if headers:
         request_headers.update(headers)
-    with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=timeout) as response:
-        data = response.read()
-        if response.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
-        content_type = response.headers.get("Content-Type", "")
-        if "text" in content_type or "json" in content_type or "html" in content_type:
-            return data.decode()
-        return data
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=timeout) as response:
+            data = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+            content_type = response.headers.get("Content-Type", "")
+            if binary is True:
+                return data
+            if binary is False or "text" in content_type or "json" in content_type or "html" in content_type:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return data.decode(charset, errors="replace")
+            return data
+    except urllib.error.HTTPError as exc:
+        guidance = (
+            "http_get received HTTP "
+            f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with js(fetch(...)), "
+            "pass site-specific headers/cookies, or configure the Browser Use fetch proxy with BROWSER_USE_API_KEY."
+        )
+        raise RuntimeError(guidance) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
+        ) from exc

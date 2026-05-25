@@ -14,11 +14,11 @@ use browser_use_core::{
     default_model_for_cwd_with_options, display_agent_path_for_session, final_statuses_for_v1_wait,
     install_process_crypto_provider, last_task_message_for_agent, local_agent_status_value,
     model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics,
-    record_python_response_final_event, record_python_worker_event,
-    resolve_agent_reference_in_tree, root_session_id, run_agent_from_config,
-    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
-    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
-    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    record_browser_script_response_events, record_python_response_final_event,
+    record_python_worker_event, resolve_agent_reference_in_tree, root_session_id,
+    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
+    run_fake_agent, update_parent_from_child_run, AgentRunOptions, CollaborationModeKind,
+    ConfigOverrides, FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, result_from_events,
@@ -160,6 +160,11 @@ enum Command {
         task_id: String,
     },
     Python {
+        task_id: String,
+        code: String,
+    },
+    #[command(alias = "browser_script")]
+    BrowserScript {
         task_id: String,
         code: String,
     },
@@ -643,6 +648,7 @@ fn main() -> Result<()> {
         Command::Show { task_id } => show(&store, &task_id),
         Command::Events { task_id } => events(&store, &task_id),
         Command::Python { task_id, code } => python(&store, &task_id, code),
+        Command::BrowserScript { task_id, code } => browser_script(&store, &task_id, code),
         Command::Export {
             task_id,
             output_dir,
@@ -892,6 +898,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Show { .. } => "show",
         Command::Events { .. } => "events",
         Command::Python { .. } => "python",
+        Command::BrowserScript { .. } => "browser_script",
         Command::Export { .. } => "export",
         Command::Import { .. } => "import",
         Command::Config { .. } => "config",
@@ -1614,6 +1621,63 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
         response
             .error
             .unwrap_or_else(|| "python worker failed".to_string())
+    )
+}
+
+fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
+    let task = ensure_task_exists(store, task_id)?;
+    if let Some(cdp_url) = std::env::var("BU_CDP_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    {
+        let connect = browser_use_browser::run_browser_command(
+            task_id,
+            &task.cwd,
+            &task.artifact_root,
+            &format!("browser connect remote-cdp --url {}", cdp_url.trim()),
+        )?;
+        if connect.content.get("status").and_then(Value::as_str) != Some("connected") {
+            bail!("browser connect remote-cdp failed: {}", connect.content);
+        }
+    }
+    store.append_event(
+        task_id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser_script",
+            "arguments": { "code": code.clone() },
+        }),
+    )?;
+    let response = browser_use_browser::run_browser_script(
+        task_id,
+        &task.cwd,
+        &task.artifact_root,
+        &code,
+        30,
+    )?;
+    record_browser_script_response_events(store, task_id, &response)?;
+    if response.ok {
+        store.append_event(
+            task_id,
+            "tool.finished",
+            serde_json::json!({ "name": "browser_script" }),
+        )?;
+        print!("{}", response.text);
+        return Ok(());
+    }
+    store.append_event(
+        task_id,
+        "tool.failed",
+        serde_json::json!({
+            "name": "browser_script",
+            "error": response.error,
+        }),
+    )?;
+    bail!(
+        "{}",
+        response
+            .error
+            .unwrap_or_else(|| "browser_script failed".to_string())
     )
 }
 

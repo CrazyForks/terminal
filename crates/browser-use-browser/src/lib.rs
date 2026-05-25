@@ -241,11 +241,13 @@ pub fn run_browser_script(
     });
 
     let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
+    let domain_skill_roots = domain_skill_roots_for(&agent_workspace_dir);
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
         artifact_dir.as_ref(),
         &agent_workspace_dir,
+        &domain_skill_roots,
         code,
     )?;
     let mut child = Command::new("python3")
@@ -379,6 +381,228 @@ fn agent_workspace_dir_for(artifact_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".browser-use-terminal").join("agent-workspace"))
 }
 
+fn domain_skill_roots_for(agent_workspace_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for var in ["BH_DOMAIN_SKILLS_ROOT", "BH_DOMAIN_SKILLS_DIR"] {
+        if let Some(value) = std::env::var_os(var).filter(|value| !value.is_empty()) {
+            for path in std::env::split_paths(&value) {
+                push_unique_existing_dir(&mut roots, path);
+            }
+        }
+    }
+    push_unique_existing_dir(&mut roots, agent_workspace_dir.join("domain-skills"));
+    if let Some(home) = home_dir() {
+        push_unique_existing_dir(
+            &mut roots,
+            home.join(".browser-use-terminal")
+                .join("agent-workspace")
+                .join("domain-skills"),
+        );
+        push_unique_existing_dir(
+            &mut roots,
+            home.join("repos")
+                .join("browser-harness")
+                .join("agent-workspace")
+                .join("domain-skills"),
+        );
+        push_unique_existing_dir(
+            &mut roots,
+            home.join("repos")
+                .join("browser-harness")
+                .join("domain-skills"),
+        );
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = manifest_dir.parent().and_then(Path::parent) {
+        push_unique_existing_dir(&mut roots, repo_root.join("domain-skills"));
+    }
+    roots
+}
+
+fn push_unique_existing_dir(roots: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.is_dir() {
+        return;
+    }
+    let key = fs::canonicalize(&path).unwrap_or(path);
+    if !roots.iter().any(|existing| existing == &key) {
+        roots.push(key);
+    }
+}
+
+fn domain_skills_enabled() -> bool {
+    match std::env::var("BH_DOMAIN_SKILLS") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
+fn normalize_domain_like_browser(value: &str) -> String {
+    let mut host = value.trim();
+    if let Some(rest) = host.strip_prefix("https://") {
+        host = rest;
+    } else if let Some(rest) = host.strip_prefix("http://") {
+        host = rest;
+    }
+    host = host
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(host)
+        .split('@')
+        .next_back()
+        .unwrap_or(host)
+        .split(':')
+        .next()
+        .unwrap_or(host);
+    host.trim_start_matches("www.").to_ascii_lowercase()
+}
+
+fn domain_skill_aliases(value: &str) -> HashSet<String> {
+    let host = normalize_domain_like_browser(value);
+    let labels = host
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    let mut aliases = HashSet::from([host.clone(), host.replace('.', "-")]);
+    if let Some(first) = labels.first() {
+        aliases.insert((*first).to_string());
+    }
+    if labels.len() >= 2 {
+        aliases.insert(labels[labels.len() - 2].to_string());
+        aliases.insert(format!(
+            "{}-{}",
+            labels[labels.len() - 2],
+            labels[labels.len() - 1]
+        ));
+    }
+    if labels.len() >= 3 {
+        aliases.insert(format!("{}-{}", labels[labels.len() - 2], labels[0]));
+        aliases.insert(format!("{}-{}", labels[0], labels[labels.len() - 2]));
+    }
+    aliases
+        .into_iter()
+        .map(|alias| alias.replace('_', "-").to_ascii_lowercase())
+        .collect()
+}
+
+fn domain_skill_matches(
+    domain: &str,
+    roots: &[PathBuf],
+    include_content: bool,
+    max_files: usize,
+    max_bytes: usize,
+) -> Result<Vec<Value>> {
+    if !domain_skills_enabled() {
+        return Ok(Vec::new());
+    }
+    let aliases = domain_skill_aliases(domain);
+    let mut matches = Vec::new();
+    let mut remaining = max_bytes;
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let site = entry.file_name().to_string_lossy().to_string();
+            let site_key = site.replace('_', "-").to_ascii_lowercase();
+            if !aliases.contains(&site_key) {
+                continue;
+            }
+            let mut files = collect_domain_skill_files(
+                &entry.path(),
+                include_content,
+                max_files,
+                &mut remaining,
+            )?;
+            if !files.is_empty() {
+                files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                matches.push(json!({
+                    "site": site,
+                    "root": root.display().to_string(),
+                    "files": files,
+                }));
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn collect_domain_skill_files(
+    site_dir: &Path,
+    include_content: bool,
+    max_files: usize,
+    remaining: &mut usize,
+) -> Result<Vec<Value>> {
+    let mut stack = vec![site_dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !matches!(extension.as_str(), "md" | "py") {
+                continue;
+            }
+            let name = path
+                .strip_prefix(site_dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let mut item = json!({
+                "name": name,
+                "path": path.display().to_string(),
+            });
+            if include_content && *remaining > 0 {
+                let content = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| format!("[failed to read domain skill: {error}]"));
+                let take = content
+                    .char_indices()
+                    .map(|(idx, _)| idx)
+                    .chain(std::iter::once(content.len()))
+                    .take_while(|idx| *idx <= *remaining)
+                    .last()
+                    .unwrap_or(0);
+                item["content"] = Value::String(content[..take].to_string());
+                item["truncated"] = Value::Bool(take < content.len());
+                *remaining = remaining.saturating_sub(take);
+            }
+            files.push(item);
+            if files.len() >= max_files {
+                return Ok(files);
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -429,9 +653,43 @@ fn dispatch_browser_command(
         "connect" => dispatch_connect(session, argv),
         "local" => dispatch_local(session, argv, artifact_dir),
         "remote" => dispatch_remote(session, argv),
+        "domain" => dispatch_domain(argv),
         "recover" => dispatch_recover(session, argv),
         "runtime" => dispatch_runtime(session, argv),
         other => bail!("unknown browser command: {other}. Run `browser help`."),
+    }
+}
+
+fn dispatch_domain(argv: &[String]) -> Result<Value> {
+    match argv.get(1).map(String::as_str) {
+        Some("skills") => {
+            let domain = option_value(argv, "--domain")
+                .or_else(|| argv.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser domain skills requires --domain <domain>"))?;
+            let include_content = has_flag(argv, "--include-content");
+            let roots = domain_skill_roots_for(
+                &std::env::var_os("BH_AGENT_WORKSPACE")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        home_dir()
+                            .map(|home| home.join(".browser-use-terminal").join("agent-workspace"))
+                            .unwrap_or_else(|| {
+                                PathBuf::from(".browser-use-terminal").join("agent-workspace")
+                            })
+                    }),
+            );
+            Ok(json!({
+                "status": "ok",
+                "domain": normalize_domain_like_browser(&domain),
+                "enabled": domain_skills_enabled(),
+                "roots": roots.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "matches": domain_skill_matches(&domain, &roots, include_content, 10, 120_000)?,
+                "next_step": "If matches are present and the task is site-specific, read them before inventing selectors, private API routes, or flows.",
+            }))
+        }
+        Some(other) => bail!("unknown browser domain command: {other}"),
+        None => bail!("browser domain requires skills"),
     }
 }
 
@@ -1186,10 +1444,59 @@ impl BrowserSession {
                 "browser is not connected. Run `browser status --json` or `browser connect ...`."
             );
         };
-        match connection.call(method, session_id, params) {
+        match connection.call(method, session_id, params.clone()) {
             Ok(value) => Ok(value),
             Err(error) => {
-                let message = format!("{error:#}");
+                let mut message = format!("{error:#}");
+                let is_current_session = session_id.is_some()
+                    && session_id == self.current_session_id.as_deref()
+                    && self.current_target_id.is_some();
+                if is_current_session && is_stale_session_error(&message) {
+                    self.last_error = Some(message.clone());
+                    self.last_error_kind = Some("session-gone".to_string());
+                    self.last_session_id = self.current_session_id.take();
+
+                    match self.reattach_same_target() {
+                        Ok(recovery)
+                            if recovery.get("status").and_then(Value::as_str)
+                                == Some("reattached") =>
+                        {
+                            let retry_session_id = self.current_session_id.clone();
+                            let retry = self.connection.as_mut().map_or_else(
+                                || Err(anyhow!("browser connection was lost during reattach")),
+                                |connection| {
+                                    connection.call(method, retry_session_id.as_deref(), params)
+                                },
+                            );
+                            match retry {
+                                Ok(value) => {
+                                    self.last_error = None;
+                                    self.last_error_kind = None;
+                                    return Ok(value);
+                                }
+                                Err(retry_error) => {
+                                    message = format!("{retry_error:#}");
+                                }
+                            }
+                        }
+                        Ok(recovery) => {
+                            let failure = format!(
+                                "CDP {method} failed because the current session is stale and reattach did not recover it: {message}; reattach result: {recovery}"
+                            );
+                            self.last_error = Some(failure.clone());
+                            self.last_error_kind = Some("target-gone".to_string());
+                            bail!(failure);
+                        }
+                        Err(recovery_error) => {
+                            let failure = format!(
+                                "CDP {method} failed because the current session is stale and reattach failed: {message}; recovery error: {recovery_error:#}"
+                            );
+                            self.last_error = Some(failure.clone());
+                            self.last_error_kind = Some("session-gone".to_string());
+                            bail!(failure);
+                        }
+                    }
+                }
                 self.last_error = Some(message.clone());
                 self.last_error_kind = Some(classify_browser_error(&message).to_string());
                 self.connection = None;
@@ -1357,6 +1664,8 @@ fn classify_browser_error(message: &str) -> &'static str {
             || lower.contains("no target with given id"))
     {
         "target-gone"
+    } else if is_stale_session_error(message) {
+        "session-gone"
     } else if lower.contains("connection refused")
         || lower.contains("couldn't connect to server")
         || lower.contains("unable to connect")
@@ -1370,6 +1679,15 @@ fn classify_browser_error(message: &str) -> &'static str {
     } else {
         "websocket-dropped"
     }
+}
+
+fn is_stale_session_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("session")
+        && (lower.contains("not found")
+            || lower.contains("no session")
+            || lower.contains("session closed")
+            || lower.contains("session with given id"))
 }
 
 fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
@@ -2759,10 +3077,6 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                     session.current_session_id = Some(session_id.clone());
                     session.current_target_id = Some(target_id.clone());
                     session.connection_generation += 1;
-                    for domain in ["Page", "DOM", "Runtime", "Network"] {
-                        let _ =
-                            session.cdp(&format!("{domain}.enable"), Some(&session_id), json!({}));
-                    }
                     Ok(json!({
                         "session_id": session_id,
                         "target_id": target_id,
@@ -2784,10 +3098,17 @@ fn browser_script_prelude(
     cwd: &Path,
     artifact_dir: &Path,
     agent_workspace_dir: &Path,
+    domain_skill_roots: &[PathBuf],
     user_code: &str,
 ) -> Result<String> {
     let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
     let encoded_helpers = general_purpose::STANDARD.encode(BROWSER_SCRIPT_HELPERS.as_bytes());
+    let domain_skill_roots_json = serde_json::to_string(
+        &domain_skill_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+    )?;
     Ok(format!(
         r#"
 import base64, contextlib, io, json, os, pathlib, shutil, socket, sys, time, traceback, urllib.request
@@ -2796,6 +3117,7 @@ BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
+DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2964,7 +3286,7 @@ result = {{
     "ok": ok,
     "text": text[-{SCRIPT_MAX_OUTPUT_CHARS}:],
     "error": error,
-    "data": {{}},
+    "data": {{"domain_skills": globals().get("__last_domain_skills", [])}} if globals().get("__last_domain_skills") else {{}},
     "outputs": __outputs,
     "artifacts": __artifacts,
     "images": __images,
@@ -3118,6 +3440,46 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::MutexGuard;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvRestore {
+        _guard: MutexGuard<'static, ()>,
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let guard = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn shell_words_accepts_browser_prefix_and_quotes() {
@@ -3142,6 +3504,13 @@ mod tests {
         assert_eq!(status["next_step"], "browser connect local");
         assert!(status.get("safety").is_some());
         assert!(status.get("connection_generation").is_some());
+    }
+
+    #[test]
+    fn stale_session_errors_are_classified_for_reattach() {
+        let message = r#"CDP Runtime.evaluate failed: {"code":-32001,"message":"Session with given id not found."}"#;
+        assert!(is_stale_session_error(message));
+        assert_eq!(classify_browser_error(message), "session-gone");
     }
 
     #[test]
@@ -3196,10 +3565,47 @@ mod tests {
         let help = browser_help();
         assert!(help.contains("browser status --json"));
         assert!(help.contains("browser connect local"));
+        assert!(help.contains("browser domain skills --domain"));
         assert!(help.contains("browser_script"));
         assert!(help
             .to_ascii_lowercase()
             .contains("remote start means start and connect"));
+    }
+
+    #[test]
+    fn browser_domain_skills_command_lists_matching_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("domain-skills");
+        fs::create_dir_all(root.join("parity")).unwrap();
+        fs::write(
+            root.join("parity/scraping.md"),
+            "# Parity\n\nUse the stable API before DOM scraping.",
+        )
+        .unwrap();
+        let root_text = root.display().to_string();
+        let _env = EnvRestore::set(&[
+            ("BH_DOMAIN_SKILLS_ROOT", &root_text),
+            ("BH_DOMAIN_SKILLS", "1"),
+        ]);
+
+        let output = run_browser_command(
+            "domain-skills",
+            temp.path(),
+            temp.path(),
+            "browser domain skills --domain https://www.parity.test/path --include-content --json",
+        )
+        .unwrap();
+
+        assert_eq!(output.content["status"], "ok");
+        assert_eq!(output.content["matches"][0]["site"], "parity");
+        assert_eq!(
+            output.content["matches"][0]["files"][0]["name"],
+            "scraping.md"
+        );
+        assert!(output.content["matches"][0]["files"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("stable API"));
     }
 
     #[test]
@@ -3255,6 +3661,110 @@ print(session_metadata()["outputs_dir"])
                 "artifact path should be absolute: {artifact}"
             );
         }
+    }
+
+    #[test]
+    fn browser_script_domain_skills_are_available_without_browser() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("domain-skills");
+        fs::create_dir_all(root.join("parity")).unwrap();
+        fs::write(
+            root.join("parity/scraping.md"),
+            "# Parity\n\nRead this before inventing selectors.",
+        )
+        .unwrap();
+        let root_text = root.display().to_string();
+        let _env = EnvRestore::set(&[
+            ("BH_DOMAIN_SKILLS_ROOT", &root_text),
+            ("BH_DOMAIN_SKILLS", "1"),
+        ]);
+        let output = run_browser_script(
+            "script-domain-skills",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+skills = domain_skills_for_url("https://www.parity.test/search", include_content=True)
+assert skills[0]["site"] == "parity", skills
+assert "before inventing selectors" in skills[0]["files"][0]["content"], skills
+print(json.dumps(skills))
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("before inventing selectors"));
+    }
+
+    #[test]
+    fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-http-get",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+import gzip
+import http.server
+import socketserver
+import threading
+import types
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/gzip":
+            assert self.headers.get("X-Parity") == "yes", dict(self.headers)
+            body = gzip.compress(b"hello gzip")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/binary":
+            body = bytes([0, 159, 255])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+try:
+    assert http_get(base + "/gzip", headers={"X-Parity": "yes"}) == "hello gzip"
+    assert http_get(base + "/binary") == bytes([0, 159, 255])
+finally:
+    server.shutdown()
+    server.server_close()
+
+class FakeFetchModule:
+    @staticmethod
+    def fetch_sync(url, headers=None, timeout_ms=None):
+        assert headers == {"X": "1"}
+        assert timeout_ms == 1234
+        return types.SimpleNamespace(text="proxied")
+
+sys.modules["fetch_use"] = FakeFetchModule
+os.environ["BROWSER_USE_API_KEY"] = "test"
+assert http_get("https://example.test/data", headers={"X": "1"}, timeout=1.234) == "proxied"
+print("http_get parity ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("http_get parity ok"));
     }
 
     #[test]

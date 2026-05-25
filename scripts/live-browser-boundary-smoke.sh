@@ -69,7 +69,7 @@ download_task="$(
 )"
 
 BU_CDP_URL="http://127.0.0.1:$port" \
-  uv run browser-use-terminal --state-dir "$state_dir" python "$download_task" '
+  uv run browser-use-terminal --state-dir "$state_dir" browser-script "$download_task" '
 from pathlib import Path
 import time
 
@@ -103,18 +103,11 @@ stale_task="$(
 )"
 
 BU_CDP_URL="http://127.0.0.1:$port" \
-  uv run browser-use-terminal --state-dir "$state_dir" python "$stale_task" '
-from browser_harness import admin, helpers
-
-try:
-    admin.restart_daemon()
-except Exception:
-    pass
-
+  uv run browser-use-terminal --state-dir "$state_dir" browser-script "$stale_task" '
 goto_url("data:text/html,<title>stale session smoke patched</title><h1>ok</h1>")
 wait_for_load(5)
 before = current_tab()
-helpers._send({"meta": "set_session", "session_id": "stale-session-for-regression", "target_id": before["targetId"]})
+_send_meta("set_session", session_id="stale-session-for-regression", target_id=before["targetId"])
 title = js("document.title")
 after = current_tab()
 

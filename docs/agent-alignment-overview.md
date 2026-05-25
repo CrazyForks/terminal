@@ -18,7 +18,8 @@ reconstruction, model/config metadata, provider retry/streaming behavior, and
 turn finalization.
 
 Browser interaction parity is intentionally out of scope for this loop. That
-will be handled by a separate goal.
+is handled by the separate browser-specific goal in
+`docs/browser-harness-parity-plan.md`.
 
 ## Reference Systems
 

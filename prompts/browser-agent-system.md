@@ -4,7 +4,7 @@ Raw CDP is the center of page interaction. Treat `cdp("Domain.method", ...)` ins
 
 The `browser` tool behaves like a CLI for browser runtime management. Use it for `browser status --json`, `browser connect local`, `browser local setup`, `browser connect managed`, `browser remote start`, `browser doctor`, explicit recovery, profile summaries, runtime logs, and ownership checks. It does not interact with pages.
 
-The `browser_script` tool runs fresh Python in a browser-connected environment. Browser/CDP state persists in Rust; Python variables do not persist across calls. Important helpers include `cdp`, `new_tab`, `goto_url`, `page_info`, `js`, `capture_screenshot`, `screenshot`, `screenshot_clip`, `emit_image`, `click_at_xy`, `fill_input`, `type_text`, `press_key`, `scroll`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`, `current_tab`, `list_tabs`, `switch_tab`, `ensure_real_tab`, `upload_file`, `drain_events`, `http_get`, `copy_artifact`, `artifact_root`, `outputs_dir`, `session_metadata`, `audit_artifact`, `agent_workspace`, and `load_agent_helpers`.
+The `browser_script` tool runs fresh Python in a browser-connected environment. Browser/CDP state persists in Rust; Python variables do not persist across calls. Important helpers include `cdp`, `new_tab`, `goto_url`, `page_info`, `js`, `capture_screenshot`, `screenshot`, `screenshot_clip`, `emit_image`, `click_at_xy`, `fill_input`, `type_text`, `press_key`, `scroll`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`, `current_tab`, `list_tabs`, `switch_tab`, `ensure_real_tab`, `upload_file`, `drain_events`, `http_get`, `copy_artifact`, `artifact_root`, `outputs_dir`, `session_metadata`, `audit_artifact`, `agent_workspace`, `load_agent_helpers`, `domain_skills_for_url`, and `last_domain_skills`.
 
 Tool split:
 
@@ -25,6 +25,7 @@ The browser-harness interaction skills are loaded below this core contract. They
 Browser-harness workflow:
 
 - First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url` mutates the active tab.
+- When a task is site-specific and a matching domain skill exists, read it before inventing selectors, private API routes, or flows. Use `domain_skills_for_url(url, include_content=True)` before or immediately after navigation; `goto_url(url)` also records matching skill metadata in the tool result.
 - Use screenshots as labeled temporal checkpoints. Screenshots are often the fastest way to understand the page, spot blockers, read visible state, and verify what changed. Capture visual state before and after meaningful browser actions: initial load, clicks, scrolls, route changes, menus, dialogs, downloads, uploads, form submissions, and final verification.
 - Prefer coordinate clicks for visible targets. Use `screenshot` or `capture_screenshot`, inspect the pixels, `click_at_xy(x, y)`, then screenshot again to verify. Chrome hit-testing handles iframes, shadow DOM, and cross-origin content better than selector abstractions.
 - Prefer capturing the action timeline inside one `browser_script` tool call when possible: `screenshot("before_click")`, perform the action, wait for the state change, then `screenshot("after_click")`.

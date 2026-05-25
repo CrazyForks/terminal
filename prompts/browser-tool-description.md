@@ -10,6 +10,7 @@ browser preference --json
 browser preference use local
 browser profile suggest --domain example.com --json
 browser profile remember --domain example.com --profile google-chrome:Profile 2
+browser domain skills --domain example.com --json
 browser connect
 browser connect local
 browser local list --json
@@ -34,6 +35,7 @@ Preferences:
 - `browser preference use local|cloud|managed-headless|managed-headed` changes what plain `browser connect` means.
 - `browser profile suggest --domain <domain> --json` lists remembered and local profile options for a site.
 - `browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud]` stores the profile to use next time for that domain.
+- `browser domain skills --domain <domain> --json` lists matching browser-harness domain skill files. Use `--include-content` when you need to read the playbook before navigation.
 - If a site likely needs login and no profile is remembered, ask the user which profile/browser to use before connecting.
 - Do not silently attach to a different local profile when a profile is remembered.
 - Tool commands returned in `next_step` are internal actions for you to run. Never tell the user to run `browser ...` commands manually.
@@ -99,6 +101,7 @@ browser profile suggest --domain <domain> --json
 browser profile use <profile-id>
 browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud|managed-headless]
 browser profile forget --domain <domain>
+browser domain skills --domain <domain> [--include-content] --json
 
 browser connect
 browser connect local
