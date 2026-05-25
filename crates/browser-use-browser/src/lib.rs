@@ -1465,7 +1465,11 @@ impl BrowserSession {
                             let retry = self.connection.as_mut().map_or_else(
                                 || Err(anyhow!("browser connection was lost during reattach")),
                                 |connection| {
-                                    connection.call(method, retry_session_id.as_deref(), params)
+                                    connection.call(
+                                        method,
+                                        retry_session_id.as_deref(),
+                                        params.clone(),
+                                    )
                                 },
                             );
                             match retry {
@@ -1494,6 +1498,47 @@ impl BrowserSession {
                             self.last_error = Some(failure.clone());
                             self.last_error_kind = Some("session-gone".to_string());
                             bail!(failure);
+                        }
+                    }
+                }
+                let error_kind = classify_browser_error(&message);
+                if matches!(error_kind, "browser-closed" | "websocket-dropped")
+                    && self.endpoint.is_some()
+                {
+                    self.last_error = Some(message.clone());
+                    self.last_error_kind = Some(error_kind.to_string());
+                    match self.reconnect_websocket() {
+                        Ok(_) => {
+                            let retry_session_id = if is_current_session {
+                                self.current_session_id.clone()
+                            } else {
+                                session_id.map(ToOwned::to_owned)
+                            };
+                            let retry = self.connection.as_mut().map_or_else(
+                                || Err(anyhow!("browser connection was lost during reconnect")),
+                                |connection| {
+                                    connection.call(
+                                        method,
+                                        retry_session_id.as_deref(),
+                                        params.clone(),
+                                    )
+                                },
+                            );
+                            match retry {
+                                Ok(value) => {
+                                    self.last_error = None;
+                                    self.last_error_kind = None;
+                                    return Ok(value);
+                                }
+                                Err(retry_error) => {
+                                    message = format!("{retry_error:#}");
+                                }
+                            }
+                        }
+                        Err(reconnect_error) => {
+                            message = format!(
+                                "{message}; reconnect after dropped CDP websocket failed: {reconnect_error:#}"
+                            );
                         }
                     }
                 }
@@ -3697,6 +3742,27 @@ print(json.dumps(skills))
     }
 
     #[test]
+    fn browser_script_helpers_survive_user_time_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-time-shadow",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+from time import time
+path = _write_b64_artifact("time_shadow", base64.b64encode(b"ok").decode(), suffix=".bin", mime_type="application/octet-stream")
+assert pathlib.Path(path).read_bytes() == b"ok"
+print("time shadow ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("time shadow ok"));
+    }
+
+    #[test]
     fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -3741,8 +3807,15 @@ thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 base = f"http://127.0.0.1:{server.server_address[1]}"
 try:
-    assert http_get(base + "/gzip", headers={"X-Parity": "yes"}) == "hello gzip"
-    assert http_get(base + "/binary") == bytes([0, 159, 255])
+    text = http_get(base + "/gzip", headers={"X-Parity": "yes"})
+    assert text == "hello gzip"
+    assert text.status_code == 200
+    assert text.text == "hello gzip"
+    assert text.content == b"hello gzip"
+    blob = http_get(base + "/binary")
+    assert blob == bytes([0, 159, 255])
+    assert blob.status_code == 200
+    assert blob.content == bytes([0, 159, 255])
 finally:
     server.shutdown()
     server.server_close()
@@ -3752,11 +3825,14 @@ class FakeFetchModule:
     def fetch_sync(url, headers=None, timeout_ms=None):
         assert headers == {"X": "1"}
         assert timeout_ms == 1234
-        return types.SimpleNamespace(text="proxied")
+        return types.SimpleNamespace(text="proxied", status_code=202, headers={"x-proxy": "yes"}, url=url)
 
 sys.modules["fetch_use"] = FakeFetchModule
 os.environ["BROWSER_USE_API_KEY"] = "test"
-assert http_get("https://example.test/data", headers={"X": "1"}, timeout=1.234) == "proxied"
+proxied = http_get("https://example.test/data", headers={"X": "1"}, timeout=1.234)
+assert proxied == "proxied"
+assert proxied.status_code == 202
+assert proxied.headers["x-proxy"] == "yes"
 print("http_get parity ok")
 "#,
             10,

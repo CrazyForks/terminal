@@ -12,7 +12,7 @@ import math
 import os
 import pathlib
 import sys
-import time
+import time as _time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -322,9 +322,12 @@ def page_info():
     if dialog:
         return {"dialog": dialog}
     expression = (
-        "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,"
-        "w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,"
-        "pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
+        "(()=>{"
+        "const root=document.documentElement||document.body||{};"
+        "return JSON.stringify({url:location.href,title:document.title||'',readyState:document.readyState||'',"
+        "w:innerWidth,h:innerHeight,sx:scrollX||0,sy:scrollY||0,"
+        "pw:root.scrollWidth||innerWidth,ph:root.scrollHeight||innerHeight});"
+        "})()"
     )
     info = json.loads(_runtime_evaluate(expression))
     info["target"] = current_tab()
@@ -415,7 +418,7 @@ def iframe_target(url_substr):
 
 
 def wait(seconds=1.0):
-    time.sleep(seconds)
+    _time.sleep(seconds)
 
 
 def _timeout_seconds(timeout):
@@ -427,14 +430,14 @@ def _timeout_seconds(timeout):
 
 def wait_for_load(timeout=15.0):
     timeout = _timeout_seconds(timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
         try:
             if js("document.readyState") == "complete":
                 return True
         except Exception:
             pass
-        time.sleep(0.3)
+        _time.sleep(0.3)
     return False
 
 
@@ -451,21 +454,21 @@ def wait_for_element(selector, timeout=10.0, visible=False):
         )
     else:
         check = f"!!document.querySelector({json.dumps(selector)})"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
         if js(check):
             return True
-        time.sleep(0.3)
+        _time.sleep(0.3)
     return False
 
 
 def wait_for_network_idle(timeout=10.0, idle_ms=500):
     timeout = _timeout_seconds(timeout)
-    deadline = time.time() + timeout
-    last_activity = time.time()
+    deadline = _time.time() + timeout
+    last_activity = _time.time()
     inflight = set()
     active_session = _send_meta("session").get("session_id")
-    while time.time() < deadline:
+    while _time.time() < deadline:
         for event in drain_events():
             if event.get("session_id") != active_session:
                 continue
@@ -473,21 +476,21 @@ def wait_for_network_idle(timeout=10.0, idle_ms=500):
             params = event.get("params", {})
             if method == "Network.requestWillBeSent":
                 inflight.add(params.get("requestId"))
-                last_activity = time.time()
+                last_activity = _time.time()
             elif method in ("Network.loadingFinished", "Network.loadingFailed"):
                 inflight.discard(params.get("requestId"))
-                last_activity = time.time()
+                last_activity = _time.time()
             elif method.startswith("Network."):
-                last_activity = time.time()
-        if not inflight and (time.time() - last_activity) * 1000 >= idle_ms:
+                last_activity = _time.time()
+        if not inflight and (_time.time() - last_activity) * 1000 >= idle_ms:
             return True
-        time.sleep(0.1)
+        _time.sleep(0.1)
     return False
 
 
 def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(label or "screenshot")).strip("_") or "screenshot"
-    path = ARTIFACT_DIR / f"{int(time.time() * 1000)}_{safe}{suffix}"
+    path = ARTIFACT_DIR / f"{int(_time.time() * 1000)}_{safe}{suffix}"
     path.write_bytes(base64.b64decode(data_b64))
     meta = {"path": str(path), "mime_type": mime_type, "detail": "auto", "label": label}
     __images.append(meta)
@@ -505,7 +508,7 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
         version = cdp("Browser.getVersion", session_id=None)
         if "Headless" in (version.get("userAgent") or ""):
             cdp("Emulation.setDeviceMetricsOverride", width=1280, height=720, deviceScaleFactor=1, mobile=False)
-            time.sleep(0.2)
+            _time.sleep(0.2)
     except Exception:
         pass
     params = {"format": kwargs.pop("format", "png")}
@@ -672,6 +675,48 @@ def upload_file(selector, path):
     cdp("DOM.setFileInputFiles", files=files, nodeId=node_id)
 
 
+class _HttpGetText(str):
+    def __new__(cls, value, status_code=None, headers=None, url=None):
+        obj = str.__new__(cls, value)
+        obj.status_code = status_code
+        obj.status = status_code
+        obj.headers = headers or {}
+        obj.url = url
+        return obj
+
+    @property
+    def text(self):
+        return str(self)
+
+    @property
+    def content(self):
+        return str(self).encode("utf-8")
+
+    def json(self):
+        return json.loads(str(self))
+
+
+class _HttpGetBytes(bytes):
+    def __new__(cls, value, status_code=None, headers=None, url=None):
+        obj = bytes.__new__(cls, value)
+        obj.status_code = status_code
+        obj.status = status_code
+        obj.headers = headers or {}
+        obj.url = url
+        return obj
+
+    @property
+    def content(self):
+        return bytes(self)
+
+    @property
+    def text(self):
+        return bytes(self).decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
 def http_get(url, headers=None, timeout=20.0, binary=None):
     """Pure HTTP fetch for static pages and APIs.
 
@@ -683,7 +728,13 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         try:
             from fetch_use import fetch_sync
 
-            return fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000)).text
+            response = fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000))
+            return _HttpGetText(
+                response.text,
+                getattr(response, "status_code", getattr(response, "status", None)),
+                dict(getattr(response, "headers", {}) or {}),
+                getattr(response, "url", url),
+            )
         except ImportError:
             pass
     request_headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
@@ -695,12 +746,14 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
             if response.headers.get("Content-Encoding") == "gzip":
                 data = gzip.decompress(data)
             content_type = response.headers.get("Content-Type", "")
+            response_headers = dict(response.headers.items())
+            status_code = getattr(response, "status", None) or response.getcode()
             if binary is True:
-                return data
+                return _HttpGetBytes(data, status_code, response_headers, response.geturl())
             if binary is False or "text" in content_type or "json" in content_type or "html" in content_type:
                 charset = response.headers.get_content_charset() or "utf-8"
-                return data.decode(charset, errors="replace")
-            return data
+                return _HttpGetText(data.decode(charset, errors="replace"), status_code, response_headers, response.geturl())
+            return _HttpGetBytes(data, status_code, response_headers, response.geturl())
     except urllib.error.HTTPError as exc:
         guidance = (
             "http_get received HTTP "

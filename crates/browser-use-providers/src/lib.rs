@@ -4207,12 +4207,14 @@ fn parse_responses_sse_stream(
 ) -> Result<()> {
     let mut stream_state = CodexSseStreamState::default();
     emit_responses_header_events(response.headers(), &mut stream_state, on_event)?;
-    let is_event_stream = response
+    let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| content_type.contains("text/event-stream"));
-    if !is_event_stream {
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_json = content_type.contains("application/json") || content_type.contains("+json");
+    if is_json {
         let body_text = response.text().context("read Responses JSON body")?;
         let body: Value = serde_json::from_str(&body_text).map_err(|error| {
             ProviderError::retryable(format!("parse Responses JSON: {error}"), None)
@@ -9667,6 +9669,40 @@ mod tests {
     }
 
     #[test]
+    fn responses_sse_without_content_type_is_streamed_like_codex() -> Result<()> {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ModelEvent::ResponseCompleted {
+                    response_id: Some(response_id),
+                    ..
+                } if response_id == "resp_123"
+            )
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn responses_sse_malformed_event_does_not_mask_later_completion_like_codex() -> Result<()> {
         let sse = concat!(
             "data: {not json}\n\n",
@@ -10794,11 +10830,16 @@ mod tests {
             .iter()
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect::<String>();
+        let content_type = if response.content_type.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Type: {}\r\n", response.content_type)
+        };
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.status,
             response.reason,
-            response.content_type,
+            content_type,
             extra_headers,
             response.body.len(),
             response.body
