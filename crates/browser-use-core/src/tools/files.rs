@@ -17,6 +17,7 @@ const DEFAULT_MAX_READ_LINES: usize = 400;
 const DEFAULT_MAX_READ_BYTES: usize = 80_000;
 const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
 const DEFAULT_MAX_LIST_RESULTS: usize = 200;
+const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const PATCH_REJECTED_OUTSIDE_PROJECT_REASON: &str =
     "patch rejected: writing outside of the project; rejected by user approval settings";
 const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
@@ -283,7 +284,20 @@ pub(crate) fn view_image(
             "high"
         };
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let mime = image_mime(&path);
+        if bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
+            bail!(
+                "view_image cannot inline {}: image is {} bytes, above the {} byte inline limit",
+                path.display(),
+                bytes.len(),
+                MAX_INLINE_LOCAL_IMAGE_BYTES
+            );
+        }
+        let mime = image_mime_for_bytes(&bytes).with_context(|| {
+            format!(
+                "view_image cannot inline {}: unsupported or invalid image bytes",
+                path.display()
+            )
+        })?;
         let image = json!({
             "path": path.display().to_string(),
             "mime_type": mime,
@@ -695,6 +709,19 @@ fn emit_patch_finished(
             "committed_delta_exact": finish.committed_delta_exact,
         }),
     )?;
+    if !finish.committed_changes.is_empty() {
+        store.append_event(
+            &session.id,
+            "turn.diff",
+            json!({
+                "source": "apply_patch",
+                "tool_call_id": call.id,
+                "changed_files": finish.committed_changes.len(),
+                "changes": applied_changes_payload(finish.committed_changes),
+                "committed_delta_exact": finish.committed_delta_exact,
+            }),
+        )?;
+    }
     Ok(())
 }
 
@@ -1218,19 +1245,20 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .any(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
-fn image_mime(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        _ => "image/png",
+fn image_mime_for_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
     }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 fn lines_to_text(lines: &[String], final_newline: bool) -> String {
@@ -1497,6 +1525,12 @@ mod tests {
             4
         );
         assert_eq!(finished.payload["committed_delta_exact"], true);
+        let turn_diff = events
+            .iter()
+            .find(|event| event.event_type == "turn.diff")
+            .expect("turn diff");
+        assert_eq!(turn_diff.payload["source"], "apply_patch");
+        assert_eq!(turn_diff.payload["changed_files"], 4);
     }
 
     #[test]
@@ -2077,5 +2111,28 @@ EOF
         let artifacts = store.artifacts_for_session(&session.id).expect("artifacts");
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].kind, "image");
+    }
+
+    #[test]
+    fn view_image_rejects_invalid_image_bytes() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let path = Path::new(&session.cwd).join("not-image.png");
+        fs::write(&path, b"not actually an image").expect("write invalid image");
+
+        let error = view_image(
+            &store,
+            &session,
+            &ToolCall {
+                id: "image_1".to_string(),
+                name: "view_image".to_string(),
+                namespace: None,
+                arguments: json!({"path": "not-image.png"}),
+            },
+            false,
+        )
+        .expect_err("invalid image should reject");
+
+        assert!(format!("{error:#}").contains("unsupported or invalid image bytes"));
     }
 }

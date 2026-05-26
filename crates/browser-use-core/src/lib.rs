@@ -46,6 +46,7 @@ use tools::{
 };
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
+const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500;
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
 const RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE: usize = 7_373;
@@ -74,6 +75,8 @@ const PERSONALITY_CONTEXT_MESSAGE_NAME: &str = "personality_context";
 const COLLABORATION_CONTEXT_MESSAGE_NAME: &str = "collaboration_context";
 const MENTION_CONTEXT_MESSAGE_NAME: &str = "typed_mention_context";
 const GENERATED_IMAGE_CONTEXT_MESSAGE_NAME: &str = "generated_image_context";
+const SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<skills_instructions>";
+const SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_instructions>";
 const COLLABORATION_CONTEXT_EVENT: &str = "model.collaboration_context";
 const GENERATED_IMAGE_CONTEXT_EVENT: &str = "model.generated_image_context";
 const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
@@ -84,6 +87,8 @@ const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
 const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+const GOAL_CREATED_EVENT: &str = "goal.created";
+const GOAL_UPDATED_EVENT: &str = "goal.updated";
 const PROPOSED_PLAN_OPEN_TAG: &str = "<proposed_plan>";
 const PROPOSED_PLAN_CLOSE_TAG: &str = "</proposed_plan>";
 const TURN_ABORTED_START_MARKER: &str = "<turn_aborted>";
@@ -93,10 +98,12 @@ const WORKSPACE_CONTEXT_PERMISSIONS_KIND: &str = "permissions";
 const WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND: &str = "multi_agent_v2_usage_hint";
 const WORKSPACE_CONTEXT_AGENTS_KIND: &str = "agents_md";
 const WORKSPACE_CONTEXT_ENVIRONMENT_KIND: &str = "environment_context";
+const WORKSPACE_CONTEXT_USER_SHELL_KIND: &str = "user_shell_command";
 const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
 const SESSION_STARTUP_WARNING_EVENT: &str = "session.startup_warning";
 const SESSION_INSTRUCTION_SOURCES_EVENT: &str = "session.instruction_sources";
 const SESSION_BASE_INSTRUCTIONS_EVENT: &str = "session.base_instructions";
+const SESSION_REVIEW_MODE_EVENT: &str = "session.review";
 const SESSION_CONFIG_SNAPSHOT_EVENT: &str = "session.config_snapshot";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 const CONTEXT_BASELINE_EVENT: &str = "context.baseline";
@@ -128,6 +135,7 @@ const DEFAULT_AGENT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 const DEFAULT_AGENT_NICKNAMES: &str = include_str!("agent_names.txt");
 const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
+const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
 const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
@@ -152,7 +160,6 @@ const RESERVED_CUSTOM_MODEL_PROVIDER_IDS: &[&str] = &[
     OLLAMA_MODEL_PROVIDER_ID,
     LMSTUDIO_MODEL_PROVIDER_ID,
 ];
-const CODEX_CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 #[cfg(any(test, not(unix)))]
 const CODEX_MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
 #[cfg(all(unix, not(test)))]
@@ -190,7 +197,6 @@ const CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS: &[(&str, bool)] = &[
     ("network_proxy", false),
     ("external_migration", false),
     ("mentions_v2", false),
-    ("prevent_idle_sleep", false),
 ];
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -479,7 +485,7 @@ impl Default for AgentRunOptions {
     fn default() -> Self {
         Self {
             max_turns: 80,
-            max_context_chars: 240_000,
+            max_context_chars: DEFAULT_MAX_CONTEXT_CHARS,
             browser_mode: None,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
@@ -748,6 +754,196 @@ pub fn append_workspace_context_event(store: &Store, session: &SessionMeta) -> R
     append_workspace_context_event_with_options(store, session, &AgentRunOptions::default())
 }
 
+pub fn append_user_shell_command_context_event(
+    store: &Store,
+    session_id: &str,
+    command: &str,
+    exit_code: i32,
+    duration: Duration,
+    output: &str,
+) -> Result<()> {
+    let output = user_shell_context_output(output);
+    let content = format!(
+        "<user_shell_command>\n<command>\n{}\n</command>\n<result>\nExit code: {}\nDuration: {:.4} seconds\nOutput:\n{}\n</result>\n</user_shell_command>",
+        command,
+        exit_code,
+        duration.as_secs_f64(),
+        output,
+    );
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": WORKSPACE_CONTEXT_USER_SHELL_KIND,
+            "content": content,
+            "command": command,
+            "exit_code": exit_code,
+            "duration_ms": duration.as_millis() as u64,
+        }),
+    )?;
+    Ok(())
+}
+
+fn user_shell_context_output(output: &str) -> String {
+    const MAX_USER_SHELL_CONTEXT_CHARS: usize = 40_000;
+    let char_count = output.chars().count();
+    if char_count <= MAX_USER_SHELL_CONTEXT_CHARS {
+        return output.to_string();
+    }
+    let head_budget = MAX_USER_SHELL_CONTEXT_CHARS / 2;
+    let tail_budget = MAX_USER_SHELL_CONTEXT_CHARS.saturating_sub(head_budget);
+    let head = output.chars().take(head_budget).collect::<String>();
+    let tail = output
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{head}\n[... omitted {} characters from user shell output ...]\n{tail}",
+        char_count.saturating_sub(head_budget + tail_budget)
+    )
+}
+
+pub fn review_prompt_uncommitted_changes() -> String {
+    "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.".to_string()
+}
+
+pub fn review_prompt_base_branch(cwd: &Path, branch: &str) -> String {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return review_prompt_uncommitted_changes();
+    }
+    if let Some(merge_base) = git_merge_base_with_head(cwd, branch) {
+        format!(
+            "Review the code changes against the base branch '{branch}'. The merge base commit for this comparison is {merge_base}. Run `git diff {merge_base}` to inspect the changes relative to {branch}. Provide prioritized, actionable findings."
+        )
+    } else {
+        format!(
+            "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
+        )
+    }
+}
+
+pub fn review_prompt_commit(cwd: &Path, sha: &str) -> String {
+    let sha = sha.trim();
+    let title = git_commit_title(cwd, sha);
+    if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+        format!("Review the code changes introduced by commit {sha} (\"{title}\"). Provide prioritized, actionable findings.")
+    } else {
+        format!("Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.")
+    }
+}
+
+pub fn review_prompt_custom(instructions: &str) -> Result<String> {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        bail!("Review prompt cannot be empty");
+    }
+    Ok(instructions.to_string())
+}
+
+pub fn review_base_instructions() -> &'static str {
+    include_str!("../../../prompts/review-prompt.md")
+}
+
+pub fn start_review_session(store: &Store, prompt: &str, cwd: impl AsRef<Path>) -> Result<String> {
+    let cwd = cwd.as_ref();
+    let session = store.create_session(None, cwd)?;
+    store.append_event(
+        &session.id,
+        SESSION_REVIEW_MODE_EVENT,
+        serde_json::json!({
+            "kind": "review",
+            "review_tool_restrictions": {
+                "goals": false,
+                "multi_agent": false,
+                "web_search": false,
+                "image_generation": false
+            },
+        }),
+    )?;
+    append_session_base_instructions_event(
+        store,
+        &session.id,
+        review_base_instructions(),
+        "review",
+    )?;
+    let options = review_mode_options(AgentRunOptions::default());
+    append_workspace_context_event_with_options(store, &session, &options)?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(prompt, cwd)?,
+    )?;
+    Ok(session.id)
+}
+
+fn review_mode_options(mut options: AgentRunOptions) -> AgentRunOptions {
+    if options.base_instructions.is_none() {
+        options.base_instructions = Some(review_base_instructions().to_string());
+    }
+    for (key, value) in [
+        ("features.goals", toml::Value::Boolean(false)),
+        ("features.multi_agent", toml::Value::Boolean(false)),
+        (
+            "features.multi_agent_v2.enabled",
+            toml::Value::Boolean(false),
+        ),
+        ("features.web_search_cached", toml::Value::Boolean(false)),
+        ("features.web_search_request", toml::Value::Boolean(false)),
+        ("features.image_generation", toml::Value::Boolean(false)),
+    ] {
+        if !options
+            .config_overrides
+            .iter()
+            .any(|(existing, _)| existing == key)
+        {
+            options.config_overrides.push((key.to_string(), value));
+        }
+    }
+    options
+}
+
+fn session_is_review_mode(events: &[EventRecord]) -> bool {
+    events
+        .iter()
+        .any(|event| event.event_type == SESSION_REVIEW_MODE_EVENT)
+}
+
+fn git_merge_base_with_head(cwd: &Path, branch: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("merge-base")
+        .arg("HEAD")
+        .arg(branch)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn git_commit_title(cwd: &Path, sha: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("show")
+        .arg("-s")
+        .arg("--format=%s")
+        .arg(sha)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn append_workspace_context_event_with_options(
     store: &Store,
     session: &SessionMeta,
@@ -792,6 +988,9 @@ pub fn append_workspace_context_event_with_options(
     let config_plugins_instructions = agents_context
         .as_ref()
         .and_then(|load| load.plugins_instructions.clone());
+    let config_skills_instructions = agents_context
+        .as_ref()
+        .and_then(|load| load.skills_instructions.clone());
     let config_include_environment_context = agents_context
         .as_ref()
         .is_none_or(|load| load.include_environment_context);
@@ -849,6 +1048,9 @@ pub fn append_workspace_context_event_with_options(
         }
         if let Some(collaboration_context) = collaboration_context.as_ref() {
             developer_sections.push(collaboration_context.clone());
+        }
+        if let Some(skills_instructions) = config_skills_instructions {
+            developer_sections.push(skills_instructions);
         }
         if let Some(plugins_instructions) = config_plugins_instructions {
             developer_sections.push(plugins_instructions);
@@ -916,6 +1118,7 @@ pub fn append_workspace_context_event_with_options(
             context,
             sources,
             warnings,
+            skills_instructions: _,
             ..
         } = agents_context;
         if context.is_some() || !sources.is_empty() || !warnings.is_empty() {
@@ -1106,11 +1309,15 @@ pub fn run_existing_session_with_provider<P: ModelProvider>(
     store: &Store,
     provider: &P,
     session_id: &str,
-    options: AgentRunOptions,
+    mut options: AgentRunOptions,
 ) -> Result<String> {
     let session = store
         .load_session(session_id)?
         .with_context(|| format!("unknown session id: {session_id}"))?;
+    let events = store.events_for_session(session_id)?;
+    if session_is_review_mode(&events) {
+        options = review_mode_options(options);
+    }
     append_workspace_context_event_with_options(store, &session, &options)?;
     let events = store.events_for_session(session_id)?;
     let messages = provider_messages_from_events(&events);
@@ -1127,6 +1334,10 @@ pub fn run_existing_session_from_config(
         .load_session(session_id)?
         .with_context(|| format!("unknown session id: {session_id}"))?;
     let existing_events = store.events_for_session(&session.id)?;
+    let review_mode = session_is_review_mode(&existing_events);
+    if review_mode {
+        config.options = review_mode_options(config.options);
+    }
     let config_snapshot = latest_session_config_snapshot_from_events(&existing_events);
     if let Some(snapshot) = config_snapshot
         .as_ref()
@@ -1162,6 +1373,17 @@ pub fn run_existing_session_from_config(
             "Model provider `{selected_provider_id}` is not available for `{provider_kind}` runs"
         );
     }
+    if review_mode && config.model_source == RunConfigValueSource::Default {
+        let mut warnings = Vec::new();
+        let review_config = load_agents_md_config_for_options(
+            Path::new(&session.cwd),
+            &mut warnings,
+            &config.options,
+        )?;
+        if let Some(review_model) = review_config.review_model.as_ref() {
+            config.model = review_model.clone();
+        }
+    }
     config.options.model_provider_id = Some(selected_provider_id.clone());
     install_config_child_agent_runner(store, &mut config);
     config.options.analytics_provider_kind = Some(provider_kind);
@@ -1169,6 +1391,76 @@ pub fn run_existing_session_from_config(
     match config.backend {
         ProviderBackend::Codex => {
             if let Some(provider_info) = snapshot_provider_info {
+                if provider_info.wire_api == "chat" {
+                    let provider = configured_openai_chat_provider_from_snapshot(
+                        store,
+                        config.model.clone(),
+                        provider_info,
+                    )?;
+                    return run_existing_session_with_provider(
+                        store,
+                        &provider,
+                        session_id,
+                        config.options,
+                    );
+                } else {
+                    let provider = configured_openai_responses_provider_from_snapshot(
+                        store,
+                        config.model.clone(),
+                        provider_info,
+                    )?;
+                    return run_existing_session_with_provider(
+                        store,
+                        &provider,
+                        session_id,
+                        config.options,
+                    );
+                }
+            }
+            if let Some(provider) = configured_openai_responses_provider(
+                store,
+                config.model.clone(),
+                &provider_config,
+                &selected_provider_id,
+            )? {
+                return run_existing_session_with_provider(
+                    store,
+                    &provider,
+                    session_id,
+                    config.options,
+                );
+            }
+            if let Some(provider) = configured_openai_chat_provider(
+                store,
+                config.model.clone(),
+                &provider_config,
+                &selected_provider_id,
+            )? {
+                return run_existing_session_with_provider(
+                    store,
+                    &provider,
+                    session_id,
+                    config.options,
+                );
+            }
+            let provider = codex_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
+        ProviderBackend::Openai => {
+            if let Some(provider_info) = snapshot_provider_info {
+                if provider_info.wire_api == "chat" {
+                    let provider = configured_openai_chat_provider_from_snapshot(
+                        store,
+                        config.model.clone(),
+                        provider_info,
+                    )?;
+                    return run_existing_session_with_provider(
+                        store,
+                        &provider,
+                        session_id,
+                        config.options,
+                    );
+                }
                 let provider = configured_openai_responses_provider_from_snapshot(
                     store,
                     config.model.clone(),
@@ -1187,35 +1479,18 @@ pub fn run_existing_session_from_config(
                 &provider_config,
                 &selected_provider_id,
             )? {
-                return run_existing_session_with_provider(
-                    store,
-                    &provider,
-                    session_id,
-                    config.options,
-                );
-            }
-            let provider = codex_provider(store, config.model)?;
-            run_existing_session_with_provider(store, &provider, session_id, config.options)
-        }
-        ProviderBackend::Openai => {
-            let provider = if let Some(provider_info) = snapshot_provider_info {
-                configured_openai_responses_provider_from_snapshot(
-                    store,
-                    config.model.clone(),
-                    provider_info,
-                )?
+                run_existing_session_with_provider(store, &provider, session_id, config.options)
+            } else if let Some(provider) = configured_openai_chat_provider(
+                store,
+                config.model.clone(),
+                &provider_config,
+                &selected_provider_id,
+            )? {
+                run_existing_session_with_provider(store, &provider, session_id, config.options)
             } else {
-                match configured_openai_responses_provider(
-                    store,
-                    config.model.clone(),
-                    &provider_config,
-                    &selected_provider_id,
-                )? {
-                    Some(provider) => provider,
-                    None => openai_provider(store, config.model)?,
-                }
-            };
-            run_existing_session_with_provider(store, &provider, session_id, config.options)
+                let provider = openai_provider(store, config.model)?;
+                run_existing_session_with_provider(store, &provider, session_id, config.options)
+            }
         }
         ProviderBackend::Anthropic => {
             let provider = anthropic_provider(store, config.model)?;
@@ -1475,6 +1750,9 @@ fn configured_openai_responses_provider(
     let Some(provider_config) = config.model_providers.get(provider_id) else {
         return Ok(None);
     };
+    if provider_config.wire_api != CodexWireApi::Responses {
+        return Ok(None);
+    }
     let base_url = provider_config
         .base_url
         .clone()
@@ -1484,6 +1762,34 @@ fn configured_openai_responses_provider(
     let mut provider = OpenAIResponsesProvider::with_optional_api_key(api_key, model, base_url)
         .with_provider_name(provider_id)
         .with_request_options(request_options);
+    if let Some(auth) = provider_config.auth.clone() {
+        provider = provider.with_command_auth_config(auth);
+    }
+    Ok(Some(provider))
+}
+
+fn configured_openai_chat_provider(
+    store: &Store,
+    model: String,
+    config: &AgentsMdConfig,
+    provider_id: &str,
+) -> Result<Option<OpenAICompatibleChatProvider>> {
+    let Some(provider_config) = config.model_providers.get(provider_id) else {
+        return Ok(None);
+    };
+    if provider_config.wire_api != CodexWireApi::Chat {
+        return Ok(None);
+    }
+    let base_url = provider_config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = provider_api_key(store, provider_id, provider_config)?;
+    let request_options = provider_request_options(provider_config);
+    let mut provider =
+        OpenAICompatibleChatProvider::with_optional_api_key(api_key, model, base_url)
+            .with_provider_name(provider_id)
+            .with_request_options(request_options);
     if let Some(auth) = provider_config.auth.clone() {
         provider = provider.with_command_auth_config(auth);
     }
@@ -1511,6 +1817,34 @@ fn configured_openai_responses_provider_from_snapshot(
     let mut provider = OpenAIResponsesProvider::with_optional_api_key(api_key, model, base_url)
         .with_provider_name(&snapshot.id)
         .with_request_options(request_options);
+    if let Some(auth) = snapshot.auth.as_ref() {
+        provider = provider.with_command_auth_config(auth.to_config());
+    }
+    Ok(provider)
+}
+
+fn configured_openai_chat_provider_from_snapshot(
+    store: &Store,
+    model: String,
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> Result<OpenAICompatibleChatProvider> {
+    if snapshot.wire_api != "chat" {
+        bail!(
+            "Model provider `{}` uses unsupported wire_api `{}`",
+            snapshot.id,
+            snapshot.wire_api
+        );
+    }
+    let base_url = snapshot
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = provider_api_key_from_snapshot(store, snapshot)?;
+    let request_options = provider_request_options_from_snapshot(snapshot);
+    let mut provider =
+        OpenAICompatibleChatProvider::with_optional_api_key(api_key, model, base_url)
+            .with_provider_name(&snapshot.id)
+            .with_request_options(request_options);
     if let Some(auth) = snapshot.auth.as_ref() {
         provider = provider.with_command_auth_config(auth.to_config());
     }
@@ -2348,6 +2682,14 @@ fn codex_responses_client_metadata(store: &Store) -> Result<HashMap<String, Stri
     )]))
 }
 
+fn provider_uses_codex_request_metadata(provider_name: &str) -> bool {
+    provider_name == "codex"
+}
+
+fn provider_uses_openai_prompt_cache_key(provider_name: &str) -> bool {
+    matches!(provider_name, "codex" | "openai")
+}
+
 fn stable_codex_installation_id(store: &Store) -> Result<String> {
     if let Some(installation_id) = store.get_setting(CODEX_INSTALLATION_ID_SETTING)? {
         if !installation_id.trim().is_empty() {
@@ -2590,6 +2932,21 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     "personality": model_personality_key(current_personality),
                 }),
             )?;
+            if !model_catalog_knows_model(&turn_config, provider.model_name()) {
+                store.append_event(
+                    &session.id,
+                    SESSION_STARTUP_WARNING_EVENT,
+                    serde_json::json!({
+                        "source": "unknown_model_catalog",
+                        "message": format!(
+                            "Model `{}` is not in the active model catalog; using conservative fallback capabilities.",
+                            provider.model_name()
+                        ),
+                        "model": provider.model_name(),
+                        "provider": model_provider_id,
+                    }),
+                )?;
+            }
             let turn_instructions = provider_base_instructions_for_session(
                 store,
                 &session,
@@ -2761,8 +3118,12 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 model_context_window,
                 agent_span.trace_id(),
             )?);
+            let mut compaction_max_context_chars = effective_compaction_max_context_chars(
+                options.max_context_chars,
+                &model_request_info,
+            );
+            let mut compact_prompt = turn_config.compact_prompt()?;
 
-            let mut deadline_warning_emitted = false;
             let mut last_external_session_message_seq =
                 latest_session_message_seq(store, &session.id)?;
             for turn_idx in 0..options.max_turns {
@@ -2778,24 +3139,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     store,
                     &session.id,
                     &mut messages,
-                    options.max_context_chars,
+                    compaction_max_context_chars,
                     turn_instructions.as_deref(),
                     model_context_window,
                     Some(turn_idx),
+                    compact_prompt.as_deref(),
                 )?;
                 normalize_provider_messages(&mut messages);
-                if maybe_emit_deadline_warning(
-                    store,
-                    &session.id,
-                    turn_idx,
-                    options.max_turns,
-                    &mut deadline_warning_emitted,
-                )? {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": "The turn budget is nearly exhausted. Stop starting new lines of investigation. Produce the best available final answer now, write or reference any artifacts you have, and explicitly mark unknown or ambiguous fields instead of timing out with no deliverable.",
-                    }));
-                }
                 let mut assistant_text = String::new();
                 let mut assistant_full_text = String::new();
                 let mut tool_calls = Vec::new();
@@ -2835,13 +3185,35 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &session.id,
                     provider,
                     {
-                        let turn_client_metadata = codex_responses_client_metadata(store)?;
-                        let turn_metadata_header = codex_lifecycle
-                            .as_ref()
-                            .map(|lifecycle| {
-                                codex_responses_turn_metadata_header(&session, lifecycle)
-                            })
-                            .transpose()?;
+                        let use_codex_request_metadata =
+                            provider_uses_codex_request_metadata(provider.provider_name());
+                        let use_prompt_cache_key =
+                            provider_uses_openai_prompt_cache_key(provider.provider_name());
+                        let turn_client_metadata = if use_codex_request_metadata {
+                            Some(codex_responses_client_metadata(store)?)
+                        } else {
+                            None
+                        };
+                        let turn_metadata_header = if use_codex_request_metadata {
+                            codex_lifecycle
+                                .as_ref()
+                                .map(|lifecycle| {
+                                    codex_responses_turn_metadata_header(&session, lifecycle)
+                                })
+                                .transpose()?
+                        } else {
+                            None
+                        };
+                        let turn_extra_headers = if use_codex_request_metadata {
+                            Some(codex_responses_extra_headers(
+                                store,
+                                &session,
+                                &options,
+                                turn_metadata_header.as_deref(),
+                            )?)
+                        } else {
+                            None
+                        };
                         ProviderTurn {
                             instructions: turn_instructions.clone(),
                             model_settings: model_settings.clone(),
@@ -2854,14 +3226,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             hosted_tools: turn_hosted_tools,
                             output_schema: options.final_output_json_schema.clone(),
                             output_schema_strict: options.final_output_json_schema_strict,
-                            prompt_cache_key: Some(session.id.clone()),
-                            client_metadata: Some(turn_client_metadata),
-                            extra_headers: Some(codex_responses_extra_headers(
-                                store,
-                                &session,
-                                &options,
-                                turn_metadata_header.as_deref(),
-                            )?),
+                            prompt_cache_key: use_prompt_cache_key.then(|| session.id.clone()),
+                            client_metadata: turn_client_metadata,
+                            extra_headers: turn_extra_headers,
                             ..ProviderTurn::default()
                         }
                     },
@@ -2989,6 +3356,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         ModelEvent::ServerModel {
                             model: server_model,
                         } => {
+                            let requested_model = provider.model_name();
                             store.append_event(
                                 &session.id,
                                 "model.server_model",
@@ -2996,10 +3364,35 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                     "turn_idx": turn_idx,
                                     "attempts": provider_turn_result.attempts,
                                     "provider": provider.provider_name(),
-                                    "model": provider.model_name(),
-                                    "server_model": server_model,
+                                    "model": requested_model,
+                                    "server_model": server_model.as_str(),
                                 }),
                             )?;
+                            if server_model != requested_model {
+                                store.append_event(
+                                    &session.id,
+                                    "model.reroute",
+                                    serde_json::json!({
+                                        "turn_idx": turn_idx,
+                                        "attempts": provider_turn_result.attempts,
+                                        "provider": provider.provider_name(),
+                                        "requested_model": requested_model,
+                                        "server_model": server_model.as_str(),
+                                    }),
+                                )?;
+                                store.append_event(
+                                    &session.id,
+                                    SESSION_STARTUP_WARNING_EVENT,
+                                    serde_json::json!({
+                                        "source": "model_reroute",
+                                        "message": format!(
+                                            "Server used model `{server_model}` instead of requested `{requested_model}`."
+                                        ),
+                                        "requested_model": requested_model,
+                                        "server_model": server_model.as_str(),
+                                    }),
+                                )?;
+                            }
                         }
                         ModelEvent::ModelRateLimits { snapshot } => {
                             record_model_rate_limits(
@@ -3053,6 +3446,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             model_context_window = model_request_info
                                 .resolved_context_window()
                                 .or_else(|| model_context_window_for_options(&options));
+                            compaction_max_context_chars = effective_compaction_max_context_chars(
+                                options.max_context_chars,
+                                &model_request_info,
+                            );
+                            compact_prompt = turn_config.compact_prompt()?;
                         }
                         ModelEvent::ServerReasoningIncluded { included } => {
                             store.append_event(
@@ -3079,10 +3477,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     store,
                     &session.id,
                     &mut messages,
-                    options.max_context_chars,
+                    compaction_max_context_chars,
                     turn_instructions.as_deref(),
                     model_context_window,
                     Some(turn_idx),
+                    compact_prompt.as_deref(),
                 )?;
 
                 if tool_calls.is_empty() {
@@ -3141,10 +3540,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 store,
                                 &session.id,
                                 &mut messages,
-                                options.max_context_chars,
+                                compaction_max_context_chars,
                                 turn_instructions.as_deref(),
                                 model_context_window,
                                 Some(turn_idx),
+                                compact_prompt.as_deref(),
                             )?;
                             step_span.set_ok();
                             continue;
@@ -3179,10 +3579,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         store,
                         &session.id,
                         &mut messages,
-                        options.max_context_chars,
+                        compaction_max_context_chars,
                         turn_instructions.as_deref(),
                         model_context_window,
                         Some(turn_idx),
+                        compact_prompt.as_deref(),
                     )?;
                     if outcome.finished {
                         step_span.set_ok();
@@ -4008,29 +4409,6 @@ fn is_cancelled(store: &Store, session_id: &str) -> Result<bool> {
         .is_some_and(|session| session.status == SessionStatus::Cancelled))
 }
 
-fn maybe_emit_deadline_warning(
-    store: &Store,
-    session_id: &str,
-    turn_idx: usize,
-    max_turns: usize,
-    emitted: &mut bool,
-) -> Result<bool> {
-    if *emitted || max_turns < 2 || turn_idx + 1 < max_turns {
-        return Ok(false);
-    }
-    *emitted = true;
-    store.append_event(
-        session_id,
-        "session.deadline_warning",
-        serde_json::json!({
-            "reason": "agent turn budget is nearly exhausted",
-            "max_turns": max_turns,
-            "remaining_turns": max_turns.saturating_sub(turn_idx),
-        }),
-    )?;
-    Ok(true)
-}
-
 #[cfg(test)]
 fn maybe_compact_messages(
     store: &Store,
@@ -4046,6 +4424,7 @@ fn maybe_compact_messages(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -4057,6 +4436,7 @@ fn maybe_compact_messages_with_context(
     base_instructions: Option<&str>,
     model_context_window: Option<i64>,
     turn_idx: Option<usize>,
+    compact_prompt: Option<&str>,
 ) -> Result<()> {
     if max_context_chars == 0 {
         return Ok(());
@@ -4078,6 +4458,7 @@ fn maybe_compact_messages_with_context(
         base_instructions,
         model_context_window,
         turn_idx,
+        compact_prompt,
         "estimated_budget_exceeded",
     )
 }
@@ -4094,6 +4475,7 @@ fn compact_messages(
     base_instructions: Option<&str>,
     model_context_window: Option<i64>,
     turn_idx: Option<usize>,
+    compact_prompt: Option<&str>,
     reason: &str,
 ) -> Result<()> {
     store.append_event(
@@ -4109,12 +4491,29 @@ fn compact_messages(
         }),
     )?;
     let events = store.events_for_session(session_id)?;
-    let context_baseline = latest_context_baseline_payload_from_events(&events);
+    let filtered_events = rollback_filtered_events(&events)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let context_baseline = latest_context_baseline_payload_from_events(&filtered_events);
+    let fallback_contract;
+    let compaction_contract = if let Some(compact_prompt) = compact_prompt {
+        compact_prompt
+    } else if let Some(base_instructions) = base_instructions {
+        base_instructions
+    } else {
+        fallback_contract = browser_agent_contract();
+        fallback_contract.as_str()
+    };
     let result = (|| -> Result<()> {
-        let context = sanitized_agent_context_from_events(&events);
-        let initial_context = initial_context_messages_from_events(&events, None, true, true);
-        let mut compacted = compacted_user_history_messages(messages);
-        compacted.push(compacted_context_summary_message(&context)?);
+        let context = sanitized_agent_context_from_events(&filtered_events);
+        let initial_context =
+            initial_context_messages_from_events(&filtered_events, None, true, true);
+        let mut compacted = compacted_user_history_messages(messages, max_context_tokens);
+        compacted.push(compacted_context_summary_message(
+            &context,
+            compaction_contract,
+        )?);
         compacted =
             insert_initial_context_before_last_real_user_or_summary(compacted, initial_context);
         *messages = compacted;
@@ -4128,11 +4527,13 @@ fn compact_messages(
         )?;
         return Err(error);
     }
+    let after_tokens = estimated_context_tokens_with_instructions(messages, base_instructions)?;
+    let after_chars = estimated_context_chars(messages)?;
     let mut payload = serde_json::json!({
         "reason": reason,
         "message_count": messages.len(),
-        "chars": estimated_context_chars(messages)?,
-        "tokens": estimated_context_tokens_with_instructions(messages, base_instructions)?,
+        "chars": after_chars,
+        "tokens": after_tokens,
         "replacement_messages": messages.clone(),
         "replacement_response_items": provider_messages_to_response_items(messages),
     });
@@ -4140,6 +4541,20 @@ fn compact_messages(
         payload["context_baseline"] = context_baseline;
     }
     let compacted_event = store.append_event(session_id, "session.compacted", payload)?;
+    if after_tokens > max_context_tokens {
+        store.append_event(
+            session_id,
+            "session.compaction_over_budget",
+            serde_json::json!({
+                "reason": reason,
+                "tokens": after_tokens,
+                "max_tokens": max_context_tokens,
+                "chars": after_chars,
+                "max_chars": max_context_chars,
+                "history_rewrite_seq": compacted_event.seq,
+            }),
+        )?;
+    }
     append_recomputed_codex_token_count_event(
         store,
         session_id,
@@ -4397,9 +4812,9 @@ fn estimate_encrypted_function_output_context_bytes(encoded_len: usize) -> usize
     encoded_len.saturating_mul(9).div_ceil(16)
 }
 
-fn compacted_user_history_messages(messages: &[Value]) -> Vec<Value> {
+fn compacted_user_history_messages(messages: &[Value], max_context_tokens: usize) -> Vec<Value> {
     let mut selected = Vec::new();
-    let mut remaining = COMPACT_USER_MESSAGE_MAX_TOKENS;
+    let mut remaining = COMPACT_USER_MESSAGE_MAX_TOKENS.min(max_context_tokens / 3);
     for message in messages.iter().rev() {
         if remaining == 0 {
             break;
@@ -4436,10 +4851,13 @@ fn user_text_message(text: String) -> Value {
     })
 }
 
-fn compacted_context_summary_message(context: &Value) -> Result<Value> {
+fn compacted_context_summary_message(
+    context: &Value,
+    browser_agent_contract: &str,
+) -> Result<Value> {
     Ok(user_text_message(format!(
         "{COMPACTION_SUMMARY_PREFIX}\n{}",
-        compacted_context_system_message(context)?
+        compacted_context_system_message(context, browser_agent_contract)?
     )))
 }
 
@@ -4503,13 +4921,15 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     )
 }
 
-fn compacted_context_system_message(context: &Value) -> Result<String> {
+fn compacted_context_system_message(
+    context: &Value,
+    browser_agent_contract: &str,
+) -> Result<String> {
     let context_json = serde_json::to_string_pretty(context)?;
-    let browser_agent_contract = browser_agent_contract();
     Ok(render_prompt_template(
         include_str!("../../../prompts/compacted-context-system.md"),
         &[
-            ("{{browser_agent_contract}}", &browser_agent_contract),
+            ("{{browser_agent_contract}}", browser_agent_contract),
             ("{{context_json}}", &context_json),
         ],
     ))
@@ -5619,6 +6039,28 @@ fn model_context_window_for_options(options: &AgentRunOptions) -> Option<i64> {
         .then(|| approx_token_count_from_chars(options.max_context_chars) as i64)
 }
 
+fn effective_compaction_max_context_chars(
+    configured_max_context_chars: usize,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+) -> usize {
+    if configured_max_context_chars == 0 {
+        return 0;
+    }
+    let Some(model_auto_compact_token_limit) = model_request_info
+        .auto_compact_token_limit()
+        .and_then(|limit| usize::try_from(limit.max(0)).ok())
+        .filter(|limit| *limit > 0)
+    else {
+        return configured_max_context_chars;
+    };
+    let model_limit_chars = token_budget_to_char_budget(model_auto_compact_token_limit);
+    if configured_max_context_chars == DEFAULT_MAX_CONTEXT_CHARS {
+        model_limit_chars
+    } else {
+        configured_max_context_chars.min(model_limit_chars)
+    }
+}
+
 fn append_codex_token_count_event(
     store: &Store,
     session_id: &str,
@@ -5879,6 +6321,16 @@ fn add_codex_token_usage(left: &Value, right: &Value) -> Value {
         "output_tokens": json_payload_i64(left, "output_tokens") + json_payload_i64(right, "output_tokens"),
         "reasoning_output_tokens": json_payload_i64(left, "reasoning_output_tokens") + json_payload_i64(right, "reasoning_output_tokens"),
         "total_tokens": json_payload_i64(left, "total_tokens") + json_payload_i64(right, "total_tokens"),
+    })
+}
+
+fn subtract_codex_token_usage(left: &Value, right: &Value) -> Value {
+    serde_json::json!({
+        "input_tokens": (json_payload_i64(left, "input_tokens") - json_payload_i64(right, "input_tokens")).max(0),
+        "cached_input_tokens": (json_payload_i64(left, "cached_input_tokens") - json_payload_i64(right, "cached_input_tokens")).max(0),
+        "output_tokens": (json_payload_i64(left, "output_tokens") - json_payload_i64(right, "output_tokens")).max(0),
+        "reasoning_output_tokens": (json_payload_i64(left, "reasoning_output_tokens") - json_payload_i64(right, "reasoning_output_tokens")).max(0),
+        "total_tokens": (json_payload_i64(left, "total_tokens") - json_payload_i64(right, "total_tokens")).max(0),
     })
 }
 
@@ -6165,6 +6617,17 @@ fn resolved_model_request_info_from_config(
             .with_token_limit(tool_output_token_limit);
     }
     model_info
+}
+
+fn model_catalog_knows_model(config: &AgentsMdConfig, model: &str) -> bool {
+    config.model_catalog.as_ref().map_or_else(
+        || {
+            browser_use_providers::bundled_model_catalog()
+                .entry_for_model(model)
+                .is_some()
+        },
+        |catalog| catalog.entry_for_model(model).is_some(),
+    )
 }
 
 fn provider_request_max_retries_for_session(
@@ -7267,7 +7730,9 @@ where
             WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND => {
                 context_messages.push(multi_agent_usage_hint_context_message(content.to_string()));
             }
-            WORKSPACE_CONTEXT_AGENTS_KIND | WORKSPACE_CONTEXT_ENVIRONMENT_KIND => {
+            WORKSPACE_CONTEXT_AGENTS_KIND
+            | WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            | WORKSPACE_CONTEXT_USER_SHELL_KIND => {
                 context_messages.push(workspace_context_message(vec![content.to_string()]));
             }
             _ => {}
@@ -7308,6 +7773,7 @@ fn workspace_context_message_from_payload(payload: &Value) -> Option<Value> {
             | WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND
             | WORKSPACE_CONTEXT_AGENTS_KIND
             | WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            | WORKSPACE_CONTEXT_USER_SHELL_KIND
     ) {
         return None;
     }
@@ -8092,6 +8558,7 @@ fn browser_tool_registry_for_session(
     let config =
         load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let mut multi_agent_tool_config = config.multi_agent_v2.tool_spec_config();
+    multi_agent_tool_config.goals_enabled = config.goals_enabled;
     multi_agent_tool_config.request_user_input_default_mode_enabled =
         config.request_user_input_default_mode_enabled;
     if !config.multi_agent_enabled {
@@ -8748,6 +9215,9 @@ fn dispatch_tool_call<P: ModelProvider>(
                 .supports_image_detail_original,
             tool_output_token_budget,
         ),
+        ToolHandlerKind::GetGoal => dispatch_get_goal_tool(store, session, call),
+        ToolHandlerKind::CreateGoal => dispatch_create_goal_tool(store, session, call),
+        ToolHandlerKind::UpdateGoal => dispatch_update_goal_tool(store, session, call),
         ToolHandlerKind::UpdatePlan => dispatch_update_plan_tool(store, session, call),
         ToolHandlerKind::RequestUserInput => {
             dispatch_request_user_input_tool(store, session, call, options)
@@ -8903,6 +9373,314 @@ fn dispatch_tool_search_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![item],
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ThreadGoalSnapshot {
+    goal_id: String,
+    objective: String,
+    status: String,
+    token_budget: Option<i64>,
+    baseline_total_token_usage: Value,
+    created_at_ms: Option<i64>,
+    updated_at_ms: Option<i64>,
+}
+
+fn latest_thread_goal_from_events(events: &[EventRecord]) -> Option<ThreadGoalSnapshot> {
+    let mut goal = None::<ThreadGoalSnapshot>;
+    for event in events {
+        match event.event_type.as_str() {
+            GOAL_CREATED_EVENT => {
+                let objective = event
+                    .payload
+                    .get("objective")
+                    .and_then(Value::as_str)?
+                    .trim()
+                    .to_string();
+                if objective.is_empty() {
+                    continue;
+                }
+                goal = Some(ThreadGoalSnapshot {
+                    goal_id: event
+                        .payload
+                        .get("goal_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| event.id.clone()),
+                    objective,
+                    status: event
+                        .payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("active")
+                        .to_string(),
+                    token_budget: event.payload.get("token_budget").and_then(Value::as_i64),
+                    baseline_total_token_usage: event
+                        .payload
+                        .get("baseline_total_token_usage")
+                        .cloned()
+                        .unwrap_or_else(empty_codex_token_usage),
+                    created_at_ms: event.payload.get("created_at_ms").and_then(Value::as_i64),
+                    updated_at_ms: event.payload.get("created_at_ms").and_then(Value::as_i64),
+                });
+            }
+            GOAL_UPDATED_EVENT => {
+                let Some(current) = goal.as_mut() else {
+                    continue;
+                };
+                if let Some(status) = event.payload.get("status").and_then(Value::as_str) {
+                    current.status = status.to_string();
+                }
+                if let Some(updated_at_ms) =
+                    event.payload.get("updated_at_ms").and_then(Value::as_i64)
+                {
+                    current.updated_at_ms = Some(updated_at_ms);
+                }
+            }
+            _ => {}
+        }
+    }
+    goal
+}
+
+fn goal_usage_payload(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> Value {
+    let current_total_usage = latest_codex_total_token_usage_from_events(events);
+    let token_usage =
+        subtract_codex_token_usage(&current_total_usage, &goal.baseline_total_token_usage);
+    let tokens_used = token_usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let remaining_tokens = goal
+        .token_budget
+        .map(|budget| budget.saturating_sub(tokens_used).max(0));
+    let elapsed_time_ms = goal
+        .created_at_ms
+        .map(|started| now_ms().saturating_sub(started).max(0));
+    serde_json::json!({
+        "tokens_used": tokens_used,
+        "token_usage": token_usage,
+        "baseline_total_token_usage": goal.baseline_total_token_usage,
+        "current_total_token_usage": current_total_usage,
+        "token_budget": goal.token_budget,
+        "remaining_tokens": remaining_tokens,
+        "elapsed_time_ms": elapsed_time_ms,
+    })
+}
+
+fn goal_snapshot_payload(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> Value {
+    serde_json::json!({
+        "goal_id": goal.goal_id,
+        "objective": goal.objective,
+        "status": goal.status,
+        "created_at_ms": goal.created_at_ms,
+        "updated_at_ms": goal.updated_at_ms,
+        "usage": goal_usage_payload(events, goal),
+    })
+}
+
+fn dispatch_get_goal_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Err(error) = validate_tool_arguments_object(&call.arguments, "get_goal", &[]) {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "get_goal",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let events = store.events_for_session(&session.id)?;
+    let payload = latest_thread_goal_from_events(&events)
+        .map(|goal| goal_snapshot_payload(&events, &goal))
+        .unwrap_or(Value::Null);
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "get_goal",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store, session, call, "get_goal", payload,
+        )?],
+    })
+}
+
+fn dispatch_create_goal_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Err(error) = validate_tool_arguments_object(
+        &call.arguments,
+        "create_goal",
+        &["objective", "token_budget"],
+    ) {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
+    let objective = call
+        .arguments
+        .get("objective")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if objective.is_empty() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "create_goal requires objective",
+        );
+    }
+    let token_budget = match call.arguments.get("token_budget").and_then(Value::as_i64) {
+        Some(value) if value > 0 => Some(value),
+        Some(_) => {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "token_budget must be a positive integer",
+            )
+        }
+        None => None,
+    };
+    let events = store.events_for_session(&session.id)?;
+    if latest_thread_goal_from_events(&events).is_some() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "goal already exists; create_goal can only be used once for a thread",
+        );
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "create_goal",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let goal_id = uuid::Uuid::new_v4().to_string();
+    store.append_event(
+        &session.id,
+        GOAL_CREATED_EVENT,
+        serde_json::json!({
+            "goal_id": goal_id,
+            "objective": objective,
+            "status": "active",
+            "token_budget": token_budget,
+            "baseline_total_token_usage": latest_codex_total_token_usage_from_events(&events),
+            "created_at_ms": now_ms(),
+            "tool_call_id": call.id,
+        }),
+    )?;
+    let events = store.events_for_session(&session.id)?;
+    let payload = latest_thread_goal_from_events(&events)
+        .map(|goal| goal_snapshot_payload(&events, &goal))
+        .unwrap_or(Value::Null);
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "create_goal",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "create_goal",
+            payload,
+        )?],
+    })
+}
+
+fn dispatch_update_goal_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Err(error) = validate_tool_arguments_object(&call.arguments, "update_goal", &["status"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
+    let status = call
+        .arguments
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !matches!(status, "complete" | "blocked") {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "update_goal status must be complete or blocked",
+        );
+    }
+    let events = store.events_for_session(&session.id)?;
+    let Some(goal) = latest_thread_goal_from_events(&events) else {
+        return dispatch_tool_validation_error(store, session, call, "no active goal exists");
+    };
+    if goal.status != "active" {
+        return dispatch_tool_validation_error(store, session, call, "goal is not active");
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "update_goal",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        GOAL_UPDATED_EVENT,
+        serde_json::json!({
+            "goal_id": goal.goal_id,
+            "status": status,
+            "updated_at_ms": now_ms(),
+            "tool_call_id": call.id,
+        }),
+    )?;
+    let events = store.events_for_session(&session.id)?;
+    let payload = latest_thread_goal_from_events(&events)
+        .map(|goal| goal_snapshot_payload(&events, &goal))
+        .unwrap_or(Value::Null);
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "update_goal",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "update_goal",
+            payload,
+        )?],
     })
 }
 
@@ -9375,6 +10153,7 @@ struct AgentsMdLoad {
     include_environment_context: bool,
     multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
+    skills_instructions: Option<String>,
     plugins_instructions: Option<String>,
     #[allow(dead_code)]
     base_instructions: Option<String>,
@@ -9706,6 +10485,7 @@ fn load_agents_md_context_for_cwd_with_thread_config(
         })
     };
     let base_instructions = config.base_instructions()?;
+    let skills_instructions = render_available_skills_instructions(codex_home_dir().as_deref());
     let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
     let plugins_instructions = render_available_plugins_instructions(&plugin_summaries);
     Ok(AgentsMdLoad {
@@ -9719,6 +10499,7 @@ fn load_agents_md_context_for_cwd_with_thread_config(
         include_environment_context: config.include_environment_context,
         multi_agent_enabled: config.multi_agent_enabled,
         multi_agent_v2: config.multi_agent_v2,
+        skills_instructions,
         plugins_instructions,
     })
 }
@@ -9778,6 +10559,7 @@ impl MultiAgentV2Config {
             } else {
                 MultiAgentToolFamily::V1
             },
+            goals_enabled: true,
             hide_spawn_agent_metadata: self.hide_spawn_agent_metadata,
             wait_default_timeout_ms: self.default_wait_timeout_ms,
             wait_min_timeout_ms: self.min_wait_timeout_ms,
@@ -9798,10 +10580,14 @@ struct AgentsMdConfig {
     project_doc_fallback_filenames: Vec<String>,
     project_root_markers: Vec<String>,
     model: Option<String>,
+    review_model: Option<String>,
     instructions: Option<String>,
     model_instructions_file: Option<PathBuf>,
+    compact_prompt: Option<String>,
+    compact_prompt_file: Option<PathBuf>,
     developer_instructions: Option<String>,
     agent_roles: BTreeMap<String, AgentRoleDefinition>,
+    goals_enabled: bool,
     multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
     personality: ModelPersonality,
@@ -9841,10 +10627,14 @@ impl Default for AgentsMdConfig {
             project_doc_fallback_filenames: Vec::new(),
             project_root_markers: vec![DEFAULT_PROJECT_ROOT_MARKER.to_string()],
             model: None,
+            review_model: None,
             instructions: None,
             model_instructions_file: None,
+            compact_prompt: None,
+            compact_prompt_file: None,
             developer_instructions: None,
             agent_roles: BTreeMap::new(),
+            goals_enabled: true,
             multi_agent_enabled: true,
             multi_agent_v2: MultiAgentV2Config::default(),
             personality: ModelPersonality::Pragmatic,
@@ -9911,6 +10701,13 @@ impl AgentsMdConfig {
         Ok(self.default_base_instructions())
     }
 
+    fn compact_prompt(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.compact_prompt_file {
+            return read_non_empty_compact_prompt_file(path).map(Some);
+        }
+        Ok(self.compact_prompt.clone())
+    }
+
     fn beta_features_header(&self) -> Option<String> {
         let features = CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS
             .iter()
@@ -9961,6 +10758,7 @@ struct CodexModelProviderConfig {
 enum CodexWireApi {
     #[default]
     Responses,
+    Chat,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -10150,18 +10948,12 @@ fn apply_session_thread_config_layer(
         bail!("Invalid session thread config: expected a TOML table.");
     };
     validate_session_thread_config_features(value)?;
-    let mut layer = toml::map::Map::new();
-    for key in ["model_provider", "model_providers", "features"] {
-        if let Some(value) = table.get(key) {
-            layer.insert(key.to_string(), value.clone());
-        }
-    }
-    if layer.is_empty() {
+    if table.is_empty() {
         return Ok(());
     }
     apply_agents_md_config_layer(
         config,
-        &toml::Value::Table(layer),
+        value,
         Path::new("session thread config"),
         cwd,
         ConfigLayerKind::NonProject,
@@ -10585,6 +11377,9 @@ fn apply_agents_md_config_layer(
     if let Some(model) = toml_optional_string(value, "model", path)? {
         config.model = Some(model);
     }
+    if let Some(review_model) = toml_optional_string(value, "review_model", path)? {
+        config.review_model = Some(review_model);
+    }
     if let Some(instructions) = toml_optional_string(value, "instructions", path)? {
         config.instructions = Some(instructions);
     }
@@ -10592,6 +11387,23 @@ fn apply_agents_md_config_layer(
         toml_optional_path(value, "model_instructions_file", path, relative_base)?
     {
         config.model_instructions_file = Some(model_instructions_file);
+    }
+    if let Some(compact_prompt) = toml_optional_string(value, "compact_prompt", path)? {
+        config.compact_prompt = Some(compact_prompt);
+        config.compact_prompt_file = None;
+    }
+    if let Some(compact_prompt_file) =
+        toml_optional_path(value, "compact_prompt_file", path, relative_base)?
+    {
+        config.compact_prompt_file = Some(compact_prompt_file);
+    }
+    if let Some(compact_prompt_file) = toml_optional_path(
+        value,
+        "experimental_compact_prompt_file",
+        path,
+        relative_base,
+    )? {
+        config.compact_prompt_file = Some(compact_prompt_file);
     }
     if let Some(model_catalog_json) =
         toml_optional_path(value, "model_catalog_json", path, relative_base)?
@@ -10736,6 +11548,9 @@ fn apply_codex_features_config_layer(
             path.display()
         );
     };
+    if let Some(enabled) = toml_optional_nested_enabled_bool(value, &["features", "goals"], path)? {
+        config.goals_enabled = enabled;
+    }
     if let Some(enabled) =
         toml_optional_nested_enabled_bool(value, &["features", "multi_agent"], path)?
     {
@@ -10784,6 +11599,7 @@ fn apply_codex_features_config_layer(
             key.as_str(),
             "multi_agent"
                 | "multi_agent_v2"
+                | "goals"
                 | "shell_tool"
                 | "unified_exec"
                 | "image_generation"
@@ -11146,6 +11962,132 @@ fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String> {
     )
 }
 
+#[derive(Clone, Debug)]
+struct LocalSkillSummary {
+    name: String,
+    path: PathBuf,
+    description: Option<String>,
+}
+
+fn render_available_skills_instructions(codex_home: Option<&Path>) -> Option<String> {
+    let mut skills = available_skill_summaries(codex_home?);
+    if skills.is_empty() {
+        return None;
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    const MAX_SKILLS: usize = 80;
+    if skills.len() > MAX_SKILLS {
+        skills.truncate(MAX_SKILLS);
+    }
+    let mut lines = vec![
+        SKILLS_INSTRUCTIONS_OPEN_TAG.to_string(),
+        "## Skills".to_string(),
+        "A skill is a set of local instructions to follow that is stored in a SKILL.md file. Below is the list of skills available in this session.".to_string(),
+        "### Available skills".to_string(),
+    ];
+    lines.extend(skills.iter().map(|skill| {
+        let path = skill.path.display();
+        if let Some(description) = skill.description.as_deref() {
+            format!("- `{}`: {} (file: {path})", skill.name, description)
+        } else {
+            format!("- `{}` (file: {path})", skill.name)
+        }
+    }));
+    lines.push("### How to use skills".to_string());
+    lines.push(
+        r###"- Discovery: The list above is the skills available in this session.
+- Trigger rules: If the user names a skill with `$SkillName` or plain text, or the task clearly matches a skill's description, use that skill for that turn.
+- How to use a skill: Open its `SKILL.md` and follow only the relevant workflow. When it references relative paths, resolve them relative to the skill directory first. Load extra files only as needed.
+- Coordination: If multiple skills apply, choose the minimal set that covers the request and state the order you will use them.
+- Missing/blocked: If a named skill is unavailable or cannot be read, say so briefly and continue with the best fallback."###
+            .to_string(),
+    );
+    lines.push(SKILLS_INSTRUCTIONS_CLOSE_TAG.to_string());
+    Some(lines.join("\n"))
+}
+
+fn available_skill_summaries(codex_home: &Path) -> Vec<LocalSkillSummary> {
+    let roots = [
+        codex_home.join("skills"),
+        codex_home.join(".tmp").join("skills"),
+    ];
+    let mut seen = HashSet::new();
+    let mut summaries = Vec::new();
+    for root in roots {
+        collect_skill_summaries(&root, &root, 0, &mut seen, &mut summaries);
+    }
+    summaries
+}
+
+fn collect_skill_summaries(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    seen: &mut HashSet<PathBuf>,
+    summaries: &mut Vec<LocalSkillSummary>,
+) {
+    const MAX_DEPTH: usize = 5;
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let skill_path = dir.join("SKILL.md");
+    if skill_path.is_file() {
+        let canonical = skill_path
+            .canonicalize()
+            .unwrap_or_else(|_| skill_path.clone());
+        if seen.insert(canonical) {
+            summaries.push(skill_summary_from_skill_md(root, &skill_path));
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_summaries(root, &path, depth + 1, seen, summaries);
+        }
+    }
+}
+
+fn skill_summary_from_skill_md(root: &Path, path: &Path) -> LocalSkillSummary {
+    let parent = path.parent().unwrap_or(root);
+    let relative = parent.strip_prefix(root).unwrap_or(parent);
+    let name = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .filter(|segment| !segment.is_empty() && *segment != ".system")
+        .collect::<Vec<_>>()
+        .join("/");
+    let name = if name.is_empty() {
+        parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("skill")
+            .to_string()
+    } else {
+        name
+    };
+    let description = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| skill_description_from_markdown(&contents));
+    LocalSkillSummary {
+        name,
+        path: path.to_path_buf(),
+        description,
+    }
+}
+
+fn skill_description_from_markdown(contents: &str) -> Option<String> {
+    let mut lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let description = lines.next()?;
+    prompt_safe_plugin_description(Some(description))
+}
+
 fn render_available_plugins_instructions(
     plugins: &[LocalPluginCapabilitySummary],
 ) -> Option<String> {
@@ -11155,7 +12097,7 @@ fn render_available_plugins_instructions(
     let mut lines = vec![
         PLUGINS_INSTRUCTIONS_OPEN_TAG.to_string(),
         "## Plugins".to_string(),
-        "A plugin is a local bundle of skills, MCP servers, and apps. Below is the list of plugins that are enabled and available in this session.".to_string(),
+        "A plugin is a local bundle of skills, MCP server configuration, and app metadata. Below is the list of plugins that are enabled and visible in this session.".to_string(),
         "### Available plugins".to_string(),
     ];
     lines.extend(plugins.iter().map(|plugin| {
@@ -11170,7 +12112,7 @@ fn render_available_plugins_instructions(
         r###"- Discovery: The list above is the plugins available in this session.
 - Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.
 - Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
-- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
+- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills and any separately exposed MCP/app tools to help solve the task.
 - Preference: When a relevant plugin is available, prefer using capabilities associated with that plugin over standalone capabilities that provide similar functionality.
 - Missing/blocked: If the user requests a plugin that is not listed above, or the plugin does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback."###
             .to_string(),
@@ -11192,7 +12134,7 @@ fn render_explicit_plugin_instructions(plugin: &LocalPluginCapabilitySummary) ->
     }
     if !plugin.mcp_server_names.is_empty() {
         lines.push(format!(
-            "- MCP servers from this plugin available in this session: {}.",
+            "- MCP servers configured by this plugin: {}. This terminal does not expose plugin MCP runtime tools unless those tools are separately listed.",
             plugin
                 .mcp_server_names
                 .iter()
@@ -11732,14 +12674,15 @@ fn parse_provider_command_auth_config(
 fn parse_codex_wire_api(value: &str) -> Result<CodexWireApi> {
     match value {
         "responses" => Ok(CodexWireApi::Responses),
-        "chat" => bail!(CODEX_CHAT_WIRE_API_REMOVED_ERROR),
-        other => bail!("unknown variant `{other}`, expected `responses`"),
+        "chat" => Ok(CodexWireApi::Chat),
+        other => bail!("unknown variant `{other}`, expected `responses` or `chat`"),
     }
 }
 
 fn codex_wire_api_key(wire_api: CodexWireApi) -> &'static str {
     match wire_api {
         CodexWireApi::Responses => "responses",
+        CodexWireApi::Chat => "chat",
     }
 }
 
@@ -12526,6 +13469,16 @@ fn read_non_empty_model_instructions_file(path: &Path) -> Result<String> {
     let contents = contents.trim().to_string();
     if contents.is_empty() {
         bail!("model instructions file is empty: {}", path.display());
+    }
+    Ok(contents)
+}
+
+fn read_non_empty_compact_prompt_file(path: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read compact prompt file {}", path.display()))?;
+    let contents = contents.trim().to_string();
+    if contents.is_empty() {
+        bail!("compact prompt file is empty: {}", path.display());
     }
     Ok(contents)
 }
@@ -13676,18 +14629,49 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
         }
     };
+    if let Some(agent_path) = agent_path.as_deref() {
+        match live_agent_path_exists_in_tree(store, &session.id, agent_path) {
+            Ok(true) => {
+                return dispatch_tool_validation_error(
+                    store,
+                    session,
+                    call,
+                    &format!("agent path `{agent_path}` already exists"),
+                )
+            }
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
     let nickname = reserve_spawn_agent_nickname(
         store,
         &session.id,
         role_config.nickname_candidates.as_deref(),
     )?;
-    let child = store.create_child_session(
+    let child = match store.create_child_session(
         &session.id,
         &session.cwd,
         agent_path.as_deref(),
         Some(nickname.as_str()),
         agent_role,
-    )?;
+    ) {
+        Ok(child) => child,
+        Err(error)
+            if agent_path.is_some()
+                && format!("{error:#}").to_ascii_lowercase().contains("unique") =>
+        {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                &format!(
+                    "agent path `{}` already exists",
+                    agent_path.as_deref().unwrap_or_default()
+                ),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(base_instructions) = base_instructions {
         append_session_base_instructions_event(
             store,
@@ -13709,6 +14693,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "model": effective_model.clone(),
             "reasoning_effort": effective_reasoning_effort.clone(),
             "service_tier": effective_service_tier.clone(),
+            "config_overrides": config_overrides_payload(&role_config.config_overrides),
             "history_mode": history_mode,
             "context": inherited_context,
             "fork_response_items": fork_response_items,
@@ -13942,13 +14927,34 @@ pub fn update_parent_from_child_run(
             "payload": payload,
         }),
     )?;
-    if matches!(status.as_str(), "done" | "failed" | "cancelled") {
+    if matches!(status.as_str(), "done" | "failed" | "cancelled")
+        && parent_can_receive_subagent_completion_mail(store, parent_id)?
+    {
         let child_path = display_agent_path_for_session(store, child_id)?;
         let notification =
             format_subagent_notification_message(&child_path, status.as_str(), &payload);
         store.send_agent_message(child_id, parent_id, &notification, false)?;
     }
     Ok(payload)
+}
+
+fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
+    let Some(parent) = store.load_session(parent_id)? else {
+        return Ok(false);
+    };
+    if !matches!(
+        parent.status,
+        SessionStatus::Created | SessionStatus::Running
+    ) {
+        return Ok(false);
+    }
+    if store
+        .agent_summary_for_child(parent_id)?
+        .is_some_and(|agent| agent.status == "closed")
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
@@ -14013,6 +15019,70 @@ fn start_child_agent_background(
         })
         .context("spawn child agent thread")?;
     Ok(())
+}
+
+fn config_overrides_payload(overrides: &[(String, toml::Value)]) -> Value {
+    Value::Array(
+        overrides
+            .iter()
+            .map(|(key, value)| {
+                serde_json::json!({
+                    "key": key,
+                    "value": value,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn config_overrides_from_payload(value: Option<&Value>) -> Vec<(String, toml::Value)> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let key = item.get("key").and_then(Value::as_str)?.to_string();
+            let value = item.get("value")?.clone();
+            let value = serde_json::from_value::<toml::Value>(value).ok()?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn child_spawn_runtime_config(
+    store: &Store,
+    child_id: &str,
+) -> Result<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Vec<(String, toml::Value)>,
+)> {
+    let events = store.events_for_session(child_id)?;
+    let Some(context) = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "agent.context")
+    else {
+        return Ok((None, None, None, Vec::new()));
+    };
+    let model = context
+        .payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reasoning_effort = context
+        .payload
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let service_tier = context
+        .payload
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let config_overrides = config_overrides_from_payload(context.payload.get("config_overrides"));
+    Ok((model, reasoning_effort, service_tier, config_overrides))
 }
 
 const SPAWN_AGENT_ALLOWED_FIELDS: &[&str] = &[
@@ -14255,8 +15325,77 @@ fn collab_input_event_payload(input: &CollabInput) -> Value {
 
 fn collab_input_event_payload_with_context(input: &CollabInput, cwd: &Path) -> Result<Value> {
     let mut input = input.clone();
+    materialize_plain_skill_context_messages(&mut input);
     materialize_mention_context_messages(&mut input, cwd)?;
     Ok(collab_input_event_payload(&input))
+}
+
+fn materialize_plain_skill_context_messages(input: &mut CollabInput) {
+    let mentions = plain_skill_mentions(&input.preview);
+    if mentions.is_empty() {
+        return;
+    }
+    let Some(codex_home) = codex_home_dir() else {
+        return;
+    };
+    let summaries = available_skill_summaries(&codex_home);
+    if summaries.is_empty() {
+        return;
+    }
+    let mut items = Vec::new();
+    for mention in mentions {
+        let matches = summaries
+            .iter()
+            .filter(|skill| skill.name == mention)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            continue;
+        }
+        let skill = matches[0];
+        items.push(serde_json::json!({
+            "type": "skill",
+            "name": skill.name.clone(),
+            "path": skill.path.display().to_string(),
+        }));
+    }
+    if items.is_empty() {
+        return;
+    }
+    let mut messages = input.skill_context_messages.take().unwrap_or_default();
+    messages.extend(skill_context_messages_from_items(&items));
+    let mut seen_messages = HashSet::new();
+    messages.retain(|message| seen_messages.insert(message_content_text(message)));
+    input.skill_context_messages = unique_non_empty_array(messages);
+    if let Some(messages) = input.skill_context_messages.as_ref() {
+        let mut connector_ids = input.app_connector_ids.take().unwrap_or_default();
+        connector_ids.extend(app_connector_ids_from_skill_context_messages(messages));
+        input.app_connector_ids = unique_non_empty_strings(connector_ids);
+    }
+}
+
+fn plain_skill_mentions(text: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut seen = HashSet::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+        let mut mention = String::new();
+        while let Some((_, next)) = chars.peek().copied() {
+            if next.is_ascii_alphanumeric() || matches!(next, '_' | '-' | '/' | '.') {
+                mention.push(next);
+                let _ = chars.next();
+            } else {
+                break;
+            }
+        }
+        let mention = mention.trim_matches(['.', '/', '-']);
+        if !mention.is_empty() && seen.insert(mention.to_string()) {
+            mentions.push(mention.to_string());
+        }
+    }
+    mentions
 }
 
 fn materialize_mention_context_messages(input: &mut CollabInput, cwd: &Path) -> Result<()> {
@@ -14546,7 +15685,26 @@ fn push_collab_local_image_parts(parts: &mut Vec<Value>, path: &str, detail: &st
     }
     match std::fs::read(path) {
         Ok(bytes) => {
-            let mime = mime_type_for_image_path(path);
+            if bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": format!(
+                        "Codex could not process the local image at `{path}`: image is {} bytes, above the {} byte inline limit",
+                        bytes.len(),
+                        MAX_INLINE_LOCAL_IMAGE_BYTES
+                    ),
+                }));
+                return;
+            }
+            let Some(mime) = mime_type_for_image_bytes(&bytes) else {
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": format!(
+                        "Codex could not process the local image at `{path}`: unsupported or invalid image bytes"
+                    ),
+                }));
+                return;
+            };
             let encoded = general_purpose::STANDARD.encode(bytes);
             push_collab_image_parts(
                 parts,
@@ -14564,18 +15722,20 @@ fn push_collab_local_image_parts(parts: &mut Vec<Value>, path: &str, detail: &st
     }
 }
 
-fn mime_type_for_image_path(path: &str) -> &'static str {
-    match Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        _ => "image/png",
+fn mime_type_for_image_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
     }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 fn spawn_agent_fork_mode(
@@ -15316,6 +16476,17 @@ pub fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result
     }
 }
 
+fn live_agent_path_exists_in_tree(
+    store: &Store,
+    session_id: &str,
+    agent_path: &str,
+) -> Result<bool> {
+    let root_id = root_session_id(store, session_id)?;
+    Ok(collect_agent_tree(store, &root_id)?
+        .into_iter()
+        .any(|agent| agent.status != "closed" && agent.agent_path.as_deref() == Some(agent_path)))
+}
+
 fn enforce_multi_agent_v2_thread_cap(
     store: &Store,
     session_id: &str,
@@ -15335,7 +16506,7 @@ fn multi_agent_v2_open_thread_count(store: &Store, session_id: &str) -> Result<u
     let root_id = root_session_id(store, session_id)?;
     Ok(1 + collect_agent_tree(store, &root_id)?
         .into_iter()
-        .filter(|agent| agent.status == "open")
+        .filter(|agent| agent.status != "closed")
         .count())
 }
 
@@ -15346,16 +16517,12 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(
+    if let Err(error) = validate_tool_arguments_object(
         &call.arguments,
+        "send_input",
         &["target", "message", "items", "interrupt"],
     ) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for send_input"),
-        );
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let Some(target_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "send_input requires target");
@@ -15453,13 +16620,8 @@ fn dispatch_resume_agent_v1_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["id"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for resume_agent"),
-        );
+    if let Err(error) = validate_tool_arguments_object(&call.arguments, "resume_agent", &["id"]) {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let Some(target_session_id) = call.arguments.get("id").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "resume_agent requires id");
@@ -15530,13 +16692,10 @@ fn dispatch_wait_agent_v1_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["targets", "timeout_ms"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for wait_agent"),
-        );
+    if let Err(error) =
+        validate_tool_arguments_object(&call.arguments, "wait_agent", &["targets", "timeout_ms"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let targets = call
         .arguments
@@ -15651,13 +16810,10 @@ fn dispatch_wait_agent_tool(
     call: &ToolCall,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["timeout_ms"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for wait_agent"),
-        );
+    if let Err(error) =
+        validate_tool_arguments_object(&call.arguments, "wait_agent", &["timeout_ms"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let config = match load_provider_config_for_session(session, options) {
         Ok(config) => config.multi_agent_v2,
@@ -15779,13 +16935,10 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
     trigger_turn: bool,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target", "message"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for {tool_name}"),
-        );
+    if let Err(error) =
+        validate_tool_arguments_object(&call.arguments, tool_name, &["target", "message"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let Some(child_ref) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(
@@ -15866,25 +17019,43 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         }),
     )?;
     if trigger_turn {
+        let (spawn_model, spawn_reasoning_effort, spawn_service_tier, spawn_config_overrides) =
+            child_spawn_runtime_config(store, &target_session_id)?;
         if let Some(runner) = options.child_agent_runner.clone() {
             if !child_was_active {
                 start_child_agent_background(
                     store,
                     &session.id,
                     &target_session_id,
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
+                    spawn_model,
+                    spawn_reasoning_effort,
+                    spawn_service_tier,
+                    spawn_config_overrides,
                     runner,
                 )?;
             }
         } else {
+            let mut child_options = options.clone();
+            child_options
+                .config_overrides
+                .extend(spawn_config_overrides);
+            if let Some(reasoning_effort) = spawn_reasoning_effort {
+                child_options.config_overrides.push((
+                    "model_reasoning_effort".to_string(),
+                    toml::Value::String(reasoning_effort),
+                ));
+            }
+            if let Some(service_tier) = spawn_service_tier {
+                child_options.config_overrides.push((
+                    "service_tier".to_string(),
+                    toml::Value::String(service_tier),
+                ));
+            }
             let run_error = run_existing_session_with_provider(
                 store,
                 provider,
                 &target_session_id,
-                options.clone(),
+                child_options,
             )
             .err()
             .map(|error| format!("{error:#}"));
@@ -15909,13 +17080,10 @@ fn dispatch_list_agents_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["path_prefix"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for list_agents"),
-        );
+    if let Err(error) =
+        validate_tool_arguments_object(&call.arguments, "list_agents", &["path_prefix"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     store.append_event(
         &session.id,
@@ -16056,13 +17224,9 @@ fn dispatch_close_agent_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for close_agent"),
-        );
+    if let Err(error) = validate_tool_arguments_object(&call.arguments, "close_agent", &["target"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let Some(child_ref) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
@@ -16130,13 +17294,9 @@ fn dispatch_close_agent_v1_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target"]) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("unexpected argument `{invalid}` for close_agent"),
-        );
+    if let Err(error) = validate_tool_arguments_object(&call.arguments, "close_agent", &["target"])
+    {
+        return dispatch_tool_validation_error(store, session, call, &error);
     }
     let Some(child_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
@@ -16212,12 +17372,21 @@ fn dispatch_close_agent_v1_tool(
     })
 }
 
-fn unexpected_tool_arguments(arguments: &Value, allowed: &[&str]) -> Option<String> {
-    let object = arguments.as_object()?;
-    object
+fn validate_tool_arguments_object(
+    arguments: &Value,
+    tool_name: &str,
+    allowed: &[&str],
+) -> std::result::Result<(), String> {
+    let Some(object) = arguments.as_object() else {
+        return Err(format!("{tool_name} arguments must be an object"));
+    };
+    if let Some(invalid) = object
         .keys()
         .find(|key| !allowed.iter().any(|allowed| allowed == &key.as_str()))
-        .cloned()
+    {
+        return Err(format!("unexpected argument `{invalid}` for {tool_name}"));
+    }
+    Ok(())
 }
 
 fn dispatch_tool_validation_error(
@@ -18830,7 +19999,7 @@ x-env = "CORP_HEADER"
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
-        let provider = InstructionCapturingProvider::default();
+        let provider = InstructionCapturingProvider::with_provider_name("codex");
         let options = AgentRunOptions::default()
             .with_model_provider_id("openrouter")
             .with_config_overrides(vec![
@@ -18897,6 +20066,29 @@ x-env = "CORP_HEADER"
         assert_eq!(turn_metadata["turn_id"].as_str(), Some(run.id.as_str()));
         assert_eq!(turn_metadata["sandbox"].as_str(), Some("none"));
         assert!(turn_metadata["turn_started_at_unix_ms"].as_i64().is_some());
+        assert_eq!(provider.captured_turn_state_present(), vec![true]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_omits_codex_request_metadata_for_generic_providers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::with_provider_name("corp");
+
+        run_agent_with_provider(
+            &store,
+            &provider,
+            "capture generic metadata",
+            &project,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(provider.captured_client_metadata(), vec![None]);
+        assert_eq!(provider.captured_extra_headers(), vec![None]);
+        assert_eq!(provider.captured_prompt_cache_keys(), vec![None]);
         assert_eq!(provider.captured_turn_state_present(), vec![true]);
         Ok(())
     }
@@ -18996,6 +20188,88 @@ x-missing = "CORP_MISSING_HEADER"
             configured_openai_responses_provider(&store, "gpt-5.5".to_string(), &config, "corp")?
                 .expect("configured provider");
         assert_eq!(provider.provider_name(), "corp");
+        Ok(())
+    }
+
+    #[test]
+    fn custom_model_provider_wire_api_chat_runs_openai_compatible_chat() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let chat_body = serde_json::json!({
+            "id": "chatcmpl_corp",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_done",
+                        "type": "function",
+                        "function": {
+                            "name": "done",
+                            "arguments": "{\"result\":\"chat ok\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, requests, handle) =
+            spawn_responses_capture_server_sequence(vec![chat_body], Duration::from_secs(20))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"
+model_provider = "corp"
+
+[model_providers.corp]
+name = "Corp"
+base_url = "{base_url}"
+wire_api = "chat"
+request_max_retries = 0
+requires_openai_auth = false
+
+[model_providers.corp.query_params]
+api-version = "chat"
+
+[model_providers.corp.http_headers]
+x-static = "chat-static"
+
+[model_providers.corp.env_http_headers]
+x-env = "CORP_HEADER"
+"#
+            ),
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let _header = EnvVarGuard::set_str("CORP_HEADER", "chat-env");
+            run_agent_from_config(
+                &store,
+                "finish through chat provider",
+                &project,
+                ProviderRunConfig::new(ProviderBackend::Openai, "qwen/custom"),
+            )
+        })?;
+
+        let request = requests.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(handle.join().expect("join chat provider server"), 1);
+        assert!(request
+            .request_line
+            .contains("/v1/chat/completions?api-version=chat"));
+        let headers = request.headers.to_ascii_lowercase();
+        assert!(headers.contains("x-static: chat-static"));
+        assert!(headers.contains("x-env: chat-env"));
+        assert!(!headers.contains("authorization: bearer"));
+
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "chat ok"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_CONFIG_SNAPSHOT_EVENT
+                && event.payload["model_provider_info"]["wire_api"] == "chat"
+        }));
         Ok(())
     }
 
@@ -23772,10 +25046,19 @@ command = "print-token"
         ];
         let thread_config: toml::Value = r#"
 model_provider = "thread"
+instructions = "thread base"
+developer_instructions = "thread developer"
+model_reasoning_effort = "low"
+model_context_window = 7000
+model_auto_compact_token_limit = 3000
+tool_output_token_limit = 77
+web_search = "live"
+allowed_web_search_modes = ["live"]
 
 [features]
 remote_compaction_v2 = true
 multi_agent = false
+shell_tool = false
 
 [model_providers.thread]
 name = "Thread"
@@ -23786,24 +25069,49 @@ request_max_retries = 7
             .with_config_overrides(request_overrides)
             .with_session_thread_config(thread_config);
 
-        let (config, headers, specs) = with_codex_home(&codex_home, || -> Result<_> {
-            let config = load_provider_config_for_session(&session, &options)?;
-            let headers = codex_responses_extra_headers(&store, &session, &options, None)?;
-            let specs = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?;
-            Ok((config, headers, specs))
-        })?;
+        let (config, headers, specs, hosted_tools) =
+            with_codex_home(&codex_home, || -> Result<_> {
+                let config = load_provider_config_for_session(&session, &options)?;
+                let headers = codex_responses_extra_headers(&store, &session, &options, None)?;
+                let specs = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?;
+                let hosted_tools =
+                    hosted_tool_specs_for_session(&session, &options, "gpt-5.5", true, false)?;
+                Ok((config, headers, specs, hosted_tools))
+            })?;
 
         assert_eq!(config.model_provider_id.as_deref(), Some("thread"));
         assert_eq!(
             config.provider_request_max_retries.get("thread").copied(),
             Some(7)
         );
+        assert_eq!(config.base_instructions()?.as_deref(), Some("thread base"));
+        assert_eq!(
+            config.developer_instructions.as_deref(),
+            Some("thread developer")
+        );
+        assert_eq!(
+            config.model_request_settings.reasoning_effort.as_deref(),
+            Some("low")
+        );
+        let model_info = resolved_model_request_info_from_config(&config, "gpt-5.5");
+        assert_eq!(model_info.resolved_context_window(), Some(7000));
+        assert_eq!(model_info.auto_compact_token_limit(), Some(3000));
+        assert_eq!(model_info.tool_output_token_budget(), 77);
         assert!(!headers
             .get(CODEX_BETA_FEATURES_HEADER)
             .is_some_and(|features| features.contains("remote_compaction_v2")));
         assert!(!config.multi_agent_enabled);
         assert!(!specs.iter().any(|spec| spec.name == "spawn_agent"));
         assert!(!specs.iter().any(|spec| spec.name == "tool_search"));
+        assert!(!specs.iter().any(|spec| {
+            matches!(
+                spec.name.as_str(),
+                "exec_command" | "write_stdin" | "shell_command"
+            )
+        }));
+        assert!(hosted_tools
+            .iter()
+            .any(|spec| matches!(spec, HostedToolSpec::WebSearch { .. })));
         Ok(())
     }
 
@@ -23887,6 +25195,29 @@ request_max_retries = 7
             .find(|spec| spec.name == "shell_command")
             .expect("shell spec");
         assert!(shell.input_schema["properties"].get("login").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn goals_feature_gate_hides_goal_tools_like_review_mode() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.goals".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)
+        })?;
+
+        assert!(!specs.iter().any(|spec| matches!(
+            spec.name.as_str(),
+            "get_goal" | "create_goal" | "update_goal"
+        )));
+        assert!(specs.iter().any(|spec| spec.name == "update_plan"));
         Ok(())
     }
 
@@ -24791,6 +26122,7 @@ name = "Thread"
             Some("base instructions that count too"),
             Some(1000),
             Some(1),
+            None,
         )?;
 
         let events = store.events_for_session(&session.id)?;
@@ -27077,7 +28409,10 @@ name = "Thread"
         );
         assert!(message_content_text(&messages[1]).contains("<environment_context>"));
         assert_eq!(messages[2]["role"], "user");
-        assert_eq!(message_content_text(&messages[2]), "x".repeat(2000));
+        let retained_user_text = message_content_text(&messages[2]);
+        assert!(retained_user_text.starts_with("x"));
+        assert!(retained_user_text.contains("[truncated]"));
+        assert!(retained_user_text.contains("omitted"));
         assert_eq!(messages[3]["role"], "user");
         assert!(is_compaction_summary_message(&messages[3]));
         assert!(
@@ -27127,13 +28462,17 @@ name = "Thread"
 
     #[test]
     fn compacted_context_keeps_browser_agent_contract() -> Result<()> {
-        let message = compacted_context_system_message(&serde_json::json!({
-            "task": "look at a browser page",
-            "browser": {
-                "url": "https://example.com",
-                "status": "connected",
-            },
-        }))?;
+        let contract = browser_agent_contract();
+        let message = compacted_context_system_message(
+            &serde_json::json!({
+                "task": "look at a browser page",
+                "browser": {
+                    "url": "https://example.com",
+                    "status": "connected",
+                },
+            }),
+            &contract,
+        )?;
 
         assert!(
             message.contains("You are still the same browser-use agent after context compaction")
@@ -27147,6 +28486,132 @@ name = "Thread"
         assert!(message.contains("Compacted prior browser-agent context"));
         assert!(message.contains("https://example.com"));
         Ok(())
+    }
+
+    #[test]
+    fn compaction_summary_uses_active_base_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "compact with custom contract" }),
+        )?;
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(2000),
+        })];
+
+        maybe_compact_messages_with_context(
+            &store,
+            &session.id,
+            &mut messages,
+            500,
+            Some("CUSTOM ACTIVE BASE CONTRACT"),
+            None,
+            Some(0),
+            None,
+        )?;
+
+        let summary = messages
+            .iter()
+            .find(|message| is_compaction_summary_message(message))
+            .map(message_content_text)
+            .context("compaction summary")?;
+        assert!(summary.contains("CUSTOM ACTIVE BASE CONTRACT"));
+        assert!(!summary.contains("Browser Agent Contract"));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_summary_prefers_configured_compact_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "compact with configured prompt" }),
+        )?;
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(2000),
+        })];
+
+        maybe_compact_messages_with_context(
+            &store,
+            &session.id,
+            &mut messages,
+            500,
+            Some("ACTIVE BASE CONTRACT"),
+            None,
+            Some(0),
+            Some("CONFIGURED COMPACT PROMPT"),
+        )?;
+
+        let summary = messages
+            .iter()
+            .find(|message| is_compaction_summary_message(message))
+            .map(message_content_text)
+            .context("compaction summary")?;
+        assert!(summary.contains("CONFIGURED COMPACT PROMPT"));
+        assert!(!summary.contains("ACTIVE BASE CONTRACT"));
+        Ok(())
+    }
+
+    #[test]
+    fn server_model_mismatch_records_reroute_warning_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ServerModel {
+                model: "server-selected-model".to_string(),
+            },
+            ModelEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "test server model reroute",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.reroute"
+                && event.payload["requested_model"] == "scripted"
+                && event.payload["server_model"] == "server-selected-model"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_STARTUP_WARNING_EVENT
+                && event.payload["source"] == "model_reroute"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn model_auto_compact_limit_controls_default_compaction_budget() {
+        let mut model_info = browser_use_providers::ModelRequestInfo::unknown();
+        model_info.context_window = Some(8_000);
+        model_info.auto_compact_token_limit = Some(6_000);
+
+        assert_eq!(
+            effective_compaction_max_context_chars(DEFAULT_MAX_CONTEXT_CHARS, &model_info),
+            token_budget_to_char_budget(6_000)
+        );
+        assert_eq!(
+            effective_compaction_max_context_chars(10_000, &model_info),
+            10_000
+        );
+        assert_eq!(effective_compaction_max_context_chars(0, &model_info), 0);
     }
 
     #[test]
@@ -27244,7 +28709,10 @@ name = "Thread"
             Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
         );
         assert_eq!(messages[2]["role"], "user");
-        assert_eq!(message_content_text(&messages[2]), "x".repeat(2000));
+        let retained_user_text = message_content_text(&messages[2]);
+        assert!(retained_user_text.starts_with("x"));
+        assert!(retained_user_text.contains("[truncated]"));
+        assert!(retained_user_text.contains("omitted"));
         assert_eq!(messages[3]["role"], "user");
         assert!(is_compaction_summary_message(&messages[3]));
         assert!(!messages
@@ -27461,7 +28929,7 @@ name = "Thread"
     }
 
     #[test]
-    fn provider_loop_emits_deadline_warning_on_final_turn() -> Result<()> {
+    fn provider_loop_does_not_inject_local_deadline_warning_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let provider = ScriptedProvider::new(vec![
@@ -27478,7 +28946,7 @@ name = "Thread"
         let session_id = run_agent_with_provider(
             &store,
             &provider,
-            "deadline warning",
+            "no deadline warning",
             temp.path(),
             AgentRunOptions {
                 max_turns: 2,
@@ -27487,13 +28955,248 @@ name = "Thread"
             },
         )?;
         let events = store.events_for_session(&session_id)?;
-        assert!(events
+        assert!(!events
             .iter()
-            .any(|event| event.event_type == "session.deadline_warning"
-                && event.payload["remaining_turns"] == 1
-                && event.payload["max_turns"] == 2));
+            .any(|event| event.event_type == "session.deadline_warning"));
         assert!(events.iter().any(|event| event.event_type == "session.done"
             && event.payload["result"] == "finished on final turn"));
+        Ok(())
+    }
+
+    #[test]
+    fn goal_tools_create_get_and_update_thread_goal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            CODEX_TOKEN_COUNT_EVENT,
+            serde_json::json!({
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 60,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 100,
+                    }
+                }
+            }),
+        )?;
+
+        let create = dispatch_create_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "create_goal_1".to_string(),
+                name: "create_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "objective": "close parity gaps",
+                    "token_budget": 1234,
+                }),
+            },
+        )?;
+        let created = serde_json::from_str::<Value>(&message_content_text(&create.messages[0]))?;
+        assert_eq!(created["objective"], "close parity gaps");
+        assert_eq!(created["status"], "active");
+        assert_eq!(created["usage"]["token_budget"], 1234);
+        assert_eq!(created["usage"]["tokens_used"], 0);
+
+        let duplicate = dispatch_create_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "create_goal_2".to_string(),
+                name: "create_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({ "objective": "duplicate" }),
+            },
+        )?;
+        assert!(message_content_text(&duplicate.messages[0]).contains("goal already exists"));
+        store.append_event(
+            &session.id,
+            CODEX_TOKEN_COUNT_EVENT,
+            serde_json::json!({
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 90,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 60,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 150,
+                    }
+                }
+            }),
+        )?;
+
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "get_goal_1".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let current = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(current["objective"], "close parity gaps");
+        assert_eq!(current["usage"]["tokens_used"], 50);
+        assert_eq!(current["usage"]["remaining_tokens"], 1184);
+
+        let update = dispatch_update_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "update_goal_1".to_string(),
+                name: "update_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({ "status": "complete" }),
+            },
+        )?;
+        let updated = serde_json::from_str::<Value>(&message_content_text(&update.messages[0]))?;
+        assert_eq!(updated["status"], "complete");
+
+        let recreate = dispatch_create_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "create_goal_3".to_string(),
+                name: "create_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({ "objective": "new goal" }),
+            },
+        )?;
+        assert!(message_content_text(&recreate.messages[0]).contains("goal already exists"));
+        Ok(())
+    }
+
+    #[test]
+    fn available_skills_inventory_is_injected_with_workspace_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        let skill_dir = codex_home.join("skills").join("Docs");
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Docs\n\nUse when documentation needs careful updates.\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let joined = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("<skills_instructions>"));
+        assert!(joined.contains("`Docs`"));
+        assert!(joined.contains("Use when documentation needs careful updates."));
+        Ok(())
+    }
+
+    #[test]
+    fn plain_dollar_skill_mentions_materialize_skill_context_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        let skill_dir = codex_home.join("skills").join("Docs");
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(skill_dir.join("SKILL.md"), "Use the docs workflow.")?;
+
+        let payload = with_codex_home(&codex_home, || {
+            typed_user_input_payload_from_text_for_cwd("Please use $Docs here", temp.path())
+        })?;
+        let messages = session_event_user_messages(&payload);
+        let joined = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Please use $Docs here"));
+        assert!(joined.contains("<skill>\n<name>Docs</name>"));
+        assert!(joined.contains("Use the docs workflow."));
+        Ok(())
+    }
+
+    #[test]
+    fn user_shell_context_replays_as_model_visible_workspace_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "use shell context"}),
+        )?;
+        append_user_shell_command_context_event(
+            &store,
+            &session.id,
+            "printf hello",
+            0,
+            Duration::from_millis(12),
+            "hello",
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let joined = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("<user_shell_command>"));
+        assert!(joined.contains("printf hello"));
+        assert!(joined.contains("Output:\nhello"));
+        Ok(())
+    }
+
+    #[test]
+    fn user_shell_context_truncates_large_output_like_tool_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "use shell context"}),
+        )?;
+        let large_output = "x".repeat(50_000);
+        append_user_shell_command_context_event(
+            &store,
+            &session.id,
+            "large-output",
+            0,
+            Duration::from_millis(1),
+            &large_output,
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let joined = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("omitted 10000 characters from user shell output"));
+        assert!(joined.len() < 45_000);
+        Ok(())
+    }
+
+    #[test]
+    fn review_prompts_match_codex_shapes_for_represented_targets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        assert_eq!(
+            review_prompt_uncommitted_changes(),
+            "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings."
+        );
+        assert_eq!(
+            review_prompt_commit(temp.path(), "deadbeef"),
+            "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings."
+        );
+        assert!(review_prompt_base_branch(temp.path(), "main")
+            .contains("Review the code changes against the base branch 'main'."));
+        assert_eq!(review_prompt_custom("check locks")?, "check locks");
+        assert!(review_prompt_custom("   ").is_err());
         Ok(())
     }
 
@@ -28446,6 +30149,121 @@ usage_hint_enabled = false
     }
 
     #[test]
+    fn spawn_agent_counts_completed_unclosed_agents_against_v2_thread_cap() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 2\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::with_text("child result");
+        let options = AgentRunOptions::default();
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &ToolCall {
+                    id: "spawn_first".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "message": "inspect first",
+                        "task_name": "first_helper",
+                    }),
+                },
+                &options,
+                &None,
+            )
+        })?;
+        let children = store.list_child_agents(&session.id)?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "done");
+
+        let rejected = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &ToolCall {
+                    id: "spawn_second".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "message": "inspect second",
+                        "task_name": "second_helper",
+                    }),
+                },
+                &options,
+                &None,
+            )
+        })?;
+        assert!(rejected.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_concurrent_threads_per_session = 2"));
+        assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_rejects_duplicate_v2_task_name_before_store_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 4\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::with_text("child result");
+        let options = AgentRunOptions::default();
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect duplicate",
+                "task_name": "repo_helper",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call("spawn_first"),
+                &options,
+                &None,
+            )
+        })?;
+        let duplicate = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call("spawn_duplicate"),
+                &options,
+                &None,
+            )
+        })?;
+
+        let content = duplicate.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(content.contains("agent path `/root/repo_helper` already exists"));
+        assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "tool.failed" && event.payload["tool_call_id"] == "spawn_duplicate"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn mailbox_messages_are_drained_into_target_turn_once_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -28545,6 +30363,38 @@ usage_hint_enabled = false
             .join("\n");
         assert!(text.contains("<subagent_notification>"));
         assert!(store.messages_for_agent(&parent.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn late_child_completion_does_not_queue_mail_to_finished_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "parent answer"}),
+        )?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/late_worker"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "child finished late"}),
+        )?;
+
+        update_parent_from_child_run(&store, &parent.id, &child.id, None)?;
+
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+        assert!(store.events_for_session(&parent.id)?.iter().any(|event| {
+            event.event_type == "agent.completed" && event.payload["child_session_id"] == child.id
+        }));
         Ok(())
     }
 
@@ -29676,14 +31526,14 @@ enabled = true
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(mention_context.contains("Skills from this plugin"));
-        assert!(mention_context.contains("MCP servers from this plugin"));
+        assert!(mention_context.contains("MCP servers configured by this plugin"));
         assert!(mention_context.contains("Apps from this plugin"));
 
         store.append_event(&session.id, "session.input", payload)?;
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
         assert!(messages.iter().any(|message| {
             is_mention_context_message(message)
-                && message_content_text(message).contains("MCP servers from this plugin")
+                && message_content_text(message).contains("MCP servers configured by this plugin")
         }));
         let model_text = messages
             .iter()
@@ -30422,6 +32272,40 @@ enabled = true
         assert!(parent_events.iter().any(
             |event| event.event_type == "tool.failed" && event.payload["name"] == "wait_agent"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v2_rejects_non_object_arguments_without_waiting() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let started_at = Instant::now();
+
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_bad_args".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!("not an object"),
+            },
+            &AgentRunOptions::default(),
+        )?;
+
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        assert_eq!(content, "wait_agent arguments must be an object");
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().any(
+            |event| event.event_type == "tool.failed" && event.payload["name"] == "wait_agent"
+        ));
+        assert!(!parent_events
+            .iter()
+            .any(|event| event.event_type == "agent.wait.started"));
         Ok(())
     }
 
@@ -31556,6 +33440,7 @@ enabled = true
 
     #[derive(Default)]
     struct InstructionCapturingProvider {
+        provider_name: Option<String>,
         instructions: std::sync::Mutex<Vec<Option<String>>>,
         model_settings: std::sync::Mutex<Vec<ModelRequestSettings>>,
         request_max_retries: std::sync::Mutex<Vec<Option<usize>>>,
@@ -31564,12 +33449,20 @@ enabled = true
         model_request_infos: std::sync::Mutex<Vec<Option<browser_use_providers::ModelRequestInfo>>>,
         client_metadata: std::sync::Mutex<Vec<Option<HashMap<String, String>>>>,
         extra_headers: std::sync::Mutex<Vec<Option<HashMap<String, String>>>>,
+        prompt_cache_keys: std::sync::Mutex<Vec<Option<String>>>,
         turn_state_present: std::sync::Mutex<Vec<bool>>,
         output_schemas: std::sync::Mutex<Vec<Option<Value>>>,
         output_schema_strict: std::sync::Mutex<Vec<bool>>,
     }
 
     impl InstructionCapturingProvider {
+        fn with_provider_name(provider_name: impl Into<String>) -> Self {
+            Self {
+                provider_name: Some(provider_name.into()),
+                ..Self::default()
+            }
+        }
+
         fn captured_instructions(&self) -> Vec<Option<String>> {
             self.instructions.lock().expect("instructions lock").clone()
         }
@@ -31625,6 +33518,13 @@ enabled = true
                 .clone()
         }
 
+        fn captured_prompt_cache_keys(&self) -> Vec<Option<String>> {
+            self.prompt_cache_keys
+                .lock()
+                .expect("prompt cache keys lock")
+                .clone()
+        }
+
         fn captured_turn_state_present(&self) -> Vec<bool> {
             self.turn_state_present
                 .lock()
@@ -31648,6 +33548,10 @@ enabled = true
     }
 
     impl ModelProvider for InstructionCapturingProvider {
+        fn provider_name(&self) -> &str {
+            self.provider_name.as_deref().unwrap_or("unknown")
+        }
+
         fn model_name(&self) -> &str {
             "gpt-5.4"
         }
@@ -31685,6 +33589,10 @@ enabled = true
                 .lock()
                 .expect("extra headers lock")
                 .push(turn.extra_headers.clone());
+            self.prompt_cache_keys
+                .lock()
+                .expect("prompt cache keys lock")
+                .push(turn.prompt_cache_key.clone());
             self.turn_state_present
                 .lock()
                 .expect("turn state present lock")
