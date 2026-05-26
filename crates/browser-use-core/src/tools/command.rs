@@ -677,16 +677,22 @@ fn maybe_intercept_apply_patch_command(
     max_chars: usize,
     legacy_shell_output: bool,
 ) -> Result<Option<CommandToolResult>> {
-    let Some(patch) = extract_apply_patch_heredoc(command) else {
+    let Some(invocation) = extract_apply_patch_invocation(command) else {
         return Ok(None);
     };
+    let effective_workdir = invocation
+        .workdir
+        .as_deref()
+        .map(|override_workdir| resolve_workdir_from_base(workdir, override_workdir))
+        .transpose()?
+        .unwrap_or_else(|| workdir.to_path_buf());
     let mut patch_session = session.clone();
-    patch_session.cwd = workdir.display().to_string();
+    patch_session.cwd = effective_workdir.display().to_string();
     let patch_call = ToolCall {
         id: call.id.clone(),
         name: "apply_patch".to_string(),
         namespace: None,
-        arguments: Value::String(patch),
+        arguments: Value::String(invocation.patch),
     };
     let result = super::files::apply_patch_tool(store, &patch_session, &patch_call)?;
     let output = match result.content {
@@ -699,7 +705,7 @@ fn maybe_intercept_apply_patch_command(
         json!({
             "tool_call_id": call.id,
             "source_tool": call.name,
-            "workdir": workdir.display().to_string(),
+            "workdir": effective_workdir.display().to_string(),
         }),
     )?;
     if legacy_shell_output {
@@ -734,8 +740,40 @@ fn maybe_intercept_apply_patch_command(
     }))
 }
 
-fn extract_apply_patch_heredoc(command: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApplyPatchInvocation {
+    patch: String,
+    workdir: Option<String>,
+}
+
+fn extract_apply_patch_invocation(command: &str) -> Option<ApplyPatchInvocation> {
     let command = command.trim();
+    let (command, workdir) = extract_cd_apply_patch_prefix(command)?;
+    extract_apply_patch_heredoc(command)
+        .or_else(|| extract_apply_patch_direct(command))
+        .map(|patch| ApplyPatchInvocation { patch, workdir })
+}
+
+fn extract_cd_apply_patch_prefix(command: &str) -> Option<(&str, Option<String>)> {
+    let command = command.trim();
+    let Some(after_cd) = command.strip_prefix("cd ") else {
+        return Some((command, None));
+    };
+    let (cd_arg, rest) = after_cd.split_once("&&")?;
+    let workdir = parse_single_shell_word(cd_arg.trim())?;
+    Some((rest.trim(), Some(workdir)))
+}
+
+fn resolve_workdir_from_base(base: &Path, workdir: &str) -> Result<PathBuf> {
+    let path = Path::new(workdir);
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    })
+}
+
+fn extract_apply_patch_heredoc(command: &str) -> Option<String> {
     let (first_line, rest) = command.split_once('\n')?;
     let delimiter = apply_patch_heredoc_delimiter(first_line.trim())?;
     let lines = rest.lines().collect::<Vec<_>>();
@@ -757,7 +795,11 @@ fn extract_apply_patch_heredoc(command: &str) -> Option<String> {
 }
 
 fn apply_patch_heredoc_delimiter(first_line: &str) -> Option<String> {
-    let rest = first_line.strip_prefix("apply_patch")?.trim_start();
+    let (command_name, rest) = first_line.split_once(char::is_whitespace)?;
+    if !matches!(command_name, "apply_patch" | "applypatch") {
+        return None;
+    }
+    let rest = rest.trim_start();
     let rest = rest.strip_prefix("<<")?;
     let rest = rest.strip_prefix('-').unwrap_or(rest).trim();
     if rest.is_empty() || rest.split_whitespace().nth(1).is_some() {
@@ -773,6 +815,44 @@ fn apply_patch_heredoc_delimiter(first_line: &str) -> Option<String> {
         .unwrap_or(rest)
         .trim();
     (!delimiter.is_empty()).then(|| delimiter.to_string())
+}
+
+fn extract_apply_patch_direct(command: &str) -> Option<String> {
+    let command = command.trim();
+    let (command_name, rest) = command.split_once(char::is_whitespace)?;
+    if !matches!(command_name, "apply_patch" | "applypatch") {
+        return None;
+    }
+    let patch = parse_single_shell_word(rest.trim())?;
+    patch
+        .trim_start()
+        .starts_with("*** Begin Patch")
+        .then_some(patch)
+}
+
+fn parse_single_shell_word(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(rest) = input.strip_prefix('\'') {
+        let end = rest.rfind('\'')?;
+        if !rest[end + 1..].trim().is_empty() {
+            return None;
+        }
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = input.strip_prefix('"') {
+        let end = rest.rfind('"')?;
+        if !rest[end + 1..].trim().is_empty() {
+            return None;
+        }
+        return Some(rest[..end].to_string());
+    }
+    if input.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    Some(input.to_string())
 }
 
 fn ensure_shell_snapshot(shell: &ShellSpec, workdir: &Path, thread_id: &str) -> Option<PathBuf> {
@@ -2950,6 +3030,81 @@ mod tests {
             |event| event.event_type == "command.intercepted_apply_patch"
                 && event.payload["source_tool"] == "shell_command"
         ));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_intercepts_applypatch_alias_and_cd_heredoc_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let nested = Path::new(&session.cwd).join("patch-root");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let patch = r#"*** Begin Patch
+*** Add File: alias.txt
++from alias cd intercept
+*** End Patch"#;
+        let command = format!("cd patch-root && applypatch <<'PATCH'\n{patch}\nPATCH");
+
+        exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_applypatch_cd".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({"cmd": command, "yield_time_ms": 5000}),
+            },
+        )
+        .expect("intercepted applypatch with cd");
+
+        assert_eq!(
+            std::fs::read_to_string(nested.join("alias.txt")).expect("patched file"),
+            "from alias cd intercept\n"
+        );
+        let events = store.events_for_session(&session.id).expect("events");
+        let intercepted = events
+            .iter()
+            .find(|event| event.event_type == "command.intercepted_apply_patch")
+            .expect("intercept event");
+        assert_eq!(intercepted.payload["workdir"], nested.display().to_string());
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_intercepts_direct_apply_patch_argument_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let patch = r#"*** Begin Patch
+*** Add File: direct.txt
++from direct intercept
+*** End Patch"#;
+        let command = format!("apply_patch '{}'", patch);
+
+        exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_apply_patch_direct".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({"cmd": command, "yield_time_ms": 5000}),
+            },
+        )
+        .expect("intercepted direct apply_patch");
+
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&session.cwd).join("direct.txt"))
+                .expect("patched file"),
+            "from direct intercept\n"
+        );
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "command.intercepted_apply_patch"));
         assert!(!events
             .iter()
             .any(|event| event.event_type == "command.started"));

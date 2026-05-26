@@ -289,26 +289,26 @@ pub(crate) fn view_image(
         } else {
             "high"
         };
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        if bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
-            bail!(
-                "view_image cannot inline {}: image is {} bytes, above the {} byte inline limit",
-                path.display(),
-                bytes.len(),
-                MAX_INLINE_LOCAL_IMAGE_BYTES
-            );
-        }
         let mode = if detail == "original" {
             PromptImageMode::Original
         } else {
             PromptImageMode::ResizeToFit
         };
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let prompt_image = load_for_prompt_bytes(&path, bytes, mode).with_context(|| {
             format!(
                 "view_image cannot inline {}: unsupported or invalid image bytes",
                 path.display()
             )
         })?;
+        if prompt_image.bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
+            bail!(
+                "view_image cannot inline {}: image is {} bytes after normalization, above the {} byte inline limit",
+                path.display(),
+                prompt_image.bytes.len(),
+                MAX_INLINE_LOCAL_IMAGE_BYTES
+            );
+        }
         let mime = prompt_image.mime;
         let image = json!({
             "path": path.display().to_string(),
@@ -1556,6 +1556,25 @@ mod tests {
         encoded.into_inner()
     }
 
+    fn noisy_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            let seed = x
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(y.wrapping_mul(12_345));
+            Rgba([
+                (seed & 0xff) as u8,
+                ((seed >> 8) & 0xff) as u8,
+                ((seed >> 16) & 0xff) as u8,
+                255,
+            ])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode noisy png");
+        encoded.into_inner()
+    }
+
     #[test]
     fn read_file_returns_numbered_range() {
         let tmp = TempDir::new().expect("tmp");
@@ -2276,6 +2295,42 @@ EOF
             .expect("tool image event");
         assert_eq!(image_event.payload["image"]["width"], 2048);
         assert_eq!(image_event.payload["image"]["height"], 768);
+    }
+
+    #[test]
+    fn view_image_resizes_before_enforcing_inline_limit_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let path = Path::new(&session.cwd).join("large-raw.png");
+        let bytes = noisy_png_bytes(2600, 2600);
+        assert!(
+            bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES,
+            "test fixture should exceed raw inline limit; got {}",
+            bytes.len()
+        );
+        fs::write(&path, bytes).expect("write png");
+
+        let result = view_image(
+            &store,
+            &session,
+            &ToolCall {
+                id: "image_1".to_string(),
+                name: "view_image".to_string(),
+                namespace: None,
+                arguments: json!({"path": "large-raw.png", "detail": "high"}),
+            },
+            true,
+        )
+        .expect("large raw image should resize before limit check");
+
+        let image_url = result.content[0]["image_url"].as_str().expect("image url");
+        let (_, encoded) = image_url.split_once(',').expect("data url");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode image");
+        assert!(decoded.len() <= MAX_INLINE_LOCAL_IMAGE_BYTES);
+        let resized = image::load_from_memory(&decoded).expect("load resized");
+        assert_eq!(resized.dimensions(), (2048, 2048));
     }
 
     #[test]

@@ -104,6 +104,24 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   forms (`applypatch`, direct invocation, and `cd ... && apply_patch`), goal
   budget/usage-limit steering, memory read-path instructions, and resize-before-
   reject handling for large local images.
+- The next concrete runtime-tool slice closes several of those audit findings:
+  Bash and apply_patch hooks now receive Codex-style `tool_input.command`
+  payloads while preserving `raw_tool_input` for local diagnostics, and
+  `updatedInput.command` is rewritten back into local `cmd`/patch arguments.
+  Shell apply-patch rescue now also recognizes `applypatch`, single-argument
+  direct invocation, and strict `cd <path> && apply_patch <<EOF` forms. Local
+  image handling now normalizes/resizes before applying the inline byte limit,
+  and memory summary context includes Codex-style read-path guidance about
+  precedence, use boundaries, and avoiding direct memory-file edits.
+- A fresh ten-agent audit after that slice found the obvious hook/applypatch/
+  image mechanics closed and moved the concrete next targets to runtime
+  recovery: invalid-image provider-error repair, compaction overflow
+  drop-oldest-and-retry behavior, actually executing `async_run` hooks, and
+  avoiding exact-looking `turn.diff` output when local only has a broad git
+  snapshot. The larger remaining pillars are still dynamic tool routing,
+  mutating streaming futures, typed history/rollout state, active-turn mailbox
+  semantics, goal budget lifecycle, full hook discovery/trust/concurrency, and
+  multi-environment tool routing.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1409,11 +1427,13 @@ The biggest remaining categories are:
   Patch completion and `turn.diff` events now include bounded unified diffs
   generated from committed patch deltas. Hook payload names also follow Codex's
   canonical names for `apply_patch` and `spawn_agent`, while matcher aliases
-  cover `Write`/`Edit` and `Agent`. Still open: concurrent/async hook execution,
-  exact hook run summaries/sources/validation, Codex-style `tool_input.command`
-  payload/update mapping for Bash and apply_patch hooks, broader apply-patch
-  shell invocation detection, exact streaming futures for mutating tools, and a
-  full Codex `TurnDiffTracker` lifecycle across every tool runtime.
+  cover `Write`/`Edit` and `Agent`. Bash/apply_patch hook inputs now expose
+  `tool_input.command`, and hook `updatedInput.command` rewrites back into the
+  local tool argument shape. The rescue path also covers `applypatch`, direct
+  single-argument invocation, and strict `cd <path> && apply_patch <<EOF`
+  forms. Still open: concurrent/async hook execution, exact hook run
+  summaries/sources/validation, exact streaming futures for mutating tools, and
+  a full Codex `TurnDiffTracker` lifecycle across every tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy
