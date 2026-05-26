@@ -2206,16 +2206,62 @@ fn browser_panel_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> 
             "viewport",
             state.browser.viewport.as_deref().unwrap_or("unknown"),
         ),
+    ];
+    if let Some(issue) = latest_browser_issue(app, state) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Last issue", bold())));
+        lines.push(kv_line("issue", &truncate(&issue.summary, 86)));
+        if let Some(next_step) = issue.next_step.as_ref() {
+            lines.push(kv_line("next", &truncate(next_step, 86)));
+        }
+    }
+    lines.extend([
         Line::from(""),
         selected("Open live browser", 0, app.selected_row),
         selected("Reconnect", 1, app.selected_row),
         selected("Change browser", 2, app.selected_row),
-    ];
+    ]);
     if let Some(notice) = app.browser_notice.as_ref() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(notice.clone(), muted())));
     }
     lines
+}
+
+#[derive(Debug)]
+struct BrowserIssueDisplay {
+    summary: String,
+    next_step: Option<String>,
+}
+
+fn latest_browser_issue(app: &App, state: &WorkbenchState) -> Option<BrowserIssueDisplay> {
+    let session = state.current_session.as_ref()?;
+    app.cached_events_for_session(&session.id)
+        .iter()
+        .rev()
+        .find_map(|event| {
+            event
+                .payload
+                .get("diagnosis")
+                .or_else(|| event.payload.get("last_issue"))
+                .and_then(browser_issue_display_from_value)
+        })
+}
+
+fn browser_issue_display_from_value(value: &serde_json::Value) -> Option<BrowserIssueDisplay> {
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let next_step = value
+        .get("next_step")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some(BrowserIssueDisplay { summary, next_step })
 }
 
 fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {

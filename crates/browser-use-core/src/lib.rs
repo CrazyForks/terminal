@@ -12831,6 +12831,7 @@ fn dispatch_browser_script_tool(
     timeout_seconds: u64,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
+    let action = browser_script_action(call)?;
     let code = call
         .arguments
         .get("code")
@@ -12845,13 +12846,42 @@ fn dispatch_browser_script_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let response = browser_use_browser::run_browser_script(
-        &session.id,
-        &session.cwd,
-        &session.artifact_root,
-        code,
-        timeout_seconds,
-    )?;
+    let response = match action {
+        BrowserScriptAction::Start => {
+            if code.trim().is_empty() {
+                anyhow::bail!("browser_script action=start requires non-empty code");
+            }
+            browser_use_browser::start_browser_script(
+                &session.id,
+                &session.cwd,
+                &session.artifact_root,
+                code,
+                timeout_seconds,
+            )?
+        }
+        BrowserScriptAction::Observe => {
+            let run_id = call
+                .arguments
+                .get("run_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("browser_script action=observe requires run_id"))?;
+            let observe_timeout_ms = call
+                .arguments
+                .get("observe_timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(1_000)
+                .clamp(1, 10_000);
+            browser_use_browser::observe_browser_script(&session.id, run_id, observe_timeout_ms)?
+        }
+        BrowserScriptAction::Cancel => {
+            let run_id = call
+                .arguments
+                .get("run_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("browser_script action=cancel requires run_id"))?;
+            browser_use_browser::cancel_browser_script(&session.id, run_id)?
+        }
+    };
     record_browser_script_response_events(store, &session.id, &response)?;
     if response.ok {
         store.append_event(
@@ -12869,7 +12899,10 @@ fn dispatch_browser_script_tool(
             serde_json::json!({
                 "name": "browser_script",
                 "tool_call_id": call.id,
+                "status": response.status,
+                "run_id": response.run_id,
                 "error": response.error,
+                "diagnosis": response.diagnosis,
             }),
         )?;
     }
@@ -12884,6 +12917,34 @@ fn dispatch_browser_script_tool(
             tool_output_token_budget,
         )?],
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserScriptAction {
+    Start,
+    Observe,
+    Cancel,
+}
+
+fn browser_script_action(call: &ToolCall) -> Result<BrowserScriptAction> {
+    match call.arguments.get("action").and_then(Value::as_str) {
+        Some("start") => Ok(BrowserScriptAction::Start),
+        Some("observe") => Ok(BrowserScriptAction::Observe),
+        Some("cancel") => Ok(BrowserScriptAction::Cancel),
+        Some(other) => anyhow::bail!("unknown browser_script action {other:?}"),
+        None if call.arguments.get("code").and_then(Value::as_str).is_some() => {
+            Ok(BrowserScriptAction::Start)
+        }
+        None if call
+            .arguments
+            .get("run_id")
+            .and_then(Value::as_str)
+            .is_some() =>
+        {
+            Ok(BrowserScriptAction::Observe)
+        }
+        None => Ok(BrowserScriptAction::Start),
+    }
 }
 
 fn normalize_request_user_input_args(
@@ -16731,6 +16792,12 @@ fn python_tool_image_output_parts(response: &RunPythonResponse) -> Result<Option
 fn browser_script_tool_message_content(
     response: &browser_use_browser::BrowserScriptOutput,
 ) -> String {
+    if response.status.as_deref() == Some("running") {
+        return browser_script_running_message(response);
+    }
+    if response.status.as_deref() == Some("cancelled") {
+        return browser_script_cancelled_message(response);
+    }
     if response.ok {
         let mut parts = Vec::new();
         if !response.text.trim().is_empty() {
@@ -16745,14 +16812,75 @@ fn browser_script_tool_message_content(
             parts.join("\n")
         }
     } else {
-        format!(
-            "browser_script failed: {}",
-            response
-                .error
-                .as_deref()
-                .unwrap_or("unknown browser_script error")
-        )
+        browser_script_failure_message(response)
     }
+}
+
+fn browser_script_running_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+    let mut parts = Vec::new();
+    if !response.text.trim().is_empty() {
+        parts.push(response.text.trim().to_string());
+    } else {
+        parts.push("browser_script is still running.".to_string());
+    }
+    if let Some(run_id) = response.run_id.as_deref() {
+        if !parts
+            .iter()
+            .any(|part| part.contains(&format!("run_id: {run_id}")))
+        {
+            parts.push(format!("run_id: {run_id}"));
+        }
+        parts.push(format!(
+            "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={}.",
+            response.next_observe_ms.unwrap_or(1_000)
+        ));
+    }
+    parts.join("\n")
+}
+
+fn browser_script_cancelled_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+    if response.text.trim().is_empty() {
+        "browser_script cancelled.".to_string()
+    } else {
+        response.text.trim().to_string()
+    }
+}
+
+fn browser_script_failure_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+    let mut parts = vec!["browser_script failed.".to_string()];
+    if let Some(diagnosis) = response.diagnosis.as_ref() {
+        parts.push(diagnosis.summary.clone());
+        parts.push(format!("What happened: {}", diagnosis.what_happened));
+        parts.push(format!("Next step: {}", diagnosis.next_step));
+    }
+    if let Some(error) = response.error.as_deref() {
+        let detail = browser_script_error_detail(error);
+        if !detail.is_empty() {
+            parts.push(format!("Details: {detail}"));
+        }
+    } else if response.diagnosis.is_none() {
+        parts.push("Details: unknown browser_script error".to_string());
+    }
+    parts.join("\n")
+}
+
+fn browser_script_error_detail(error: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 500;
+    let detail = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(error.trim());
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let mut out = detail
+        .chars()
+        .take(MAX_DETAIL_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn browser_script_tool_message_content_value(
@@ -16773,7 +16901,7 @@ fn browser_script_tool_message_content_value(
 fn browser_script_image_output_parts(
     response: &browser_use_browser::BrowserScriptOutput,
 ) -> Result<Option<Vec<Value>>> {
-    if !response.ok || response.images.is_empty() {
+    if response.images.is_empty() {
         return Ok(None);
     }
     let mut parts = Vec::new();
@@ -16873,13 +17001,17 @@ pub fn record_browser_script_response_events(
         session_id,
         "tool.output",
         serde_json::json!({
-            "name": "browser_script",
-            "ok": response.ok,
-            "text": response.text,
-            "data": response.data,
+                "name": "browser_script",
+                "ok": response.ok,
+                "status": response.status,
+                "run_id": response.run_id,
+                "next_observe_ms": response.next_observe_ms,
+                "text": response.text,
+                "data": response.data,
             "images": response.images,
             "artifacts": response.artifacts,
             "error": response.error,
+            "diagnosis": response.diagnosis,
         }),
     )?;
     Ok(())
@@ -17115,6 +17247,88 @@ mod tests {
         fn drop(&mut self) {
             tools::command::cleanup_session_commands(&self.0);
         }
+    }
+
+    #[test]
+    fn browser_script_failures_use_compact_diagnosis_for_model_output() {
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: false,
+            text: String::new(),
+            error: Some(
+                "Traceback (most recent call last):\nRuntimeError: read CDP Runtime.evaluate: IO error"
+                    .to_string(),
+            ),
+            diagnosis: Some(browser_use_browser::BrowserIssueDiagnosis {
+                summary: "Browser is still connected; the same page should still be usable."
+                    .to_string(),
+                what_happened: "A CDP read timed out while waiting for Chrome.".to_string(),
+                next_step: "Continue on the same page with a smaller chunk.".to_string(),
+                browser_usable: true,
+                page_usable: true,
+                error_kind: "cdp-read-timeout".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let message = browser_script_tool_message_content(&response);
+
+        assert!(message.contains("browser_script failed."));
+        assert!(message.contains("same page should still be usable"));
+        assert!(message.contains("Next step: Continue on the same page"));
+        assert!(message.contains("Details: RuntimeError: read CDP Runtime.evaluate"));
+        assert!(!message.contains("Traceback (most recent call last)"));
+    }
+
+    #[test]
+    fn browser_script_failure_can_still_return_images_to_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let image_path = temp.path().join("before_failure.png");
+        std::fs::write(&image_path, [0x89, b'P', b'N', b'G'])?;
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: false,
+            text: String::new(),
+            error: Some("RuntimeError: after screenshot".to_string()),
+            diagnosis: Some(browser_use_browser::BrowserIssueDiagnosis {
+                summary: "The script failed, but the browser page should still be reusable."
+                    .to_string(),
+                what_happened: "The Python browser_script code raised an error.".to_string(),
+                next_step: "Inspect the screenshot and retry a smaller step.".to_string(),
+                browser_usable: true,
+                page_usable: true,
+                error_kind: "browser-script-error".to_string(),
+            }),
+            images: vec![serde_json::json!({
+                "path": image_path.display().to_string(),
+                "mime_type": "image/png",
+                "detail": "high",
+            })],
+            ..Default::default()
+        };
+
+        let content = browser_script_tool_message_content_value(&response)?;
+        let parts = content.as_array().expect("expected multimodal content");
+
+        assert!(parts.iter().any(|part| part["type"] == "output_text"));
+        assert!(parts.iter().any(|part| part["type"] == "input_image"));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_script_running_message_tells_model_to_observe() {
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: true,
+            status: Some("running".to_string()),
+            run_id: Some("bs-test".to_string()),
+            next_observe_ms: Some(1_000),
+            text: "browser_script is still running.".to_string(),
+            ..Default::default()
+        };
+
+        let message = browser_script_tool_message_content(&response);
+
+        assert!(message.contains("run_id: bs-test"));
+        assert!(message.contains("action=\"observe\""));
+        assert!(message.contains("observe_timeout_ms=1000"));
     }
 
     #[test]
