@@ -1688,6 +1688,38 @@ The biggest remaining categories are:
   non-goal gaps remain typed history/replay, dynamic skill/plugin/tool
   contributors, hook lifecycle depth, subagent lifecycle depth, and
   provider/model policy layering.
+- The current goal-accounting slice closes the next concrete Codex goal-runtime
+  gap without adopting remote/server-only goal machinery. Goal time is no
+  longer derived from `now - created_at_ms`; it is accumulated from explicit
+  `goal.accounted` events emitted during active runtime checkpoints. The same
+  accounting events freeze stopped-goal usage so completed goals no longer drift
+  when later unrelated `token_count` events arrive. Runtime checkpoints now use
+  the active turn start as the wall-clock baseline and Codex-style effective
+  token deltas as the token baseline. `create_goal` also returns Codex's
+  positive-budget validation wording.
+- Verification for the goal-accounting slice passed the full local gate after
+  the audit-surfaced duplicate-charging regression was added: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The full workspace
+  run passed with browser-use-browser 16 passed plus 2 ignored browser smokes,
+  CLI 18, core 435, protocol 19, providers 104, python-worker 11, store 15,
+  TUI 140, and doc-tests. The live Codex-auth smoke used root session
+  `bfa5626ce30f` and child session `4c5d285fcf07`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice agreed that the new
+  branch-local behavior was goal accounting, not a broad prompt/provider/tool
+  regression. Two auditors independently called out possible duplicate charging
+  across the new model-usage, assistant-turn, and tool-output checkpoints; the
+  new `goal_accounting_checkpoints_do_not_double_charge_tokens` regression
+  covers that path. Several reports over-counted out-of-scope SDK/server
+  surfaces or repeated stale "hooks/skills absent" language, so those claims
+  were filtered against the already implemented and tested hook, skill, plugin,
+  and review slices. The remaining material gaps are still architectural:
+  dynamic callable contributors, cancellable async tool futures with read/write
+  gates, first-class active-turn/thread control state, typed
+  history/rollout/replay ownership, deeper local compaction/token lifecycle
+  precision, persistent goal state and external mutation callbacks, richer
+  subagent lifecycle ownership, and review/plugin/skill manager depth.
 
 ## Definition of Done
 
