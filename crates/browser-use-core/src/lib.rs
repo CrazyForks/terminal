@@ -165,6 +165,7 @@ const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 const GOAL_CREATED_EVENT: &str = "goal.created";
 const GOAL_UPDATED_EVENT: &str = "goal.updated";
+const GOAL_ACCOUNTING_EVENT: &str = "goal.accounted";
 const GOAL_BUDGET_LIMIT_STEERING_EVENT: &str = "goal.budget_limit_steering_requested";
 const PROPOSED_PLAN_OPEN_TAG: &str = "<proposed_plan>";
 const PROPOSED_PLAN_CLOSE_TAG: &str = "</proposed_plan>";
@@ -3466,6 +3467,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             let mut last_external_session_message_seq =
                 latest_session_message_seq(store, &session.id)?;
             for turn_idx in 0..options.max_turns {
+                let turn_started_at_ms = now_ms();
                 ensure_not_cancelled(store, &session.id)?;
                 append_new_external_session_messages_with_phase(
                     store,
@@ -3707,6 +3709,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 model_context_window,
                                 turn_idx,
                             )?;
+                            append_goal_progress_accounting(
+                                store,
+                                &session.id,
+                                turn_idx,
+                                "model_usage",
+                                turn_started_at_ms,
+                                options.collaboration_mode != CollaborationModeKind::Plan,
+                            )?;
                             maybe_mark_goal_budget_limited(
                                 store,
                                 &session.id,
@@ -3922,6 +3932,37 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 )?;
 
                 if tool_calls.is_empty() {
+                    append_goal_progress_accounting(
+                        store,
+                        &session.id,
+                        turn_idx,
+                        "assistant_turn",
+                        turn_started_at_ms,
+                        options.collaboration_mode != CollaborationModeKind::Plan,
+                    )?;
+                    maybe_mark_goal_budget_limited(store, &session.id, turn_idx, "assistant_turn")?;
+                    if let Some(goal_context) =
+                        budget_limited_goal_context_message_if_needed(store, &session.id, turn_idx)?
+                    {
+                        messages.push(goal_context);
+                        maybe_compact_messages_with_model(
+                            store,
+                            &session,
+                            provider,
+                            &mut messages,
+                            compaction_max_context_chars,
+                            turn_instructions.as_deref(),
+                            &model_settings,
+                            &model_request_info,
+                            model_context_window,
+                            Some(turn_idx),
+                            compact_prompt.as_deref(),
+                            &options,
+                            &runtime_hooks,
+                        )?;
+                        step_span.set_ok();
+                        continue;
+                    }
                     let active_queue_drain = drain_active_turn_queue_into_messages(
                         store,
                         &session,
@@ -4174,6 +4215,15 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     turn_diff_before.as_ref(),
                     turn_idx,
                 )?;
+                append_goal_progress_accounting(
+                    store,
+                    &session.id,
+                    turn_idx,
+                    "tool_outputs",
+                    turn_started_at_ms,
+                    options.collaboration_mode != CollaborationModeKind::Plan,
+                )?;
+                maybe_mark_goal_budget_limited(store, &session.id, turn_idx, "tool_outputs")?;
                 let mut finished_after_tools = false;
                 for outcome in dispatched_outcomes {
                     finished_after_tools |= outcome.finished;
@@ -12888,17 +12938,98 @@ fn latest_thread_goal_from_events(events: &[EventRecord]) -> Option<ThreadGoalSn
     goal
 }
 
+fn goal_created_event_ts_ms(events: &[EventRecord], goal_id: &str) -> Option<i64> {
+    events.iter().rev().find_map(|event| {
+        (event.event_type == GOAL_CREATED_EVENT)
+            .then(|| {
+                event
+                    .payload
+                    .get("goal_id")
+                    .and_then(Value::as_str)
+                    .map(|payload_goal_id| payload_goal_id == goal_id)
+                    .unwrap_or(event.id == goal_id)
+            })
+            .filter(|matches| *matches)
+            .map(|_| event.ts_ms)
+    })
+}
+
+fn goal_accounting_matches_goal(event: &EventRecord, goal_id: &str) -> bool {
+    event.event_type == GOAL_ACCOUNTING_EVENT
+        && event.payload.get("goal_id").and_then(Value::as_str) == Some(goal_id)
+}
+
+fn goal_accounted_usage_from_events(events: &[EventRecord], goal_id: &str) -> (Value, i64, bool) {
+    let mut token_usage = empty_codex_token_usage();
+    let mut time_used_seconds = 0_i64;
+    let mut saw_accounting = false;
+    for event in events
+        .iter()
+        .filter(|event| goal_accounting_matches_goal(event, goal_id))
+    {
+        saw_accounting = true;
+        if let Some(delta) = event.payload.get("token_usage_delta") {
+            token_usage = add_codex_token_usage(&token_usage, delta);
+        }
+        time_used_seconds = time_used_seconds.saturating_add(
+            event
+                .payload
+                .get("time_delta_seconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0),
+        );
+    }
+    (token_usage, time_used_seconds, saw_accounting)
+}
+
+fn latest_goal_accounting_baseline(
+    events: &[EventRecord],
+    goal: &ThreadGoalSnapshot,
+) -> (Value, Option<i64>) {
+    for event in events.iter().rev() {
+        if !goal_accounting_matches_goal(event, &goal.goal_id) {
+            continue;
+        }
+        let total_usage = event
+            .payload
+            .get("total_token_usage")
+            .cloned()
+            .unwrap_or_else(|| {
+                let (accounted_usage, _, _) =
+                    goal_accounted_usage_from_events(events, &goal.goal_id);
+                add_codex_token_usage(&goal.baseline_total_token_usage, &accounted_usage)
+            });
+        let accounted_at_ms = event
+            .payload
+            .get("accounted_at_ms")
+            .and_then(Value::as_i64)
+            .or(Some(event.ts_ms));
+        return (total_usage, accounted_at_ms);
+    }
+    (
+        goal.baseline_total_token_usage.clone(),
+        goal.created_at_ms
+            .or_else(|| goal_created_event_ts_ms(events, &goal.goal_id)),
+    )
+}
+
 fn goal_usage_payload(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> Value {
     let current_total_usage = latest_codex_total_token_usage_from_events(events);
-    let token_usage =
+    let fallback_token_usage =
         subtract_codex_token_usage(&current_total_usage, &goal.baseline_total_token_usage);
+    let (accounted_token_usage, time_used_seconds, saw_accounting) =
+        goal_accounted_usage_from_events(events, &goal.goal_id);
+    let token_usage = if saw_accounting {
+        accounted_token_usage
+    } else {
+        fallback_token_usage
+    };
     let tokens_used = goal_token_delta_for_usage(&token_usage);
     let remaining_tokens = goal
         .token_budget
         .map(|budget| budget.saturating_sub(tokens_used).max(0));
-    let elapsed_time_ms = goal
-        .created_at_ms
-        .map(|started| now_ms().saturating_sub(started).max(0));
+    let elapsed_time_ms = time_used_seconds.saturating_mul(1000);
     serde_json::json!({
         "tokens_used": tokens_used,
         "token_usage": token_usage,
@@ -12906,6 +13037,7 @@ fn goal_usage_payload(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> Valu
         "current_total_token_usage": current_total_usage,
         "token_budget": goal.token_budget,
         "remaining_tokens": remaining_tokens,
+        "time_used_seconds": time_used_seconds,
         "elapsed_time_ms": elapsed_time_ms,
     })
 }
@@ -12916,6 +13048,55 @@ fn goal_time_used_seconds(usage: &Value) -> i64 {
         .and_then(Value::as_i64)
         .unwrap_or(0)
         .saturating_div(1000)
+}
+
+fn append_goal_progress_accounting(
+    store: &Store,
+    session_id: &str,
+    turn_idx: usize,
+    reason: &str,
+    turn_started_at_ms: i64,
+    account_tokens: bool,
+) -> Result<()> {
+    let events = store.events_for_session(session_id)?;
+    let Some(goal) = latest_thread_goal_from_events(&events) else {
+        return Ok(());
+    };
+    if !matches!(goal.status.as_str(), "active" | "budget_limited") {
+        return Ok(());
+    }
+    let current_total_usage = latest_codex_total_token_usage_from_events(&events);
+    let (last_accounted_usage, last_accounted_at_ms) =
+        latest_goal_accounting_baseline(&events, &goal);
+    let token_usage_delta = if account_tokens {
+        subtract_codex_token_usage(&current_total_usage, &last_accounted_usage)
+    } else {
+        empty_codex_token_usage()
+    };
+    let token_delta = goal_token_delta_for_usage(&token_usage_delta);
+    let now = now_ms();
+    let time_baseline = last_accounted_at_ms
+        .unwrap_or(turn_started_at_ms)
+        .max(turn_started_at_ms);
+    let time_delta_seconds = now.saturating_sub(time_baseline).max(0) / 1000;
+    if token_delta <= 0 && time_delta_seconds <= 0 {
+        return Ok(());
+    }
+    store.append_event(
+        session_id,
+        GOAL_ACCOUNTING_EVENT,
+        serde_json::json!({
+            "goal_id": goal.goal_id,
+            "turn_idx": turn_idx,
+            "reason": reason,
+            "token_delta": token_delta,
+            "token_usage_delta": token_usage_delta,
+            "total_token_usage": current_total_usage,
+            "time_delta_seconds": time_delta_seconds,
+            "accounted_at_ms": now,
+        }),
+    )?;
+    Ok(())
 }
 
 fn goal_effective_status(goal: &ThreadGoalSnapshot, usage: &Value) -> String {
@@ -13229,7 +13410,7 @@ fn dispatch_create_goal_tool(
                 store,
                 session,
                 call,
-                "token_budget must be a positive integer",
+                "goal budgets must be positive when provided",
             )
         }
         None => None,
@@ -36022,6 +36203,324 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         assert_eq!(current["usage"]["tokens_used"], 40);
         assert_eq!(current["goal"]["tokensUsed"], 40);
         assert_eq!(current["remainingTokens"], 60);
+        Ok(())
+    }
+
+    #[test]
+    fn goal_time_used_comes_from_accounting_events_not_goal_age() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            GOAL_CREATED_EVENT,
+            serde_json::json!({
+                "goal_id": "goal-time",
+                "objective": "avoid idle clock drift",
+                "status": "active",
+                "created_at_ms": 1,
+                "baseline_total_token_usage": empty_codex_token_usage(),
+            }),
+        )?;
+
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "get_goal_no_time".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let current = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(current["usage"]["time_used_seconds"], 0);
+        assert_eq!(current["goal"]["timeUsedSeconds"], 0);
+
+        store.append_event(
+            &session.id,
+            GOAL_ACCOUNTING_EVENT,
+            serde_json::json!({
+                "goal_id": "goal-time",
+                "time_delta_seconds": 7,
+                "token_delta": 0,
+                "token_usage_delta": empty_codex_token_usage(),
+                "total_token_usage": empty_codex_token_usage(),
+                "accounted_at_ms": 8_000,
+            }),
+        )?;
+
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "get_goal_accounted_time".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let current = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(current["usage"]["time_used_seconds"], 7);
+        assert_eq!(current["usage"]["elapsed_time_ms"], 7_000);
+        assert_eq!(current["goal"]["timeUsedSeconds"], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_goal_accounting_freezes_tokens_after_completion_like_codex() -> Result<()> {
+        #[derive(Default)]
+        struct CompleteGoalProvider {
+            turns: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for CompleteGoalProvider {
+            fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut turns = self.turns.lock().expect("turns");
+                *turns += 1;
+                if *turns > 1 {
+                    return Ok(vec![
+                        ModelEvent::TextDelta {
+                            text: "done".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]);
+                }
+                Ok(vec![
+                    ModelEvent::Usage {
+                        usage: browser_use_protocol::ModelUsage {
+                            input_tokens: Some(100),
+                            input_cached_tokens: Some(40),
+                            output_tokens: Some(20),
+                            reasoning_output_tokens: Some(30),
+                            total_tokens: Some(150),
+                            input_cache_creation_tokens: None,
+                            input_cost_usd: None,
+                            input_cached_cost_usd: None,
+                            input_cache_creation_cost_usd: None,
+                            output_cost_usd: None,
+                            cost_usd: None,
+                            cost_source: None,
+                        },
+                    },
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "complete_goal".to_string(),
+                            name: "update_goal".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "status": "complete" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ])
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        append_workspace_context_event(&store, &session)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "complete the goal"}),
+        )?;
+        dispatch_create_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "create_goal_freeze".to_string(),
+                name: "create_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "objective": "freeze accounted tokens",
+                    "token_budget": 500,
+                }),
+            },
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let session_id = session.id.clone();
+        let session_for_get = session.clone();
+
+        run_loaded_session_with_provider(
+            &store,
+            &CompleteGoalProvider::default(),
+            session,
+            messages,
+            AgentRunOptions::default(),
+        )?;
+
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session_for_get,
+            &ToolCall {
+                id: "get_goal_freeze_before".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let completed = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(completed["status"], "complete");
+        assert_eq!(completed["goal"]["tokensUsed"], 80);
+
+        store.append_event(
+            &session_id,
+            CODEX_TOKEN_COUNT_EVENT,
+            serde_json::json!({
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 9_000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 9_000,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 18_000,
+                    }
+                }
+            }),
+        )?;
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session_for_get,
+            &ToolCall {
+                id: "get_goal_freeze_after".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let completed = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(completed["goal"]["tokensUsed"], 80);
+        assert!(store.events_for_session(&session_id)?.iter().any(|event| {
+            event.event_type == GOAL_ACCOUNTING_EVENT
+                && event.payload["reason"] == "model_usage"
+                && event.payload["token_delta"] == 80
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn goal_accounting_checkpoints_do_not_double_charge_tokens() -> Result<()> {
+        #[derive(Default)]
+        struct TextThenGoalProvider {
+            turns: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for TextThenGoalProvider {
+            fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut turns = self.turns.lock().expect("turns");
+                *turns += 1;
+                match *turns {
+                    1 => Ok(vec![
+                        ModelEvent::Usage {
+                            usage: browser_use_protocol::ModelUsage {
+                                input_tokens: Some(30),
+                                input_cached_tokens: Some(10),
+                                output_tokens: Some(5),
+                                reasoning_output_tokens: Some(50),
+                                total_tokens: Some(85),
+                                input_cache_creation_tokens: None,
+                                input_cost_usd: None,
+                                input_cached_cost_usd: None,
+                                input_cache_creation_cost_usd: None,
+                                output_cost_usd: None,
+                                cost_usd: None,
+                                cost_source: None,
+                            },
+                        },
+                        ModelEvent::TextDelta {
+                            text: "partial progress".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]),
+                    2 => Ok(vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "goal_done".to_string(),
+                                name: "update_goal".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({ "status": "complete" }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]),
+                    _ => Ok(vec![
+                        ModelEvent::TextDelta {
+                            text: "done".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]),
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        append_workspace_context_event(&store, &session)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "continue until goal is done"}),
+        )?;
+        dispatch_create_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "create_goal_no_double".to_string(),
+                name: "create_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "objective": "avoid duplicate charging",
+                    "token_budget": 500,
+                }),
+            },
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let session_id = session.id.clone();
+
+        run_loaded_session_with_provider(
+            &store,
+            &TextThenGoalProvider::default(),
+            session,
+            messages,
+            AgentRunOptions {
+                max_turns: 5,
+                ..AgentRunOptions::default()
+            },
+        )?;
+
+        let events = store.events_for_session(&session_id)?;
+        let accounting_events = events
+            .iter()
+            .filter(|event| event.event_type == GOAL_ACCOUNTING_EVENT)
+            .collect::<Vec<_>>();
+        let token_delta_sum = accounting_events.iter().fold(0_i64, |sum, event| {
+            sum.saturating_add(
+                event
+                    .payload
+                    .get("token_delta")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            )
+        });
+        let positive_token_events = accounting_events
+            .iter()
+            .filter(|event| {
+                event
+                    .payload
+                    .get("token_delta")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    > 0
+            })
+            .count();
+        assert_eq!(token_delta_sum, 25);
+        assert_eq!(positive_token_events, 1);
+        assert!(events.iter().any(|event| {
+            event.event_type == "goal.continuation_requested"
+                && event.payload["reason"] == "assistant_text_without_terminal_goal_update"
+        }));
         Ok(())
     }
 
