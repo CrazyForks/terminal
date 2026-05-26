@@ -732,16 +732,12 @@ fn committed_node_for_event(
             vec![tool_image_label(event, state)],
             NodeStyle::Normal,
         )),
-        "tool.failed" => {
-            let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
-            let error = payload_string(event, "error").unwrap_or_else(|| "tool failed".to_string());
-            Some(timeline_node(
-                event,
-                "error",
-                vec![format!("{name} failed: {error}")],
-                NodeStyle::Failed,
-            ))
-        }
+        "tool.failed" => Some(timeline_node(
+            event,
+            "error",
+            tool_failed_lines(event),
+            NodeStyle::Failed,
+        )),
         "tool.output_spilled" => {
             let path = event
                 .payload
@@ -1657,6 +1653,7 @@ fn artifact_created_node(event: &EventRecord, _state: &WorkbenchState) -> Option
 
 fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
+        "browser_script" => Some(("browser", "running browser script")),
         "python" => Some(("python", "running browser Python")),
         "exec_command" => Some(("run", "running command")),
         "write_stdin" => Some(("run", "writing to command")),
@@ -1673,10 +1670,10 @@ fn should_show_generic_tool_output_text(name: &str) -> bool {
 }
 
 fn tool_output_group(name: &str) -> &str {
-    if name == "python" {
-        "python"
-    } else {
-        "tool"
+    match name {
+        "browser_script" => "browser",
+        "python" => "python",
+        _ => "tool",
     }
 }
 
@@ -2607,6 +2604,67 @@ fn is_useful_source(source: &str) -> bool {
     !source.is_empty() && source != "about:blank"
 }
 
+fn tool_failed_lines(event: &EventRecord) -> Vec<String> {
+    let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
+    let Some(diagnosis) = event
+        .payload
+        .get("diagnosis")
+        .filter(|value| value.is_object())
+    else {
+        let error = payload_string(event, "error").unwrap_or_else(|| "tool failed".to_string());
+        return vec![format!("{name} failed: {}", friendly_error_message(&error))];
+    };
+
+    let mut lines = vec![format!("{name} failed")];
+    if let Some(summary) = diagnosis_text(diagnosis, "summary") {
+        lines.push(summary);
+    }
+    if let Some(what_happened) = diagnosis_text(diagnosis, "what_happened") {
+        lines.push(format!("What happened: {what_happened}"));
+    }
+    if let Some(next_step) = diagnosis_text(diagnosis, "next_step") {
+        lines.push(format!("Next: {next_step}"));
+    }
+    if let Some(error) = payload_string(event, "error") {
+        let detail = last_error_line(&error);
+        if !detail.is_empty() {
+            lines.push(format!("Details: {}", truncate_inline(&detail, 180)));
+        }
+    }
+    lines
+}
+
+fn diagnosis_text(diagnosis: &serde_json::Value, key: &str) -> Option<String> {
+    diagnosis
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn last_error_line(error: &str) -> String {
+    error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(error.trim())
+        .to_string()
+}
+
+fn truncate_inline(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
 fn preview_lines(text: &str, limit: usize) -> Vec<String> {
     let mut out = text
         .lines()
@@ -3130,6 +3188,43 @@ mod tests {
                 "read Taskfile.yml".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn browser_script_failures_render_compact_diagnosis() {
+        let event = EventRecord {
+            seq: 7,
+            id: "event-7".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.failed".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "error": "Traceback (most recent call last):\nRuntimeError: read CDP Runtime.evaluate: IO error",
+                "diagnosis": {
+                    "summary": "Browser is still connected; the same page should still be usable.",
+                    "what_happened": "A CDP read timed out while waiting for Chrome.",
+                    "next_step": "Continue on the same page with a smaller chunk.",
+                    "browser_usable": true,
+                    "page_usable": true,
+                    "error_kind": "cdp-read-timeout"
+                }
+            }),
+        };
+
+        let lines = tool_failed_lines(&event);
+
+        assert_eq!(lines[0], "browser_script failed");
+        assert!(lines.iter().any(|line| line.contains("same page")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Next: Continue on the same page")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Details: RuntimeError")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("Traceback (most recent call last)")));
     }
 
     #[test]

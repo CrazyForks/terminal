@@ -1270,10 +1270,24 @@ fn browser_script_tool_spec() -> ToolSpec {
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python code to run in a fresh process with browser helpers preimported."
+                    "description": "Python code to run in a fresh process with browser helpers preimported. Omit when action is observe or cancel."
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "observe", "cancel"],
+                    "description": "start launches code and returns either a final result or a run_id; observe listens for new output/final status; cancel stops a running script. Defaults to start when code is provided and observe when only run_id is provided."
+                },
+                "run_id": {
+                    "type": "string",
+                    "description": "Running browser_script id returned by a previous start call. Required for observe and cancel."
+                },
+                "observe_timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
                 }
             },
-            "required": ["code"],
             "additionalProperties": false
         }),
         output_schema: None,
@@ -1924,6 +1938,8 @@ mod tests {
             "click_at_xy",
             "screenshot(label)",
             "The user does not see those pixels inline",
+            "status: running",
+            "action=\"observe\"",
             "cdp(...)",
             "Do not import Playwright",
             "audit_artifact",
@@ -1949,6 +1965,7 @@ mod tests {
             "browser domain skills --domain",
             "browser doctor --json",
             "browser recover reconnect-websocket",
+            "browser script runs --json",
             "browser runtime ownership --json",
             "External user Chrome is never killed or relaunched",
         ] {

@@ -19,6 +19,8 @@ browser local setup --profile google-chrome:Profile 2
 browser connect managed --headed
 browser remote start --profile-name Work
 browser recover reconnect-websocket
+browser script runs --json
+browser script cancel <run_id>
 ```
 
 Mental model:
@@ -28,6 +30,8 @@ Mental model:
 - Rust holds the CDP websocket, current target id, current session id, ownership, and connection generation.
 - Python in `browser_script` is fresh per call; Python variables do not persist.
 - Nothing reloads, relaunches, closes, or switches tabs silently. If IDs may change, this tool reports that and you choose the next action.
+- `browser status --json` may include `last_issue`, a compact diagnosis from the most recent browser/browser_script failure. Use its `next_step`, `browser_usable`, and `page_usable` fields before deciding to reconnect.
+- `browser status --json` also lists active `browser_script` runs. Use the `browser_script` tool with `action="observe"` to listen to them; use `browser script cancel <run_id>` only for cleanup or explicit cancellation.
 
 Preferences:
 
@@ -126,6 +130,9 @@ browser recover reattach-same-target
 browser recover restart-runtime
 browser recover restart-owned-browser
 browser recover stop-owned-remote
+
+browser script runs --json
+browser script cancel <run_id>
 
 browser runtime logs
 browser runtime ownership --json

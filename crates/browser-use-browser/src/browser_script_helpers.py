@@ -120,6 +120,26 @@ def _has_return_statement(expression):
     n = len(expression)
     state = "code"
     quote = ""
+    brace_stack = []
+    pending_function_body = False
+    pending_arrow_body = False
+
+    def is_ident(ch):
+        return ch == "_" or ch == "$" or ch.isalnum()
+
+    def is_keyword_at(keyword, pos):
+        if not expression.startswith(keyword, pos):
+            return False
+        before = expression[pos - 1] if pos > 0 else ""
+        after_pos = pos + len(keyword)
+        after = expression[after_pos] if after_pos < n else ""
+        return not is_ident(before) and not is_ident(after)
+
+    def next_nonspace(pos):
+        while pos < n and expression[pos].isspace():
+            pos += 1
+        return expression[pos] if pos < n else ""
+
     while i < n:
         ch = expression[i]
         nxt = expression[i + 1] if i + 1 < n else ""
@@ -137,10 +157,31 @@ def _has_return_statement(expression):
                 state = "block_comment"
                 i += 2
                 continue
-            if expression.startswith("return", i):
-                before = expression[i - 1] if i > 0 else ""
-                after = expression[i + 6] if i + 6 < n else ""
-                if not (before == "_" or before.isalnum()) and not (after == "_" or after.isalnum()):
+            if ch == "=" and nxt == ">":
+                pending_arrow_body = True
+                i += 2
+                continue
+            if pending_arrow_body and not ch.isspace() and ch != "{":
+                pending_arrow_body = False
+            if ch == "{":
+                brace_stack.append(pending_function_body or pending_arrow_body)
+                pending_function_body = False
+                pending_arrow_body = False
+                i += 1
+                continue
+            if ch == "}":
+                if brace_stack:
+                    brace_stack.pop()
+                i += 1
+                continue
+            if is_keyword_at("function", i):
+                pending_function_body = True
+                i += len("function")
+                continue
+            if is_keyword_at("return", i):
+                inside_nested_function = any(brace_stack)
+                looks_like_property_key = next_nonspace(i + len("return")) == ":"
+                if not inside_nested_function and not looks_like_property_key:
                     return True
             i += 1
             continue

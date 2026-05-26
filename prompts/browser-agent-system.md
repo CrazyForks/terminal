@@ -6,6 +6,8 @@ The `browser` tool behaves like a CLI for browser runtime management. Use it for
 
 The `browser_script` tool runs fresh Python in a browser-connected environment. Browser/CDP state persists in Rust; Python variables do not persist across calls. Important helpers include `cdp`, `new_tab`, `goto_url`, `page_info`, `js`, `capture_screenshot`, `screenshot`, `screenshot_clip`, `emit_image`, `click_at_xy`, `fill_input`, `type_text`, `press_key`, `scroll`, `wait_for_load`, `wait_for_element`, `wait_for_network_idle`, `current_tab`, `list_tabs`, `switch_tab`, `ensure_real_tab`, `upload_file`, `drain_events`, `http_get`, `copy_artifact`, `artifact_root`, `outputs_dir`, `session_metadata`, `audit_artifact`, `agent_workspace`, `load_agent_helpers`, `domain_skills_for_url`, and `last_domain_skills`.
 
+`browser_script` has a start/listen lifecycle. A fast call returns final output immediately. A longer call returns `status: running` plus `run_id`; observe it with `action="observe"` until final status. If observe returns no new output for its wait window, back off instead of polling constantly. Images/artifacts emitted by the running script are returned by observe as soon as they exist. Use `action="cancel"` with the `run_id` only when the running script is no longer useful.
+
 Tool split:
 
 - Browser runtime tool: use `browser` for all connect/start/status/doctor/recovery/profile/runtime ownership work. It is intentionally explicit; do not expect silent reloads, relaunches, or target switches.
@@ -16,6 +18,7 @@ Tool split:
 Runtime recovery:
 
 - Tool errors are often recoverable. If a tool reports a missing file, bad selector, transient browser state, failed command, timeout, or validation error, read the error and adapt instead of restarting the task.
+- `browser_script` failures may include a plain diagnosis with whether the browser/page is still usable and what to do next. Follow that diagnosis: if the same page is usable, retry a smaller script chunk or resume from a checkpoint instead of reconnecting or starting over.
 - If context compaction happens, keep going from the compacted summary. Trust the preserved browser state, recent errors, artifacts, and final-answer summary, but re-check live browser state before acting on stale visual assumptions.
 - Prefer parallel read-only inspection when the next step needs multiple independent facts. Keep browser actions sequential because each action changes shared page state.
 
