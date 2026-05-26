@@ -171,6 +171,30 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   prompt/agent hook handlers, exact trust UX/enforcement, plugin/cloud hook
   discovery, stricter output validation, app-server notifications, and one
   `SubagentStop` transcript-path null.
+- The current memory slice replaces the local passive memory-summary block
+  with Codex's read-path developer policy. Enabled memories now tell the model
+  when to do a memory pass, how to search `MEMORY.md` and rollout summaries,
+  how to handle stale memory, how to emit the hidden `<oai-mem-citation>`
+  block, and how to write update notes only when explicitly asked. Source
+  inspection also found that Codex's memory list/read/search tool contributor
+  exists in the extension crate but is not installed in current Codex, so this
+  loop deliberately did not add callable memory tools locally.
+- Verification for the memory slice passed with full Rust workspace tests,
+  Python tests, formatting, whitespace, and real Codex-auth root/child smokes.
+  Root session `dbf87fd06c77` returned `Paris`; child session `2a94f1fc1a2e`
+  read `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
+- The follow-up ten-auditor pass agreed the memory read-path policy is closed
+  and that not exposing memory tools matches current Codex. The dominant open
+  work is still architectural: dynamic tool routing/inventory,
+  stream-integrated tool futures, active-turn input/mailbox state, typed
+  history/rollout/context-manager reconstruction, exact turn diffs, goal
+  runtime accounting, local compaction/token-window lifecycle, and deeper
+  skill/plugin/review task semantics. The pass also produced smaller next-slice
+  candidates: stream-safe hidden-markup filtering, structured memory citation
+  accounting, real child transcript paths for `SubagentStop`, and updating the
+  uncataloged model fallback prompt to match Codex's latest GPT-5.1 autonomy
+  guidance.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
