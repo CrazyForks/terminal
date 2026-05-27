@@ -15870,6 +15870,7 @@ fn load_agents_md_config_with_thread_config(
             warnings,
         )?;
     }
+    apply_enabled_plugin_mcp_servers_config_layer(&mut config, warnings)?;
     apply_enabled_plugin_hooks_config_layer(&mut config, warnings)?;
     if config.model_catalog.is_none() {
         if let Some(snapshot) = load_fresh_models_cache(&base) {
@@ -16809,6 +16810,78 @@ fn apply_hooks_config_events_with_source(
     Ok(())
 }
 
+fn apply_enabled_plugin_mcp_servers_config_layer(
+    config: &mut AgentsMdConfig,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if !config.plugins_enabled || config.plugins.is_empty() {
+        return Ok(());
+    }
+    let Some(codex_home) = codex_home_dir() else {
+        return Ok(());
+    };
+    let plugins = config.plugins.clone();
+    for (config_name, plugin_config) in plugins {
+        if !plugin_config.enabled {
+            continue;
+        }
+        let Some(plugin_root) = local_plugin_root_for_config_name(&codex_home, &config_name) else {
+            continue;
+        };
+        let Some(manifest_path) = plugin_manifest_path(&plugin_root) else {
+            continue;
+        };
+        let manifest_contents = match std::fs::read_to_string(&manifest_path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to read plugin manifest {} for MCP servers: {error}",
+                    manifest_path.display()
+                ));
+                continue;
+            }
+        };
+        let manifest = match serde_json::from_str::<LocalPluginManifest>(&manifest_contents) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to parse plugin manifest {} for MCP servers: {error}",
+                    manifest_path.display()
+                ));
+                continue;
+            }
+        };
+        let mcp_path =
+            plugin_relative_path(&plugin_root, manifest.mcp_servers.as_deref(), ".mcp.json");
+        let Some(layer) = plugin_mcp_servers_toml_layer(&plugin_root, &mcp_path, warnings) else {
+            continue;
+        };
+        let mut plugin_servers = BTreeMap::new();
+        if let Err(error) = mcp::apply_mcp_servers_config_layer(
+            &mut plugin_servers,
+            &layer,
+            &mcp_path,
+            &plugin_root,
+        ) {
+            warnings.push(format!(
+                "failed to parse plugin MCP server config {}: {error:#}",
+                mcp_path.display()
+            ));
+            continue;
+        }
+        for (server_name, server) in plugin_servers {
+            if config.mcp_servers.contains_key(&server_name) {
+                warnings.push(format!(
+                    "skipping plugin MCP server `{server_name}` from `{config_name}` because an earlier MCP server with that name is already configured"
+                ));
+                continue;
+            }
+            config.mcp_servers.insert(server_name, server);
+        }
+    }
+    Ok(())
+}
+
 fn apply_enabled_plugin_hooks_config_layer(
     config: &mut AgentsMdConfig,
     warnings: &mut Vec<String>,
@@ -17076,12 +17149,6 @@ struct LocalPluginHookConfigSource {
     state_path: PathBuf,
     display_path: String,
     value: toml::Value,
-}
-
-#[derive(Deserialize)]
-struct LocalPluginMcpFile {
-    #[serde(default, rename = "mcpServers")]
-    mcp_servers: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -17416,17 +17483,126 @@ fn directory_contains_file_named(root: &Path, file_name: &str, max_depth: usize)
 
 fn plugin_mcp_server_names(plugin_root: &Path, configured: Option<&str>) -> Vec<String> {
     let path = plugin_relative_path(plugin_root, configured, ".mcp.json");
-    let Some(parsed) = std::fs::read_to_string(path)
+    let Some(servers) = std::fs::read_to_string(path)
         .ok()
-        .and_then(|contents| serde_json::from_str::<LocalPluginMcpFile>(&contents).ok())
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .and_then(|value| plugin_mcp_servers_from_json(&value))
     else {
         return Vec::new();
     };
-    parsed
-        .mcp_servers
+    servers
         .into_keys()
         .filter(|name| !name.trim().is_empty())
         .collect()
+}
+
+fn plugin_mcp_servers_toml_layer(
+    plugin_root: &Path,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<toml::Value> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(_) => return None,
+    };
+    let value = match serde_json::from_str::<Value>(&contents) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to parse plugin MCP config {}: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let Some(servers) = plugin_mcp_servers_from_json(&value) else {
+        warnings.push(format!(
+            "ignoring plugin MCP config {}: expected `mcpServers` or a server map",
+            path.display()
+        ));
+        return None;
+    };
+    if servers.is_empty() {
+        return None;
+    }
+
+    let mut table = toml::map::Map::new();
+    for (server_name, server_value) in servers {
+        if server_name.trim().is_empty() {
+            continue;
+        }
+        let normalized = normalize_plugin_mcp_server_value(plugin_root, server_value);
+        let Some(toml_value) = json_value_to_toml_value(&normalized) else {
+            warnings.push(format!(
+                "ignoring plugin MCP server `{server_name}` from {}: unsupported JSON value",
+                path.display()
+            ));
+            continue;
+        };
+        table.insert(server_name, toml_value);
+    }
+    if table.is_empty() {
+        return None;
+    }
+
+    let mut root = toml::map::Map::new();
+    root.insert("mcp_servers".to_string(), toml::Value::Table(table));
+    Some(toml::Value::Table(root))
+}
+
+fn plugin_mcp_servers_from_json(value: &Value) -> Option<BTreeMap<String, Value>> {
+    let object = value.as_object()?;
+    if let Some(servers) = object
+        .get("mcpServers")
+        .or_else(|| object.get("mcp_servers"))
+    {
+        return servers.as_object().map(|servers| {
+            servers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        });
+    }
+    Some(
+        object
+            .iter()
+            .filter(|(name, value)| {
+                !name.starts_with('$')
+                    && !matches!(name.as_str(), "schema" | "version" | "name" | "description")
+                    && value.is_object()
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn normalize_plugin_mcp_server_value(plugin_root: &Path, value: Value) -> Value {
+    let Value::Object(mut object) = value else {
+        return Value::Object(Map::new());
+    };
+
+    if let Some(Value::String(_transport_type)) = object.remove("type") {}
+
+    if let Some(Value::Object(mut oauth)) = object.remove("oauth") {
+        oauth.remove("callbackPort");
+        if let Some(client_id) = oauth.remove("clientId") {
+            oauth.entry("client_id".to_string()).or_insert(client_id);
+        }
+        if !oauth.is_empty() {
+            object.insert("oauth".to_string(), Value::Object(oauth));
+        }
+    }
+
+    if let Some(Value::String(cwd)) = object.get("cwd") {
+        if !Path::new(cwd).is_absolute() {
+            object.insert(
+                "cwd".to_string(),
+                Value::String(plugin_root.join(cwd).display().to_string()),
+            );
+        }
+    }
+
+    Value::Object(object)
 }
 
 fn plugin_app_connector_ids(plugin_root: &Path, configured: Option<&str>) -> Vec<String> {
@@ -18769,7 +18945,7 @@ fn render_explicit_plugin_instructions(plugin: &LocalPluginCapabilitySummary) ->
     }
     if !plugin.mcp_server_names.is_empty() {
         lines.push(format!(
-            "- MCP servers configured by this plugin: {}. This terminal does not expose plugin MCP runtime tools unless those tools are separately listed.",
+            "- MCP servers configured by this plugin: {}. Supported local MCP servers expose their tools like other MCP tools in this session.",
             plugin
                 .mcp_server_names
                 .iter()
@@ -42716,7 +42892,7 @@ description = "Missing developer instructions"
         Ok(())
     }
 
-    fn write_mock_codex_plugin_bundle(codex_home: &Path) -> Result<()> {
+    fn write_mock_codex_plugin_bundle(codex_home: &Path) -> Result<PathBuf> {
         let plugin_root = codex_home
             .join(CODEX_PLUGIN_CACHE_DIR)
             .join("test")
@@ -42767,7 +42943,7 @@ plugins = true
 enabled = true
 "#,
         )?;
-        Ok(())
+        Ok(plugin_root)
     }
 
     #[test]
@@ -42842,6 +43018,176 @@ enabled = true
             .join("\n");
         assert!(!model_text.contains("plugin://sample@test"));
         assert!(!model_text.contains("[@sample]"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_dispatches_plugin_stdio_mcp_tool_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let plugin_root = write_mock_codex_plugin_bundle(&codex_home)?;
+        let mcp_script = temp.path().join("plugin_mcp_echo.py");
+        write_test_mcp_echo_server(&mcp_script)?;
+        std::fs::write(
+            plugin_root.join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "sample": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": [mcp_script],
+                        "startup_timeout_ms": 2000,
+                        "tool_timeout_ms": 2000
+                    }
+                }
+            })
+            .to_string(),
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let store = Store::open(temp.path().join("state"))?;
+            let provider = ScriptedProvider::new(vec![
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "plugin_mcp_1".to_string(),
+                            name: "echo_tool".to_string(),
+                            namespace: Some("mcp__sample__".to_string()),
+                            arguments: serde_json::json!({"text": "plugin"}),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                vec![
+                    ModelEvent::TextDelta {
+                        text: "final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ],
+            ]);
+
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "Use the sample plugin MCP echo tool.",
+                temp.path(),
+                AgentRunOptions::default(),
+            )?;
+            let events = store.events_for_session(&session_id)?;
+            assert!(events.iter().any(|event| {
+                event.event_type == "mcp.tool_result"
+                    && event.payload["mcp_server"] == "sample"
+                    && event.payload["mcp_tool"] == "echo.tool"
+                    && event.payload["result"]["content"][0]["text"] == "echo:plugin"
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == MODEL_RESPONSE_INPUT_ITEM_EVENT
+                    && event.payload["call_id"] == "plugin_mcp_1"
+                    && event.payload["item"]["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("\"text\":\"plugin\""))
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == "session.done" && event.payload["result"] == "final"
+            }));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn plugin_manifest_mcp_path_and_flat_map_are_supported_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let plugin_root = write_mock_codex_plugin_bundle(&codex_home)?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            serde_json::json!({
+                "name": "sample",
+                "description": "Inspect sample data",
+                "mcpServers": "./config/custom.mcp.json"
+            })
+            .to_string(),
+        )?;
+        std::fs::create_dir_all(plugin_root.join("config"))?;
+        std::fs::write(
+            plugin_root.join("config").join("custom.mcp.json"),
+            serde_json::json!({
+                "$schema": "https://example.invalid/mcp.schema.json",
+                "version": "1",
+                "toolkit": {
+                    "type": "stdio",
+                    "command": "python3",
+                    "args": ["server.py"],
+                    "cwd": "tools",
+                    "env": {"PLUGIN_MODE": "1"}
+                }
+            })
+            .to_string(),
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let mut warnings = Vec::new();
+
+        let config = with_codex_home(&codex_home, || {
+            load_agents_md_config_for_options(&project, &mut warnings, &AgentRunOptions::default())
+        })?;
+
+        let server = config
+            .mcp_servers
+            .get("toolkit")
+            .context("plugin toolkit MCP server")?;
+        assert_eq!(server.server_name, "toolkit");
+        assert_eq!(server.command, "python3");
+        assert_eq!(server.args, vec!["server.py"]);
+        assert_eq!(
+            server.cwd.as_deref(),
+            Some(plugin_root.join("tools").as_path())
+        );
+        assert_eq!(server.env.get("PLUGIN_MODE").map(String::as_str), Some("1"));
+        assert!(!config.mcp_servers.contains_key("version"));
+        assert_eq!(
+            plugin_mcp_server_names(&plugin_root, Some("./config/custom.mcp.json")),
+            vec!["toolkit".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_mcp_server_config_wins_over_plugin_duplicate_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        write_mock_codex_plugin_bundle(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[features]
+plugins = true
+
+[plugins."sample@test"]
+enabled = true
+
+[mcp_servers.sample]
+command = "explicit-mcp"
+"#,
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let mut warnings = Vec::new();
+
+        let config = with_codex_home(&codex_home, || {
+            load_agents_md_config_for_options(&project, &mut warnings, &AgentRunOptions::default())
+        })?;
+
+        let server = config
+            .mcp_servers
+            .get("sample")
+            .context("explicit sample MCP server")?;
+        assert_eq!(server.command, "explicit-mcp");
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("skipping plugin MCP server `sample`")
+                && warning
+                    .contains("because an earlier MCP server with that name is already configured")
+        }));
         Ok(())
     }
 

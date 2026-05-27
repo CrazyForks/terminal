@@ -2016,6 +2016,30 @@ The biggest remaining categories are:
   the remaining MCP deltas are lifecycle depth, same-server parallel throughput,
   HTTP/OAuth/elicitation, startup/status/provenance, and app/plugin connector
   integration.
+- The current plugin-MCP slice connects enabled local Codex plugin bundles to
+  the same local stdio MCP runtime instead of only showing plugin MCP names in
+  prompt context. Wrapped `.mcp.json` files, flat server-map files, manifest
+  `mcpServers` paths, relative `cwd` normalization, OAuth key normalization,
+  and explicit-config precedence are covered by tests. A runtime regression
+  proves a plugin-provided stdio MCP server can expose and execute
+  `mcp__sample__echo_tool` through the provider loop. This deliberately does
+  not claim app connector, streamable HTTP, OAuth, elicitation, plugin install,
+  or marketplace sync parity.
+- Verification for the plugin-MCP slice passed formatting, whitespace, Python,
+  and full Rust workspace checks. The live Codex-auth smoke used root session
+  `8a3915043d32`, which returned `Paris`, and child session `291d1d6b0884`,
+  which read `AGENTS.md` as `Agent Notes`. No TUI behavior changed, so the
+  terminal verifier was not rerun for this slice.
+- Ten broad read-only audits after the plugin-MCP slice agreed that supported
+  local stdio plugin MCP runtime exposure is now closed. They did not find a
+  bounded parser/runtime regression in this slice. Their consensus moved the
+  next work back to architecture: a dynamic tool/contributor graph including
+  discoverable plugin/install tools, a cancellable stream-time tool runtime
+  with read/write gates and a shared turn-diff tracker, a first-class
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item/context history,
+  local compaction/token-window precision, MCP/tool-output fidelity, hook trust
+  and handler depth, structured review task lifecycle, multi-environment
+  routing, and exact diffs beyond `apply_patch`.
 - The repeated next high-impact gaps are not MCP-specific: per-turn dynamic
   tool contributor/router planning, a unified cancellable tool runtime with
   read/write gates and abort outputs, first-class active-turn
