@@ -1877,6 +1877,44 @@ The biggest remaining categories are:
   richer goal/status and turn/tool lifecycle visibility, token-usage trend and
   breakdown displays, stronger interrupt/recovery affordances, attachment-rich
   composer state, and exact transcript/history reconstruction.
+- The current TUI prompt-history slice closes the highest-confidence
+  write-mostly history gap. The composer now reads Codex-shaped
+  `$CODEX_HOME/history.jsonl`, combines it with local in-session submissions,
+  supports Up/Ctrl+P and Down/Ctrl+N recall with draft restore, keeps multiline
+  cursor movement intact, and adds a Ctrl+R reverse-search overlay with
+  newest-first unique matching, match cycling, Enter acceptance, and Esc/Ctrl+C
+  draft restore.
+- The first broad audit wave found several prompt-history edge cases, so the
+  slice was tightened before final verification. Normal Up/Down lookup now
+  snapshots persistent history metadata and fetches entries lazily; local
+  submissions stay separate from later async persistence to avoid duplicate
+  recall; adjacent local duplicate submissions are collapsed; and non-empty
+  composer history navigation is allowed only when the text exactly matches the
+  last recalled entry at a text boundary, matching Codex's safer ownership
+  rule. Async command hooks are also skipped like Codex instead of running and
+  injecting context.
+- Verification for this slice passed the full terminal UI definition of done
+  because `crates/browser-use-tui` changed: `scripts/verify-terminal-ui.sh`
+  ran formatting, full Rust workspace tests, Python tests, deterministic setup/
+  account/model/done/running/cancelled/browser/history/developer dumps, and the
+  real tmux smoke. Focused coverage also passed `cargo test -p browser-use-tui
+  prompt_history`, `cargo test -p browser-use-tui`, `cargo test -p
+  browser-use-core message_history`, and `cargo test -p browser-use-core hook`.
+  The artifact directory `/tmp/but-design-loop` was inspected, and no ANSI or
+  bracketed-paste marker leaks were found.
+- The live Codex-auth smoke used root session `b069942a250f` and child session
+  `f6b0a4381917`. The root returned `Paris`; the child read
+  `/tmp/but-codex-agent-parity-smoke-final.txt` and returned
+  `agent-parity-smoke-ok`.
+- Ten broad read-only child audits after final verification all completed in
+  two waves. They did not identify a new bounded prompt-history regression.
+  Consensus remaining gaps are the larger provider-neutral architecture slices:
+  dynamic app/plugin/extension/MCP tool contributors, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, stream-integrated cancellable tool
+  futures with read/write gates, typed rollout/history/fork reconstruction,
+  exact cumulative turn-diff tracking, deeper compaction/token lifecycle
+  precision, persistent MCP/session lifecycle, richer skill/plugin/review
+  manager depth, and multi-environment tool routing.
 
 ## Definition of Done
 

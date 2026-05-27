@@ -8976,6 +8976,9 @@ fn run_hooks_for_event(
             continue;
         }
         for hook in &group.hooks {
+            if hook.async_run {
+                continue;
+            }
             let configured_order = invocations.len();
             invocations.push(prepare_command_hook_run(
                 store,
@@ -16352,6 +16355,13 @@ fn apply_hooks_config_events_with_source(
                             })
                     })
                     .transpose()?;
+                let async_run = hook_table
+                    .get("async")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                if async_run {
+                    continue;
+                }
                 commands.push(HookCommandConfig {
                     command,
                     command_windows: hook_table
@@ -16359,10 +16369,7 @@ fn apply_hooks_config_events_with_source(
                         .and_then(toml::Value::as_str)
                         .map(str::to_string),
                     timeout_sec,
-                    async_run: hook_table
-                        .get("async")
-                        .and_then(toml::Value::as_bool)
-                        .unwrap_or(false),
+                    async_run,
                     status_message: hook_table
                         .get("status_message")
                         .and_then(toml::Value::as_str)
@@ -20001,6 +20008,14 @@ pub fn lookup_message_history_entry(
     lookup_message_history_entry_at_path(&message_history_path(config), log_id, offset)
 }
 
+pub fn message_history_entries(
+    log_id: u64,
+    count: usize,
+    config: &MessageHistoryConfig,
+) -> Vec<MessageHistoryEntry> {
+    message_history_entries_at_path(&message_history_path(config), log_id, count)
+}
+
 fn message_history_path(config: &MessageHistoryConfig) -> PathBuf {
     config.codex_home.join(MESSAGE_HISTORY_FILENAME)
 }
@@ -20137,6 +20152,46 @@ fn lookup_message_history_entry_at_path(
         }
     }
     None
+}
+
+fn message_history_entries_at_path(
+    path: &Path,
+    log_id: u64,
+    count: usize,
+) -> Vec<MessageHistoryEntry> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let Some(file) = OpenOptions::new().read(true).open(path).ok() else {
+        return Vec::new();
+    };
+    let Some(current_log_id) = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| message_history_log_identity(&metadata))
+    else {
+        return Vec::new();
+    };
+    if current_log_id != log_id {
+        return Vec::new();
+    }
+    for _ in 0..MESSAGE_HISTORY_LOCK_RETRIES {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                return BufReader::new(&file)
+                    .lines()
+                    .take(count)
+                    .filter_map(|line| line.ok())
+                    .filter_map(|line| serde_json::from_str::<MessageHistoryEntry>(&line).ok())
+                    .collect();
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                thread::sleep(MESSAGE_HISTORY_LOCK_RETRY_SLEEP);
+            }
+            Err(_) => return Vec::new(),
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -27647,6 +27702,13 @@ command = "print-token"
                 .context("second history entry")?
                 .session_id,
             "session-b"
+        );
+        assert_eq!(
+            message_history_entries(log_id, count, &config)
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect::<Vec<_>>(),
+            vec!["first prompt".to_string(), "second prompt".to_string()]
         );
         assert!(lookup_message_history_entry(log_id.saturating_add(1), 0, &config).is_none());
 
@@ -36810,7 +36872,7 @@ sys.exit(2)
     }
 
     #[test]
-    fn async_command_hooks_execute_and_inject_context() -> Result<()> {
+    fn async_command_hooks_are_skipped_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
@@ -36829,17 +36891,11 @@ sys.exit(2)
         };
 
         let messages = run_session_start_hooks(&store, &session, &hooks, "gpt-5.4")?;
-        assert_eq!(messages.len(), 1);
-        assert!(message_content_text(&messages[0]).contains("async hook context"));
+        assert!(messages.is_empty());
         let events = store.events_for_session(&session.id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "hook.completed"
-                && event.payload["hook_event_name"] == "SessionStart"
-                && event.payload["async"] == true
-        }));
         assert!(!events
             .iter()
-            .any(|event| event.event_type == "hook.skipped"));
+            .any(|event| event.event_type.starts_with("hook.")));
         Ok(())
     }
 
