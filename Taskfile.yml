@@ -10,6 +10,7 @@ tasks:
   tui:dev:
     aliases:
       - dev
+      - up
     desc: Run the browser-use TUI from source, forwarding args after --
     silent: true
     cmds:
