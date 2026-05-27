@@ -634,7 +634,7 @@ fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize 
             | TranscriptKind::Error { .. }
             | TranscriptKind::Cancelled { .. }
             | TranscriptKind::Stack { .. },
-        ) => 2,
+        ) => 1,
         _ => 1,
     }
 }
@@ -3168,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_output_pairs_have_extra_vertical_space() {
+    fn prompt_output_pairs_use_one_blank_line() {
         let prompt = TranscriptNode {
             id: "prompt".to_string(),
             seq: 1,
@@ -3192,8 +3192,34 @@ mod tests {
 
         assert_eq!(line_text(&lines[0]), "> go to gusto");
         assert_eq!(line_text(&lines[1]), "");
-        assert_eq!(line_text(&lines[2]), "");
-        assert_eq!(line_text(&lines[3]), "Please open Chrome first.");
+        assert_eq!(line_text(&lines[2]), "Please open Chrome first.");
+    }
+
+    #[test]
+    fn prompt_streaming_output_uses_one_blank_line() {
+        let prompt = TranscriptNode {
+            id: "prompt".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Prompt {
+                text: "whats up".to_string(),
+                followup: false,
+            },
+        };
+        let answer = TranscriptNode {
+            id: "answer".to_string(),
+            seq: 2,
+            revision: 2,
+            kind: TranscriptKind::StreamingAssistant {
+                markdown: "Not much. I'm ready to work.".to_string(),
+            },
+        };
+
+        let lines = cells_to_lines([&prompt, &answer].into_iter(), 80, DisplayMode::Active);
+
+        assert_eq!(line_text(&lines[0]), "> whats up");
+        assert_eq!(line_text(&lines[1]), "");
+        assert_eq!(line_text(&lines[2]), "Not much. I'm ready to work.");
     }
 
     #[test]
