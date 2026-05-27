@@ -153,7 +153,11 @@ impl TranscriptNode {
                 lines
             }
             TranscriptKind::StreamingAssistant { markdown } => {
-                markdown_cell_lines(markdown, width, mode)
+                let mut lines = markdown_cell_lines(markdown, width, mode);
+                if mode == DisplayMode::Active {
+                    reserve_streaming_tail_line(&mut lines);
+                }
+                lines
             }
             TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             TranscriptKind::RequestUserInput { request, state } => {
@@ -384,6 +388,7 @@ impl TranscriptNode {
                         lines = lines.into_iter().skip(skip).collect();
                     }
                 }
+                reserve_streaming_tail_line(&mut lines);
                 lines
             }
             TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
@@ -1936,6 +1941,19 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
     lines
 }
 
+fn reserve_streaming_tail_line(lines: &mut Vec<Line<'static>>) {
+    if lines.last().is_none_or(line_is_blank) {
+        return;
+    }
+    lines.push(Line::from(""));
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .all(|span| span.content.as_ref().trim().is_empty())
+}
+
 fn proposed_plan_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let plan_lines = markdown_cell_lines(
         markdown,
@@ -3220,6 +3238,50 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "> whats up");
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "Not much. I'm ready to work.");
+        assert_eq!(line_text(&lines[3]), "");
+    }
+
+    #[test]
+    fn active_streaming_reserves_tail_without_committing_partial_line() {
+        fn model_for(markdown: &str) -> TranscriptModel {
+            TranscriptModel {
+                session_id: "session".to_string(),
+                committed: Vec::new(),
+                terminal_committed: Vec::new(),
+                active: Some(TranscriptNode {
+                    id: "stream".to_string(),
+                    seq: 1,
+                    revision: 1,
+                    kind: TranscriptKind::StreamingAssistant {
+                        markdown: markdown.to_string(),
+                    },
+                }),
+                last_event_seq: 1,
+                revision: 1,
+                live_phase: 0,
+            }
+        }
+
+        let first = model_for("Not much. I'm ready to work.");
+        let first_native_stream = active_streaming_lines(Some(&first), 80);
+        assert_eq!(first_native_stream.len(), 1);
+
+        let first_viewport = active_viewport_lines_with_stream_skip(Some(&first), 80, 100, 0);
+        assert_eq!(
+            line_text(&first_viewport[0]),
+            "Not much. I'm ready to work."
+        );
+        assert_eq!(line_text(&first_viewport[1]), "");
+
+        let second = model_for("Not much. I'm ready to work.\n\nSend me the command.");
+        let second_native_stream = active_streaming_lines(Some(&second), 80);
+        let emitted_lines = second_native_stream.len().saturating_sub(1);
+        let second_viewport =
+            active_viewport_lines_with_stream_skip(Some(&second), 80, 100, emitted_lines);
+
+        assert_eq!(line_text(&second_viewport[0]), "Send me the command.");
+        assert_eq!(line_text(&second_viewport[1]), "");
+        assert_eq!(first_viewport.len(), second_viewport.len());
     }
 
     #[test]
