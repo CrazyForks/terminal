@@ -275,6 +275,15 @@ def append_store_event(state_dir: Path, session_id: str, event_type: str, payloa
         conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
 
 
+def set_session_status(state_dir: Path, session_id: str, status: str) -> None:
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET status = ?, updated_ms = ? WHERE id = ?",
+            (status, now_ms, session_id),
+        )
+
+
 def create_live_subagent(
     state_dir: Path,
     parent_id: str,
@@ -448,12 +457,16 @@ def smoke_interactive_terminal(binary: Path) -> None:
         wait_for(session, "> something-bla", "alt-backspace-hyphenated-word-before")
         tmux_send_alt_backspace(session)
         hyphenated_word = capture_after_idle(session, "alt-backspace-hyphenated-word", visible_only=True)
-        assert_contains(hyphenated_word, "> something-", "alt-backspace should delete trailing word token")
-        assert_not_contains(hyphenated_word, "> something-bla", "alt-backspace should delete trailing word token")
+        assert_contains(hyphenated_word, "Type to steer the agent", "alt-backspace should delete to previous blank")
+        assert_not_contains(hyphenated_word, "> something-bla", "alt-backspace should delete to previous blank")
+        assert_not_contains(hyphenated_word, "> something-", "alt-backspace should delete to previous blank")
+
+        tmux_send_literal(session, "before something-bla")
+        wait_for(session, "> before something-bla", "alt-backspace-space-word-before")
         tmux_send_alt_backspace(session)
-        hyphen = capture_after_idle(session, "alt-backspace-hyphen", visible_only=True)
-        assert_contains(hyphen, "> something", "alt-backspace should delete punctuation token separately")
-        assert_not_contains(hyphen, "> something-", "alt-backspace should delete punctuation token separately")
+        spaced_word = capture_after_idle(session, "alt-backspace-space-word", visible_only=True)
+        assert_contains(spaced_word, "> before ", "alt-backspace should stop at previous blank")
+        assert_not_contains(spaced_word, "> before something-bla", "alt-backspace should stop at previous blank")
         tmux_send_alt_backspace(session)
         wait_for(session, "Type to steer the agent", "main-after-alt-backspace-word-clear")
 
@@ -473,13 +486,21 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(after_paste_clear, "paste two", "ctrl+c should clear pasted composer text")
 
         tmux_send(session, "/")
-        palette = wait_for(session, "/auth", "slash-palette-open")
+        palette = wait_for(session, "/model", "slash-palette-open")
         assert_contains(palette, "/task", "slash palette should show the first product action")
-        assert_contains(palette, "/auth", "slash palette should fit every product action")
+        assert_contains(palette, "/mode", "slash palette should expose collaboration mode")
+        assert_contains(palette, "/plan", "slash palette should expose Plan mode")
+        assert_contains(palette, "/model", "slash palette should show the model command in the visible window")
         assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
+        assert_not_contains(palette, "/auth", "slash palette overflows extra actions into filtering")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
-        wait_for(session, "/model", "slash-palette-open-model")
+        tmux_send_literal(session, "auth")
+        auth_actions = wait_for(session, "> auth", "slash-palette-auth-filtered")
+        assert_contains(auth_actions, "/auth", "slash palette should find auth through filtering")
+        assert_not_contains(auth_actions, "/model", "slash palette should hide non-matching model command")
+        tmux_send(session, "C-u")
+        wait_for(session, "/model", "slash-palette-filter-cleared")
         tmux_send_literal(session, "bro")
         actions = wait_for(session, "> bro", "slash-palette-filtered")
         assert_contains(actions, "/browser", "slash palette should show matching command")
@@ -493,7 +514,10 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "Enter")
         model = wait_for(session, "Choose the model and provider for this session", "model-panel")
         assert_contains(model, "bring your own key", "model surface should show lower sections")
-        assert_contains(model, "DeepSeek V4 Pro", "model surface should fit all model rows")
+        if "DeepSeek V4 Pro" not in model:
+            tmux_send(session, "Up")
+            model = wait_for(session, "DeepSeek V4 Pro", "model-panel-deepseek")
+        assert_contains(model, "DeepSeek V4 Pro", "model surface should show all model rows through navigation")
         assert_contains(model, "Enter:select", "model surface footer should be visible")
         assert_first_content_near_top(model, 2, "model surface should not be rendered in the compact dock")
         tmux_send(session, "Escape")
@@ -667,19 +691,108 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_double_escape_stops_running_task(binary: Path) -> None:
+def smoke_double_escape_opens_message_selector(binary: Path) -> None:
     session = f"but-smoke-esc-stop-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-stop-"))
     try:
         start_session(session, binary, state_dir)
         wait_for(session, "Type to steer the agent", "double-escape-running")
         tmux_send(session, "Escape")
-        armed = wait_for(session, "esc again to stop", "double-escape-armed")
+        armed = wait_for(session, "esc again to edit messages", "double-escape-armed")
         assert_contains(armed, "Type to steer the agent", "first escape should keep the task running")
         assert_no_legacy_dashboard_chrome(armed, "first escape should not restore old dashboard chrome")
         tmux_send(session, "Escape")
-        stopped = wait_for(session, "stopped", "double-escape-stopped")
-        assert_not_contains(stopped, "^[[", "double escape should not leak escape sequences")
+        selector = wait_for(session, "Messages", "double-escape-messages")
+        assert_contains(selector, "run", "message selector should show the submitted prompt")
+        assert_contains(
+            selector,
+            "Edit submitted prompts or cancel queued follow-ups",
+            "message selector should describe the actual submitted/queued actions",
+        )
+        assert_contains(selector, "Enter:edit | Esc:close", "submitted message selector should not advertise delete")
+        assert_not_contains(selector, "Del:remove", "submitted messages cannot be literally deleted")
+        assert_not_contains(selector, "^[[", "double escape should not leak escape sequences")
+        tmux_send(session, "C-c")
+        stopped = wait_for(session, "stopped", "ctrl-c-stopped-after-message-selector")
+        assert_not_contains(stopped, "^[[", "ctrl+c stop should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_escape_reclaims_prompt_before_output(binary: Path) -> None:
+    session = f"but-smoke-esc-reclaim-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-reclaim-"))
+    prompt = "take this back"
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="done",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "esc-reclaim-start-ready")
+        tmux_send_literal(session, prompt)
+        tmux_send(session, "Enter")
+        wait_for(session, f"> {prompt}", "esc-reclaim-submitted")
+
+        tmux_send(session, "Escape")
+        reclaimed = wait_for(session, f"> {prompt}", "esc-reclaim-returned")
+        assert_not_contains(
+            reclaimed,
+            "esc again to edit messages",
+            "single escape before output should reclaim instead of arming the message selector",
+        )
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            rollback_count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE type = 'session.rollback' "
+                "AND payload_json LIKE '%\"action\":\"take_back\"%'"
+            ).fetchone()[0]
+        if rollback_count != 1:
+            raise AssertionError(f"expected one take_back rollback event, saw {rollback_count}")
+
+        tmux_send(session, "C-u")
+        cleared = capture_after_idle(session, "esc-reclaim-cleared", visible_only=True)
+        assert_not_contains(
+            cleared,
+            prompt,
+            "clearing the reclaimed composer text should remove the prompt from the visible terminal",
+        )
+        assert_not_contains(cleared, "^[[", "escape reclaim should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_tab_queues_followup_after_current_turn(binary: Path) -> None:
+    session = f"but-smoke-tab-queue-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-tab-queue-"))
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "Type to steer the agent", "tab-queue-running")
+        tmux_send_literal(session, "after current turn")
+        tmux_send(session, "Tab")
+        queued = wait_for(session, "queued follow-up", "tab-queue-pending")
+        assert_contains(queued, "after current turn", "tab should keep the queued prompt visible")
+        assert_contains(queued, "Type to steer", "tab should leave the active turn running")
+
+        session_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            session_id,
+            "session.done",
+            {"result": "Current turn finished"},
+        )
+        set_session_status(state_dir, session_id, "done")
+        sent = wait_for(session, "sending", "tab-queue-sent")
+        assert_contains(
+            sent,
+            "> after current turn",
+            "queued follow-up should submit when the current turn finishes",
+        )
+        assert_not_contains(sent, "queued follow-up", "sent queued follow-up should stop rendering as queued")
+        assert_not_contains(sent, "^[[", "tab queued follow-up should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -787,6 +900,14 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
         append_store_event(
             state_dir,
             session_id,
+            "session.startup_warning",
+            {
+                "message": "Model `gpt-5.5` is not in the active model catalog; using conservative fallback capabilities."
+            },
+        )
+        append_store_event(
+            state_dir,
+            session_id,
             "model.turn.request",
             {"model": "GPT-5.5", "provider": "codex", "turn_idx": 1},
         )
@@ -841,6 +962,11 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
         )
         time.sleep(0.5)
         done_full = capture(session, "transcript-scroll-done-full")
+        assert_contains(
+            done_full,
+            "Model `gpt-5.5` is not in the active model catalog",
+            "final committed answer should preserve deferred startup warnings",
+        )
         assert_count(
             done_full,
             "live output line 01",
@@ -968,14 +1094,57 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         append_store_event(
             state_dir,
             session_id,
-            "model.stream_delta",
-            {"text": "streaming now", "turn_idx": 1},
+            "file.read",
+            {"path": "Cargo.toml"},
         )
-        wait_for(session, "streaming now", "prompt-only-followup-streaming")
+        wait_for(session, "read Cargo.toml", "prompt-only-followup-deferred-read")
+        deferred_read_visible = capture_after_idle(
+            session,
+            "prompt-only-followup-deferred-read-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            deferred_read_visible,
+            "read Cargo.toml",
+            "follow-up activity should show as the active tail before streaming starts",
+        )
+
+        streaming_text = (
+            "I'll inspect the repo structure and key docs/config first, then\n"
+            "summarize what it appears to be and how it's organized."
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.stream_delta",
+            {"text": streaming_text, "turn_idx": 1},
+        )
+        wait_for(session, "summarize what", "prompt-only-followup-streaming")
+        fresh_streaming_visible = capture_visible(
+            session,
+            "prompt-only-followup-streaming-fresh-visible",
+        )
+        assert_not_contains(
+            fresh_streaming_visible,
+            "Thinking...",
+            "fresh streaming follow-up should not show the thinking indicator while text is arriving",
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.response.output_item.completed",
+            {"item_type": "message", "phase": "commentary", "turn_idx": 1},
+        )
+        wait_for(session, "Thinking...", "prompt-only-followup-commentary-complete")
         streaming_visible = capture_after_idle(
             session,
             "prompt-only-followup-streaming-visible",
             visible_only=True,
+        )
+        streaming_full = capture_after_idle(
+            session,
+            "prompt-only-followup-streaming-full",
+            visible_only=False,
         )
         assert_contains(
             streaming_visible,
@@ -984,18 +1153,39 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         )
         assert_contains(
             streaming_visible,
-            "streaming now",
+            "I'll inspect the repo structure and key docs/config first, then",
             "streaming follow-up should keep live output visible",
+        )
+        assert_contains(
+            streaming_visible,
+            "summarize what it appears to be and how it's organized.",
+            "streaming follow-up should keep the active tail visible",
+        )
+        assert_contains(
+            streaming_visible,
+            "read Cargo.toml",
+            "streaming follow-up should keep the previous activity tail visible",
+        )
+        assert_contains(
+            streaming_full,
+            "read Cargo.toml",
+            "streaming follow-up should flush the previous activity tail into native scrollback",
+        )
+        assert_line_directly_followed_by(
+            streaming_visible,
+            "first, then",
+            "summarize what",
+            "streaming follow-up should not insert a separator inside the assistant paragraph",
+        )
+        assert_contains(
+            streaming_visible,
+            "Thinking...",
+            "commentary before tool calls should keep the live thinking indicator visible",
         )
         assert_not_contains(
             streaming_visible,
             "Working...",
             "streaming follow-up should not show a redundant live heartbeat",
-        )
-        assert_not_contains(
-            streaming_visible,
-            "thinking",
-            "streaming follow-up should replace the prompt-only thinking indicator",
         )
         assert_not_contains(
             streaming_visible,
@@ -1027,9 +1217,21 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         )
         assert_count(
             response_visible,
-            "streaming now",
-            0,
-            "streaming text hidden by a tool-call response should not remain duplicated in active viewport",
+            "I'll inspect the repo structure and key docs/config first, then",
+            1,
+            "streaming text before a tool-call response should commit once above the tool row",
+        )
+        assert_line_directly_followed_by(
+            response_visible,
+            "first, then",
+            "summarize what",
+            "committed streaming text should keep paragraph lines adjacent above the tool row",
+        )
+        assert_count(
+            response_visible,
+            "summarize what it appears to be and how it's organized.",
+            1,
+            "streaming text before a tool-call response should commit once above the tool row",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -1327,7 +1529,9 @@ def main() -> int:
     smoke_ready_resize_does_not_leave_stale_frames(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
-    smoke_double_escape_stops_running_task(binary)
+    smoke_double_escape_opens_message_selector(binary)
+    smoke_escape_reclaims_prompt_before_output(binary)
+    smoke_tab_queues_followup_after_current_turn(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_streaming_transcript_scrolls_above_composer(binary)
     smoke_prompt_only_followup_keeps_completed_transcript(binary)

@@ -3,6 +3,8 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    ChangeMode,
+    PlanMode,
     ChooseModel,
     Authenticate,
     Update,
@@ -33,10 +35,23 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         action: PaletteAction::ChangeBrowser,
     },
     PaletteItem {
+        command: "/mode",
+        description: "choose collaboration mode",
+        action: PaletteAction::ChangeMode,
+    },
+    PaletteItem {
+        command: "/plan",
+        description: "switch to Plan mode",
+        action: PaletteAction::PlanMode,
+    },
+    PaletteItem {
         command: "/model",
         description: "choose model and provider",
         action: PaletteAction::ChooseModel,
     },
+];
+
+const HIDDEN_ITEMS: [PaletteItem; 3] = [
     PaletteItem {
         command: "/auth",
         description: "sign in to a provider",
@@ -47,13 +62,12 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         description: "install the latest release",
         action: PaletteAction::Update,
     },
+    PaletteItem {
+        command: "/exit",
+        description: "quit browser-use terminal",
+        action: PaletteAction::Exit,
+    },
 ];
-
-const EXIT_ITEM: PaletteItem = PaletteItem {
-    command: "/exit",
-    description: "quit browser-use terminal",
-    action: PaletteAction::Exit,
-};
 
 pub(crate) const fn max_item_count() -> usize {
     VISIBLE_ITEMS.len()
@@ -67,7 +81,7 @@ pub(crate) fn items_filtered(filter: &str) -> Vec<PaletteItem> {
     VISIBLE_ITEMS
         .iter()
         .copied()
-        .chain(std::iter::once(EXIT_ITEM))
+        .chain(HIDDEN_ITEMS.iter().copied())
         .filter(|item| item.command[1..].to_ascii_lowercase().contains(&trimmed))
         .collect()
 }

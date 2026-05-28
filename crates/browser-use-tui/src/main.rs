@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 #[cfg(not(test))]
 use std::io::Read;
@@ -14,12 +14,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{install_process_crypto_provider, product_analytics};
+use browser_use_core::{
+    cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
+    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
+    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
+    product_analytics, typed_user_input_payload_from_items_for_cwd,
+    typed_user_input_payload_from_text_for_cwd, AgentRunOptions, CollaborationModeKind,
+    ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence, UnifiedExecShutdownCleanup,
+};
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, ClaudeCodeOAuthCredential, CodexAuth,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
+    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
@@ -50,8 +58,10 @@ use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
+mod clipboard_paste;
 mod composer;
 mod markdown;
 mod palette;
@@ -70,10 +80,12 @@ use render::{
 };
 use runtime::run_agent_thread;
 use settings::{
-    browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
-    AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
+    browser_use_cloud_env_key_present, display_and_provider_model_for_input,
+    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
+    model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -83,6 +95,15 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
+const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
+const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
+const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
+const REQUEST_USER_INPUT_OTHER_LABEL: &str = "None of the above";
+const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
+pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
+const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
+const SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT: &str = "session.queued_followup.cancelled";
+const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -90,12 +111,20 @@ const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 struct Args {
     #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
-    #[arg(long, default_value = "GPT-5.5")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
+    /// Layer $BROWSER_USE_TERMINAL_HOME/<name>.config.toml on top of the base user config.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+    /// Override a configuration value. Use a dotted path and TOML value.
+    #[arg(short = 'c', long = "config", value_name = "key=value", action = clap::ArgAction::Append)]
+    config_overrides: Vec<String>,
     #[arg(long, default_value = "Codex login")]
     account: String,
     #[arg(long, default_value = "Local Chrome")]
     browser: String,
+    #[arg(long = "collaboration-mode", value_enum, default_value_t = CollaborationModeArg::Default)]
+    collaboration_mode: CollaborationModeArg,
     #[arg(long)]
     dump_screen: bool,
     #[arg(long, default_value_t = 120)]
@@ -112,6 +141,21 @@ struct Args {
     agent: AgentBackend,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CollaborationModeArg {
+    Default,
+    Plan,
+}
+
+impl From<CollaborationModeArg> for CollaborationModeKind {
+    fn from(value: CollaborationModeArg) -> Self {
+        match value {
+            CollaborationModeArg::Default => CollaborationModeKind::Default,
+            CollaborationModeArg::Plan => CollaborationModeKind::Plan,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Surface {
     Main,
@@ -122,9 +166,11 @@ enum Surface {
     ApiKey,
     Telemetry,
     Model,
+    Mode,
     Browser,
     BrowserSelect,
     History,
+    Messages,
     Developer,
 }
 
@@ -136,9 +182,11 @@ impl Surface {
                 | Self::ApiKey
                 | Self::Telemetry
                 | Self::Model
+                | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::History
+                | Self::Messages
                 | Self::Developer
         )
     }
@@ -167,6 +215,7 @@ enum ScreenArg {
     Account,
     Telemetry,
     Model,
+    Mode,
     Browser,
     History,
     Developer,
@@ -179,6 +228,7 @@ impl From<ScreenArg> for Surface {
             ScreenArg::Account => Self::Account,
             ScreenArg::Telemetry => Self::Telemetry,
             ScreenArg::Model => Self::Model,
+            ScreenArg::Mode => Self::Mode,
             ScreenArg::Browser => Self::Browser,
             ScreenArg::History => Self::History,
             ScreenArg::Developer => Self::Developer,
@@ -208,6 +258,57 @@ struct SetupResult {
     kind: SetupResultKind,
     account: String,
     message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RequestUserInputOption {
+    pub(crate) label: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RequestUserInputQuestion {
+    pub(crate) id: String,
+    pub(crate) header: String,
+    pub(crate) question: String,
+    #[serde(rename = "isOther", default)]
+    pub(crate) is_other: bool,
+    #[serde(rename = "isSecret", default)]
+    pub(crate) is_secret: bool,
+    pub(crate) options: Option<Vec<RequestUserInputOption>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRequestUserInput {
+    pub(crate) call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) questions: Vec<RequestUserInputQuestion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestUserInputFocus {
+    Options,
+    Notes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestUserInputAnswerDraft {
+    pub(crate) option_cursor: Option<usize>,
+    pub(crate) committed_option: Option<usize>,
+    pub(crate) notes: String,
+    pub(crate) answer_committed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestUserInputState {
+    pub(crate) session_id: String,
+    pub(crate) call_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) current_idx: usize,
+    pub(crate) focus: RequestUserInputFocus,
+    pub(crate) answers: Vec<RequestUserInputAnswerDraft>,
+    pub(crate) confirm_unanswered: bool,
+    pub(crate) confirm_selected: usize,
 }
 
 #[derive(Debug)]
@@ -260,7 +361,24 @@ impl Drop for CodexLoginFlow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
-    SendFollowup { session_id: String, text: String },
+    StartTaskSubmission(UserSubmission),
+    SendFollowup {
+        session_id: String,
+        text: String,
+    },
+    SendFollowupSubmission {
+        session_id: String,
+        submission: UserSubmission,
+    },
+    QueueFollowupSubmission {
+        session_id: String,
+        submission: UserSubmission,
+    },
+    AnswerRequestUserInput {
+        session_id: String,
+        call_id: String,
+        text: String,
+    },
     RetryTask(String),
     OpenBrowser,
     ReconnectBrowser,
@@ -268,6 +386,8 @@ enum AppCommand {
     OpenHistory,
     SelectHistory(String),
     ChangeModel,
+    ChangeMode,
+    SetCollaborationMode(CollaborationModeKind),
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
@@ -279,6 +399,181 @@ enum AppCommand {
     SaveTelemetry(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserSubmission {
+    text: String,
+    local_images: Vec<PathBuf>,
+}
+
+impl UserSubmission {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            local_images: Vec::new(),
+        }
+    }
+
+    fn has_local_images(&self) -> bool {
+        !self.local_images.is_empty()
+    }
+
+    fn display_text(&self) -> String {
+        display_text_for_local_images_and_text(self.local_images.len(), &self.text)
+            .unwrap_or_default()
+    }
+}
+
+fn typed_user_input_payload_for_submission_for_cwd(
+    submission: &UserSubmission,
+    cwd: impl AsRef<Path>,
+) -> Result<serde_json::Value> {
+    if submission.local_images.is_empty() {
+        return typed_user_input_payload_from_text_for_cwd(&submission.text, cwd);
+    }
+
+    let mut items = Vec::new();
+    for path in &submission.local_images {
+        items.push(serde_json::json!({
+            "type": "local_image",
+            "path": path.display().to_string(),
+            "detail": "high",
+        }));
+    }
+    if !submission.text.is_empty() {
+        items.push(serde_json::json!({
+            "type": "text",
+            "text": submission.text,
+        }));
+    }
+    let mut payload =
+        typed_user_input_payload_from_items_for_cwd(&serde_json::Value::Array(items), cwd)?;
+    payload["text"] = serde_json::json!(submission.display_text());
+    Ok(payload)
+}
+
+pub(crate) fn user_input_display_text_from_payload(payload: &serde_json::Value) -> Option<String> {
+    if let Some(items) = payload.get("items").and_then(serde_json::Value::as_array) {
+        let local_image_count = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(serde_json::Value::as_str),
+                    Some("image" | "local_image")
+                )
+            })
+            .count();
+        if local_image_count > 0 {
+            let text = items
+                .iter()
+                .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(display) = display_text_for_local_images_and_text(local_image_count, &text)
+            {
+                return Some(display);
+            }
+        }
+    }
+
+    payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn display_text_for_local_images_and_text(image_count: usize, text: &str) -> Option<String> {
+    let text = text.trim();
+    if image_count == 0 {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let labels = (1..=image_count)
+        .map(|idx| format!("[Image {idx}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        Some(labels)
+    } else {
+        Some(format!("{labels}\n{text}"))
+    }
+}
+
+fn event_payload_text(event: &EventRecord) -> Option<String> {
+    user_input_display_text_from_payload(&event.payload)
+}
+
+fn event_is_pre_output_after_submission(event: &EventRecord, target_seq: i64) -> bool {
+    match event.event_type.as_str() {
+        "model.turn.request" | "model.thinking_delta" | "session.status" => true,
+        "workspace.context"
+        | "model.switch_context"
+        | "model.personality_context"
+        | "model.collaboration_context"
+        | "model.generated_image_context" => {
+            event
+                .payload
+                .get("before_seq")
+                .and_then(serde_json::Value::as_i64)
+                == Some(target_seq)
+        }
+        _ => false,
+    }
+}
+
+fn queued_followup_marker_seq(event: &EventRecord) -> Option<i64> {
+    event
+        .payload
+        .get("queued_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(serde_json::Value::as_i64)
+}
+
+fn pending_queued_followup_events_from_events(events: &[EventRecord]) -> Vec<&EventRecord> {
+    let closed = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                SESSION_QUEUED_FOLLOWUP_SENT_EVENT | SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT
+            )
+        })
+        .filter_map(queued_followup_marker_seq)
+        .collect::<HashSet<_>>();
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT && !closed.contains(&event.seq)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageActionKind {
+    Submitted,
+    Queued,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageActionRow {
+    seq: i64,
+    kind: MessageActionKind,
+    text: String,
+    followup: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionModelSelection {
+    display_model: String,
+    provider_model: String,
+    account: String,
+    backend: AgentBackend,
+    model_provider_id: Option<String>,
+}
+
 struct App {
     store: Store,
     store_rx: mpsc::Receiver<StoreNotification>,
@@ -286,6 +581,8 @@ struct App {
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
+    prompt_history: PromptHistoryState,
+    request_input: Option<RequestUserInputState>,
     surface: Surface,
     selected_row: usize,
     setup_complete: bool,
@@ -293,6 +590,9 @@ struct App {
     model: String,
     model_configured: bool,
     provider_model: String,
+    model_provider_id: Option<String>,
+    model_choices: Vec<ModelChoice>,
+    collaboration_mode: CollaborationModeKind,
     browser: String,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<usize>,
@@ -675,6 +975,669 @@ impl NativeHistoryState {
     }
 }
 
+const MAX_LOCAL_PROMPT_HISTORY_ENTRIES: usize = 1_000;
+
+#[derive(Debug, Default)]
+struct PromptHistoryState {
+    persistent_initialized: bool,
+    persistent_log_id: u64,
+    persistent_count: usize,
+    persistent_cache: HashMap<usize, String>,
+    persistent_search_entries: Option<Vec<String>>,
+    local_entries: Vec<String>,
+    nav_index: Option<usize>,
+    nav_draft: Option<String>,
+    last_history_text: Option<String>,
+    search: Option<PromptHistorySearchState>,
+}
+
+#[derive(Clone, Debug)]
+struct PromptHistorySearchState {
+    query: String,
+    draft: String,
+    matches: Vec<String>,
+    selected: Option<usize>,
+}
+
+impl PromptHistoryState {
+    fn refresh_persistent_metadata(&mut self, config: Option<&MessageHistoryConfig>) {
+        let Some(config) = config else {
+            self.replace_persistent_metadata(0, 0);
+            return;
+        };
+        if matches!(config.settings.persistence, MessageHistoryPersistence::None) {
+            self.replace_persistent_metadata(0, 0);
+            return;
+        }
+
+        let (log_id, count) = browser_use_core::message_history_metadata(config);
+        if !self.persistent_initialized
+            || self.persistent_log_id != log_id
+            || count < self.persistent_count
+        {
+            self.replace_persistent_metadata(log_id, count);
+        }
+    }
+
+    fn replace_persistent_metadata(&mut self, log_id: u64, count: usize) {
+        if self.persistent_initialized
+            && self.persistent_log_id == log_id
+            && self.persistent_count == count
+        {
+            return;
+        }
+        self.persistent_initialized = true;
+        self.persistent_log_id = log_id;
+        self.persistent_count = count;
+        self.persistent_cache.clear();
+        self.persistent_search_entries = None;
+        self.reset_navigation();
+    }
+
+    fn record_submission(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.local_entries.last().is_some_and(|entry| entry == text) {
+            self.reset_navigation();
+            self.search = None;
+            return;
+        }
+        self.local_entries.push(text.to_string());
+        if self.local_entries.len() > MAX_LOCAL_PROMPT_HISTORY_ENTRIES {
+            let overflow = self
+                .local_entries
+                .len()
+                .saturating_sub(MAX_LOCAL_PROMPT_HISTORY_ENTRIES);
+            self.local_entries.drain(0..overflow);
+        }
+        self.reset_navigation();
+        self.search = None;
+    }
+
+    fn reset_navigation(&mut self) {
+        self.nav_index = None;
+        self.nav_draft = None;
+        self.last_history_text = None;
+    }
+
+    fn is_navigating(&self) -> bool {
+        self.nav_index.is_some()
+    }
+
+    fn should_handle_navigation(&self, text: &str, cursor_at_boundary: bool) -> bool {
+        if self.total_entries() == 0 {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        cursor_at_boundary && self.last_history_text.as_deref() == Some(text)
+    }
+
+    fn total_entries(&self) -> usize {
+        self.persistent_count + self.local_entries.len()
+    }
+
+    fn entry_at(&mut self, index: usize, config: Option<&MessageHistoryConfig>) -> Option<String> {
+        if index < self.persistent_count {
+            return self.persistent_entry(index, config);
+        }
+        self.local_entries
+            .get(index.saturating_sub(self.persistent_count))
+            .cloned()
+    }
+
+    fn persistent_entry(
+        &mut self,
+        offset: usize,
+        config: Option<&MessageHistoryConfig>,
+    ) -> Option<String> {
+        if offset >= self.persistent_count {
+            return None;
+        }
+        if let Some(entry) = self.persistent_cache.get(&offset) {
+            return Some(entry.clone());
+        }
+        let config = config?;
+        let entry =
+            browser_use_core::lookup_message_history_entry(self.persistent_log_id, offset, config)?;
+        if entry.text.trim().is_empty() {
+            return None;
+        }
+        self.persistent_cache.insert(offset, entry.text.clone());
+        Some(entry.text)
+    }
+
+    fn search_entries(&mut self, config: Option<&MessageHistoryConfig>) -> Vec<String> {
+        if self.persistent_search_entries.is_none() {
+            let persistent_entries = config
+                .filter(|_| self.persistent_count > 0)
+                .map(|config| {
+                    browser_use_core::message_history_entries(
+                        self.persistent_log_id,
+                        self.persistent_count,
+                        config,
+                    )
+                    .into_iter()
+                    .filter_map(|entry| (!entry.text.trim().is_empty()).then_some(entry.text))
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.persistent_search_entries = Some(persistent_entries);
+        }
+        let persistent_entries = self.persistent_search_entries.clone().unwrap_or_default();
+        let mut entries = Vec::with_capacity(persistent_entries.len() + self.local_entries.len());
+        entries.extend(persistent_entries);
+        entries.extend(self.local_entries.iter().cloned());
+        entries
+    }
+}
+
+fn prompt_history_search_matches(entries: &[String], query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for entry in entries.iter().rev() {
+        let normalized = entry.to_lowercase();
+        if normalized.contains(&query) && seen.insert(entry.clone()) {
+            matches.push(entry.clone());
+        }
+    }
+    matches
+}
+
+fn key_matches_control_char(key: KeyEvent, ch: char, raw: char) -> bool {
+    matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char(value),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if value.eq_ignore_ascii_case(&ch)
+    ) || matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char(value),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } if value == raw
+    )
+}
+
+fn is_prompt_history_search_start_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'r', '\u{0012}')
+}
+
+fn is_prompt_history_search_next_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 's', '\u{0013}')
+}
+
+fn is_prompt_history_search_cancel_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'c', '\u{0003}')
+}
+
+fn is_prompt_history_search_backspace_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'h', '\u{0008}')
+}
+
+fn is_prompt_history_search_clear_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'u', '\u{0015}')
+}
+
+pub(crate) fn collaboration_mode_label(mode: CollaborationModeKind) -> &'static str {
+    match mode {
+        CollaborationModeKind::Default => "Default",
+        CollaborationModeKind::Plan => "Plan",
+    }
+}
+
+fn collaboration_mode_setting_value(mode: CollaborationModeKind) -> &'static str {
+    match mode {
+        CollaborationModeKind::Default => "default",
+        CollaborationModeKind::Plan => "plan",
+    }
+}
+
+fn collaboration_mode_from_setting(value: &str) -> Option<CollaborationModeKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Some(CollaborationModeKind::Default),
+        "plan" => Some(CollaborationModeKind::Plan),
+        _ => None,
+    }
+}
+
+fn next_collaboration_mode(mode: CollaborationModeKind) -> CollaborationModeKind {
+    match mode {
+        CollaborationModeKind::Default => CollaborationModeKind::Plan,
+        CollaborationModeKind::Plan => CollaborationModeKind::Default,
+    }
+}
+
+fn pending_request_user_input_from_events(
+    events: &[EventRecord],
+) -> Option<PendingRequestUserInput> {
+    let start_idx = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.done" | "session.failed" | "session.cancelled"
+            )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let recent_events = &events[start_idx..];
+    let mut answered = HashSet::new();
+    for event in recent_events
+        .iter()
+        .filter(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+    {
+        if let Some(turn_id) = event
+            .payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            answered.insert(turn_id);
+        } else if let Some(call_id) = event
+            .payload
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            answered.insert(call_id);
+        }
+    }
+    recent_events.iter().find_map(|event| {
+        if event.event_type != REQUEST_USER_INPUT_REQUEST_EVENT {
+            return None;
+        }
+        let call_id = event
+            .payload
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)?;
+        let turn_id = event
+            .payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(call_id);
+        if answered.contains(turn_id) || answered.contains(call_id) {
+            return None;
+        }
+        let questions = event.payload.get("questions")?.clone();
+        let questions = serde_json::from_value::<Vec<RequestUserInputQuestion>>(questions).ok()?;
+        Some(Some(PendingRequestUserInput {
+            call_id: call_id.to_string(),
+            turn_id: turn_id.to_string(),
+            questions,
+        }))
+    })?
+}
+
+impl RequestUserInputState {
+    fn new(session_id: String, request: &PendingRequestUserInput) -> Self {
+        let answers = request
+            .questions
+            .iter()
+            .map(|question| {
+                let option_cursor = (request_user_input_option_count(question) > 0).then_some(0);
+                RequestUserInputAnswerDraft {
+                    option_cursor,
+                    committed_option: None,
+                    notes: String::new(),
+                    answer_committed: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        Self {
+            session_id,
+            call_id: request.call_id.clone(),
+            turn_id: request.turn_id.clone(),
+            current_idx: 0,
+            focus: RequestUserInputFocus::Options,
+            answers,
+            confirm_unanswered: false,
+            confirm_selected: 0,
+        }
+    }
+}
+
+fn request_user_input_option_count(question: &RequestUserInputQuestion) -> usize {
+    let option_count = question.options.as_ref().map(Vec::len).unwrap_or_default();
+    if question.is_other && option_count > 0 {
+        option_count.saturating_add(1)
+    } else {
+        option_count
+    }
+}
+
+fn request_user_input_option_label(
+    question: &RequestUserInputQuestion,
+    idx: usize,
+) -> Option<String> {
+    let options = question.options.as_ref()?;
+    if idx < options.len() {
+        return options.get(idx).map(|option| option.label.clone());
+    }
+    if question.is_other && idx == options.len() {
+        return Some(REQUEST_USER_INPUT_OTHER_LABEL.to_string());
+    }
+    None
+}
+
+fn request_user_input_state_answer_values(
+    question: &RequestUserInputQuestion,
+    draft: &RequestUserInputAnswerDraft,
+) -> Vec<String> {
+    if !draft.answer_committed {
+        return Vec::new();
+    }
+    let mut values = draft
+        .committed_option
+        .and_then(|idx| request_user_input_option_label(question, idx))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let note = draft.notes.trim();
+    if !note.is_empty() {
+        values.push(format!("user_note: {note}"));
+    }
+    values
+}
+
+fn request_user_input_state_response_payload(
+    request: &PendingRequestUserInput,
+    state: &RequestUserInputState,
+) -> serde_json::Value {
+    let mut answers = serde_json::Map::new();
+    for (idx, question) in request.questions.iter().enumerate() {
+        let values = state
+            .answers
+            .get(idx)
+            .map(|draft| request_user_input_state_answer_values(question, draft))
+            .unwrap_or_default();
+        answers.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "answers": values,
+            }),
+        );
+    }
+    serde_json::json!({
+        "turn_id": request.turn_id.clone(),
+        "call_id": request.call_id.clone(),
+        "questions": request.questions.clone(),
+        "answers": answers,
+    })
+}
+
+fn request_user_input_response_payload(
+    request: &PendingRequestUserInput,
+    text: &str,
+) -> serde_json::Value {
+    let parts = request_user_input_answer_texts(request, text);
+    let mut answers = serde_json::Map::new();
+    for (idx, question) in request.questions.iter().enumerate() {
+        let answer_text = parts.get(idx).map(String::as_str).unwrap_or_default();
+        answers.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "answers": request_user_input_answer_values(question, answer_text),
+            }),
+        );
+    }
+    serde_json::json!({
+        "turn_id": request.turn_id.clone(),
+        "call_id": request.call_id.clone(),
+        "questions": request.questions.clone(),
+        "answers": answers,
+    })
+}
+
+fn request_user_input_answer_texts(request: &PendingRequestUserInput, text: &str) -> Vec<String> {
+    if let Some(parts) = keyed_request_user_input_answers(request, text) {
+        return parts;
+    }
+    split_request_user_input_answers(text, request.questions.len())
+}
+
+fn keyed_request_user_input_answers(
+    request: &PendingRequestUserInput,
+    text: &str,
+) -> Option<Vec<String>> {
+    if request.questions.len() <= 1 {
+        return None;
+    }
+    let mut parts = vec![String::new(); request.questions.len()];
+    let mut used = vec![false; request.questions.len()];
+    let mut unmatched = Vec::new();
+    for part in request_user_input_text_parts(text) {
+        let Some((raw_key, raw_value)) = part.split_once(':') else {
+            unmatched.push(part);
+            continue;
+        };
+        let Some(idx) = request_user_input_question_index(request, raw_key.trim()) else {
+            unmatched.push(part);
+            continue;
+        };
+        parts[idx] = raw_value.trim().to_string();
+        used[idx] = true;
+    }
+    if !used.iter().any(|is_used| *is_used) {
+        return None;
+    }
+    let mut next_unmatched = unmatched.into_iter();
+    for (idx, is_used) in used.iter_mut().enumerate() {
+        if *is_used {
+            continue;
+        }
+        if let Some(value) = next_unmatched.next() {
+            parts[idx] = value;
+            *is_used = true;
+        }
+    }
+    Some(parts)
+}
+
+fn request_user_input_text_parts(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split(';'))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn request_user_input_question_index(
+    request: &PendingRequestUserInput,
+    key: &str,
+) -> Option<usize> {
+    if let Ok(number) = key.trim().parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .filter(|idx| *idx < request.questions.len());
+    }
+    let normalized_key = normalize_request_user_input_key(key);
+    request.questions.iter().position(|question| {
+        normalize_request_user_input_key(&question.id) == normalized_key
+            || normalize_request_user_input_key(&question.header) == normalized_key
+            || normalize_request_user_input_key(&question.question) == normalized_key
+    })
+}
+
+fn normalize_request_user_input_key(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ':' | '.' | ')' | '('))
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn split_request_user_input_answers(text: &str, question_count: usize) -> Vec<String> {
+    if question_count <= 1 {
+        return vec![text.trim().to_string()];
+    }
+    let line_parts = request_user_input_text_parts(text);
+    if line_parts.len() >= question_count {
+        return line_parts;
+    }
+    line_parts
+}
+
+fn request_user_input_answer_values(
+    question: &RequestUserInputQuestion,
+    answer_text: &str,
+) -> Vec<String> {
+    let answer_text = answer_text.trim();
+    let Some(options) = question
+        .options
+        .as_ref()
+        .filter(|options| !options.is_empty())
+    else {
+        return (!answer_text.is_empty())
+            .then(|| answer_text.to_string())
+            .into_iter()
+            .collect();
+    };
+    if answer_text.is_empty() {
+        return Vec::new();
+    }
+    if matches_ignore_ascii_case(answer_text, "unanswered")
+        || matches_ignore_ascii_case(answer_text, "skip")
+    {
+        return Vec::new();
+    }
+    if let Some((number, note)) = parse_numbered_request_user_input_answer(answer_text) {
+        if let Some(option) = number.checked_sub(1).and_then(|idx| options.get(idx)) {
+            return vec![option.label.clone()];
+        }
+        if question.is_other && number == options.len().saturating_add(1) {
+            let mut out = vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+            if let Some(note) = note.filter(|note| !note.is_empty()) {
+                out.push(format!("user_note: {note}"));
+            }
+            return out;
+        }
+    }
+    if let Some(option) = options
+        .iter()
+        .find(|option| request_user_input_option_matches(&option.label, answer_text))
+    {
+        return vec![option.label.clone()];
+    }
+    if question.is_other {
+        let note = strip_request_user_input_other_prefix(answer_text).unwrap_or(answer_text);
+        if request_user_input_option_matches(REQUEST_USER_INPUT_OTHER_LABEL, answer_text) {
+            return vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+        }
+        let mut out = vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+        if !note.is_empty() && !note.eq_ignore_ascii_case(REQUEST_USER_INPUT_OTHER_LABEL) {
+            out.push(format!("user_note: {note}"));
+        }
+        return out;
+    }
+    vec![answer_text.to_string()]
+}
+
+fn parse_numbered_request_user_input_answer(answer_text: &str) -> Option<(usize, Option<String>)> {
+    let trimmed = answer_text.trim();
+    let digit_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if digit_len == 0 {
+        return None;
+    }
+    let number = trimmed[..digit_len].parse::<usize>().ok()?;
+    let rest = trimmed[digit_len..].trim_start();
+    if rest.is_empty() {
+        return Some((number, None));
+    }
+    let note = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix(':'))
+        .or_else(|| rest.strip_prefix('-'))
+        .map(str::trim);
+    note.map(|note| (number, Some(note.to_string())))
+}
+
+fn request_user_input_option_matches(option_label: &str, answer_text: &str) -> bool {
+    normalize_request_user_input_option_label(option_label)
+        == normalize_request_user_input_option_label(answer_text)
+}
+
+fn normalize_request_user_input_option_label(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_recommended = trimmed
+        .strip_suffix("(Recommended)")
+        .or_else(|| trimmed.strip_suffix("(recommended)"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    without_recommended.to_ascii_lowercase()
+}
+
+fn strip_request_user_input_other_prefix(answer_text: &str) -> Option<&str> {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower
+        .strip_prefix("other:")
+        .map(|_| trimmed["other:".len()..].trim())
+}
+
+fn matches_ignore_ascii_case(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
+    backend.as_setting()
+}
+
+fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionModelSelection> {
+    if event.event_type != SESSION_MODEL_SELECTION_EVENT {
+        return None;
+    }
+    let backend = event
+        .payload
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .and_then(AgentBackend::from_setting)?;
+    let provider_model = event
+        .payload
+        .get("provider_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let display_model = event
+        .payload
+        .get("display_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| provider_model.clone());
+    let account = event
+        .payload
+        .get("account")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
+    let model_provider_id = event
+        .payload
+        .get("model_provider_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(SessionModelSelection {
+        display_model,
+        provider_model,
+        account,
+        backend,
+        model_provider_id,
+    })
+}
+
 impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
@@ -691,24 +1654,86 @@ impl App {
             None
         };
         let surface = args.overlay.map(Into::into).unwrap_or(Surface::Main);
+        let current_dir = std::env::current_dir()?;
+        let config_overrides = parse_config_overrides(&args.config_overrides)?;
+        let config_profile = args.config_profile.as_deref();
         let setup_complete = store.get_setting("setup.complete")?.as_deref() == Some("1");
         let account = store
             .get_setting("account")?
             .unwrap_or_else(|| args.account.clone());
-        let stored_model = store.get_setting("model")?;
-        let had_stored_model = stored_model.is_some();
-        let model_configured = had_stored_model || setup_complete;
-        let model = stored_model.unwrap_or_else(|| args.model.clone());
-        let provider_model = store
-            .get_setting("provider.model")?
-            .unwrap_or_else(|| provider_model_for_display(&model).to_string());
-        let browser = store
-            .get_setting("browser")?
-            .unwrap_or_else(|| args.browser.clone());
         let agent_backend = store
             .get_setting("agent.backend")?
             .and_then(|value| AgentBackend::from_setting(&value))
             .unwrap_or(args.agent);
+        let model_choices =
+            model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
+                .map(|catalog| model_choices_for_catalog(&catalog))
+                .unwrap_or_else(|_| fallback_model_choices());
+        let stored_model = store.get_setting("model")?;
+        let had_stored_model = stored_model.is_some();
+        let explicit_model = args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let configured_model =
+            configured_model_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
+                .unwrap_or(None);
+        let selected_model_override = explicit_model.map(ToOwned::to_owned).or(configured_model);
+        let has_model_override = selected_model_override.is_some();
+        let (default_display_model, default_provider_model) = if let Some(model) =
+            selected_model_override.as_deref()
+        {
+            display_and_provider_model_for_input(model, &model_choices)
+        } else {
+            let chatgpt_mode = matches!(agent_backend, AgentBackend::Codex);
+            let provider_model = default_model_for_cwd_with_options(
+                &current_dir,
+                config_profile,
+                &config_overrides,
+                chatgpt_mode,
+            )
+            .unwrap_or_else(|_| "gpt-5.5".to_string());
+            let display_model = display_model_for_provider_model(&provider_model, &model_choices);
+            (display_model, provider_model)
+        };
+        let model_configured = has_model_override || had_stored_model || setup_complete;
+        let model = if has_model_override {
+            default_display_model
+        } else {
+            stored_model.unwrap_or(default_display_model)
+        };
+        let provider_model = if has_model_override {
+            default_provider_model.clone()
+        } else {
+            store.get_setting("provider.model")?.unwrap_or_else(|| {
+                if had_stored_model {
+                    provider_model_for_display(&model, &model_choices)
+                } else {
+                    default_provider_model.clone()
+                }
+            })
+        };
+        let configured_model_provider_id = configured_model_provider_id_for_cwd_with_options(
+            &current_dir,
+            config_profile,
+            &config_overrides,
+        )
+        .unwrap_or(None);
+        let stored_model_provider_id = store
+            .get_setting("provider.id")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let model_provider_id = configured_model_provider_id
+            .or(stored_model_provider_id)
+            .or_else(|| Some(model_provider_id_for_backend(agent_backend).to_string()));
+        let collaboration_mode = store
+            .get_setting(COLLABORATION_MODE_SETTING)?
+            .and_then(|value| collaboration_mode_from_setting(&value))
+            .unwrap_or_else(|| args.collaboration_mode.into());
+        let browser = store
+            .get_setting("browser")?
+            .unwrap_or_else(|| args.browser.clone());
         let selected_row = 0;
         let _ = had_stored_model;
         let mut app = Self {
@@ -718,6 +1743,8 @@ impl App {
             args,
             selected_session_id,
             composer: Composer::default(),
+            prompt_history: PromptHistoryState::default(),
+            request_input: None,
             surface,
             selected_row,
             setup_complete,
@@ -725,6 +1752,9 @@ impl App {
             model,
             model_configured,
             provider_model,
+            model_provider_id,
+            model_choices,
+            collaboration_mode,
             browser,
             api_key_account: None,
             pending_model_after_auth: None,
@@ -771,6 +1801,11 @@ impl App {
                 .apply_notification(&self.store, notification)?;
         }
         if changed {
+            self.refresh_cached_projection();
+        }
+        if self.flush_ready_queued_followups()? {
+            changed = true;
+            self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
         }
         Ok(changed)
@@ -866,8 +1901,13 @@ impl App {
     }
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
-        let changed = self.state_cache.refresh_all(&self.store)?;
+        let mut changed = self.state_cache.refresh_all(&self.store)?;
         if changed {
+            self.refresh_cached_projection();
+        }
+        if self.flush_ready_queued_followups()? {
+            changed = true;
+            self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
         }
         Ok(changed)
@@ -875,6 +1915,143 @@ impl App {
 
     fn cached_events_for_session(&self, session_id: &str) -> &[EventRecord] {
         self.state_cache.events_for_session(session_id)
+    }
+
+    fn pending_queued_followup_events<'a>(
+        &self,
+        events: &'a [EventRecord],
+    ) -> Vec<&'a EventRecord> {
+        pending_queued_followup_events_from_events(events)
+    }
+
+    pub(crate) fn queued_followup_is_pending(&self, session_id: &str, queued_seq: i64) -> bool {
+        self.pending_queued_followup_events(self.cached_events_for_session(session_id))
+            .into_iter()
+            .any(|event| event.seq == queued_seq)
+    }
+
+    fn flush_ready_queued_followups(&mut self) -> Result<bool> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status.is_active() {
+            return Ok(false);
+        }
+        let events = self.store.events_for_session(&session_id)?;
+        let pending = pending_queued_followup_events_from_events(&events);
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        for queued in pending {
+            let mut payload = queued.payload.clone();
+            payload["queued_from_seq"] = serde_json::json!(queued.seq);
+            self.store
+                .append_event(&session_id, "session.followup", payload)?;
+            self.store.append_event(
+                &session_id,
+                SESSION_QUEUED_FOLLOWUP_SENT_EVENT,
+                serde_json::json!({ "queued_seq": queued.seq }),
+            )?;
+        }
+        self.status_notice = Some("Sent queued follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
+    }
+
+    pub(crate) fn message_action_rows(&self) -> Vec<MessageActionRow> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Vec::new();
+        };
+        let events = self.cached_events_for_session(session_id);
+        let mut rows = browser_use_core::rollback_filtered_event_records(events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(|event| {
+                event_payload_text(event).map(|text| MessageActionRow {
+                    seq: event.seq,
+                    kind: MessageActionKind::Submitted,
+                    text,
+                    followup: event.event_type == "session.followup",
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.pending_queued_followup_events(events)
+                .into_iter()
+                .filter_map(|event| {
+                    event_payload_text(event).map(|text| MessageActionRow {
+                        seq: event.seq,
+                        kind: MessageActionKind::Queued,
+                        text,
+                        followup: true,
+                    })
+                }),
+        );
+        rows.sort_by_key(|row| row.seq);
+        rows
+    }
+
+    fn latest_reclaimable_submitted_message(
+        &mut self,
+    ) -> Result<Option<(String, MessageActionRow, bool)>> {
+        if !self.composer.is_empty() {
+            return Ok(None);
+        }
+        self.refresh_state_cache_from_store()?;
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(None);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(None);
+        };
+        if !session.status.is_active() {
+            return Ok(None);
+        }
+        let events = self.store.events_for_session(&session_id)?;
+        let filtered = browser_use_core::rollback_filtered_event_records(&events);
+        let Some(row) = filtered.iter().rev().find_map(|event| {
+            if !matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup"
+            ) {
+                return None;
+            }
+            event_payload_text(event).map(|text| MessageActionRow {
+                seq: event.seq,
+                kind: MessageActionKind::Submitted,
+                text,
+                followup: event.event_type == "session.followup",
+            })
+        }) else {
+            return Ok(None);
+        };
+        let pre_output_only = events
+            .iter()
+            .filter(|event| event.seq > row.seq)
+            .all(|event| event_is_pre_output_after_submission(event, row.seq));
+        if !pre_output_only {
+            return Ok(None);
+        }
+        let has_prior_submitted_message = filtered.iter().any(|event| {
+            event.seq < row.seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        });
+        Ok(Some((session_id, row, has_prior_submitted_message)))
     }
 
     fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
@@ -885,6 +2062,580 @@ impl App {
 
     fn history_tasks_are_visible(&self) -> bool {
         self.surface == Surface::History || self.selected_session_id.is_none()
+    }
+
+    pub(crate) fn pending_request_user_input(
+        &self,
+        session_id: &str,
+    ) -> Option<PendingRequestUserInput> {
+        pending_request_user_input_from_events(self.cached_events_for_session(session_id))
+    }
+
+    fn current_pending_request_user_input(&self) -> Option<(String, PendingRequestUserInput)> {
+        let session_id = self.selected_session_id.as_deref()?;
+        let active = self
+            .state_cache
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| session.status.is_active());
+        if !active {
+            return None;
+        }
+        self.pending_request_user_input(session_id)
+            .map(|request| (session_id.to_string(), request))
+    }
+
+    pub(crate) fn request_input_display_state(
+        &self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> RequestUserInputState {
+        self.request_input
+            .as_ref()
+            .filter(|state| {
+                state.session_id == session_id
+                    && state.call_id == request.call_id
+                    && state.turn_id == request.turn_id
+            })
+            .cloned()
+            .unwrap_or_else(|| RequestUserInputState::new(session_id.to_string(), request))
+    }
+
+    fn ensure_request_input_state(&mut self, session_id: &str, request: &PendingRequestUserInput) {
+        let should_reset = self.request_input.as_ref().is_none_or(|state| {
+            state.session_id != session_id
+                || state.call_id != request.call_id
+                || state.turn_id != request.turn_id
+                || state.answers.len() != request.questions.len()
+        });
+        if should_reset {
+            self.request_input = Some(RequestUserInputState::new(session_id.to_string(), request));
+        }
+        self.clamp_request_input_state(request);
+    }
+
+    fn clamp_request_input_state(&mut self, request: &PendingRequestUserInput) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        if state.current_idx >= request.questions.len() {
+            state.current_idx = request.questions.len().saturating_sub(1);
+        }
+        for (idx, answer) in state.answers.iter_mut().enumerate() {
+            let count = request
+                .questions
+                .get(idx)
+                .map(request_user_input_option_count)
+                .unwrap_or_default();
+            if count == 0 {
+                answer.option_cursor = None;
+                answer.committed_option = None;
+                continue;
+            }
+            if let Some(cursor) = answer.option_cursor {
+                answer.option_cursor = Some(cursor.min(count - 1));
+            }
+            if answer
+                .committed_option
+                .is_some_and(|selected| selected >= count)
+            {
+                answer.committed_option = None;
+                answer.answer_committed = false;
+            }
+        }
+        let current_has_options = request
+            .questions
+            .get(state.current_idx)
+            .is_some_and(|question| request_user_input_option_count(question) > 0);
+        if !current_has_options {
+            state.focus = RequestUserInputFocus::Notes;
+        }
+    }
+
+    fn save_current_request_input_notes(&mut self) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        if state.focus != RequestUserInputFocus::Notes {
+            return;
+        }
+        if let Some(answer) = state.answers.get_mut(state.current_idx) {
+            answer.notes = self.composer.input().to_string();
+        }
+    }
+
+    fn restore_current_request_input_notes(&mut self) {
+        let Some(state) = self.request_input.as_ref() else {
+            self.composer.clear();
+            return;
+        };
+        if state.focus == RequestUserInputFocus::Notes {
+            let notes = state
+                .answers
+                .get(state.current_idx)
+                .map(|answer| answer.notes.clone())
+                .unwrap_or_default();
+            self.composer.set_input(notes);
+        } else {
+            self.composer.clear();
+        }
+    }
+
+    fn request_input_state_has_touched_answer(&self) -> bool {
+        self.request_input.as_ref().is_some_and(|state| {
+            state.focus == RequestUserInputFocus::Notes
+                || state.confirm_unanswered
+                || state.answers.iter().any(|answer| {
+                    answer.answer_committed
+                        || answer.committed_option.is_some()
+                        || !answer.notes.trim().is_empty()
+                })
+        })
+    }
+
+    fn move_request_input_question(&mut self, request: &PendingRequestUserInput, next: bool) {
+        if request.questions.is_empty() {
+            return;
+        }
+        self.save_current_request_input_notes();
+        if let Some(state) = self.request_input.as_mut() {
+            let len = request.questions.len();
+            let offset = if next { 1 } else { len.saturating_sub(1) };
+            state.current_idx = (state.current_idx + offset) % len;
+            state.confirm_unanswered = false;
+            let current_has_options = request
+                .questions
+                .get(state.current_idx)
+                .is_some_and(|question| request_user_input_option_count(question) > 0);
+            state.focus = if current_has_options {
+                RequestUserInputFocus::Options
+            } else {
+                RequestUserInputFocus::Notes
+            };
+        }
+        self.restore_current_request_input_notes();
+    }
+
+    fn jump_to_request_input_question(&mut self, request: &PendingRequestUserInput, idx: usize) {
+        if idx >= request.questions.len() {
+            return;
+        }
+        self.save_current_request_input_notes();
+        if let Some(state) = self.request_input.as_mut() {
+            state.current_idx = idx;
+            state.confirm_unanswered = false;
+            let current_has_options = request
+                .questions
+                .get(state.current_idx)
+                .is_some_and(|question| request_user_input_option_count(question) > 0);
+            state.focus = if current_has_options {
+                RequestUserInputFocus::Options
+            } else {
+                RequestUserInputFocus::Notes
+            };
+        }
+        self.restore_current_request_input_notes();
+    }
+
+    fn move_request_input_option(&mut self, request: &PendingRequestUserInput, delta: isize) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(question) = request.questions.get(state.current_idx) else {
+            return;
+        };
+        let count = request_user_input_option_count(question);
+        if count == 0 {
+            return;
+        }
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        let current = answer.option_cursor.unwrap_or(0) as isize;
+        answer.option_cursor = Some((current + delta).rem_euclid(count as isize) as usize);
+        answer.committed_option = None;
+        answer.answer_committed = false;
+    }
+
+    fn clear_current_request_input_selection(&mut self) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        answer.option_cursor = None;
+        answer.committed_option = None;
+        answer.answer_committed = false;
+        answer.notes.clear();
+        self.composer.clear();
+    }
+
+    fn commit_current_request_input_answer(&mut self, request: &PendingRequestUserInput) {
+        self.save_current_request_input_notes();
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(question) = request.questions.get(state.current_idx) else {
+            return;
+        };
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        if request_user_input_option_count(question) > 0 {
+            answer.committed_option = answer.option_cursor;
+            answer.answer_committed = answer.committed_option.is_some();
+        } else {
+            answer.answer_committed = !answer.notes.trim().is_empty();
+        }
+    }
+
+    fn first_unanswered_request_input_index(
+        &self,
+        request: &PendingRequestUserInput,
+    ) -> Option<usize> {
+        let state = self.request_input.as_ref()?;
+        request
+            .questions
+            .iter()
+            .enumerate()
+            .find_map(|(idx, question)| {
+                let values = state
+                    .answers
+                    .get(idx)
+                    .map(|draft| request_user_input_state_answer_values(question, draft))
+                    .unwrap_or_default();
+                values.is_empty().then_some(idx)
+            })
+    }
+
+    fn request_input_unanswered_count(&self, request: &PendingRequestUserInput) -> usize {
+        let Some(state) = self.request_input.as_ref() else {
+            return request.questions.len();
+        };
+        request
+            .questions
+            .iter()
+            .enumerate()
+            .filter(|(idx, question)| {
+                state
+                    .answers
+                    .get(*idx)
+                    .map(|draft| request_user_input_state_answer_values(question, draft))
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .count()
+    }
+
+    fn open_request_input_unanswered_confirmation(&mut self, request: &PendingRequestUserInput) {
+        let unanswered = self.request_input_unanswered_count(request);
+        if let Some(state) = self.request_input.as_mut() {
+            state.confirm_unanswered = true;
+            state.confirm_selected = 0;
+        }
+        let suffix = if unanswered == 1 {
+            "question"
+        } else {
+            "questions"
+        };
+        self.status_notice = Some(format!(
+            "Submit with {unanswered} unanswered {suffix}? Press Enter to proceed."
+        ));
+    }
+
+    fn submit_request_input_state(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> Result<()> {
+        let Some(state) = self.request_input.clone() else {
+            return Ok(());
+        };
+        let payload = request_user_input_state_response_payload(request, &state);
+        self.store
+            .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        self.request_input = None;
+        self.composer.clear();
+        self.status_notice = None;
+        Ok(())
+    }
+
+    fn advance_or_submit_request_input(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> Result<()> {
+        let is_last = self
+            .request_input
+            .as_ref()
+            .is_none_or(|state| state.current_idx + 1 >= request.questions.len());
+        if !is_last {
+            self.move_request_input_question(request, true);
+            return Ok(());
+        }
+        if self.request_input_unanswered_count(request) > 0 {
+            self.open_request_input_unanswered_confirmation(request);
+            return Ok(());
+        }
+        self.submit_request_input_state(session_id, request)
+    }
+
+    fn handle_request_input_confirmation_key(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+        key: KeyEvent,
+    ) -> Result<bool> {
+        if !self
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.confirm_unanswered)
+        {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                if let Some(idx) = self.first_unanswered_request_input_index(request) {
+                    self.jump_to_request_input_question(request, idx);
+                }
+                self.status_notice = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(state) = self.request_input.as_mut() {
+                    state.confirm_selected = 1usize.saturating_sub(state.confirm_selected.min(1));
+                }
+            }
+            KeyCode::Char('1') | KeyCode::Char('2') => {
+                if let Some(state) = self.request_input.as_mut() {
+                    state.confirm_selected = if matches!(key.code, KeyCode::Char('1')) {
+                        0
+                    } else {
+                        1
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                let proceed = self
+                    .request_input
+                    .as_ref()
+                    .is_none_or(|state| state.confirm_selected == 0);
+                if proceed {
+                    return self
+                        .submit_request_input_state(session_id, request)
+                        .map(|_| true);
+                }
+                if let Some(idx) = self.first_unanswered_request_input_index(request) {
+                    self.jump_to_request_input_question(request, idx);
+                }
+                self.status_notice = None;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_request_user_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return Ok(false);
+        }
+        let Some((session_id, request)) = self.current_pending_request_user_input() else {
+            self.request_input = None;
+            return Ok(false);
+        };
+        self.ensure_request_input_state(&session_id, &request);
+        if self.handle_request_input_confirmation_key(&session_id, &request, key)? {
+            return Ok(true);
+        }
+        let state_uses_composer = self
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.focus == RequestUserInputFocus::Notes);
+        let composer_has_parser_text = !self.composer.is_empty()
+            && !state_uses_composer
+            && !self.request_input_state_has_touched_answer();
+        if composer_has_parser_text {
+            return Ok(false);
+        }
+        match key {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
+                if !self.composer.is_empty() {
+                    self.composer.clear();
+                    self.save_current_request_input_notes();
+                } else {
+                    self.cancel_current_task()?;
+                    self.request_input = None;
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                let cleared_notes = self
+                    .request_input
+                    .as_ref()
+                    .is_some_and(|state| state.focus == RequestUserInputFocus::Notes)
+                    || !self.composer.is_empty();
+                if cleared_notes {
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Options;
+                        if let Some(answer) = state.answers.get_mut(state.current_idx) {
+                            answer.notes.clear();
+                            answer.answer_committed = false;
+                        }
+                    }
+                    self.composer.clear();
+                } else {
+                    self.cancel_current_task()?;
+                    self.request_input = None;
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                let focus_is_notes = self
+                    .request_input
+                    .as_ref()
+                    .is_some_and(|state| state.focus == RequestUserInputFocus::Notes);
+                if focus_is_notes {
+                    self.save_current_request_input_notes();
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Options;
+                    }
+                    self.composer.clear();
+                } else {
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Notes;
+                    }
+                    self.restore_current_request_input_notes();
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                self.move_request_input_question(&request, false);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                self.move_request_input_question(&request, true);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.move_request_input_option(&request, -1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                ..
+            } if !state_uses_composer => {
+                self.move_request_input_option(&request, -1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.move_request_input_option(&request, 1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                ..
+            } if !state_uses_composer => {
+                self.move_request_input_option(&request, 1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Backspace | KeyCode::Delete,
+                ..
+            } if !state_uses_composer => {
+                self.clear_current_request_input_selection();
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            } if !state_uses_composer => {
+                self.commit_current_request_input_answer(&request);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !state_uses_composer
+                && modifiers.is_empty()
+                && ch.is_ascii_digit()
+                && ch != '0' =>
+            {
+                let digit = ch.to_digit(10).unwrap_or_default() as usize;
+                if let Some(state) = self.request_input.as_mut() {
+                    let current_idx = state.current_idx;
+                    if let Some(question) = request.questions.get(current_idx) {
+                        let count = request_user_input_option_count(question);
+                        if (1..=count).contains(&digit) {
+                            if let Some(answer) = state.answers.get_mut(current_idx) {
+                                answer.option_cursor = Some(digit - 1);
+                            }
+                        }
+                    }
+                }
+                self.commit_current_request_input_answer(&request);
+                self.advance_or_submit_request_input(&session_id, &request)?;
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.commit_current_request_input_answer(&request);
+                self.advance_or_submit_request_input(&session_id, &request)?;
+                Ok(true)
+            }
+            _ if state_uses_composer && self.composer.handle_key(key) => {
+                self.save_current_request_input_notes();
+                if let Some(state) = self.request_input.as_mut() {
+                    let current_idx = state.current_idx;
+                    if let Some(answer) = state.answers.get_mut(current_idx) {
+                        answer.answer_committed = false;
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn open_surface(&mut self, surface: Surface) {
@@ -910,8 +2661,62 @@ impl App {
     }
 
     fn submit(&mut self) -> Result<()> {
+        if let Some((session_id, request)) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id && session.status.is_active())
+                    .map(|session| session.id.clone())
+            })
+            .and_then(|session_id| {
+                self.pending_request_user_input(&session_id)
+                    .map(|request| (session_id, request))
+            })
+        {
+            let text = self.composer.take_trimmed();
+            self.dispatch(AppCommand::AnswerRequestUserInput {
+                session_id,
+                call_id: request.turn_id,
+                text,
+            })?;
+            return Ok(());
+        }
         let text = self.composer.input().trim().to_string();
-        if text.is_empty() {
+        let has_local_images = self.composer.has_local_images();
+        if !has_local_images {
+            if let Some(plan_text) = text
+                .strip_prefix("/plan")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .map(str::trim)
+            {
+                if self.current_task_is_active()?
+                    && self.collaboration_mode != CollaborationModeKind::Plan
+                {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+                self.composer.take_trimmed();
+                self.dispatch(AppCommand::SetCollaborationMode(
+                    CollaborationModeKind::Plan,
+                ))?;
+                if !plan_text.is_empty() {
+                    self.submit_plain_text(plan_text.to_string())?;
+                }
+                return Ok(());
+            }
+        }
+        if !has_local_images && text == "/mode" {
+            self.composer.take_trimmed();
+            self.dispatch(AppCommand::ChangeMode)?;
+            return Ok(());
+        }
+        if text.is_empty() && !has_local_images {
             if let Some(session) = self
                 .selected_session_id
                 .as_deref()
@@ -946,23 +2751,96 @@ impl App {
             if !active && !self.ensure_agent_ready()? {
                 return Ok(());
             }
-            let text = self.composer.take_trimmed();
-            self.dispatch(AppCommand::SendFollowup {
-                session_id: session.id,
-                text,
-            })?;
+            let submission = self.take_composer_submission();
+            if submission.has_local_images() {
+                self.dispatch(AppCommand::SendFollowupSubmission {
+                    session_id: session.id,
+                    submission,
+                })?;
+            } else {
+                self.dispatch(AppCommand::SendFollowup {
+                    session_id: session.id,
+                    text: submission.text,
+                })?;
+            }
             return Ok(());
         }
         if !self.ensure_agent_ready()? {
             return Ok(());
         }
-        let text = self.composer.take_trimmed();
-        self.dispatch(AppCommand::StartTask(text))?;
+        let submission = self.take_composer_submission();
+        if submission.has_local_images() {
+            self.dispatch(AppCommand::StartTaskSubmission(submission))?;
+        } else {
+            self.dispatch(AppCommand::StartTask(submission.text))?;
+        }
         Ok(())
     }
 
+    fn take_composer_submission(&mut self) -> UserSubmission {
+        let (text, local_images) = self.composer.take_submission();
+        UserSubmission { text, local_images }
+    }
+
+    fn queue_current_composer_followup(&mut self) -> Result<bool> {
+        if self.surface != Surface::Main || self.composer.is_empty() {
+            return Ok(false);
+        }
+        let Some(session) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !session.status.is_active() {
+            return Ok(false);
+        }
+        let submission = self.take_composer_submission();
+        self.dispatch(AppCommand::QueueFollowupSubmission {
+            session_id: session.id,
+            submission,
+        })?;
+        Ok(true)
+    }
+
+    fn submit_plain_text(&mut self, text: String) -> Result<()> {
+        if let Some(session) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+            })
+            .cloned()
+        {
+            self.dispatch(AppCommand::SendFollowup {
+                session_id: session.id,
+                text,
+            })
+        } else {
+            self.dispatch(AppCommand::StartTask(text))
+        }
+    }
+
     fn ensure_agent_ready(&mut self) -> Result<bool> {
-        if let Some(notice) = self.auth_notice()? {
+        let selection = self.current_model_selection();
+        self.ensure_agent_ready_for_selection(&selection)
+    }
+
+    fn ensure_agent_ready_for_selection(
+        &mut self,
+        selection: &SessionModelSelection,
+    ) -> Result<bool> {
+        if let Some(notice) = self.auth_notice_for_selection(selection)? {
             self.status_notice = Some(notice);
             self.open_surface(Surface::Account);
             return Ok(false);
@@ -979,38 +2857,49 @@ impl App {
     fn dispatch(&mut self, command: AppCommand) -> Result<()> {
         match command {
             AppCommand::StartTask(text) => {
-                if !self.ensure_agent_ready()? {
-                    return Ok(());
-                }
-                let session = self.store.create_session(None, std::env::current_dir()?)?;
-                self.store.append_event(
-                    &session.id,
-                    "session.input",
-                    serde_json::json!({ "text": text }),
-                )?;
-                self.selected_session_id = Some(session.id.clone());
-                self.native_history.reset_with_clear();
-                self.start_agent_for_session(session.id)?;
+                self.start_task_submission(UserSubmission::text(text))?;
+            }
+            AppCommand::StartTaskSubmission(submission) => {
+                self.start_task_submission(submission)?;
             }
             AppCommand::SendFollowup { session_id, text } => {
-                let active = self
-                    .store
-                    .load_session(&session_id)?
-                    .is_some_and(|session| session.status.is_active());
-                if !active && !self.ensure_agent_ready()? {
+                self.send_followup_submission(session_id, UserSubmission::text(text))?;
+            }
+            AppCommand::SendFollowupSubmission {
+                session_id,
+                submission,
+            } => {
+                self.send_followup_submission(session_id, submission)?;
+            }
+            AppCommand::QueueFollowupSubmission {
+                session_id,
+                submission,
+            } => {
+                self.queue_followup_submission(session_id, submission)?;
+            }
+            AppCommand::AnswerRequestUserInput {
+                session_id,
+                call_id,
+                text,
+            } => {
+                let Some(request) = self.pending_request_user_input(&session_id) else {
+                    self.status_notice = Some("No pending user-input request.".to_string());
+                    return Ok(());
+                };
+                if request.turn_id != call_id && request.call_id != call_id {
+                    self.status_notice =
+                        Some("That user-input request is no longer pending.".to_string());
                     return Ok(());
                 }
-                self.store.append_event(
-                    &session_id,
-                    "session.followup",
-                    serde_json::json!({ "text": text }),
-                )?;
-                if !active {
-                    self.start_agent_for_session(session_id)?;
-                }
+                let payload = request_user_input_response_payload(&request, &text);
+                self.store
+                    .append_event(&session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+                self.request_input = None;
+                self.status_notice = None;
             }
             AppCommand::RetryTask(session_id) => {
-                if !self.ensure_agent_ready()? {
+                let selection = self.session_model_selection_or_current(&session_id)?;
+                if !self.ensure_agent_ready_for_selection(&selection)? {
                     return Ok(());
                 }
                 self.store.append_event(
@@ -1034,6 +2923,22 @@ impl App {
                 self.close_surface();
             }
             AppCommand::ChangeModel => self.open_surface(Surface::Model),
+            AppCommand::ChangeMode => self.open_surface(Surface::Mode),
+            AppCommand::SetCollaborationMode(mode) => {
+                if self.collaboration_mode != mode && self.current_task_is_active()? {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+                self.collaboration_mode = mode;
+                self.persist_runtime_settings()?;
+                self.status_notice = Some(format!(
+                    "Collaboration mode set to {}.",
+                    collaboration_mode_label(mode)
+                ));
+            }
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
@@ -1048,14 +2953,120 @@ impl App {
         Ok(())
     }
 
+    fn start_task_submission(&mut self, submission: UserSubmission) -> Result<()> {
+        let selection = self.current_model_selection();
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(());
+        }
+        let cwd = std::env::current_dir()?;
+        let session = self.store.create_session(None, &cwd)?;
+        self.append_session_model_selection(&session.id, &selection)?;
+        let options = self.configured_agent_options()?;
+        browser_use_core::append_workspace_context_event_with_options(
+            &self.store,
+            &session,
+            &options,
+        )?;
+        let _ = self.refresh_prompt_history_for(&cwd, &options);
+        self.store.append_event(
+            &session.id,
+            "session.input",
+            typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
+        )?;
+        self.prompt_history.record_submission(&submission.text);
+        self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
+        self.selected_session_id = Some(session.id.clone());
+        self.native_history.reset_with_clear();
+        self.start_agent_for_session(session.id)?;
+        Ok(())
+    }
+
+    fn send_followup_submission(
+        &mut self,
+        session_id: String,
+        submission: UserSubmission,
+    ) -> Result<()> {
+        let active = self
+            .store
+            .load_session(&session_id)?
+            .is_some_and(|session| session.status.is_active());
+        if !active {
+            let selection = self.session_model_selection_or_current(&session_id)?;
+            if !self.ensure_agent_ready_for_selection(&selection)? {
+                return Ok(());
+            }
+        }
+        let session = self
+            .store
+            .load_session(&session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        let options = self.configured_agent_options().ok();
+        if let Some(options) = options.as_ref() {
+            let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
+        }
+        self.store.append_event(
+            &session_id,
+            "session.followup",
+            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?,
+        )?;
+        self.prompt_history.record_submission(&submission.text);
+        if let Some(options) = options.as_ref() {
+            self.maybe_append_message_history(
+                &session_id,
+                &submission.text,
+                Path::new(&session.cwd),
+                options,
+            );
+        }
+        if !active {
+            self.start_agent_for_session(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn queue_followup_submission(
+        &mut self,
+        session_id: String,
+        submission: UserSubmission,
+    ) -> Result<()> {
+        let session = self
+            .store
+            .load_session(&session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        if !session.status.is_active() {
+            return self.send_followup_submission(session_id, submission);
+        }
+        let mut payload =
+            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+        payload["delivery"] = serde_json::json!("after_current_turn");
+        self.store
+            .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        self.prompt_history.record_submission(&submission.text);
+        if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
+            self.maybe_append_message_history(
+                &session_id,
+                &submission.text,
+                Path::new(&session.cwd),
+                &options,
+            );
+        }
+        self.status_notice = Some("Queued follow-up after the current turn.".to_string());
+        Ok(())
+    }
+
     fn start_agent_for_session(&self, session_id: String) -> Result<()> {
-        if matches!(self.agent_backend, AgentBackend::None) {
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if matches!(selection.backend, AgentBackend::None) {
             return Ok(());
         }
         let state_dir = self.args.state_dir.clone();
-        let backend = self.agent_backend;
-        let model = self.provider_model.clone();
+        let backend = selection.backend;
+        let model = selection.provider_model.clone();
+        let model_provider_id = selection.model_provider_id.clone();
         let browser = self.browser.clone();
+        let collaboration_mode = self.collaboration_mode;
+        let config_profile = self.args.config_profile.clone();
+        let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
         thread::Builder::new()
             .name(format!("browser-use-agent-{session_id}"))
@@ -1064,7 +3075,18 @@ impl App {
                 let failure_session_id = session_id.clone();
                 let failure_notifier = notifier.clone();
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    run_agent_thread(state_dir, session_id, backend, model, browser, notifier)
+                    run_agent_thread(
+                        state_dir,
+                        session_id,
+                        backend,
+                        model,
+                        model_provider_id,
+                        browser,
+                        collaboration_mode,
+                        config_profile,
+                        config_overrides,
+                        notifier,
+                    )
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -1101,6 +3123,7 @@ impl App {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id)?;
         Ok(true)
     }
 
@@ -1121,19 +3144,155 @@ impl App {
             .is_some_and(|until| Instant::now() <= until)
     }
 
-    fn handle_main_escape(&mut self) -> Result<()> {
-        if self.escape_stop_is_pending() {
-            if self.cancel_current_task()? {
-                self.escape_stop_until = None;
-                self.quit_hint_until = None;
-                return Ok(());
+    fn open_message_actions(&mut self) -> Result<()> {
+        self.refresh_state_cache_from_store()?;
+        let rows = self.message_action_rows();
+        if rows.is_empty() {
+            self.status_notice = Some("No messages to edit.".to_string());
+            self.escape_stop_until = None;
+            return Ok(());
+        }
+        self.close_slash_palette();
+        self.surface = Surface::Messages;
+        self.selected_row = rows.len().saturating_sub(1);
+        self.escape_stop_until = None;
+        Ok(())
+    }
+
+    fn selected_message_action_row(&self) -> Option<MessageActionRow> {
+        let rows = self.message_action_rows();
+        rows.get(self.selected_row.min(rows.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    pub(crate) fn selected_message_action_is_queued(&self) -> bool {
+        self.selected_message_action_row()
+            .is_some_and(|row| row.kind == MessageActionKind::Queued)
+    }
+
+    fn submitted_turns_to_rollback_from(&self, target_seq: i64) -> usize {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return 1;
+        };
+        browser_use_core::rollback_filtered_event_records(
+            self.cached_events_for_session(session_id),
+        )
+        .into_iter()
+        .filter(|event| {
+            event.seq >= target_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .count()
+        .max(1)
+    }
+
+    fn cancel_queued_followup(&mut self, row: &MessageActionRow) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        self.store.append_event(
+            session_id,
+            SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT,
+            serde_json::json!({
+                "queued_seq": row.seq,
+                "reason": "removed from message selector",
+            }),
+        )?;
+        self.status_notice = Some("Removed queued follow-up.".to_string());
+        Ok(())
+    }
+
+    fn rollback_submitted_message(&mut self, row: &MessageActionRow, action: &str) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(());
+        };
+        if self.current_task_is_active()? {
+            self.cancel_current_task()?;
+        }
+        let num_turns = self.submitted_turns_to_rollback_from(row.seq);
+        self.store.append_event(
+            &session_id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({
+                "num_turns": num_turns,
+                "target_seq": row.seq,
+                "action": action,
+                "source": if action == "take_back" { "tui_escape" } else { "tui_message_selector" },
+            }),
+        )?;
+        self.native_history.reset_with_clear();
+        Ok(())
+    }
+
+    fn reclaim_latest_submitted_message_before_output(&mut self) -> Result<bool> {
+        let Some((_session_id, row, has_prior_submitted_message)) =
+            self.latest_reclaimable_submitted_message()?
+        else {
+            return Ok(false);
+        };
+        self.rollback_submitted_message(&row, "take_back")?;
+        self.composer.set_input(row.text);
+        if !has_prior_submitted_message {
+            self.selected_session_id = None;
+            self.native_history.reset_with_clear();
+        }
+        self.close_surface();
+        self.escape_stop_until = None;
+        self.quit_hint_until = None;
+        self.status_notice = Some("Message returned to composer.".to_string());
+        self.refresh_state_cache_from_store()?;
+        Ok(true)
+    }
+
+    fn edit_selected_message(&mut self) -> Result<()> {
+        let Some(row) = self.selected_message_action_row() else {
+            return Ok(());
+        };
+        match row.kind {
+            MessageActionKind::Queued => self.cancel_queued_followup(&row)?,
+            MessageActionKind::Submitted => self.rollback_submitted_message(&row, "edit")?,
+        }
+        self.composer.set_input(row.text);
+        self.close_surface();
+        self.status_notice = Some("Editing message. Press Enter to send.".to_string());
+        Ok(())
+    }
+
+    fn remove_selected_message(&mut self) -> Result<()> {
+        let Some(row) = self.selected_message_action_row() else {
+            return Ok(());
+        };
+        match row.kind {
+            MessageActionKind::Queued => self.cancel_queued_followup(&row)?,
+            MessageActionKind::Submitted => {
+                self.status_notice =
+                    Some("Submitted messages can be edited, not removed.".to_string());
             }
         }
-        self.escape_stop_until = if self.current_task_is_active()? {
-            Some(Instant::now() + DOUBLE_ESCAPE_STOP_WINDOW)
-        } else {
-            None
-        };
+        if row.kind == MessageActionKind::Queued {
+            self.close_surface();
+        }
+        Ok(())
+    }
+
+    fn handle_main_escape(&mut self) -> Result<()> {
+        if self.escape_stop_is_pending() {
+            self.open_message_actions()?;
+            self.quit_hint_until = None;
+            return Ok(());
+        }
+        if self.reclaim_latest_submitted_message_before_output()? {
+            return Ok(());
+        }
+        self.escape_stop_until =
+            if self.selected_session_id.is_some() && !self.message_action_rows().is_empty() {
+                Some(Instant::now() + DOUBLE_ESCAPE_STOP_WINDOW)
+            } else {
+                None
+            };
         self.close_surface();
         Ok(())
     }
@@ -1146,21 +3305,97 @@ impl App {
         if key.code != KeyCode::Esc || !key.modifiers.is_empty() {
             self.escape_stop_until = None;
         }
+        let quit_requested = matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        );
+        if quit_requested {
+            return Ok(true);
+        }
+        if self.prompt_history.search.is_some() {
+            self.handle_prompt_history_search_key(key)?;
+            self.drain_store_notifications()?;
+            return Ok(false);
+        }
+        if !quit_requested && self.handle_request_user_input_key(key)? {
+            self.drain_store_notifications()?;
+            return Ok(false);
+        }
+        if self.surface == Surface::Main
+            && !self.is_slash_palette_active()
+            && !self.is_first_run_setup_visible()?
+        {
+            match key {
+                _ if !self.composer.has_local_images()
+                    && is_prompt_history_search_start_key(key) =>
+                {
+                    self.begin_prompt_history_search()?;
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                KeyEvent {
+                    code: KeyCode::Up, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } if self.should_prompt_history_handle_older()?
+                    && self.navigate_prompt_history_older()? =>
+                {
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } if self.prompt_history.is_navigating()
+                    && self.navigate_prompt_history_newer()? =>
+                {
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         match key {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if self.surface == Surface::Main
+                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && c.eq_ignore_ascii_case(&'v') =>
+            {
+                self.paste_image_from_clipboard();
+            }
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => return Ok(true),
             KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Char(c),
+                modifiers,
                 ..
-            } => {
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 if !self.composer.is_empty() {
                     self.composer.clear();
+                    self.prompt_history.reset_navigation();
                 } else if self.cancel_current_task()? {
                     self.quit_hint_until = None;
+                    if self.surface == Surface::Messages {
+                        self.close_surface();
+                    }
                 } else if self
                     .quit_hint_until
                     .is_some_and(|until| Instant::now() <= until)
@@ -1211,6 +3446,24 @@ impl App {
             } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
             _ if self.is_first_run_setup_visible()? => {}
             KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            } if self.surface == Surface::Main => {
+                if self.current_task_is_active()? {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                } else {
+                    self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
+                        self.collaboration_mode,
+                    )))?;
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } if self.queue_current_composer_followup()? => {}
+            KeyEvent {
                 code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
             KeyEvent {
@@ -1242,13 +3495,13 @@ impl App {
                 code: KeyCode::Up, ..
             } if self.surface == Surface::Main
                 && !(self.composer.is_empty() && self.main_selection_count()? > 0)
-                && self.composer.handle_key(key) => {}
+                && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Down,
                 ..
             } if self.surface == Surface::Main
                 && !(self.composer.is_empty() && self.main_selection_count()? > 0)
-                && self.composer.handle_key(key) => {}
+                && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.surface != Surface::Main
@@ -1273,6 +3526,20 @@ impl App {
                 code: KeyCode::Down,
                 ..
             } if self.surface == Surface::Main => {}
+            KeyEvent {
+                code: KeyCode::Backspace | KeyCode::Delete,
+                ..
+            } if self.surface == Surface::Messages => self.remove_selected_message()?,
+            KeyEvent {
+                code: KeyCode::Char('x') | KeyCode::Char('d'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Messages => self.remove_selected_message()?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Messages => self.edit_selected_message()?,
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -1332,11 +3599,7 @@ impl App {
                 self.palette_filter.pop();
                 self.clamp_slash_palette_selection();
             }
-            _ if self.surface == Surface::Main && self.composer.handle_key(key) => {
-                if self.is_slash_palette_active() {
-                    self.clamp_slash_palette_selection();
-                }
-            }
+            _ if self.surface == Surface::Main && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL,
@@ -1354,18 +3617,37 @@ impl App {
             self.clamp_slash_palette_selection();
             return;
         }
+        if let Some(search) = self.prompt_history.search.as_mut() {
+            search.query.push_str(text);
+            let _ = self.update_prompt_history_search_matches();
+            return;
+        }
         if self.is_first_run_setup_visible().unwrap_or(false) {
             return;
         }
         match self.surface {
             Surface::Main => {
-                self.composer.insert_paste(text);
+                if self.composer.insert_paste(text) {
+                    self.prompt_history.reset_navigation();
+                }
             }
             Surface::ApiKey | Surface::Telemetry => {
                 self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
             _ => {}
+        }
+    }
+
+    fn paste_image_from_clipboard(&mut self) {
+        match clipboard_paste::paste_image_to_temp_png() {
+            Ok((path, _info)) => {
+                self.composer.attach_image(path);
+                self.prompt_history.reset_navigation();
+            }
+            Err(error) => {
+                self.status_notice = Some(format!("Failed to paste image: {error}"));
+            }
         }
     }
 
@@ -1446,14 +3728,18 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Model => {
-                let model_index = VISIBLE_MODEL_CHOICES
-                    .get(
-                        self.selected_row
-                            .min(VISIBLE_MODEL_CHOICES.len().saturating_sub(1)),
-                    )
-                    .copied()
-                    .unwrap_or(0);
+                let model_index = self
+                    .selected_row
+                    .min(self.model_choices.len().saturating_sub(1));
                 self.dispatch(AppCommand::SaveModel(model_index))?;
+            }
+            Surface::Mode => {
+                let mode = match self.selected_row.min(1) {
+                    0 => CollaborationModeKind::Default,
+                    _ => CollaborationModeKind::Plan,
+                };
+                self.close_surface();
+                self.dispatch(AppCommand::SetCollaborationMode(mode))?;
             }
             Surface::Browser => match self.selected_row.min(2) {
                 0 => self.dispatch(AppCommand::OpenBrowser)?,
@@ -1463,6 +3749,7 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
+            Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
                 _ => self.close_surface(),
@@ -1649,6 +3936,10 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::ChangeMode => self.dispatch(AppCommand::ChangeMode)?,
+            PaletteAction::PlanMode => self.dispatch(AppCommand::SetCollaborationMode(
+                CollaborationModeKind::Plan,
+            ))?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
@@ -1696,8 +3987,8 @@ impl App {
         Ok(())
     }
 
-    fn models_for_account(account: &str) -> Vec<usize> {
-        MODEL_CHOICES
+    fn models_for_account(&self, account: &str) -> Vec<usize> {
+        self.model_choices
             .iter()
             .enumerate()
             .filter(|(_, choice)| choice.account == account)
@@ -1705,12 +3996,12 @@ impl App {
             .collect()
     }
 
-    fn default_model_for_account(account: &str) -> Option<usize> {
-        Self::models_for_account(account).into_iter().next()
+    fn default_model_for_account(&self, account: &str) -> Option<usize> {
+        self.models_for_account(account).into_iter().next()
     }
 
     fn advance_after_auth(&mut self) -> Result<()> {
-        if let Some(index) = Self::default_model_for_account(&self.account) {
+        if let Some(index) = self.default_model_for_account(&self.account) {
             return self.save_model(index);
         }
         self.selected_row = 0;
@@ -1719,13 +4010,17 @@ impl App {
     }
 
     fn save_model(&mut self, index: usize) -> Result<()> {
-        let choice = MODEL_CHOICES
-            .get(index.min(MODEL_CHOICES.len().saturating_sub(1)))
-            .unwrap_or(&MODEL_CHOICES[0]);
-        self.model = choice.display.to_string();
+        let choice = self
+            .model_choices
+            .get(index.min(self.model_choices.len().saturating_sub(1)))
+            .cloned()
+            .or_else(|| fallback_model_choices().into_iter().next())
+            .context("no model choices available")?;
+        self.model = choice.display.clone();
         self.account = choice.account.to_string();
-        self.provider_model = choice.provider_model.to_string();
+        self.provider_model = choice.provider_model.clone();
         self.agent_backend = choice.backend;
+        self.model_provider_id = Some(model_provider_id_for_backend(choice.backend).to_string());
         self.model_configured = true;
         self.track_model_selected();
         if self.account == ACCOUNT_CODEX && !self.has_codex_login()? {
@@ -1750,7 +4045,383 @@ impl App {
         } else {
             self.status_notice = Some(format!("Model set to {}.", self.model));
         }
+        if let Some(session_id) = self.selected_session_id.as_deref() {
+            if self
+                .store
+                .load_session(session_id)?
+                .is_some_and(|session| !session.status.is_active())
+            {
+                self.append_session_model_selection(session_id, &self.current_model_selection())?;
+            }
+        }
         self.close_surface();
+        Ok(())
+    }
+
+    fn current_model_selection(&self) -> SessionModelSelection {
+        SessionModelSelection {
+            display_model: self.model.clone(),
+            provider_model: self.provider_model.clone(),
+            account: self.account.clone(),
+            backend: self.agent_backend,
+            model_provider_id: self.model_provider_id.clone(),
+        }
+    }
+
+    fn parsed_config_overrides(&self) -> Result<ConfigOverrides> {
+        parse_config_overrides(&self.args.config_overrides)
+    }
+
+    fn configured_agent_options(&self) -> Result<AgentRunOptions> {
+        let mut options = AgentRunOptions::default()
+            .with_collaboration_mode(self.collaboration_mode)
+            .with_model_compaction(true);
+        if let Some(profile) = self.args.config_profile.as_ref() {
+            options = options.with_config_profile(profile.clone());
+        }
+        let config_overrides = self.parsed_config_overrides()?;
+        if !config_overrides.is_empty() {
+            options = options.with_config_overrides(config_overrides);
+        }
+        Ok(options)
+    }
+
+    fn maybe_append_message_history(
+        &self,
+        session_id: &str,
+        text: &str,
+        cwd: &Path,
+        options: &AgentRunOptions,
+    ) {
+        #[cfg(not(test))]
+        {
+            let session_id = session_id.to_string();
+            let text = text.to_string();
+            let cwd = cwd.to_path_buf();
+            let options = options.clone();
+            std::thread::spawn(move || {
+                let _ = browser_use_core::append_message_history_entry_for_cwd(
+                    &text,
+                    &session_id,
+                    &cwd,
+                    &options,
+                );
+            });
+        }
+        #[cfg(test)]
+        {
+            let _ = (session_id, text, cwd, options);
+        }
+    }
+
+    fn prompt_history_config(&self) -> Result<Option<MessageHistoryConfig>> {
+        let cwd = std::env::current_dir()?;
+        let options = self.configured_agent_options()?;
+        browser_use_core::message_history_config_for_cwd_with_options(&cwd, &options)
+    }
+
+    fn refresh_prompt_history(&mut self) -> Result<Option<MessageHistoryConfig>> {
+        let config = self.prompt_history_config()?;
+        self.prompt_history
+            .refresh_persistent_metadata(config.as_ref());
+        Ok(config)
+    }
+
+    fn refresh_prompt_history_for(
+        &mut self,
+        cwd: &Path,
+        options: &AgentRunOptions,
+    ) -> Result<Option<MessageHistoryConfig>> {
+        let config = browser_use_core::message_history_config_for_cwd_with_options(cwd, options)?;
+        self.prompt_history
+            .refresh_persistent_metadata(config.as_ref());
+        Ok(config)
+    }
+
+    fn should_prompt_history_handle_older(&mut self) -> Result<bool> {
+        if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return Ok(false);
+        }
+        if self.composer.has_local_images() {
+            return Ok(false);
+        }
+        if self.is_first_run_setup_visible()? {
+            return Ok(false);
+        }
+        let _ = self.refresh_prompt_history()?;
+        let text = self.composer.input().to_string();
+        if text.is_empty() && self.main_selection_count()? > 0 {
+            return Ok(false);
+        }
+        Ok(self
+            .prompt_history
+            .should_handle_navigation(&text, self.composer.cursor_is_at_text_boundary()))
+    }
+
+    fn navigate_prompt_history_older(&mut self) -> Result<bool> {
+        let config = self.refresh_prompt_history()?;
+        let total_entries = self.prompt_history.total_entries();
+        if total_entries == 0 {
+            return Ok(false);
+        }
+        let mut next_index = match self.prompt_history.nav_index {
+            Some(index) if index > 0 => index - 1,
+            Some(_) => return Ok(true),
+            None => {
+                self.prompt_history.nav_draft = Some(self.composer.input().to_string());
+                total_entries - 1
+            }
+        };
+        let entry = loop {
+            if let Some(entry) = self.prompt_history.entry_at(next_index, config.as_ref()) {
+                break entry;
+            }
+            if next_index == 0 {
+                return Ok(false);
+            }
+            next_index -= 1;
+        };
+        self.prompt_history.nav_index = Some(next_index);
+        self.prompt_history.last_history_text = Some(entry.clone());
+        self.composer.set_input(entry);
+        Ok(true)
+    }
+
+    fn navigate_prompt_history_newer(&mut self) -> Result<bool> {
+        let Some(index) = self.prompt_history.nav_index else {
+            return Ok(false);
+        };
+        let config = self.refresh_prompt_history()?;
+        let total_entries = self.prompt_history.total_entries();
+        if index + 1 < total_entries {
+            let next_index = index + 1;
+            let Some(entry) = self.prompt_history.entry_at(next_index, config.as_ref()) else {
+                return Ok(false);
+            };
+            self.prompt_history.nav_index = Some(next_index);
+            self.prompt_history.last_history_text = Some(entry.clone());
+            self.composer.set_input(entry);
+        } else {
+            let draft = self.prompt_history.nav_draft.take().unwrap_or_default();
+            self.prompt_history.nav_index = None;
+            self.prompt_history.last_history_text = None;
+            self.composer.set_input(draft);
+        }
+        Ok(true)
+    }
+
+    fn begin_prompt_history_search(&mut self) -> Result<()> {
+        let _ = self.refresh_prompt_history()?;
+        self.close_slash_palette();
+        self.prompt_history.reset_navigation();
+        self.prompt_history.search = Some(PromptHistorySearchState {
+            query: String::new(),
+            draft: self.composer.input().to_string(),
+            matches: Vec::new(),
+            selected: None,
+        });
+        Ok(())
+    }
+
+    fn handle_prompt_history_search_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.prompt_history.search.is_none() {
+            return Ok(false);
+        }
+        if is_prompt_history_search_start_key(key)
+            || matches!(
+                key,
+                KeyEvent {
+                    code: KeyCode::Up,
+                    ..
+                }
+            )
+        {
+            self.move_prompt_history_search_selection(1);
+            return Ok(true);
+        }
+        if is_prompt_history_search_next_key(key)
+            || matches!(
+                key,
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }
+            )
+        {
+            self.move_prompt_history_search_selection(-1);
+            return Ok(true);
+        }
+        if is_prompt_history_search_cancel_key(key) {
+            self.cancel_prompt_history_search();
+            return Ok(true);
+        }
+        if is_prompt_history_search_backspace_key(key) {
+            if let Some(search) = self.prompt_history.search.as_mut() {
+                search.query.pop();
+            }
+            self.update_prompt_history_search_matches()?;
+            return Ok(true);
+        }
+        if is_prompt_history_search_clear_key(key) {
+            if let Some(search) = self.prompt_history.search.as_mut() {
+                search.query.clear();
+            }
+            self.update_prompt_history_search_matches()?;
+            return Ok(true);
+        }
+        let handled = match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.cancel_prompt_history_search();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if self
+                    .prompt_history
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.selected.is_some())
+                {
+                    self.prompt_history.search = None;
+                    self.prompt_history.reset_navigation();
+                }
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                if let Some(search) = self.prompt_history.search.as_mut() {
+                    search.query.pop();
+                }
+                self.update_prompt_history_search_matches()?;
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !ch.is_control()
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(search) = self.prompt_history.search.as_mut() {
+                    search.query.push(ch);
+                }
+                self.update_prompt_history_search_matches()?;
+                true
+            }
+            _ => true,
+        };
+        Ok(handled)
+    }
+
+    fn update_prompt_history_search_matches(&mut self) -> Result<()> {
+        let Some(search) = self.prompt_history.search.as_ref() else {
+            return Ok(());
+        };
+        let query = search.query.clone();
+        let draft = search.draft.clone();
+        let config = self.refresh_prompt_history()?;
+        let entries = self.prompt_history.search_entries(config.as_ref());
+        let matches = prompt_history_search_matches(&entries, &query);
+        let selected = (!matches.is_empty()).then_some(0);
+        if let Some(search) = self.prompt_history.search.as_mut() {
+            search.matches = matches;
+            search.selected = selected;
+        }
+        if let Some(text) = self.prompt_history_selected_search_text() {
+            self.composer.set_input(text);
+        } else {
+            self.composer.set_input(draft);
+        }
+        Ok(())
+    }
+
+    fn move_prompt_history_search_selection(&mut self, delta: isize) {
+        let Some(search) = self.prompt_history.search.as_mut() else {
+            return;
+        };
+        let Some(selected) = search.selected else {
+            return;
+        };
+        let max = search.matches.len().saturating_sub(1);
+        let next = (selected as isize + delta).clamp(0, max as isize) as usize;
+        search.selected = Some(next);
+        if let Some(text) = self.prompt_history_selected_search_text() {
+            self.composer.set_input(text);
+        }
+    }
+
+    fn prompt_history_selected_search_text(&self) -> Option<String> {
+        let search = self.prompt_history.search.as_ref()?;
+        let selected = search.selected?;
+        search.matches.get(selected).cloned()
+    }
+
+    fn cancel_prompt_history_search(&mut self) {
+        if let Some(search) = self.prompt_history.search.take() {
+            self.composer.set_input(search.draft);
+        }
+        self.prompt_history.reset_navigation();
+    }
+
+    fn handle_main_composer_key(&mut self, key: KeyEvent) -> bool {
+        let before = self.composer.input().to_string();
+        let handled = self.composer.handle_key(key);
+        if handled && self.composer.input() != before {
+            self.prompt_history.reset_navigation();
+        }
+        if handled && self.is_slash_palette_active() {
+            self.clamp_slash_palette_selection();
+        }
+        handled
+    }
+
+    fn session_model_selection_or_current(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionModelSelection> {
+        Ok(self
+            .session_model_selection(session_id)?
+            .unwrap_or_else(|| self.current_model_selection()))
+    }
+
+    fn session_model_selection(&self, session_id: &str) -> Result<Option<SessionModelSelection>> {
+        Ok(self
+            .store
+            .events_for_session(session_id)?
+            .iter()
+            .rev()
+            .find_map(session_model_selection_from_event))
+    }
+
+    fn append_session_model_selection(
+        &self,
+        session_id: &str,
+        selection: &SessionModelSelection,
+    ) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "display_model": selection.display_model,
+            "provider_model": selection.provider_model,
+            "account": selection.account,
+            "backend": selection.backend.as_setting(),
+        });
+        if let Some(model_provider_id) = selection
+            .model_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            payload["model_provider_id"] = serde_json::Value::String(model_provider_id.to_string());
+        }
+        self.store
+            .append_event(session_id, SESSION_MODEL_SELECTION_EVENT, payload)?;
         Ok(())
     }
 
@@ -2120,9 +4791,21 @@ impl App {
         self.store.set_setting("model", &self.model)?;
         self.store
             .set_setting("provider.model", &self.provider_model)?;
+        self.store.set_setting(
+            COLLABORATION_MODE_SETTING,
+            collaboration_mode_setting_value(self.collaboration_mode),
+        )?;
         self.store.set_setting("browser", &self.browser)?;
         self.store
             .set_setting("agent.backend", self.agent_backend.as_setting())?;
+        if let Some(model_provider_id) = self
+            .model_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.store.set_setting("provider.id", model_provider_id)?;
+        }
         Ok(())
     }
 
@@ -2140,10 +4823,12 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Model => VISIBLE_MODEL_CHOICES.len(),
+            Surface::Model => self.model_choices.len(),
+            Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::History => self.workbench_state()?.history.len(),
+            Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
         })
     }
@@ -2164,6 +4849,8 @@ impl App {
     }
 
     fn open_slash_palette(&mut self) {
+        self.prompt_history.search = None;
+        self.prompt_history.reset_navigation();
         self.palette_open = true;
         self.palette_filter.clear();
         self.selected_row = 0;
@@ -2200,6 +4887,22 @@ impl App {
     }
 
     fn execute_slash_palette_selection(&mut self) -> Result<bool> {
+        let filter = self.palette_filter.trim().trim_start_matches('/');
+        if let Some(plan_text) = filter
+            .strip_prefix("plan")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+            .map(str::to_string)
+        {
+            self.close_slash_palette();
+            self.dispatch(AppCommand::SetCollaborationMode(
+                CollaborationModeKind::Plan,
+            ))?;
+            if !plan_text.is_empty() {
+                self.submit_plain_text(plan_text.to_string())?;
+            }
+            return Ok(false);
+        }
         let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
             self.close_slash_palette();
@@ -2322,7 +5025,14 @@ impl App {
     }
 
     fn auth_notice(&self) -> Result<Option<String>> {
-        let notice = match self.agent_backend {
+        self.auth_notice_for_selection(&self.current_model_selection())
+    }
+
+    fn auth_notice_for_selection(
+        &self,
+        selection: &SessionModelSelection,
+    ) -> Result<Option<String>> {
+        let notice = match selection.backend {
             AgentBackend::Openai
                 if !self.has_stored_or_env(
                     "auth.openai.api_key",
@@ -2353,7 +5063,8 @@ impl App {
                 Some("Codex login is missing. Select Codex login to sign in.".to_string())
             }
             AgentBackend::Anthropic
-                if is_claude_code_account(&self.account) && !self.has_claude_code_oauth()? =>
+                if is_claude_code_account(&selection.account)
+                    && !self.has_claude_code_oauth()? =>
             {
                 Some(
                     "Claude Code login is missing. Open Claude Code sign-in here before retrying."
@@ -2361,7 +5072,7 @@ impl App {
                 )
             }
             AgentBackend::Anthropic
-                if !is_claude_code_account(&self.account)
+                if !is_claude_code_account(&selection.account)
                     && !self.has_stored_or_env(
                         "auth.anthropic.api_key",
                         &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -2421,7 +5132,9 @@ impl App {
         {
             return Ok(true);
         }
-        Ok(codex_env_auth_present())
+        Ok(load_codex_managed_auth().is_ok()
+            || load_codex_auth().is_ok()
+            || codex_env_auth_present())
     }
 
     fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
@@ -2429,6 +5142,10 @@ impl App {
             .set_setting("auth.codex.access_token", auth.access_token.trim())?;
         self.store
             .set_setting("auth.codex.account_id", auth.account_id.trim())?;
+        self.store.delete_setting("auth.codex.id_token")?;
+        self.store.delete_setting("auth.codex.refresh_token")?;
+        self.store.delete_setting("auth.codex.source_path")?;
+        self.store.delete_setting("auth.codex.last_refresh")?;
         Ok(())
     }
 
@@ -2992,6 +5709,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn main() -> Result<()> {
     install_process_crypto_provider();
+    let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     install_agent_panic_hook();
     load_dotenv()?;
     let args = Args::parse();
@@ -3310,11 +6028,17 @@ fn desired_terminal_viewport_height_for(
                 .live_stream_emitted_lines_for(&session.id, body_width)
         })
         .unwrap_or(0);
-    let stream_skip_lines = stream_skip_lines.max(
-        transcript::active_streaming_lines(transcript_model.as_ref(), body_width)
-            .len()
-            .saturating_sub(1),
-    );
+    let active_streaming_lines =
+        transcript::active_streaming_lines(transcript_model.as_ref(), body_width);
+    let estimated_stream_skip_lines =
+        if transcript::active_streaming_can_commit_all(transcript_model.as_ref())
+            && active_streaming_lines.len() > 1
+        {
+            active_streaming_lines.len()
+        } else {
+            active_streaming_lines.len().saturating_sub(1)
+        };
+    let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
     let active_lines = transcript::active_viewport_lines_with_stream_skip(
         transcript_model.as_ref(),
         body_width,
@@ -3591,13 +6315,15 @@ fn maybe_emit_native_transcript(
     };
     debug_assert_eq!(model.session_id, session_id);
     let _model_revision = model.revision;
-    let defer_pending_prompt = session.status.is_active();
+    let has_live_streaming_output =
+        !transcript::active_streaming_lines(Some(&model), width).is_empty();
+    let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
         // No session header card — the transcript starts straight with
         // the conversation content.
         let emission =
-            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_pending_prompt);
+            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_open_tail);
         if !emission.lines.is_empty() {
             insert_initial_native_lines(terminal, emission.lines)?;
         }
@@ -3617,7 +6343,7 @@ fn maybe_emit_native_transcript(
             &model,
             after_seq,
             width,
-            defer_pending_prompt,
+            defer_open_tail,
         );
         if let Some(prefix) = live_stream_prefix.as_deref() {
             emission.lines = strip_live_stream_prefix(emission.lines, prefix);
@@ -3642,7 +6368,12 @@ fn maybe_emit_native_live_stream(
     width: u16,
 ) -> Result<()> {
     let lines = transcript::active_streaming_lines(Some(model), width);
-    let emit_count = lines.len().saturating_sub(1);
+    let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
+    {
+        lines.len()
+    } else {
+        lines.len().saturating_sub(1)
+    };
     if emit_count == 0 {
         app.native_history.clear_live_stream();
         return Ok(());
@@ -3654,7 +6385,11 @@ fn maybe_emit_native_live_stream(
     if emit_count <= already {
         return Ok(());
     }
-    insert_native_lines(terminal, lines[already..emit_count].to_vec())?;
+    let mut emitted_lines = lines[already..emit_count].to_vec();
+    if already == 0 {
+        emitted_lines.insert(0, Line::from(""));
+    }
+    insert_native_lines(terminal, emitted_lines)?;
     let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
     app.native_history.set_live_stream_emitted_lines(
         &model.session_id,
@@ -3673,16 +6408,34 @@ fn strip_live_stream_prefix(
         return lines;
     }
     let line_text = plain_text_lines(&lines);
-    let skip = line_text
-        .iter()
-        .zip(live_stream_prefix.iter())
-        .take_while(|(line, prefix)| line.trim_end() == prefix.trim_end())
-        .count();
-    if skip == 0 {
-        lines
-    } else {
-        lines.into_iter().skip(skip).collect()
+    let Some(prefix_start) = live_stream_prefix_start(&line_text, live_stream_prefix) else {
+        return lines;
+    };
+    let prefix_end = prefix_start + live_stream_prefix.len();
+    lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            if (prefix_start..prefix_end).contains(&idx) {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect()
+}
+
+fn live_stream_prefix_start(line_text: &[String], live_stream_prefix: &[String]) -> Option<usize> {
+    if live_stream_prefix.is_empty() || live_stream_prefix.len() > line_text.len() {
+        return None;
     }
+    let last_start = line_text.len() - live_stream_prefix.len();
+    (0..=last_start).rev().find(|start| {
+        line_text[*start..*start + live_stream_prefix.len()]
+            .iter()
+            .zip(live_stream_prefix.iter())
+            .all(|(line, prefix)| line.trim_end() == prefix.trim_end())
+    })
 }
 
 fn plain_text_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -4053,12 +6806,17 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
 mod redesign_tests {
     use super::*;
 
+    static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn args(temp: &tempfile::TempDir) -> Args {
         Args {
             state_dir: temp.path().to_path_buf(),
-            model: "GPT-5.5".to_string(),
+            model: None,
+            config_profile: None,
+            config_overrides: Vec::new(),
             account: "Codex login".to_string(),
             browser: BROWSER_LOCAL_CHROME.to_string(),
+            collaboration_mode: CollaborationModeArg::Default,
             dump_screen: true,
             width: 100,
             height: 28,
@@ -4077,6 +6835,133 @@ mod redesign_tests {
         app.store.set_setting("setup.complete", "1")?;
         app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
+    }
+
+    fn write_test_png(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let image = image::ImageBuffer::from_pixel(2, 2, image::Rgba([12u8, 34, 56, 255]));
+        image.save(path)?;
+        Ok(())
+    }
+
+    fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        unsafe {
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", app_home);
+        }
+        let result = f();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn submit_attached_image_as_local_image_item() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let image_path = temp.path().join("clipboard.png");
+        write_test_png(&image_path)?;
+
+        app.composer.set_input("describe this".to_string());
+        app.composer.attach_image(image_path.clone());
+        app.submit()?;
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session after submit")?;
+        let events = app.store.events_for_session(&session_id)?;
+        let input = events
+            .iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(input.payload["text"], "[Image 1]\ndescribe this");
+        assert!(!input.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(image_path.to_string_lossy().as_ref()));
+        assert_eq!(input.payload["items"][0]["type"], "local_image");
+        assert_eq!(
+            input.payload["items"][0]["path"],
+            image_path.display().to_string()
+        );
+        assert_eq!(input.payload["items"][1]["type"], "text");
+        let content = input.payload["content"].as_array().context("content")?;
+        assert!(content.iter().any(|part| {
+            part["type"] == "input_image"
+                && part["image_url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        }));
+        assert!(content
+            .iter()
+            .any(|part| part["type"] == "input_text" && part["text"] == "describe this"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_image_display_text_uses_labels_not_paths() {
+        let payload = serde_json::json!({
+            "text": "[local_image:/tmp/but-clipboard-one.png]\n[local_image:/tmp/but-clipboard-two.png]\nwhat is here",
+            "items": [
+                {"type": "local_image", "path": "/tmp/but-clipboard-one.png"},
+                {"type": "local_image", "path": "/tmp/but-clipboard-two.png"},
+                {"type": "text", "text": "what is here"}
+            ],
+        });
+
+        let display = user_input_display_text_from_payload(&payload).expect("display text");
+        assert_eq!(display, "[Image 1] [Image 2]\nwhat is here");
+        assert!(!display.contains("but-clipboard"));
+    }
+
+    fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(app_home)?;
+        std::fs::write(
+            app_home.join("catalog.json"),
+            r#"{
+  "models": [
+    {
+      "slug": "hidden-catalog-model",
+      "display_name": "Hidden Catalog Model",
+      "description": "not picker-visible",
+      "visibility": "none",
+      "supported_in_api": true,
+      "priority": 0
+    },
+    {
+      "slug": "chatgpt-only-catalog",
+      "display_name": "ChatGPT Only Catalog",
+      "description": "ChatGPT-only catalog model",
+      "visibility": "list",
+      "supported_in_api": false,
+      "priority": 1
+    },
+    {
+      "slug": "catalog-gpt",
+      "display_name": "Catalog GPT",
+      "description": "Catalog API model",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 2
+    }
+  ]
+}"#,
+        )?;
+        std::fs::write(
+            app_home.join("config.toml"),
+            "model_catalog_json = \"catalog.json\"\n",
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -4199,14 +7084,682 @@ mod redesign_tests {
         match surface {
             Surface::Account => "Authenticate",
             Surface::Model => "Model",
+            Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::History => "History",
+            Surface::Messages => "Messages",
             Surface::Developer => "Developer",
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
             Surface::Main => "",
         }
+    }
+
+    #[test]
+    fn plan_slash_command_starts_task_with_plan_mode_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.set_input("/plan draft a migration".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Plan);
+        assert_eq!(
+            app.store
+                .get_setting(COLLABORATION_MODE_SETTING)?
+                .as_deref(),
+            Some("plan")
+        );
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let events = app.store.events_for_session(&session_id)?;
+        let mode_idx = events
+            .iter()
+            .position(|event| {
+                event.event_type == "session.collaboration_mode"
+                    && event.payload["mode"] == serde_json::json!("plan")
+            })
+            .context("plan mode event")?;
+        let input_idx = events
+            .iter()
+            .position(|event| {
+                event.event_type == "session.input"
+                    && event.payload["text"] == serde_json::json!("draft a migration")
+            })
+            .context("session input event")?;
+
+        assert!(mode_idx < input_idx);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_slash_command_does_not_submit_old_mode_followup_while_running() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "existing turn"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        app.set_input("/plan revise this".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            0
+        );
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        assert_eq!(app.composer.input(), "/plan revise this");
+        assert!(app.status_notice.as_deref().is_some_and(|notice| notice
+            .contains("Collaboration mode can change after the running turn finishes")));
+        Ok(())
+    }
+
+    #[test]
+    fn tui_start_task_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.dispatch(AppCommand::StartTask(
+            "check [$Calendar](app://calendar)".to_string(),
+        ))?;
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let input = app
+            .store
+            .events_for_session(&session_id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(
+            input.payload["app_connector_ids"],
+            serde_json::json!(["calendar"])
+        );
+        assert!(!input.payload["content"]
+            .as_array()
+            .context("input content")?
+            .iter()
+            .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
+        Ok(())
+    }
+
+    #[test]
+    fn tui_followup_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "existing turn"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "then use [@Notes](plugin://notes@example)".to_string(),
+        })?;
+
+        let followup = app
+            .store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.followup")
+            .context("session.followup")?;
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(!followup.payload["content"]
+            .as_array()
+            .context("followup content")?
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plugin://")));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_submit_answers_pending_request_not_followup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "plan a change"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "turn_id": "turn-current",
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Questions"));
+        assert!(screen.contains("Scope [scope]"));
+        assert!(screen.contains("Which scope should I use?"));
+        assert!(screen.contains("Answer the agent's question..."));
+
+        app.set_input("2".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            0
+        );
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["turn_id"],
+            serde_json::json!("turn-current")
+        );
+        assert_eq!(response.payload["call_id"], serde_json::json!("ask_scope"));
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now"])
+        );
+        assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_prefers_turn_id_over_stale_call_id_response() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "turn_id": "turn-current",
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_RESPONSE_EVENT,
+            serde_json::json!({
+                "turn_id": "turn-stale",
+                "call_id": "ask_scope",
+                "answers": {
+                    "scope": {
+                        "answers": ["Plan (Recommended)"]
+                    }
+                }
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        let pending = app
+            .pending_request_user_input(&session.id)
+            .context("pending request")?;
+        assert_eq!(pending.turn_id, "turn-current");
+        assert_eq!(pending.call_id, "ask_scope");
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_digit_shortcut_selects_option() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now"])
+        );
+        assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_notes_append_user_note() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        for ch in "keep minimal".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now", "user_note: keep minimal"])
+        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 100));
+        assert!(text.contains("Questions 1/1 answered"));
+        assert!(text.contains("note: keep minimal"));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_empty_answer_requires_confirmation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_questions",
+                "questions": [
+                    {
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    },
+                    {
+                        "id": "risk",
+                        "header": "Risk",
+                        "question": "Which risk level?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Low (Recommended)", "description": "Small change."},
+                            {"label": "High", "description": "Large change."}
+                        ]
+                    }
+                ]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT));
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Submit with 1 unanswered question")));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Submit with unanswered questions?"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        assert_eq!(
+            response.payload["answers"]["risk"]["answers"],
+            serde_json::json!([])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_accepts_keyed_multi_question_answers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_questions",
+                "questions": [
+                    {
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    },
+                    {
+                        "id": "risk",
+                        "header": "Risk",
+                        "question": "Which risk level?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Low (Recommended)", "description": "Small change."},
+                            {"label": "High", "description": "Large change."}
+                        ]
+                    }
+                ]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        app.set_input("risk: 2\nscope: Plan".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        assert_eq!(
+            response.payload["answers"]["risk"]["answers"],
+            serde_json::json!(["High"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_other_number_preserves_user_note() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        app.set_input("3: keep this as a design review".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!([
+                REQUEST_USER_INPUT_OTHER_LABEL,
+                "user_note: keep this as a design review"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_requests_are_fifo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        for (call_id, question_id) in [("call_1", "first"), ("call_2", "second")] {
+            app.store.append_event(
+                &session.id,
+                REQUEST_USER_INPUT_REQUEST_EVENT,
+                serde_json::json!({
+                    "call_id": call_id,
+                    "questions": [{
+                        "id": question_id,
+                        "header": question_id,
+                        "question": format!("Answer {question_id}?"),
+                        "isOther": true,
+                        "options": [
+                            {"label": "Yes (Recommended)", "description": "Proceed."},
+                            {"label": "No", "description": "Stop."}
+                        ]
+                    }]
+                }),
+            )?;
+        }
+        app.drain_store_notifications()?;
+
+        assert_eq!(
+            app.pending_request_user_input(&session.id)
+                .context("first pending")?
+                .call_id,
+            "call_1"
+        );
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))?);
+        app.drain_store_notifications()?;
+        assert_eq!(
+            app.pending_request_user_input(&session.id)
+                .context("second pending")?
+                .call_id,
+            "call_2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_request_clears_after_terminal_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope?",
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build", "description": "Build now."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+        assert!(app.pending_request_user_input(&session.id).is_some());
+
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "finished"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(app.pending_request_user_input(&session.id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_proposed_plan_renders_as_plan_not_raw_tags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "plan the migration"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.collaboration_mode",
+            serde_json::json!({"mode": "plan"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": "Intro\n<proposed_plan>\n- Step 1\n- Step 2\n</proposed_plan>\nOutro",
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("Intro"));
+        assert!(text.contains("Outro"));
+        assert!(text.contains("Proposed Plan"));
+        assert!(text.contains("Step 1"));
+        assert!(!text.contains("<proposed_plan>"));
+        assert!(!text.contains("</proposed_plan>"));
+        Ok(())
+    }
+
+    #[test]
+    fn default_mode_streaming_keeps_literal_proposed_plan_tags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "write literal tags"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.collaboration_mode",
+            serde_json::json!({"mode": "default"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": "Literal\n<proposed_plan>\nnot a plan\n</proposed_plan>",
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("Literal"));
+        assert!(text.contains("<proposed_plan>"));
+        assert!(text.contains("</proposed_plan>"));
+        assert!(!text.contains("Proposed Plan"));
+        Ok(())
     }
 
     #[test]
@@ -4507,7 +8060,11 @@ mod redesign_tests {
             let temp = tempfile::tempdir()?;
             let mut app = App::new(args(&temp))?;
             app.open_surface(Surface::Model);
-            app.selected_row = 5;
+            app.selected_row = app
+                .model_choices
+                .iter()
+                .position(|choice| choice.provider_model == "moonshotai/kimi-k2.5")
+                .context("Kimi OpenRouter model row")?;
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.model, "Kimi K2.5");
             assert_eq!(app.account, "OpenRouter API key");
@@ -4552,6 +8109,47 @@ mod redesign_tests {
         assert!(!screen.contains("**14 items**"));
         assert!(!screen.contains("`coupon.json`"));
         assert!(!screen.contains("┌"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_warnings_and_instruction_sources_are_visible() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let agents_path = temp.path().join("AGENTS.md").display().to_string();
+        app.store.append_event(
+            &session.id,
+            "session.instruction_sources",
+            serde_json::json!({
+                "source": "agents_md",
+                "sources": [agents_path],
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.startup_warning",
+            serde_json::json!({
+                "source": "agents_md",
+                "message": "Project AGENTS.md instructions contain invalid UTF-8",
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect cart"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("• warning"), "{screen}");
+        assert!(screen.contains("invalid UTF-8"), "{screen}");
+
+        app.open_surface(Surface::Developer);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Instruction sources"), "{screen}");
+        assert!(screen.contains("AGENTS.md"), "{screen}");
+        assert!(screen.contains("Startup warnings"), "{screen}");
         Ok(())
     }
 
@@ -4622,6 +8220,70 @@ mod redesign_tests {
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
+        Ok(())
+    }
+
+    #[test]
+    fn composer_context_bar_uses_latest_token_count_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect token count"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Context accounting is visible."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 999, "cost_usd": 0.0123}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 12345
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 20,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 30
+                    },
+                    "model_context_window": 100000
+                },
+                "rate_limits": null,
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": null,
+                "rate_limits": {"limit_id": "codex"},
+                "turn_idx": 0
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("12.3k/100k"));
+        assert!(!screen.contains("999/60k"));
+        assert!(screen.contains("$0.0123"));
         Ok(())
     }
 
@@ -4697,11 +8359,15 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
+        assert!(screen.contains("/mode"));
+        assert!(screen.contains("/plan"));
         assert!(screen.contains("/model"));
-        assert!(screen.contains("/auth"));
+        assert!(!screen.contains("/auth"));
         assert!(!screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
+        assert!(screen.contains("choose collaboration mode"));
+        assert!(screen.contains("switch to Plan mode"));
         assert!(!screen.contains("filter actions"));
         assert!(!screen.contains("tab history"));
         assert!(!screen.contains("Open browser"));
@@ -4725,6 +8391,18 @@ mod redesign_tests {
             .enumerate()
             .any(|(idx, line)| idx > input_row && line.contains("/task")));
         assert!(screen.contains("/history"));
+        for ch in "auth".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> auth");
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx > input_row && line.contains("/auth")));
+        assert!(screen.contains("sign in to a provider"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.palette_filter(), "");
         for ch in "bro".chars() {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
@@ -4956,6 +8634,223 @@ mod redesign_tests {
     }
 
     #[test]
+    fn model_selector_uses_active_catalog_presets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        write_tui_model_catalog(&app_home)?;
+
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let mut app = ready_app(&temp)?;
+            app.store.set_setting("auth.codex.access_token", "token")?;
+            app.store.set_setting("auth.codex.account_id", "account")?;
+            app.open_surface(Surface::Model);
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("ChatGPT Only Catalog"));
+            assert!(screen.contains("Catalog GPT"));
+            assert!(!screen.contains("Hidden Catalog Model"));
+            assert!(!app.model_choices.iter().any(|choice| {
+                choice.account == ACCOUNT_OPENAI && choice.provider_model == "chatgpt-only-catalog"
+            }));
+
+            app.save_model(0)?;
+            assert_eq!(app.provider_model, "chatgpt-only-catalog");
+            assert_eq!(app.model, "ChatGPT Only Catalog");
+            assert_eq!(app.account, ACCOUNT_CODEX);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
+        std::fs::write(
+            app_home.join("config.toml"),
+            r#"
+model = "configured-corp-model"
+model_provider = "corp"
+
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(app.model, "configured-corp-model");
+            assert_eq!(selection.provider_model, "configured-corp-model");
+            assert_eq!(selection.backend, AgentBackend::Codex);
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
+        std::fs::write(
+            app_home.join("config.toml"),
+            r#"
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+        std::fs::write(
+            app_home.join("work.config.toml"),
+            r#"
+model = "profile-model"
+model_provider = "corp"
+"#,
+        )?;
+
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                config_profile: Some("work".to_string()),
+                config_overrides: vec![
+                    "model=\"override-model\"".to_string(),
+                    "developer_instructions=\"TUI session policy\"".to_string(),
+                ],
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(selection.provider_model, "override-model");
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+
+            let session = app.store.create_session(None, temp.path())?;
+            let options = app.configured_agent_options()?;
+            browser_use_core::append_workspace_context_event_with_options(
+                &app.store, &session, &options,
+            )?;
+            let events = app.store.events_for_session(&session.id)?;
+            let permissions = events
+                .iter()
+                .find(|event| {
+                    event.event_type == "workspace.context"
+                        && event
+                            .payload
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("permissions")
+                })
+                .and_then(|event| event.payload.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .context("permissions workspace context")?;
+            assert!(permissions.contains("TUI session policy"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_config_overrides_beat_stored_model_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.set_setting("model", "Stored Model")?;
+        store.set_setting("provider.model", "stored-model")?;
+        store.set_setting("provider.id", "codex")?;
+        drop(store);
+
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
+        std::fs::write(
+            app_home.join("config.toml"),
+            r#"
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                config_overrides: vec![
+                    "model=\"override-model\"".to_string(),
+                    "model_provider=\"corp\"".to_string(),
+                ],
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(selection.display_model, "override-model");
+            assert_eq!(selection.provider_model, "override-model");
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_selection_is_session_scoped_for_followups() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        write_tui_model_catalog(&app_home)?;
+
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let mut app = ready_app(&temp)?;
+            app.store.set_setting("auth.openai.api_key", "openai-key")?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "session.input",
+                serde_json::json!({"text": "finished task"}),
+            )?;
+            app.store.append_event(
+                &session.id,
+                "session.done",
+                serde_json::json!({"result": "done"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+
+            let openai_catalog_index = app
+                .model_choices
+                .iter()
+                .position(|choice| {
+                    choice.account == ACCOUNT_OPENAI && choice.provider_model == "catalog-gpt"
+                })
+                .context("OpenAI catalog model row")?;
+            app.save_model(openai_catalog_index)?;
+
+            app.model = "GPT-5.5".to_string();
+            app.provider_model = "gpt-5.5".to_string();
+            app.account = ACCOUNT_CODEX.to_string();
+            app.agent_backend = AgentBackend::Codex;
+
+            let selection = app.session_model_selection_or_current(&session.id)?;
+            assert_eq!(selection.provider_model, "catalog-gpt");
+            assert_eq!(selection.account, ACCOUNT_OPENAI);
+            assert_eq!(selection.backend, AgentBackend::Openai);
+            assert_eq!(selection.model_provider_id.as_deref(), Some("openai"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn credential_action_rows_are_real_menu_choices() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -5153,7 +9048,15 @@ mod redesign_tests {
             let temp = tempfile::tempdir()?;
             let mut app = ready_app(&temp)?;
             app.open_surface(Surface::Model);
-            app.selected_row = 3;
+            let opus_index = app
+                .model_choices
+                .iter()
+                .position(|choice| {
+                    choice.account == settings::ACCOUNT_ANTHROPIC
+                        && choice.provider_model == "claude-opus-4-7"
+                })
+                .context("Anthropic Opus model row")?;
+            app.selected_row = opus_index;
 
             let screen = render_dump(&mut app)?;
             assert!(!screen.contains("Claude Code sub"));
@@ -5162,7 +9065,7 @@ mod redesign_tests {
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.pending_model_after_auth, Some(5));
+            assert_eq!(app.pending_model_after_auth, Some(opus_index));
             assert_eq!(
                 app.api_key_account.as_deref(),
                 Some(settings::ACCOUNT_ANTHROPIC)
@@ -5249,13 +9152,15 @@ mod redesign_tests {
             Surface::Setup,
             Surface::Account,
             Surface::Model,
+            Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
         ] {
             app.open_surface(surface);
             let count = match surface {
                 Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
-                Surface::Model => VISIBLE_MODEL_CHOICES.len(),
+                Surface::Model => app.model_choices.len(),
+                Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 _ => unreachable!(),
             };
@@ -5333,16 +9238,17 @@ mod redesign_tests {
 
         // The model picker wraps the same way.
         app.open_surface(Surface::Model);
-        for _ in 0..VISIBLE_MODEL_CHOICES.len() - 1 {
+        let model_choice_count = app.model_choices.len();
+        for _ in 0..model_choice_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, model_choice_count - 1);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("DeepSeek V4 Pro"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, model_choice_count - 1);
         Ok(())
     }
 
@@ -5373,6 +9279,30 @@ mod redesign_tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "browser.reconnect_requested"));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_live_url_is_visible_in_browser_panel() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.open_surface(Surface::Browser);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("live view"));
+        assert!(screen.contains("https://live.browser-use.com/?wss=example"));
         Ok(())
     }
 
@@ -5472,6 +9402,176 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.composer.cursor(), app.composer.input_len());
         Ok(())
+    }
+
+    #[test]
+    fn prompt_history_recalls_persistent_and_local_entries() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            browser_use_core::append_message_history_entry(
+                "older persisted prompt",
+                "session-a",
+                &config,
+            )?;
+            browser_use_core::append_message_history_entry(
+                "newer persisted prompt",
+                "session-b",
+                &config,
+            )?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "older persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "");
+
+            app.set_input("draft prompt".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft prompt");
+
+            app.set_input(String::new());
+            app.prompt_history.record_submission("local newest prompt");
+            browser_use_core::append_message_history_entry(
+                "local newest prompt",
+                "session-c",
+                &config,
+            )?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local newest prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+
+            app.set_input(String::new());
+            app.prompt_history.reset_navigation();
+            app.prompt_history
+                .record_submission("local\nmultiline prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local\nmultiline prompt");
+            app.set_input_cursor("local".chars().count());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local\nmultiline prompt");
+
+            app.set_input("draft first line\nsecond line".to_string());
+            app.prompt_history.reset_navigation();
+            app.set_input_cursor("draft first line".chars().count());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft first line\nsecond line");
+            assert_eq!(app.composer.cursor(), "draft first line".chars().count());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn prompt_history_snapshots_before_local_submission_and_skips_bad_offsets() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let options = app.configured_agent_options()?;
+            app.refresh_prompt_history_for(temp.path(), &options)?;
+            app.prompt_history.record_submission("same-turn prompt");
+            browser_use_core::append_message_history_entry(
+                "same-turn prompt",
+                "session-a",
+                &config,
+            )?;
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "same-turn prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "same-turn prompt");
+
+            let history_path = codex_home.path().join("history.jsonl");
+            std::fs::remove_file(&history_path)?;
+            browser_use_core::append_message_history_entry(
+                "valid persisted prompt",
+                "session-b",
+                &config,
+            )?;
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&history_path)?;
+            writeln!(file, "{{not-json")?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "valid persisted prompt");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn prompt_history_ctrl_r_search_accepts_and_restores_drafts() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            browser_use_core::append_message_history_entry(
+                "find old invoice",
+                "session-a",
+                &config,
+            )?;
+            browser_use_core::append_message_history_entry("book hotel", "session-b", &config)?;
+            browser_use_core::append_message_history_entry(
+                "find newer receipt",
+                "session-c",
+                &config,
+            )?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0012}'), KeyModifiers::NONE))?);
+            for ch in "find".chars() {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.composer.input(), "find newer receipt");
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("find newer receipt"));
+            let matches = &app.prompt_history.search.as_ref().unwrap().matches;
+            assert_eq!(
+                matches,
+                &vec![
+                    "find newer receipt".to_string(),
+                    "find old invoice".to_string()
+                ]
+            );
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0012}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find old invoice");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0013}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find newer receipt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find newer receipt");
+            assert!(app.prompt_history.search.is_none());
+
+            app.set_input("draft text".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))?);
+            for ch in "missing".chars() {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.composer.input(), "draft text");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0003}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft text");
+            assert!(app.prompt_history.search.is_none());
+            Ok(())
+        })
     }
 
     #[test]
@@ -5711,7 +9811,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn active_streaming_viewport_stays_stable_while_message_grows() -> Result<()> {
+    fn active_streaming_viewport_moves_separator_to_native_scrollback() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5756,12 +9856,12 @@ mod redesign_tests {
 
         let grown_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert_eq!(grown_desired, initial_desired);
+        assert_eq!(grown_desired.saturating_add(1), initial_desired);
         Ok(())
     }
 
     #[test]
-    fn pre_tool_streaming_text_is_hidden_after_tool_call_response() -> Result<()> {
+    fn pre_tool_streaming_text_commits_before_tool_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5809,9 +9909,94 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("• note"));
-        assert!(!screen.contains("Need more targeted."));
+        assert!(screen.contains("Need more targeted."));
         assert!(screen.contains("Final answer from session.done."));
         assert!(!screen.contains("• answer draft"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_session_preserves_visible_streaming_text_before_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I found the transcript handoff issue."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "provider disconnected"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("I found the transcript handoff issue."),
+            "{screen}"
+        );
+        assert!(screen.contains("provider disconnected"), "{screen}");
+        assert_eq!(
+            screen
+                .matches("I found the transcript handoff issue.")
+                .count(),
+            1,
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_session_preserves_visible_streaming_text_before_stopped_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I found the transcript handoff issue."}),
+        )?;
+        app.store
+            .append_event(&session.id, "session.cancelled", serde_json::json!({}))?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("I found the transcript handoff issue."),
+            "{screen}"
+        );
+        assert!(screen.contains("Progress is saved in history."), "{screen}");
+        assert_eq!(
+            screen
+                .matches("I found the transcript handoff issue.")
+                .count(),
+            1,
+            "{screen}"
+        );
         Ok(())
     }
 
@@ -5951,6 +10136,54 @@ mod redesign_tests {
         assert!(!screen.contains("SHOULD_NOT_RENDER"), "{screen}");
         assert!(!screen.contains("real file body"), "{screen}");
         Ok(())
+    }
+
+    #[test]
+    fn live_stream_prefix_strips_after_deferred_warning_rows() {
+        let lines = vec![
+            Line::from("• warning"),
+            Line::from("  └ Model `gpt-5.5` is not in the active model catalog."),
+            Line::from(
+                "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and",
+            ),
+            Line::from("ready to work on the repo."),
+        ];
+        let prefix = vec![
+            "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and"
+                .to_string(),
+        ];
+
+        let stripped = plain_text_lines(&strip_live_stream_prefix(lines, &prefix));
+
+        assert_eq!(
+            stripped,
+            vec![
+                "• warning",
+                "  └ Model `gpt-5.5` is not in the active model catalog.",
+                "ready to work on the repo.",
+            ]
+        );
+    }
+
+    #[test]
+    fn live_stream_prefix_preserves_separator_before_remaining_tail() {
+        let lines = vec![
+            Line::from(""),
+            Line::from("I'll inspect the repo structure and key docs/config first, then"),
+            Line::from("summarize what it appears to be and how it's organized."),
+        ];
+        let prefix =
+            vec!["I'll inspect the repo structure and key docs/config first, then".to_string()];
+
+        let stripped = plain_text_lines(&strip_live_stream_prefix(lines, &prefix));
+
+        assert_eq!(
+            stripped,
+            vec![
+                "",
+                "summarize what it appears to be and how it's organized.",
+            ]
+        );
     }
 
     #[test]
@@ -6597,15 +10830,15 @@ mod redesign_tests {
             &session.id,
             "browser.state",
             serde_json::json!({
-                "title": "Amazon Web Services Sign-In",
+                "title": "Example Account Sign-In",
                 "tabs": 2,
-                "url": "https://signin.aws.amazon.com/signin?redirect_uri=https%3A%2F%2Faws.amazon.com%2Fmarketplace%2Fmanagement%2Fseller-settings%2Faccount%2Fcustom-notification-submitted%3F%26isauthcode%3Dtrue&client_id=arn%3Aaws%3Aiam%3A%3A015428540659%3Auser%2Fawsmp-contessa&forceMobileApp=0",
+                "url": "https://accounts.example.com/signin?redirect_uri=https%3A%2F%2Fconsole.example.com%2Fworkspace%2Fmanagement%2Fsettings%2Fnotifications%2Fcustom-notification-submitted%3F%26isauthcode%3Dtrue&client_id=example-client-id-with-a-long-value&forceMobileApp=0",
             }),
         )?;
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("signin.aws.amazon.com/signin?..."));
+        assert!(screen.contains("accounts.example.com/signin?..."));
         assert!(!screen.contains("redirect_uri=https"));
         Ok(())
     }
@@ -6808,15 +11041,82 @@ mod redesign_tests {
         )?;
         app.drain_store_notifications()?;
         let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(streaming, prompt_only.saturating_sub(1));
+        assert_eq!(streaming, prompt_only);
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
-        assert!(!streaming_screen.contains("thinking"));
+        assert!(!streaming_screen.contains("Thinking..."));
         assert!(!streaming_screen.contains("Working..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
         assert!(lines_plain_text(&emission.lines).contains("> yo"));
+        Ok(())
+    }
+
+    #[test]
+    fn quiet_streaming_commentary_shows_thinking_status_after_debounce() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event_with_identity(
+            &session.id,
+            "quiet-streaming-commentary".to_string(),
+            browser_use_store::now_ms().saturating_sub(1_000),
+            "model.stream_delta",
+            serde_json::json!({"text": "I checked the top-level files and docs."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I checked the top-level files and docs."));
+        assert!(screen.contains("Thinking..."));
+        assert!(!screen.contains("Working..."));
+        Ok(())
+    }
+
+    #[test]
+    fn commentary_completion_restores_thinking_status_without_debounce() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I checked the top-level files and docs."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.response.output_item.completed",
+            serde_json::json!({"item_type": "message", "phase": "commentary"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I checked the top-level files and docs."));
+        assert!(screen.contains("Thinking..."));
+        assert!(!screen.contains("Working..."));
         Ok(())
     }
 
@@ -6911,6 +11211,7 @@ mod redesign_tests {
         app.args.height = measured;
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Type to steer the agent"));
+        assert!(!screen.contains("Thinking..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let streaming_lines = lines_plain_text(&transcript::active_streaming_lines(
@@ -6920,7 +11221,6 @@ mod redesign_tests {
         assert!(streaming_lines.contains("This is a Rust-first browser agent"));
         assert!(streaming_lines.contains("browser-use"));
         assert!(streaming_lines.contains("core design"));
-        assert!(!screen.contains("thinking"));
         Ok(())
     }
 
@@ -6963,7 +11263,7 @@ mod redesign_tests {
         app.drain_store_notifications()?;
 
         let initial = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(initial, docked);
+        assert_eq!(initial, docked.saturating_add(1));
 
         let streamed = (1..=24)
             .map(|idx| format!("live output line {idx:02}"))
@@ -6977,12 +11277,13 @@ mod redesign_tests {
         app.drain_store_notifications()?;
 
         let grown = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(grown, initial);
+        assert_eq!(grown.saturating_add(1), initial);
         app.args.width = 100;
         app.args.height = grown;
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live output line 24"));
         assert!(!screen.contains("live output line 01"));
+        assert!(!screen.contains("Thinking..."));
         assert!(!screen.contains("Working..."));
         assert!(screen.contains("Type to steer the agent"));
         Ok(())
@@ -7041,16 +11342,16 @@ mod redesign_tests {
 
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
-        let note_emission = transcript::terminal_scrollback_emission_since(
+        let commentary_emission = transcript::terminal_scrollback_emission_since(
             &model,
             prompt_emission.last_seq,
             120,
             true,
         );
-        let note_text = lines_plain_text(&note_emission.lines);
-        assert!(!note_text.contains("> can you tell me about this repo?"));
-        assert!(!note_text.contains("• note"));
-        assert!(!note_text.contains("Yoooo! What can I help you with?"));
+        let commentary_text = lines_plain_text(&commentary_emission.lines);
+        assert!(!commentary_text.contains("> can you tell me about this repo?"));
+        assert!(!commentary_text.contains("• note"));
+        assert!(commentary_text.contains("Yoooo! What can I help you with?"));
         let replay_emission =
             transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
         let replay_text = lines_plain_text(&replay_emission.lines);
@@ -7062,7 +11363,7 @@ mod redesign_tests {
             "{replay_text}"
         );
         assert!(!replay_text.contains("• note"));
-        assert!(!replay_text.contains("Yoooo! What can I help you with?"));
+        assert!(replay_text.contains("Yoooo! What can I help you with?"));
 
         app.args.width = 120;
         app.args.height = 28;
@@ -7070,7 +11371,7 @@ mod redesign_tests {
         assert_eq!(
             active_screen.matches("Yoooo! What can I help you with?").count(),
             0,
-            "stream text committed as a note should not be duplicated in the active viewport\n{active_screen}"
+            "committed pre-tool commentary should not be duplicated in the active viewport\n{active_screen}"
         );
         Ok(())
     }
@@ -7176,6 +11477,137 @@ mod redesign_tests {
     }
 
     #[test]
+    fn streaming_flushes_deferred_activity_tail_before_replacing_live_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "inspect repo".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> inspect repo"));
+        assert!(!prompt_text.contains("README.md"), "{prompt_text}");
+        app.native_history.last_seq = prompt_emission.last_seq;
+        let active_before_stream =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_before_stream.contains("read README.md, Cargo.toml"),
+            "{active_before_stream}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I am checking the files before summarizing."}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let has_live_streaming_output =
+            !transcript::active_streaming_lines(Some(&model), 120).is_empty();
+        let stream_emission = transcript::terminal_scrollback_emission_since(
+            &model,
+            app.native_history.last_seq,
+            120,
+            !has_live_streaming_output,
+        );
+        let stream_emission_text = lines_plain_text(&stream_emission.lines);
+        assert!(
+            stream_emission_text.contains("read README.md, Cargo.toml"),
+            "{stream_emission_text}"
+        );
+        assert!(
+            !stream_emission_text.contains("I am checking"),
+            "{stream_emission_text}"
+        );
+        app.native_history.last_seq = stream_emission.last_seq;
+        let active_during_stream =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_during_stream.contains("I am checking the files"),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("Thinking..."),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("Working..."),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("README.md"),
+            "{active_during_stream}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"tool_call_count": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Taskfile.yml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let active_after_response =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_after_response.contains("read Taskfile.yml"),
+            "{active_after_response}"
+        );
+        assert!(
+            !active_after_response.contains("README.md"),
+            "{active_after_response}"
+        );
+        assert!(
+            !active_after_response.contains("Cargo.toml"),
+            "{active_after_response}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn multiline_composer_does_not_resize_completed_history_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -7228,6 +11660,7 @@ mod redesign_tests {
         for surface in [
             Surface::History,
             Surface::Model,
+            Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
             Surface::Account,
@@ -7421,6 +11854,279 @@ mod redesign_tests {
     }
 
     #[test]
+    fn enter_steers_and_tab_queues_followup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("steer before the next tool".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "steer before the next tool"
+        }));
+
+        app.set_input("after the current turn".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let queued = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT
+                    && event.payload["text"] == "after the current turn"
+            })
+            .context("queued follow-up")?
+            .seq;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            1
+        );
+
+        app.store.append_event(
+            &running.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_SENT_EVENT
+                && event.payload["queued_seq"] == queued
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "after the current turn"
+                && event.payload["queued_from_seq"] == queued
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn message_selector_edits_submitted_and_cancels_queued_messages() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "first answer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "revise this"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "second answer"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        let submitted_selector = render_dump(&mut app)?;
+        assert!(submitted_selector.contains("Enter:edit | Esc:close"));
+        assert!(!submitted_selector.contains("Del:remove"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        assert!(app.composer.input().is_empty());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.composer.input(), "revise this");
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ROLLBACK_EVENT
+                && event.payload["action"] == "edit"
+                && event.payload["num_turns"] == 1
+        }));
+        let visible = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["initial task"]);
+
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "running"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+        app.set_input("queued draft".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        let queued_selector = render_dump(&mut app)?;
+        assert!(queued_selector.contains("Del:cancel queued"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT
+                && event.payload["reason"] == "removed from message selector"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_reclaims_initial_prompt_before_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let submitted = app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "whats up"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "checking context"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "whats up");
+        assert_eq!(app.selected_session_id, None);
+        assert!(!app.escape_stop_is_pending());
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ROLLBACK_EVENT
+                && event.payload["action"] == "take_back"
+                && event.payload["source"] == "tui_escape"
+                && event.payload["target_seq"] == submitted.seq
+                && event.payload["num_turns"] == 1
+        }));
+        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert!(visible_submissions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_reclaims_followup_before_output_without_clearing_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "first answer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "revise this"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "revise this");
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some(session.id.as_str())
+        );
+        assert!(!app.escape_stop_is_pending());
+        let events = app.store.events_for_session(&session.id)?;
+        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_submissions, vec!["initial task"]);
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_does_not_reclaim_after_streamed_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "visible output"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert!(app.composer.input().is_empty());
+        assert!(app.escape_stop_is_pending());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        Ok(())
+    }
+
+    #[test]
     fn agent_panic_records_failed_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -7458,7 +12164,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn escape_twice_stops_running_task() -> Result<()> {
+    fn escape_twice_opens_message_selector_and_ctrl_c_stops_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -7466,6 +12172,11 @@ mod redesign_tests {
             &running.id,
             "session.input",
             serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "visible output"}),
         )?;
         app.selected_session_id = Some(running.id.clone());
 
@@ -7478,16 +12189,25 @@ mod redesign_tests {
             Some(SessionStatus::Running)
         );
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("esc again to stop"));
+        assert!(screen.contains("esc again to edit messages"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
         assert!(!app.escape_stop_is_pending());
+        assert_eq!(app.surface, Surface::Messages);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Messages"));
+        assert!(screen.contains("run"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL))?);
         assert_eq!(
             app.store
                 .load_session(&running.id)?
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
+        assert_eq!(app.surface, Surface::Main);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("stopped"));
         Ok(())
     }
 }

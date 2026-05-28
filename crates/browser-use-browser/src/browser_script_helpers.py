@@ -10,12 +10,16 @@ import gzip
 import json
 import math
 import os
+import pathlib
 import sys
-import time
+import time as _time
+import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+__last_domain_skills = []
 
 
 def _send_meta(meta, **params):
@@ -116,6 +120,26 @@ def _has_return_statement(expression):
     n = len(expression)
     state = "code"
     quote = ""
+    brace_stack = []
+    pending_function_body = False
+    pending_arrow_body = False
+
+    def is_ident(ch):
+        return ch == "_" or ch == "$" or ch.isalnum()
+
+    def is_keyword_at(keyword, pos):
+        if not expression.startswith(keyword, pos):
+            return False
+        before = expression[pos - 1] if pos > 0 else ""
+        after_pos = pos + len(keyword)
+        after = expression[after_pos] if after_pos < n else ""
+        return not is_ident(before) and not is_ident(after)
+
+    def next_nonspace(pos):
+        while pos < n and expression[pos].isspace():
+            pos += 1
+        return expression[pos] if pos < n else ""
+
     while i < n:
         ch = expression[i]
         nxt = expression[i + 1] if i + 1 < n else ""
@@ -133,10 +157,31 @@ def _has_return_statement(expression):
                 state = "block_comment"
                 i += 2
                 continue
-            if expression.startswith("return", i):
-                before = expression[i - 1] if i > 0 else ""
-                after = expression[i + 6] if i + 6 < n else ""
-                if not (before == "_" or before.isalnum()) and not (after == "_" or after.isalnum()):
+            if ch == "=" and nxt == ">":
+                pending_arrow_body = True
+                i += 2
+                continue
+            if pending_arrow_body and not ch.isspace() and ch != "{":
+                pending_arrow_body = False
+            if ch == "{":
+                brace_stack.append(pending_function_body or pending_arrow_body)
+                pending_function_body = False
+                pending_arrow_body = False
+                i += 1
+                continue
+            if ch == "}":
+                if brace_stack:
+                    brace_stack.pop()
+                i += 1
+                continue
+            if is_keyword_at("function", i):
+                pending_function_body = True
+                i += len("function")
+                continue
+            if is_keyword_at("return", i):
+                inside_nested_function = any(brace_stack)
+                looks_like_property_key = next_nonspace(i + len("return")) == ":"
+                if not inside_nested_function and not looks_like_property_key:
                     return True
             i += 1
             continue
@@ -181,8 +226,133 @@ def js(expression, target_id=None, returnByValue=True):
     )
 
 
+def _truthy_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _domain_skill_roots():
+    roots = []
+    configured = os.environ.get("BH_DOMAIN_SKILLS_ROOT") or os.environ.get("BH_DOMAIN_SKILLS_DIR")
+    if configured:
+        roots.extend(pathlib.Path(part).expanduser() for part in configured.split(os.pathsep) if part.strip())
+    for root in globals().get("DOMAIN_SKILL_ROOTS", []):
+        roots.append(pathlib.Path(root).expanduser())
+    try:
+        roots.append(pathlib.Path(agent_workspace()) / "domain-skills")
+    except Exception:
+        pass
+
+    seen = set()
+    out = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.is_dir():
+            out.append(resolved)
+    return out
+
+
+def _domain_from_url(value):
+    value = str(value or "").strip()
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = (parsed.hostname or value.split("/", 1)[0]).strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _domain_skill_aliases(url_or_domain):
+    host = _domain_from_url(url_or_domain)
+    aliases = {host, host.replace(".", "-")}
+    labels = [part for part in host.split(".") if part]
+    if labels:
+        aliases.add(labels[0])
+    if len(labels) >= 2:
+        aliases.add(labels[-2])
+        aliases.add(f"{labels[-2]}-{labels[-1]}")
+    if len(labels) >= 3:
+        aliases.add(f"{labels[-2]}-{labels[0]}")
+        aliases.add(f"{labels[0]}-{labels[-2]}")
+    return {alias.lower().replace("_", "-") for alias in aliases if alias}
+
+
+def _domain_skills_enabled():
+    if os.environ.get("BH_DOMAIN_SKILLS") is not None:
+        return _truthy_env("BH_DOMAIN_SKILLS")
+    return bool(_domain_skill_roots())
+
+
+def domain_skills_for_url(url_or_domain, include_content=False, max_files=10, max_bytes=120000):
+    """Return matching browser-harness domain-skill files for a URL/domain.
+
+    Set include_content=True when the task is site-specific and the model needs
+    the playbook before inventing selectors, private API routes, or flows.
+    """
+    aliases = _domain_skill_aliases(url_or_domain)
+    matches = []
+    remaining = int(max_bytes)
+    for root in _domain_skill_roots():
+        try:
+            entries = sorted(root.iterdir(), key=lambda path: path.name.lower())
+        except OSError:
+            continue
+        for site_dir in entries:
+            if not site_dir.is_dir():
+                continue
+            site_key = site_dir.name.lower().replace("_", "-")
+            if site_key not in aliases:
+                continue
+            files = []
+            for path in sorted(site_dir.rglob("*")):
+                if not path.is_file() or path.suffix.lower() not in (".md", ".py"):
+                    continue
+                rel = path.relative_to(site_dir).as_posix()
+                item = {"name": rel, "path": str(path)}
+                if include_content and remaining > 0:
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError as exc:
+                        content = f"[failed to read domain skill: {exc}]"
+                    encoded = content[:remaining]
+                    item["content"] = encoded
+                    item["truncated"] = len(encoded) < len(content)
+                    remaining -= len(encoded)
+                files.append(item)
+                if len(files) >= max_files:
+                    break
+            if files:
+                matches.append({"site": site_dir.name, "root": str(root), "files": files})
+    return matches
+
+
+def last_domain_skills(include_content=False):
+    if not __last_domain_skills:
+        return []
+    if include_content:
+        url = __last_domain_skills[0].get("url") if isinstance(__last_domain_skills[0], dict) else None
+        if url:
+            return domain_skills_for_url(url, include_content=True)
+    return __last_domain_skills
+
+
 def goto_url(url):
+    global __last_domain_skills
     result = cdp("Page.navigate", url=url)
+    __last_domain_skills = []
+    if _domain_skills_enabled():
+        skills = domain_skills_for_url(url, include_content=False)
+        if skills:
+            __last_domain_skills = [{"url": url, **skill} for skill in skills]
+            result = {**result, "domain_skills": __last_domain_skills}
     wait_for_load(timeout=15)
     return result
 
@@ -193,9 +363,12 @@ def page_info():
     if dialog:
         return {"dialog": dialog}
     expression = (
-        "JSON.stringify({url:location.href,title:document.title,readyState:document.readyState,"
-        "w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,"
-        "pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})"
+        "(()=>{"
+        "const root=document.documentElement||document.body||{};"
+        "return JSON.stringify({url:location.href,title:document.title||'',readyState:document.readyState||'',"
+        "w:innerWidth,h:innerHeight,sx:scrollX||0,sy:scrollY||0,"
+        "pw:root.scrollWidth||innerWidth,ph:root.scrollHeight||innerHeight});"
+        "})()"
     )
     info = json.loads(_runtime_evaluate(expression))
     info["target"] = current_tab()
@@ -286,7 +459,7 @@ def iframe_target(url_substr):
 
 
 def wait(seconds=1.0):
-    time.sleep(seconds)
+    _time.sleep(seconds)
 
 
 def _timeout_seconds(timeout):
@@ -298,14 +471,14 @@ def _timeout_seconds(timeout):
 
 def wait_for_load(timeout=15.0):
     timeout = _timeout_seconds(timeout)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
         try:
             if js("document.readyState") == "complete":
                 return True
         except Exception:
             pass
-        time.sleep(0.3)
+        _time.sleep(0.3)
     return False
 
 
@@ -322,21 +495,21 @@ def wait_for_element(selector, timeout=10.0, visible=False):
         )
     else:
         check = f"!!document.querySelector({json.dumps(selector)})"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
         if js(check):
             return True
-        time.sleep(0.3)
+        _time.sleep(0.3)
     return False
 
 
 def wait_for_network_idle(timeout=10.0, idle_ms=500):
     timeout = _timeout_seconds(timeout)
-    deadline = time.time() + timeout
-    last_activity = time.time()
+    deadline = _time.time() + timeout
+    last_activity = _time.time()
     inflight = set()
     active_session = _send_meta("session").get("session_id")
-    while time.time() < deadline:
+    while _time.time() < deadline:
         for event in drain_events():
             if event.get("session_id") != active_session:
                 continue
@@ -344,21 +517,21 @@ def wait_for_network_idle(timeout=10.0, idle_ms=500):
             params = event.get("params", {})
             if method == "Network.requestWillBeSent":
                 inflight.add(params.get("requestId"))
-                last_activity = time.time()
+                last_activity = _time.time()
             elif method in ("Network.loadingFinished", "Network.loadingFailed"):
                 inflight.discard(params.get("requestId"))
-                last_activity = time.time()
+                last_activity = _time.time()
             elif method.startswith("Network."):
-                last_activity = time.time()
-        if not inflight and (time.time() - last_activity) * 1000 >= idle_ms:
+                last_activity = _time.time()
+        if not inflight and (_time.time() - last_activity) * 1000 >= idle_ms:
             return True
-        time.sleep(0.1)
+        _time.sleep(0.1)
     return False
 
 
 def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(label or "screenshot")).strip("_") or "screenshot"
-    path = ARTIFACT_DIR / f"{int(time.time() * 1000)}_{safe}{suffix}"
+    path = ARTIFACT_DIR / f"{int(_time.time() * 1000)}_{safe}{suffix}"
     path.write_bytes(base64.b64decode(data_b64))
     meta = {"path": str(path), "mime_type": mime_type, "detail": "auto", "label": label}
     __images.append(meta)
@@ -376,7 +549,7 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
         version = cdp("Browser.getVersion", session_id=None)
         if "Headless" in (version.get("userAgent") or ""):
             cdp("Emulation.setDeviceMetricsOverride", width=1280, height=720, deviceScaleFactor=1, mobile=False)
-            time.sleep(0.2)
+            _time.sleep(0.2)
     except Exception:
         pass
     params = {"format": kwargs.pop("format", "png")}
@@ -450,6 +623,17 @@ _PRINTABLE_KEY_CODES = {
     "`": (192, "Backquote"),
 }
 
+_MODIFIER_BITS = {
+    "alt": 1,
+    "option": 1,
+    "ctrl": 2,
+    "control": 2,
+    "cmd": 4,
+    "command": 4,
+    "meta": 4,
+    "shift": 8,
+}
+
 
 def _printable_key_metadata(key):
     if len(key) != 1:
@@ -465,8 +649,27 @@ def _printable_key_metadata(key):
     return ord(key), key, key
 
 
+def _parse_key_chord(key, modifiers):
+    if not isinstance(key, str) or "+" not in key:
+        return key, modifiers
+    parts = [part.strip() for part in key.split("+") if part.strip()]
+    if len(parts) < 2:
+        return key, modifiers
+    parsed_modifiers = modifiers
+    for part in parts[:-1]:
+        bit = _MODIFIER_BITS.get(part.lower())
+        if bit is None:
+            return key, modifiers
+        parsed_modifiers |= bit
+    parsed_key = parts[-1]
+    if parsed_key.lower() == "space":
+        parsed_key = " "
+    return parsed_key, parsed_modifiers
+
+
 def press_key(key, modifiers=0):
-    """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift."""
+    """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift. Chords like "Meta+A" also work."""
+    key, modifiers = _parse_key_chord(key, modifiers)
     vk, code, text = _KEYS.get(key) or _printable_key_metadata(key) or (0, key, "")
     base = {
         "key": key,
@@ -475,7 +678,8 @@ def press_key(key, modifiers=0):
         "windowsVirtualKeyCode": vk,
         "nativeVirtualKeyCode": vk,
     }
-    cdp("Input.dispatchKeyEvent", type="keyDown", **base, **({"text": text} if text else {}))
+    event_type = "rawKeyDown" if modifiers else "keyDown"
+    cdp("Input.dispatchKeyEvent", type=event_type, **base, **({"text": text} if text and not modifiers else {}))
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
     return True
 
@@ -485,17 +689,70 @@ def scroll(x=0, y=0, dy=600, dx=0):
     return True
 
 
+def _query_selector_node_id(selector):
+    doc = cdp("DOM.getDocument", depth=0)
+    root = (doc or {}).get("root") or {}
+    root_id = root.get("nodeId")
+    if not root_id:
+        return None
+    result = cdp("DOM.querySelector", nodeId=root_id, selector=selector)
+    node_id = (result or {}).get("nodeId")
+    return node_id or None
+
+
+def _wait_for_selector_node_id(selector, timeout=0.0):
+    deadline = _time.monotonic() + _timeout_seconds(timeout)
+    while True:
+        node_id = _query_selector_node_id(selector)
+        if node_id:
+            return node_id
+        if timeout <= 0 or _time.monotonic() >= deadline:
+            return None
+        _time.sleep(0.1)
+
+
+def _quad_center(quad):
+    if not quad or len(quad) < 8:
+        return None
+    xs = quad[0::2]
+    ys = quad[1::2]
+    if max(xs) <= min(xs) or max(ys) <= min(ys):
+        return None
+    return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+
+
+def _node_center(node_id):
+    try:
+        model = (cdp("DOM.getBoxModel", nodeId=node_id) or {}).get("model") or {}
+    except Exception:
+        return None
+    return _quad_center(model.get("border")) or _quad_center(model.get("content"))
+
+
+def _focus_selector_like_user(selector, timeout=0.0):
+    node_id = _wait_for_selector_node_id(selector, timeout=timeout)
+    if not node_id:
+        return False
+    try:
+        cdp("DOM.scrollIntoViewIfNeeded", nodeId=node_id)
+    except Exception:
+        pass
+    center = _node_center(node_id)
+    if center:
+        click_at_xy(center[0], center[1])
+        return True
+    try:
+        cdp("DOM.focus", nodeId=node_id)
+        return True
+    except Exception:
+        return False
+
+
 def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
-    """Fill a framework-managed input using real key events plus input/change."""
+    """Fill an input by focusing it through CDP, then using browser input events."""
     if clear_first is not None:
         clear = clear_first
-    if timeout > 0 and not wait_for_element(selector, timeout=timeout):
-        raise RuntimeError(f"fill_input: element not found: {selector!r}")
-    focused = js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        "if(!e)return false;e.focus();return true;}})()"
-    )
-    if not focused:
+    if not _focus_selector_like_user(selector, timeout=timeout):
         raise RuntimeError(f"fill_input: element not found: {selector!r}")
     if clear:
         mods = 4 if sys.platform == "darwin" else 2
@@ -509,27 +766,9 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
         cdp("Input.dispatchKeyEvent", type="rawKeyDown", **select_all)
         cdp("Input.dispatchKeyEvent", type="keyUp", **select_all)
         press_key("Backspace")
-    for ch in text:
-        press_key(ch)
-    js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        "if(!e)return;"
-        "e.dispatchEvent(new Event('input',{bubbles:true}));"
-        "e.dispatchEvent(new Event('change',{bubbles:true}));}})();"
-    )
+    if text:
+        type_text(str(text))
     return True
-
-
-_KC = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, " ": 32, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40}
-
-
-def dispatch_key(selector, key="Enter", event="keypress"):
-    kc = _KC.get(key, ord(key) if len(key) == 1 else 0)
-    js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        f"if(e){{e.focus();e.dispatchEvent(new KeyboardEvent({json.dumps(event)},"
-        f"{{key:{json.dumps(key)},code:{json.dumps(key)},keyCode:{kc},which:{kc},bubbles:true}}));}}}})()"
-    )
 
 
 def upload_file(selector, path):
@@ -541,15 +780,107 @@ def upload_file(selector, path):
     cdp("DOM.setFileInputFiles", files=files, nodeId=node_id)
 
 
-def http_get(url, headers=None, timeout=20.0):
+class _HttpGetText(str):
+    def __new__(cls, value, status_code=None, headers=None, url=None):
+        obj = str.__new__(cls, value)
+        obj.status_code = status_code
+        obj.status = status_code
+        obj.headers = headers or {}
+        obj.url = url
+        return obj
+
+    @property
+    def text(self):
+        return str(self)
+
+    @property
+    def content(self):
+        return str(self).encode("utf-8")
+
+    def json(self):
+        return json.loads(str(self))
+
+
+class _HttpGetBytes(bytes):
+    def __new__(cls, value, status_code=None, headers=None, url=None):
+        obj = bytes.__new__(cls, value)
+        obj.status_code = status_code
+        obj.status = status_code
+        obj.headers = headers or {}
+        obj.url = url
+        return obj
+
+    @property
+    def content(self):
+        return bytes(self)
+
+    @property
+    def text(self):
+        return bytes(self).decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    """Pure HTTP fetch for static pages and APIs.
+
+    When BROWSER_USE_API_KEY is set and fetch_use is installed, route through
+    fetch-use like browser-harness. Otherwise fall back to local urllib with a
+    browser-like UA and gzip handling. Pass binary=True for bytes.
+    """
+    if os.environ.get("BROWSER_USE_API_KEY"):
+        try:
+            from fetch_use import fetch_sync
+
+            response = fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000))
+            status_code = getattr(response, "status_code", getattr(response, "status", None))
+            response_headers = dict(getattr(response, "headers", {}) or {})
+            response_url = getattr(response, "url", url)
+            if binary is True:
+                data = getattr(response, "content", None)
+                if data is None:
+                    data = getattr(response, "body", None)
+                if data is None:
+                    data = getattr(response, "text", "").encode("utf-8", errors="replace")
+                elif isinstance(data, str):
+                    data = data.encode("utf-8", errors="replace")
+                else:
+                    data = bytes(data)
+                return _HttpGetBytes(data, status_code, response_headers, response_url)
+            return _HttpGetText(
+                response.text,
+                status_code,
+                response_headers,
+                response_url,
+            )
+        except ImportError:
+            pass
     request_headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     if headers:
         request_headers.update(headers)
-    with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=timeout) as response:
-        data = response.read()
-        if response.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
-        content_type = response.headers.get("Content-Type", "")
-        if "text" in content_type or "json" in content_type or "html" in content_type:
-            return data.decode()
-        return data
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=timeout) as response:
+            data = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+            content_type = response.headers.get("Content-Type", "")
+            response_headers = dict(response.headers.items())
+            status_code = getattr(response, "status", None) or response.getcode()
+            if binary is True:
+                return _HttpGetBytes(data, status_code, response_headers, response.geturl())
+            if binary is False or "text" in content_type or "json" in content_type or "html" in content_type:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return _HttpGetText(data.decode(charset, errors="replace"), status_code, response_headers, response.geturl())
+            return _HttpGetBytes(data, status_code, response_headers, response.geturl())
+    except urllib.error.HTTPError as exc:
+        guidance = (
+            "http_get received HTTP "
+            f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with js(fetch(...)), "
+            "pass site-specific headers/cookies, or configure the Browser Use fetch proxy with BROWSER_USE_API_KEY."
+        )
+        raise RuntimeError(guidance) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
+        ) from exc

@@ -9,6 +9,10 @@ Important execution model:
 - Each `browser_script` call starts a fresh Python process.
 - Python variables do not persist across calls.
 - Browser/CDP state persists in Rust.
+- Fast calls return their final result immediately. Long calls return `status: running` with a `run_id`; keep observing that same run until it finishes, fails, or is cancelled.
+- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. If observe reports no new output, wait/back off instead of polling in a tight loop.
+- To stop a running script, call this tool with `action="cancel"` and the `run_id`. Partial images and artifacts emitted before cancellation are preserved.
+- A failed `browser_script` call may include a short diagnosis. Read that diagnosis first: if it says the browser is still connected or the same page is usable, continue from the same page instead of reconnecting.
 - Helpers are preimported; you do not need imports for normal browser work.
 - CDP is the source of truth. If a helper is incomplete, use `cdp(...)` directly.
 - Keep browser actions sequential and deliberate.
@@ -32,7 +36,7 @@ screenshot_clip(label, x, y, width, height)
 click_at_xy(x, y)
 fill_input(selector, text, clear=True)
 type_text(text)
-press_key(key)
+press_key(key, modifiers=0)  # accepts chords like "Meta+A"; modifiers: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8
 scroll(x=0, y=600)
 
 wait_for_load(timeout=10)
@@ -56,17 +60,28 @@ session_metadata()
 audit_artifact(data=None, **requirements)
 load_agent_helpers()
 agent_workspace()
+domain_skills_for_url(url_or_domain, include_content=False)
+last_domain_skills(include_content=False)
 ```
 
 Usage guidance:
 
-- `goto_url(url)` navigates the current controlled tab. Use `new_tab(url)` only when you intentionally want another tab.
+- First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab.
+- Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
+- For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
+- Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
+- If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
+- If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
+- If a running script emits screenshots/images before it finishes, `observe` returns those images as soon as they are available. Use the pixels to guide the next observe/retry.
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
+- For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
+- Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
+- For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.

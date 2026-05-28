@@ -1,5 +1,9 @@
 use anyhow::Result;
-use browser_use_protocol::{HistoryRow, TelemetrySummary, WorkbenchState};
+use browser_use_core::CollaborationModeKind;
+use browser_use_protocol::{
+    instruction_sources_from_events, startup_warnings_from_events, HistoryRow, TelemetrySummary,
+    WorkbenchState,
+};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
@@ -11,14 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
-    VISIBLE_MODEL_CHOICES,
+    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
+    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
 
-use super::{App, ProductState, SetupResultKind, Surface};
+use super::{
+    collaboration_mode_label, App, MessageActionKind, ProductState, RequestUserInputFocus,
+    SetupResultKind, Surface,
+};
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
@@ -384,15 +390,23 @@ fn main_bottom_height_for(
     if !surface.is_bottom_pane() {
         return composer_pane_height(app, product_state, area.width);
     }
-    let line_count =
-        surface_lines(surface, app, state, content_width(area.width) as usize).len() as u16;
+    let line_count = surface_lines(
+        surface,
+        app,
+        state,
+        content_width(area.width) as usize,
+        usize::MAX,
+    )
+    .len() as u16;
     let max_height = match surface {
-        Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
+        Surface::Model | Surface::History | Surface::Messages => {
+            area.height.saturating_sub(2).max(6)
+        }
         Surface::BrowserSelect => 22,
         _ => 18,
     };
-    // Add room for the surface header (rule + title + description + spacer).
-    let desired = line_count.saturating_add(6).clamp(8, max_height);
+    // Add room for the surface header, footer, borders, and content margins.
+    let desired = line_count.saturating_add(10).clamp(8, max_height);
     let available = area.height.saturating_sub(2).max(4);
     desired.min(available)
 }
@@ -436,11 +450,11 @@ fn render_bottom_pane(
     frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
     let body_area = content_area(chunks[1]);
     let body_width = body_area.width as usize;
-    let mut lines = surface_lines(surface, app, state, body_width);
+    let mut lines = surface_lines(surface, app, state, body_width, body_area.height as usize);
     // For surfaces whose body is a straight list of selectable rows indexed by
-    // `selected_row` (currently just History), keep the selection in view by
+    // `selected_row`, keep the selection in view by
     // dropping rows from the top once it would otherwise scroll off the bottom.
-    if matches!(surface, Surface::History) {
+    if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
             let skip = app.selected_row + 1 - body_h;
@@ -469,6 +483,9 @@ pub(crate) fn active_modal_overlay(
 ) -> Option<ModalOverlay> {
     if app.is_slash_palette_active() {
         return command_palette_overlay(app, area);
+    }
+    if app.prompt_history.search.is_some() {
+        return prompt_history_search_overlay(app, area);
     }
     if app.surface.is_popup() {
         return surface_popup_overlay(app, state, area, app.surface);
@@ -547,9 +564,13 @@ fn surface_popup_rect(
     const MIN_W: u16 = 40;
     const MIN_H: u16 = 10;
     const MAX_W: u16 = 84;
-    const MAX_H: u16 = 26;
     const H_MARGIN: u16 = 4;
-    const V_MARGIN: u16 = 2;
+    let max_h = if surface == Surface::Model {
+        area.height
+    } else {
+        26
+    };
+    let v_margin: u16 = if surface == Surface::Model { 0 } else { 2 };
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -565,15 +586,16 @@ fn surface_popup_rect(
     let body_inner_width = popup_w
         .saturating_sub(2 + CONTENT_HORIZONTAL_MARGIN * 2)
         .max(1) as usize;
-    let body_line_count = surface_lines(surface, app, state, body_inner_width).len() as u16;
+    let body_line_count =
+        surface_lines(surface, app, state, body_inner_width, usize::MAX).len() as u16;
     let desired_h = body_line_count.saturating_add(8);
 
     let popup_h = if area.height <= MIN_H {
         area.height
     } else {
         desired_h
-            .clamp(MIN_H, MAX_H)
-            .min(area.height.saturating_sub(V_MARGIN.saturating_mul(2)))
+            .clamp(MIN_H, max_h)
+            .min(area.height.saturating_sub(v_margin.saturating_mul(2)))
             .max(MIN_H.min(area.height))
     };
 
@@ -610,7 +632,7 @@ fn render_surface_popup_box(
     // Layout inside the popup: header lines, body, footer line.
     let header = surface_header_lines(surface, inner.width);
     let header_h = (header.len() as u16).min(inner.height);
-    let footer_text = surface_footer(surface);
+    let footer_text = surface_footer_for_app(surface, app);
     let footer_h: u16 = if footer_text.is_empty() { 0 } else { 1 };
     let body_h = inner
         .height
@@ -629,8 +651,14 @@ fn render_surface_popup_box(
     Paragraph::new(header).render(content_area(chunks[0]), buffer);
 
     let body_area = content_area(chunks[1]);
-    let mut lines = surface_lines(surface, app, state, body_area.width as usize);
-    if matches!(surface, Surface::History) {
+    let mut lines = surface_lines(
+        surface,
+        app,
+        state,
+        body_area.width as usize,
+        body_area.height as usize,
+    );
+    if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
             let skip = app.selected_row + 1 - body_h;
@@ -831,6 +859,147 @@ fn render_command_palette_box(
     cursor
 }
 
+fn prompt_history_search_overlay(app: &App, area: Rect) -> Option<ModalOverlay> {
+    let rect = prompt_history_search_popup_rect(area)?;
+    let local_rect = Rect::new(0, 0, rect.width, rect.height);
+    let mut buffer = Buffer::empty(local_rect);
+    let local_cursor = render_prompt_history_search_box(&mut buffer, local_rect, app)?;
+    let cursor = Position {
+        x: rect.x.saturating_add(local_cursor.x),
+        y: rect.y.saturating_add(local_cursor.y),
+    };
+    Some(ModalOverlay {
+        rect,
+        buffer,
+        cursor: Some(cursor),
+    })
+}
+
+fn prompt_history_search_popup_rect(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    const MIN_W: u16 = 40;
+    const MIN_H: u16 = 9;
+    const MAX_W: u16 = 84;
+    const H_MARGIN: u16 = 4;
+    const V_MARGIN: u16 = 2;
+
+    let popup_w = if area.width <= MIN_W {
+        area.width
+    } else {
+        area.width
+            .saturating_sub(H_MARGIN.saturating_mul(2))
+            .min(MAX_W)
+            .max(MIN_W)
+    };
+    let available_h = area
+        .height
+        .saturating_sub(V_MARGIN.saturating_mul(2))
+        .max(MIN_H.min(area.height));
+    let popup_h = 11.min(available_h).max(MIN_H.min(available_h));
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    Some(Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    })
+}
+
+fn render_prompt_history_search_box(
+    buffer: &mut Buffer,
+    popup_rect: Rect,
+    app: &App,
+) -> Option<Position> {
+    let search = app.prompt_history.search.as_ref()?;
+    Clear.render(popup_rect, buffer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border());
+    let inner = block.inner(popup_rect);
+    block.render(popup_rect, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let input_area = chunks[0];
+    let query = search.query.clone();
+    Paragraph::new(Line::from(vec![
+        Span::styled("> ", accent()),
+        Span::styled(query.clone(), text_style()),
+    ]))
+    .render(input_area, buffer);
+    let cursor = Position {
+        x: input_area
+            .x
+            .saturating_add(2)
+            .saturating_add((query.chars().count() as u16).min(input_area.width.saturating_sub(2))),
+        y: input_area.y,
+    };
+
+    Paragraph::new(Line::from("")).render(chunks[1], buffer);
+
+    let body_width = chunks[2].width as usize;
+    let body_h = chunks[2].height as usize;
+    let mut rows = prompt_history_search_rows(search, body_width);
+    if rows.len() > body_h {
+        rows.truncate(body_h);
+    }
+    Paragraph::new(rows)
+        .style(Style::default().fg(text()))
+        .wrap(Wrap { trim: false })
+        .render(chunks[2], buffer);
+
+    Paragraph::new(Line::from(Span::styled(
+        " ctrl+r/↑ older · ctrl+s/↓ newer · enter accept · esc cancel",
+        muted(),
+    )))
+    .alignment(Alignment::Right)
+    .render(chunks[3], buffer);
+    Some(cursor)
+}
+
+fn prompt_history_search_rows(
+    search: &super::PromptHistorySearchState,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if search.query.trim().is_empty() {
+        return vec![Line::from(Span::styled("  ", muted()))];
+    }
+    if search.matches.is_empty() {
+        return vec![Line::from(Span::styled("  No matching prompts.", muted()))];
+    }
+    search
+        .matches
+        .iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            let is_selected = search.selected == Some(idx);
+            let marker = if is_selected { "› " } else { "  " };
+            let preview = truncate(&first_line(text), width.saturating_sub(6).max(4));
+            let style = if is_selected { text_style() } else { muted() };
+            highlight_selectable_row(
+                vec![Span::styled(marker, accent()), Span::styled(preview, style)],
+                is_selected,
+                width,
+            )
+        })
+        .collect()
+}
+
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
     let height = height as usize;
     if height == 0 {
@@ -894,7 +1063,7 @@ fn render_surface(
         app.welcome_logo_rect.set(None);
     }
     let body_width = body_area.width as usize;
-    let mut lines = surface_lines(surface, app, state, body_width);
+    let mut lines = surface_lines(surface, app, state, body_width, body_area.height as usize);
     trim_trailing_whitespace(&mut lines);
     frame.render_widget(
         Paragraph::new(lines)
@@ -903,7 +1072,7 @@ fn render_surface(
         body_area,
     );
     frame.render_widget(
-        Paragraph::new(surface_footer(surface))
+        Paragraph::new(surface_footer_for_app(surface, app))
             .style(muted())
             .alignment(Alignment::Right),
         chunks[2],
@@ -920,9 +1089,14 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
         Surface::Model => ("Model", "Choose the model and provider for this session"),
+        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::History => ("History", "Browse and resume previous tasks"),
+        Surface::Messages => (
+            "Messages",
+            "Edit submitted prompts or cancel queued follow-ups",
+        ),
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
         Surface::Main => ("", ""),
     }
@@ -952,6 +1126,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
         Surface::History => "",
+        Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
@@ -960,11 +1135,28 @@ fn surface_footer(surface: Surface) -> &'static str {
     }
 }
 
+fn messages_footer(app: &App) -> &'static str {
+    if app.selected_message_action_is_queued() {
+        "Enter:edit | Del:cancel queued | Esc:close"
+    } else {
+        "Enter:edit | Esc:close"
+    }
+}
+
+fn surface_footer_for_app(surface: Surface, app: &App) -> &'static str {
+    if surface == Surface::Messages {
+        messages_footer(app)
+    } else {
+        surface_footer(surface)
+    }
+}
+
 fn surface_lines(
     surface: Surface,
     app: &App,
     state: &WorkbenchState,
     width: usize,
+    height: usize,
 ) -> Vec<Line<'static>> {
     match surface {
         Surface::Setup => setup_lines(app, width),
@@ -973,10 +1165,12 @@ fn surface_lines(
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
-        Surface::Model => model_lines(app),
+        Surface::Model => model_lines(app, height),
+        Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::History => history_lines(app, state, width),
+        Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
         Surface::Main => Vec::new(),
     }
@@ -1107,14 +1301,40 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
 /// Status row below the composer: active model and context-fill bar,
 /// plus running cost when there is one. The browser lives on the box's
 /// bottom border, not here.
-fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
+fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
-    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
+    spans.push(Span::styled(
+        collaboration_mode_label(app.collaboration_mode).to_string(),
+        muted(),
+    ));
+    spans.push(status_separator());
+    spans.extend(context_bar_spans(
+        usage.context_tokens.unwrap_or(0),
+        usage.context_budget_tokens,
+    ));
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
+    }
+    if let Some(live_url) = state
+        .browser
+        .live_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let used = spans_text_width(&spans);
+        let prefix_width = status_separator_width() + "live ".chars().count();
+        if width > used.saturating_add(prefix_width).saturating_add(8) {
+            let available = width.saturating_sub(used + prefix_width);
+            spans.push(status_separator());
+            spans.push(Span::styled(
+                format!("live {}", truncate(live_url, available)),
+                muted(),
+            ));
+        }
     }
     Line::from(spans)
 }
@@ -1155,10 +1375,9 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Token budget the context bar fills toward. `browser-use-core` compacts the
-/// conversation at `max_context_chars` (240_000) / `APPROX_CHARS_PER_TOKEN` (4),
-/// so the agent operates within ~60k tokens regardless of the underlying model.
-const CONTEXT_BUDGET_TOKENS: i64 = 60_000;
+/// Fallback budget for older sessions that predate Codex-style `token_count`
+/// events with model context-window metadata.
+const FALLBACK_CONTEXT_BUDGET_TOKENS: i64 = 60_000;
 
 /// Width, in cells, of the filled/empty context bar.
 const CONTEXT_BAR_WIDTH: usize = 10;
@@ -1166,9 +1385,12 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 /// A plain context bar — solid `█` fill over a `░` track — followed by the
 /// `used/budget` token counts. Turns red as the conversation nears the
 /// compaction budget.
-fn context_bar_spans(used_tokens: i64) -> Vec<Span<'static>> {
+fn context_bar_spans(used_tokens: i64, budget_tokens: Option<i64>) -> Vec<Span<'static>> {
     let used_tokens = used_tokens.max(0);
-    let ratio = (used_tokens as f64 / CONTEXT_BUDGET_TOKENS as f64).clamp(0.0, 1.0);
+    let budget_tokens = budget_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let ratio = (used_tokens as f64 / budget_tokens as f64).clamp(0.0, 1.0);
     let fill_style = if ratio >= 0.9 { failed() } else { accent() };
 
     let filled = ((ratio * CONTEXT_BAR_WIDTH as f64).round() as usize).min(CONTEXT_BAR_WIDTH);
@@ -1181,7 +1403,7 @@ fn context_bar_spans(used_tokens: i64) -> Vec<Span<'static>> {
             format!(
                 "{}/{}",
                 format_token_count(used_tokens),
-                format_token_count(CONTEXT_BUDGET_TOKENS)
+                format_token_count(budget_tokens)
             ),
             muted(),
         ),
@@ -1194,10 +1416,21 @@ fn status_separator() -> Span<'static> {
     Span::styled("  ·  ", dim())
 }
 
-/// Per-session token and cost totals derived from `model.usage` store events.
+fn status_separator_width() -> usize {
+    5
+}
+
+fn spans_text_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
+}
+
+/// Per-session token and cost totals. Codex-style `token_count` events are the
+/// source of truth for context occupancy; legacy `model.usage` remains a
+/// fallback for old sessions and the cost source.
 struct SessionUsage {
     /// Prompt tokens of the most recent model turn — i.e. current context occupancy.
     context_tokens: Option<i64>,
+    context_budget_tokens: Option<i64>,
     /// Accumulated estimated cost across the whole session, in USD.
     cost_usd: f64,
 }
@@ -1205,29 +1438,55 @@ struct SessionUsage {
 fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
     let mut usage = SessionUsage {
         context_tokens: None,
+        context_budget_tokens: None,
         cost_usd: 0.0,
     };
     let Some(session) = state.current_session.as_ref() else {
         return usage;
     };
+    let mut legacy_context_tokens = None;
     for event in app.cached_events_for_session(&session.id) {
-        if event.event_type != "model.usage" {
-            continue;
+        match event.event_type.as_str() {
+            "token_count" => {
+                let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
+                    continue;
+                };
+                if let Some(total_tokens) = info
+                    .get("last_token_usage")
+                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(serde_json::Value::as_i64)
+                {
+                    usage.context_tokens = Some(total_tokens);
+                }
+                if let Some(model_context_window) = info
+                    .get("model_context_window")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|tokens| *tokens > 0)
+                {
+                    usage.context_budget_tokens = Some(model_context_window);
+                }
+            }
+            "model.usage" => {
+                if let Some(input_tokens) = event
+                    .payload
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                {
+                    legacy_context_tokens = Some(input_tokens);
+                }
+                if let Some(cost) = event
+                    .payload
+                    .get("cost_usd")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    usage.cost_usd += cost;
+                }
+            }
+            _ => {}
         }
-        if let Some(input_tokens) = event
-            .payload
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_i64)
-        {
-            usage.context_tokens = Some(input_tokens);
-        }
-        if let Some(cost) = event
-            .payload
-            .get("cost_usd")
-            .and_then(serde_json::Value::as_f64)
-        {
-            usage.cost_usd += cost;
-        }
+    }
+    if usage.context_tokens.is_none() {
+        usage.context_tokens = legacy_context_tokens;
     }
     usage
 }
@@ -1247,7 +1506,20 @@ fn format_token_count(tokens: i64) -> String {
 
 fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
     let current_session = state.current_session.as_ref();
-    let placeholder = if current_session.is_some_and(|session| session.status.is_active()) {
+    let pending_request = current_session
+        .filter(|session| session.status.is_active())
+        .and_then(|session| app.pending_request_user_input(&session.id));
+    let placeholder = if pending_request.is_some() {
+        if app
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.focus == RequestUserInputFocus::Notes)
+        {
+            "Add notes..."
+        } else {
+            "Answer the agent's question..."
+        }
+    } else if current_session.is_some_and(|session| session.status.is_active()) {
         "Type to steer the agent..."
     } else if current_session.is_some() {
         "Ask a follow-up..."
@@ -1303,7 +1575,9 @@ fn render_footer(
     {
         "ctrl+c again to quit"
     } else if app.escape_stop_is_pending() {
-        "esc again to stop"
+        "esc again to edit messages"
+    } else if app.surface == Surface::Messages {
+        messages_footer(app)
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
@@ -1806,53 +2080,88 @@ fn telemetry_key_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn model_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
-        lines.push(Line::from(Span::styled(notice.clone(), failed())));
-        lines.push(Line::from(""));
+        lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
+        lines.push((None, Line::from("")));
     }
-    lines.push(Line::from(Span::styled("recommended", muted())));
-    let mut row_idx = 0;
-    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx == 0) {
-        lines.push(model_row(idx, row_idx, app));
-        row_idx += 1;
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("bring your own key", muted())));
-    for &idx in VISIBLE_MODEL_CHOICES
+    lines.push((None, Line::from(Span::styled("recommended", muted()))));
+    let mut row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::Recommended, 0);
+    lines.push((None, Line::from("")));
+    lines.push((
+        None,
+        Line::from(Span::styled("bring your own key", muted())),
+    ));
+    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::BringYourOwnKey, row_idx);
+    lines.push((None, Line::from("")));
+    lines.push((None, Line::from(Span::styled("openrouter", muted()))));
+    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenRouter, row_idx);
+    lines.push((None, Line::from("")));
+    lines.push((None, Line::from(Span::styled("deepseek", muted()))));
+    push_model_group_lines(&mut lines, app, ModelChoiceGroup::Deepseek, row_idx);
+    crop_model_lines(lines, app.selected_row, height)
+}
+
+fn push_model_group_lines(
+    lines: &mut Vec<(Option<usize>, Line<'static>)>,
+    app: &App,
+    group: ModelChoiceGroup,
+    mut row_idx: usize,
+) -> usize {
+    for (idx, _) in app
+        .model_choices
         .iter()
-        .filter(|&&idx| (3..=5).contains(&idx))
+        .enumerate()
+        .filter(|(_, choice)| choice.group == group)
     {
-        lines.push(model_row(idx, row_idx, app));
+        lines.push((Some(row_idx), model_row(idx, row_idx, app)));
         row_idx += 1;
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("openrouter", muted())));
-    for &idx in VISIBLE_MODEL_CHOICES
+    row_idx
+}
+
+fn crop_model_lines(
+    lines: Vec<(Option<usize>, Line<'static>)>,
+    selected_row: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= height {
+        return lines.into_iter().map(|(_, line)| line).collect();
+    }
+    let selected_line = lines
         .iter()
-        .filter(|&&idx| (6..=8).contains(&idx))
-    {
-        lines.push(model_row(idx, row_idx, app));
-        row_idx += 1;
+        .position(|(row, _)| *row == Some(selected_row))
+        .unwrap_or(0);
+    let visible = height;
+    let mut start = selected_line.saturating_sub(visible / 2);
+    start = start.min(lines.len().saturating_sub(visible));
+    let end = (start + visible).min(lines.len());
+    let mut visible_lines = lines[start..end]
+        .iter()
+        .map(|(_, line)| line.clone())
+        .collect::<Vec<_>>();
+    if start > 0 {
+        visible_lines[0] = Line::from(Span::styled("  ...", muted()));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("deepseek", muted())));
-    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx == 9) {
-        lines.push(model_row(idx, row_idx, app));
-        row_idx += 1;
+    if end < lines.len() {
+        let last = visible_lines.len().saturating_sub(1);
+        visible_lines[last] = Line::from(Span::styled("  ...", muted()));
     }
-    lines
+    visible_lines
 }
 
 fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
-    let choice = MODEL_CHOICES[idx];
+    let choice = &app.model_choices[idx];
     let is_selected = row_idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
     let name_style = if is_selected { bold() } else { text_style() };
     let access = access_label(choice.account);
-    let descriptor = descriptor_for(idx);
+    let descriptor = choice.descriptor.as_str();
     let descriptor_style = if descriptor == "needs key" {
         dim()
     } else {
@@ -1860,9 +2169,9 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     };
     highlight_selectable_row(
         vec![
-            Span::styled(format!("{:<20}", choice.display), name_style),
+            Span::styled(fixed_width_cell(&choice.display, 20), name_style),
             Span::styled(format!("{:<22}", access), muted()),
-            Span::styled(format!("{:<22}", descriptor), descriptor_style),
+            Span::styled(fixed_width_cell(descriptor, 22), descriptor_style),
             Span::styled(if current { " *" } else { "" }.to_string(), done()),
         ],
         is_selected,
@@ -1873,6 +2182,64 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     )
 }
 
+fn fixed_width_cell(value: &str, width: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= width {
+        return format!("{value:<width$}");
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    out.push('~');
+    out
+}
+
+fn mode_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        mode_row(
+            0,
+            app,
+            CollaborationModeKind::Default,
+            "Default",
+            "execute tasks and update TODOs",
+        ),
+        mode_row(
+            1,
+            app,
+            CollaborationModeKind::Plan,
+            "Plan",
+            "propose a plan before implementation",
+        ),
+    ]
+}
+
+fn mode_row(
+    row_idx: usize,
+    app: &App,
+    mode: CollaborationModeKind,
+    label: &'static str,
+    description: &'static str,
+) -> Line<'static> {
+    let is_selected = row_idx == app.selected_row;
+    let current = app.collaboration_mode == mode;
+    highlight_selectable_row(
+        vec![
+            Span::styled(
+                format!("{label:<12}"),
+                if is_selected { bold() } else { text_style() },
+            ),
+            Span::styled(format!("{description:<38}"), muted()),
+            Span::styled(if current { " *" } else { "" }.to_string(), done()),
+        ],
+        is_selected,
+        56,
+    )
+}
+
 fn access_label(account: &'static str) -> &'static str {
     if account == ACCOUNT_CODEX {
         "Codex login"
@@ -1880,16 +2247,6 @@ fn access_label(account: &'static str) -> &'static str {
         "Claude Code sub"
     } else {
         account
-    }
-}
-
-fn descriptor_for(idx: usize) -> &'static str {
-    match idx {
-        0 => "best default",
-        1 => "good browser agent",
-        2 => "latest, strongest",
-        7 => "vision + tools",
-        _ => "needs key",
     }
 }
 
@@ -2035,12 +2392,7 @@ fn browser_panel_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> 
         ),
         kv_line(
             "live view",
-            state
-                .browser
-                .live_url
-                .as_deref()
-                .map(|_| "available")
-                .unwrap_or("not available"),
+            state.browser.live_url.as_deref().unwrap_or("not available"),
         ),
         kv_line(
             "tabs",
@@ -2054,16 +2406,62 @@ fn browser_panel_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> 
             "viewport",
             state.browser.viewport.as_deref().unwrap_or("unknown"),
         ),
+    ];
+    if let Some(issue) = latest_browser_issue(app, state) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Last issue", bold())));
+        lines.push(kv_line("issue", &truncate(&issue.summary, 86)));
+        if let Some(next_step) = issue.next_step.as_ref() {
+            lines.push(kv_line("next", &truncate(next_step, 86)));
+        }
+    }
+    lines.extend([
         Line::from(""),
         selected("Open live browser", 0, app.selected_row),
         selected("Reconnect", 1, app.selected_row),
         selected("Change browser", 2, app.selected_row),
-    ];
+    ]);
     if let Some(notice) = app.browser_notice.as_ref() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(notice.clone(), muted())));
     }
     lines
+}
+
+#[derive(Debug)]
+struct BrowserIssueDisplay {
+    summary: String,
+    next_step: Option<String>,
+}
+
+fn latest_browser_issue(app: &App, state: &WorkbenchState) -> Option<BrowserIssueDisplay> {
+    let session = state.current_session.as_ref()?;
+    app.cached_events_for_session(&session.id)
+        .iter()
+        .rev()
+        .find_map(|event| {
+            event
+                .payload
+                .get("diagnosis")
+                .or_else(|| event.payload.get("last_issue"))
+                .and_then(browser_issue_display_from_value)
+        })
+}
+
+fn browser_issue_display_from_value(value: &serde_json::Value) -> Option<BrowserIssueDisplay> {
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let next_step = value
+        .get("next_step")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some(BrowserIssueDisplay { summary, next_step })
 }
 
 fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
@@ -2075,6 +2473,31 @@ fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'s
         .iter()
         .enumerate()
         .map(|(idx, row)| history_overlay_line(row, idx, app.selected_row, width))
+        .collect()
+}
+
+fn message_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let rows = app.message_action_rows();
+    if rows.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No submitted messages yet.",
+            dim(),
+        ))];
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let kind = match row.kind {
+                MessageActionKind::Submitted if row.followup => "sent",
+                MessageActionKind::Submitted => "start",
+                MessageActionKind::Queued => "queued",
+            };
+            let content = vec![
+                Span::styled(format!("{kind:<8}"), muted()),
+                Span::styled(truncate(&row.text, width.saturating_sub(12)), text_style()),
+            ];
+            highlight_selectable_row(content, idx == app.selected_row, width)
+        })
         .collect()
 }
 
@@ -2101,17 +2524,42 @@ fn developer_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled("No task selected.", dim())));
         return lines;
     };
+    let events = app.cached_events_for_session(&session.id);
+    let instruction_sources = instruction_sources_from_events(events);
+    if !instruction_sources.is_empty() {
+        lines.push(Line::from(Span::styled("Instruction sources", bold())));
+        lines.push(Line::from(""));
+        for source in instruction_sources.iter().take(8) {
+            lines.push(kv_line("agents", source));
+        }
+        if instruction_sources.len() > 8 {
+            lines.push(Line::from(Span::styled(
+                format!("{} more source(s)", instruction_sources.len() - 8),
+                dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    let startup_warnings = startup_warnings_from_events(events);
+    if !startup_warnings.is_empty() {
+        lines.push(Line::from(Span::styled("Startup warnings", bold())));
+        lines.push(Line::from(""));
+        for warning in startup_warnings.iter().take(4) {
+            lines.push(Line::from(Span::styled(truncate(warning, 80), muted())));
+        }
+        if startup_warnings.len() > 4 {
+            lines.push(Line::from(Span::styled(
+                format!("{} more warning(s)", startup_warnings.len() - 4),
+                dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     append_telemetry_detail_lines(&mut lines, &state.telemetry);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Events", bold())));
     lines.push(Line::from(""));
-    for event in app
-        .cached_events_for_session(&session.id)
-        .iter()
-        .rev()
-        .take(12)
-        .rev()
-    {
+    for event in events.iter().rev().take(12).rev() {
         let payload = truncate(&event.payload.to_string(), 44);
         lines.push(Line::from(vec![
             Span::styled(format!("{:>4}  ", event.seq), muted()),

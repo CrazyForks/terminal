@@ -76,17 +76,35 @@ pub struct ArtifactMeta {
     pub created_ms: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_description: Option<String>,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeform: Option<FreeformToolFormat>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FreeformToolFormat {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub syntax: String,
+    pub definition: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub arguments: Value,
 }
 
@@ -118,6 +136,7 @@ pub struct ModelUsage {
     pub input_cached_tokens: Option<i64>,
     pub input_cache_creation_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub input_cost_usd: Option<f64>,
     pub input_cached_cost_usd: Option<f64>,
@@ -125,6 +144,37 @@ pub struct ModelUsage {
     pub output_cost_usd: Option<f64>,
     pub cost_usd: Option<f64>,
     pub cost_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct RateLimitSnapshot {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+    pub credits: Option<CreditsSnapshot>,
+    pub plan_type: Option<String>,
+    pub rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelVerification {
+    TrustedAccessForCyber,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -141,8 +191,37 @@ pub enum ModelEvent {
     ToolCall {
         call: ToolCall,
     },
+    CustomToolCallInputDelta {
+        call_id: String,
+        name: String,
+        delta: String,
+    },
     Usage {
         usage: ModelUsage,
+    },
+    ResponseOutputItem {
+        item: Value,
+    },
+    ResponseCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_turn: Option<bool>,
+    },
+    ServerModel {
+        model: String,
+    },
+    ModelRateLimits {
+        snapshot: RateLimitSnapshot,
+    },
+    ModelVerifications {
+        verifications: Vec<ModelVerification>,
+    },
+    ModelsEtag {
+        etag: String,
+    },
+    ServerReasoningIncluded {
+        included: bool,
     },
     Done,
 }
@@ -215,6 +294,55 @@ pub fn task_from_events(events: &[EventRecord]) -> Option<String> {
     })
 }
 
+pub fn startup_warnings_from_events(events: &[EventRecord]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "session.startup_warning")
+        .filter_map(|event| {
+            event
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+pub fn instruction_sources_from_events(events: &[EventRecord]) -> Vec<String> {
+    let mut sources = Vec::new();
+    for event in events {
+        if !matches!(
+            event.event_type.as_str(),
+            "session.instruction_sources" | "workspace.context"
+        ) {
+            continue;
+        }
+        if event.event_type == "workspace.context"
+            && event.payload.get("kind").and_then(Value::as_str) != Some("agents_md")
+        {
+            continue;
+        }
+        let Some(items) = event.payload.get("sources").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(source) = item
+                .as_str()
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+            else {
+                continue;
+            };
+            if !sources.iter().any(|existing| existing == source) {
+                sources.push(source.to_string());
+            }
+        }
+    }
+    sources
+}
+
 pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
     let mut starts = Vec::new();
     for (idx, event) in events.iter().enumerate() {
@@ -260,19 +388,30 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
 }
 
 pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
+    session_result_from_events(events).or_else(|| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event.event_type.as_str() {
+                "agent.completed" => event
+                    .payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("result"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|result| !result.is_empty())
+                    .map(normalize_result_text),
+                _ => None,
+            })
+    })
+}
+
+pub fn session_result_from_events(events: &[EventRecord]) -> Option<String> {
     events
         .iter()
         .rev()
         .find_map(|event| match event.event_type.as_str() {
             "session.done" => session_done_result_text(&event.payload),
-            "agent.completed" => event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("result"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|result| !result.is_empty())
-                .map(normalize_result_text),
             _ => None,
         })
 }
@@ -462,6 +601,7 @@ pub fn browser_summary_from_events(
                 summary.live_url = event
                     .payload
                     .get("live_url")
+                    .or_else(|| event.payload.get("url"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
             }
@@ -716,7 +856,7 @@ pub fn sanitized_agent_context_from_events(events: &[EventRecord]) -> Value {
     }
     serde_json::json!({
         "task": task_from_events(events),
-        "result": result_from_events(events),
+        "result": session_result_from_events(events),
         "failure": failure_from_events(events),
         "browser": {
             "status": browser.status,
@@ -1044,7 +1184,7 @@ pub fn project_workbench(
         .as_ref()
         .is_some_and(|session| session.status == SessionStatus::Done)
     {
-        result_from_events(events_for_current)
+        session_result_from_events(events_for_current)
     } else {
         None
     };
@@ -1080,6 +1220,59 @@ pub fn project_workbench(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn event(seq: i64, event_type: &str, payload: Value) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("e{seq}"),
+            session_id: "s1".to_string(),
+            ts_ms: seq,
+            event_type: event_type.to_string(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn startup_warnings_and_instruction_sources_are_extracted_from_events() {
+        let events = vec![
+            event(
+                1,
+                "workspace.context",
+                json!({
+                    "kind": "agents_md",
+                    "sources": ["/repo/AGENTS.md"],
+                }),
+            ),
+            event(
+                2,
+                "session.instruction_sources",
+                json!({
+                    "source": "agents_md",
+                    "sources": ["/repo/AGENTS.md", "/repo/crates/AGENTS.md"],
+                }),
+            ),
+            event(
+                3,
+                "session.startup_warning",
+                json!({
+                    "source": "agents_md",
+                    "message": "Project AGENTS.md contains invalid UTF-8",
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            instruction_sources_from_events(&events),
+            vec![
+                "/repo/AGENTS.md".to_string(),
+                "/repo/crates/AGENTS.md".to_string()
+            ]
+        );
+        assert_eq!(
+            startup_warnings_from_events(&events),
+            vec!["Project AGENTS.md contains invalid UTF-8".to_string()]
+        );
+    }
 
     #[test]
     fn projects_task_result_browser_and_activity_from_events() {
@@ -1144,6 +1337,32 @@ mod tests {
                 "ran cargo test -p browser-use-core",
                 "modified main.rs",
             ]
+        );
+    }
+
+    #[test]
+    fn browser_live_url_projection_accepts_current_and_legacy_payload_keys() {
+        let current = vec![event(
+            1,
+            "browser.live_url",
+            json!({"live_url": "https://live.browser-use.com/watch"}),
+        )];
+        let browser = browser_summary_from_events(&current, "browser use cloud");
+        assert_eq!(browser.status, "connected");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/watch")
+        );
+
+        let legacy = vec![event(
+            1,
+            "browser.live_url",
+            json!({"url": "https://live.browser-use.com/legacy"}),
+        )];
+        let browser = browser_summary_from_events(&legacy, "browser use cloud");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/legacy")
         );
     }
 
@@ -1250,6 +1469,44 @@ mod tests {
             payload: json!({"result": format!("{answer}{answer}")}),
         }];
         assert_eq!(result_from_events(&events).as_deref(), Some(answer));
+    }
+
+    #[test]
+    fn session_result_ignores_subagent_completion_after_done() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 1,
+                event_type: "session.done".to_string(),
+                payload: json!({"result": "parent answer"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 2,
+                event_type: "agent.completed".to_string(),
+                payload: json!({
+                    "child_session_id": "child",
+                    "status": "done",
+                    "payload": {"result": "child answer"},
+                }),
+            },
+        ];
+
+        assert_eq!(
+            session_result_from_events(&events).as_deref(),
+            Some("parent answer")
+        );
+        assert_eq!(
+            result_from_events(&events).as_deref(),
+            Some("parent answer")
+        );
+
+        let context = sanitized_agent_context_from_events(&events);
+        assert_eq!(context["result"], "parent answer");
     }
 
     #[test]
@@ -1807,6 +2064,7 @@ mod tests {
             call: ToolCall {
                 id: "call_1".to_string(),
                 name: "python".to_string(),
+                namespace: None,
                 arguments: json!({"code": "print(1)"}),
             },
         };
