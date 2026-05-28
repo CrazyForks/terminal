@@ -506,6 +506,24 @@ fn event_payload_text(event: &EventRecord) -> Option<String> {
     user_input_display_text_from_payload(&event.payload)
 }
 
+fn event_is_pre_output_after_submission(event: &EventRecord, target_seq: i64) -> bool {
+    match event.event_type.as_str() {
+        "model.turn.request" | "model.thinking_delta" | "session.status" => true,
+        "workspace.context"
+        | "model.switch_context"
+        | "model.personality_context"
+        | "model.collaboration_context"
+        | "model.generated_image_context" => {
+            event
+                .payload
+                .get("before_seq")
+                .and_then(serde_json::Value::as_i64)
+                == Some(target_seq)
+        }
+        _ => false,
+    }
+}
+
 fn queued_followup_marker_seq(event: &EventRecord) -> Option<i64> {
     event
         .payload
@@ -1985,6 +2003,57 @@ impl App {
         rows
     }
 
+    fn latest_reclaimable_submitted_message(
+        &mut self,
+    ) -> Result<Option<(String, MessageActionRow, bool)>> {
+        if !self.composer.is_empty() {
+            return Ok(None);
+        }
+        self.refresh_state_cache_from_store()?;
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(None);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(None);
+        };
+        if !session.status.is_active() {
+            return Ok(None);
+        }
+        let events = self.store.events_for_session(&session_id)?;
+        let filtered = browser_use_core::rollback_filtered_event_records(&events);
+        let Some(row) = filtered.iter().rev().find_map(|event| {
+            if !matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup"
+            ) {
+                return None;
+            }
+            event_payload_text(event).map(|text| MessageActionRow {
+                seq: event.seq,
+                kind: MessageActionKind::Submitted,
+                text,
+                followup: event.event_type == "session.followup",
+            })
+        }) else {
+            return Ok(None);
+        };
+        let pre_output_only = events
+            .iter()
+            .filter(|event| event.seq > row.seq)
+            .all(|event| event_is_pre_output_after_submission(event, row.seq));
+        if !pre_output_only {
+            return Ok(None);
+        }
+        let has_prior_submitted_message = filtered.iter().any(|event| {
+            event.seq < row.seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        });
+        Ok(Some((session_id, row, has_prior_submitted_message)))
+    }
+
     fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
         let mut state = empty_workbench_state(&self.browser);
         state.failure = Some("Could not load state.".to_string());
@@ -3151,11 +3220,31 @@ impl App {
                 "num_turns": num_turns,
                 "target_seq": row.seq,
                 "action": action,
-                "source": "tui_message_selector",
+                "source": if action == "take_back" { "tui_escape" } else { "tui_message_selector" },
             }),
         )?;
         self.native_history.reset_with_clear();
         Ok(())
+    }
+
+    fn reclaim_latest_submitted_message_before_output(&mut self) -> Result<bool> {
+        let Some((_session_id, row, has_prior_submitted_message)) =
+            self.latest_reclaimable_submitted_message()?
+        else {
+            return Ok(false);
+        };
+        self.rollback_submitted_message(&row, "take_back")?;
+        self.composer.set_input(row.text);
+        if !has_prior_submitted_message {
+            self.selected_session_id = None;
+            self.native_history.reset_with_clear();
+        }
+        self.close_surface();
+        self.escape_stop_until = None;
+        self.quit_hint_until = None;
+        self.status_notice = Some("Message returned to composer.".to_string());
+        self.refresh_state_cache_from_store()?;
+        Ok(true)
     }
 
     fn edit_selected_message(&mut self) -> Result<()> {
@@ -3193,6 +3282,9 @@ impl App {
         if self.escape_stop_is_pending() {
             self.open_message_actions()?;
             self.quit_hint_until = None;
+            return Ok(());
+        }
+        if self.reclaim_latest_submitted_message_before_output()? {
             return Ok(());
         }
         self.escape_stop_until =
@@ -11874,6 +11966,143 @@ wire_api = "responses"
     }
 
     #[test]
+    fn escape_once_reclaims_initial_prompt_before_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let submitted = app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "whats up"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "checking context"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "whats up");
+        assert_eq!(app.selected_session_id, None);
+        assert!(!app.escape_stop_is_pending());
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ROLLBACK_EVENT
+                && event.payload["action"] == "take_back"
+                && event.payload["source"] == "tui_escape"
+                && event.payload["target_seq"] == submitted.seq
+                && event.payload["num_turns"] == 1
+        }));
+        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert!(visible_submissions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_reclaims_followup_before_output_without_clearing_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "first answer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "revise this"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "revise this");
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some(session.id.as_str())
+        );
+        assert!(!app.escape_stop_is_pending());
+        let events = app.store.events_for_session(&session.id)?;
+        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_submissions, vec!["initial task"]);
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_does_not_reclaim_after_streamed_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "visible output"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert!(app.composer.input().is_empty());
+        assert!(app.escape_stop_is_pending());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        Ok(())
+    }
+
+    #[test]
     fn agent_panic_records_failed_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -11919,6 +12148,11 @@ wire_api = "responses"
             &running.id,
             "session.input",
             serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "visible output"}),
         )?;
         app.selected_session_id = Some(running.id.clone());
 

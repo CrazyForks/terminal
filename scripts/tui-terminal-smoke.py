@@ -720,6 +720,51 @@ def smoke_double_escape_opens_message_selector(binary: Path) -> None:
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def smoke_escape_reclaims_prompt_before_output(binary: Path) -> None:
+    session = f"but-smoke-esc-reclaim-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-reclaim-"))
+    prompt = "take this back"
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="done",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "esc-reclaim-start-ready")
+        tmux_send_literal(session, prompt)
+        tmux_send(session, "Enter")
+        wait_for(session, f"> {prompt}", "esc-reclaim-submitted")
+
+        tmux_send(session, "Escape")
+        reclaimed = wait_for(session, f"> {prompt}", "esc-reclaim-returned")
+        assert_not_contains(
+            reclaimed,
+            "esc again to edit messages",
+            "single escape before output should reclaim instead of arming the message selector",
+        )
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            rollback_count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE type = 'session.rollback' "
+                "AND payload_json LIKE '%\"action\":\"take_back\"%'"
+            ).fetchone()[0]
+        if rollback_count != 1:
+            raise AssertionError(f"expected one take_back rollback event, saw {rollback_count}")
+
+        tmux_send(session, "C-u")
+        cleared = capture_after_idle(session, "esc-reclaim-cleared", visible_only=True)
+        assert_not_contains(
+            cleared,
+            prompt,
+            "clearing the reclaimed composer text should remove the prompt from the visible terminal",
+        )
+        assert_not_contains(cleared, "^[[", "escape reclaim should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def smoke_tab_queues_followup_after_current_turn(binary: Path) -> None:
     session = f"but-smoke-tab-queue-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-tab-queue-"))
@@ -1485,6 +1530,7 @@ def main() -> int:
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
     smoke_double_escape_opens_message_selector(binary)
+    smoke_escape_reclaims_prompt_before_output(binary)
     smoke_tab_queues_followup_after_current_turn(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_streaming_transcript_scrolls_above_composer(binary)
