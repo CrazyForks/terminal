@@ -22,9 +22,11 @@ anyhow = "1"
 arboard = "3.6.1"
 base64 = "0.22"
 bm25 = "2.3.2"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+futures-util = "0.3"
 ignore = "0.4"
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -39,6 +41,7 @@ sha1 = "0.10.6"
 sha2 = "0.10"
 similar = "2.7.0"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 toml = "0.8"
 tree-sitter = "0.25.10"
 tree-sitter-bash = "0.25"
