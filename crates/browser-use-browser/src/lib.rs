@@ -2,16 +2,18 @@
 //!
 //! The LLM-facing split is intentional:
 //! - `browser` controls connection/lifecycle/debug state.
-//! - `browser_script` runs fresh Python for page interaction through this
-//!   Rust-held CDP connection.
+//! - `browser_execute` runs persistent JavaScript jobs through this Rust-held
+//!   CDP connection.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,6 +33,8 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
+const BROWSER_EXECUTOR_JS: &str = include_str!("browser_executor.js");
+const BROWSER_JOB_DEFAULT_OBSERVE_MS: u64 = 1_000;
 
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
@@ -40,6 +44,33 @@ pub struct BrowserCommandOutput {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct BrowserScriptOutput {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_observe_ms: Option<u64>,
+    pub text: String,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis: Option<BrowserIssueDiagnosis>,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default)]
+    pub outputs: Vec<Value>,
+    #[serde(default)]
+    pub summary: Vec<Value>,
+    #[serde(default)]
+    pub artifacts: Vec<Value>,
+    #[serde(default)]
+    pub images: Vec<Value>,
+    #[serde(default)]
+    pub browser_events: Vec<Value>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct BrowserJobOutput {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -121,9 +152,21 @@ struct Endpoint {
     candidate_id: Option<String>,
 }
 
+#[derive(Clone)]
 struct CdpConnection {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
-    next_id: u64,
+    tx: mpsc::Sender<CdpBrokerCommand>,
+    events: Arc<Mutex<VecDeque<Value>>>,
+}
+
+struct CdpBrokerCall {
+    method: String,
+    session_id: Option<String>,
+    params: Value,
+    response: mpsc::Sender<std::result::Result<Value, String>>,
+}
+
+enum CdpBrokerCommand {
+    Call(CdpBrokerCall),
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +259,47 @@ impl Default for BrowserSession {
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
 static BROWSER_SCRIPT_RUNS: OnceLock<Mutex<HashMap<String, BrowserScriptRun>>> = OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static BROWSER_JS_EXECUTORS: OnceLock<Mutex<HashMap<String, BrowserJsExecutor>>> = OnceLock::new();
+static BROWSER_JOB_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+struct BrowserJsExecutor {
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    state: Arc<BrowserExecutorSharedState>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+struct BrowserExecutorSharedState {
+    inner: Mutex<BrowserExecutorState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BrowserExecutorState {
+    jobs: HashMap<String, BrowserJobState>,
+    failed: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct BrowserJobState {
+    id: String,
+    session_id: String,
+    artifact_dir: PathBuf,
+    ok: bool,
+    status: String,
+    text: String,
+    error: Option<String>,
+    diagnosis: Option<BrowserIssueDiagnosis>,
+    data: Value,
+    outputs: Vec<Value>,
+    summary: Vec<Value>,
+    artifacts: Vec<Value>,
+    images: Vec<Value>,
+    browser_events: Vec<Value>,
+    seq: u64,
+    started_at_ms: u128,
+    timeout_ms: u64,
+}
 
 struct BrowserScriptRun {
     id: String,
@@ -248,6 +332,10 @@ fn browser_script_runs() -> &'static Mutex<HashMap<String, BrowserScriptRun>> {
     BROWSER_SCRIPT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn browser_js_executors() -> &'static Mutex<HashMap<String, BrowserJsExecutor>> {
+    BROWSER_JS_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn active_browser_script_runs_json(session_id: &str) -> Value {
     let runs = browser_script_runs()
         .lock()
@@ -265,6 +353,665 @@ fn active_browser_script_runs_json(session_id: &str) -> Value {
             })
             .collect(),
     )
+}
+
+fn active_browser_jobs_json(session_id: &str) -> Value {
+    let executors = browser_js_executors()
+        .lock()
+        .expect("browser JS executor registry poisoned");
+    let Some(executor) = executors.get(session_id) else {
+        return Value::Array(Vec::new());
+    };
+    let Ok(state) = executor.state.inner.lock() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        state
+            .jobs
+            .values()
+            .filter(|job| job.session_id == session_id && job.status == "running")
+            .map(|job| {
+                json!({
+                    "run_id": job.id,
+                    "status": job.status,
+                    "started_at_ms": job.started_at_ms as u64,
+                    "timeout_ms": job.timeout_ms,
+                    "next_step": format!("browser_observe run_id={}", job.id),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub fn execute_browser_js(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    code: &str,
+    yield_time_ms: u64,
+    timeout_ms: u64,
+) -> Result<BrowserJobOutput> {
+    if code.trim().is_empty() {
+        bail!("browser_execute requires non-empty code");
+    }
+    fs::create_dir_all(artifact_dir.as_ref())
+        .with_context(|| format!("create artifact dir {}", artifact_dir.as_ref().display()))?;
+    ensure_browser_session_has_connection(session_id)?;
+    let run_id = new_browser_job_run_id();
+    let timeout_ms = timeout_ms.max(1);
+    let yield_time_ms = yield_time_ms.clamp(1, 30_000);
+    let executor = ensure_browser_js_executor(session_id, cwd.as_ref(), artifact_dir.as_ref())?;
+    {
+        let mut state = executor
+            .state
+            .inner
+            .lock()
+            .expect("browser JS executor state poisoned");
+        state.jobs.insert(
+            run_id.clone(),
+            BrowserJobState {
+                id: run_id.clone(),
+                session_id: session_id.to_string(),
+                artifact_dir: artifact_dir.as_ref().to_path_buf(),
+                ok: true,
+                status: "running".to_string(),
+                started_at_ms: unix_time_ms(),
+                timeout_ms,
+                ..Default::default()
+            },
+        );
+        executor.state.changed.notify_all();
+    }
+    send_browser_executor_message(
+        &executor,
+        json!({
+            "type": "execute",
+            "run_id": run_id,
+            "code": code,
+            "timeout_ms": timeout_ms,
+        }),
+    )?;
+    wait_for_browser_job(
+        &executor.state,
+        &run_id,
+        0,
+        Duration::from_millis(yield_time_ms),
+    )
+}
+
+pub fn observe_browser_job(
+    session_id: &str,
+    run_id: &str,
+    yield_time_ms: u64,
+) -> Result<BrowserJobOutput> {
+    let executors = browser_js_executors()
+        .lock()
+        .expect("browser JS executor registry poisoned");
+    let executor = executors
+        .get(session_id)
+        .ok_or_else(|| anyhow!("unknown browser job {run_id:?}"))?;
+    let seq = {
+        let state = executor
+            .state
+            .inner
+            .lock()
+            .expect("browser JS executor state poisoned");
+        let job = state
+            .jobs
+            .get(run_id)
+            .ok_or_else(|| anyhow!("unknown browser job {run_id:?}"))?;
+        if job.session_id != session_id {
+            bail!("browser job {run_id} belongs to a different session");
+        }
+        job.seq
+    };
+    wait_for_browser_job(
+        &executor.state,
+        run_id,
+        seq,
+        Duration::from_millis(yield_time_ms.clamp(1, 30_000)),
+    )
+}
+
+pub fn cancel_browser_job(
+    session_id: &str,
+    run_id: &str,
+    reason: &str,
+) -> Result<BrowserJobOutput> {
+    let executors = browser_js_executors()
+        .lock()
+        .expect("browser JS executor registry poisoned");
+    let executor = executors
+        .get(session_id)
+        .ok_or_else(|| anyhow!("unknown browser job {run_id:?}"))?;
+    send_browser_executor_message(
+        executor,
+        json!({
+            "type": "cancel",
+            "run_id": run_id,
+            "reason": reason,
+        }),
+    )?;
+    wait_for_browser_job(
+        &executor.state,
+        run_id,
+        0,
+        Duration::from_millis(BROWSER_JOB_DEFAULT_OBSERVE_MS),
+    )
+}
+
+fn ensure_browser_js_executor(
+    session_id: &str,
+    cwd: &Path,
+    artifact_dir: &Path,
+) -> Result<BrowserJsExecutor> {
+    let mut executors = browser_js_executors()
+        .lock()
+        .expect("browser JS executor registry poisoned");
+    if let Some(executor) = executors.get(session_id) {
+        return Ok(executor.clone_for_use());
+    }
+    if !command_exists("bun") {
+        bail!("Bun is required for browser_execute but was not found on PATH");
+    }
+    fs::create_dir_all(artifact_dir)
+        .with_context(|| format!("create artifact dir {}", artifact_dir.display()))?;
+    let script_path = artifact_dir.join(".browser-executor.js");
+    fs::write(&script_path, BROWSER_EXECUTOR_JS)
+        .with_context(|| format!("write {}", script_path.display()))?;
+    let mut child = Command::new("bun")
+        .arg(&script_path)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn Bun browser executor")?;
+    let stdin = Arc::new(Mutex::new(
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Bun browser executor missing stdin"))?,
+    ));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Bun browser executor missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Bun browser executor missing stderr"))?;
+    let state = Arc::new(BrowserExecutorSharedState {
+        inner: Mutex::new(BrowserExecutorState::default()),
+        changed: Condvar::new(),
+    });
+    let reader_state = Arc::clone(&state);
+    let reader_stdin = Arc::clone(&stdin);
+    let reader_session_id = session_id.to_string();
+    let reader = thread::Builder::new()
+        .name(format!("browser-js-executor-{session_id}"))
+        .spawn(move || {
+            read_browser_executor_stdout(
+                stdout,
+                stderr,
+                reader_session_id,
+                reader_stdin,
+                reader_state,
+            )
+        })
+        .context("spawn browser executor reader")?;
+    let executor = BrowserJsExecutor {
+        child: Arc::new(Mutex::new(child)),
+        stdin,
+        state,
+        reader: Some(reader),
+    };
+    let clone = executor.clone_for_use();
+    executors.insert(session_id.to_string(), executor);
+    Ok(clone)
+}
+
+impl BrowserJsExecutor {
+    fn clone_for_use(&self) -> Self {
+        Self {
+            child: Arc::clone(&self.child),
+            stdin: Arc::clone(&self.stdin),
+            state: Arc::clone(&self.state),
+            reader: None,
+        }
+    }
+}
+
+fn send_browser_executor_message(executor: &BrowserJsExecutor, value: Value) -> Result<()> {
+    let mut stdin = executor
+        .stdin
+        .lock()
+        .expect("browser JS executor stdin poisoned");
+    serde_json::to_writer(&mut *stdin, &value)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn read_browser_executor_stdout(
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    session_id: String,
+    stdin: Arc<Mutex<ChildStdin>>,
+    state: Arc<BrowserExecutorSharedState>,
+) {
+    let stderr_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stderr.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => mark_browser_executor_failed(
+                    &stderr_state,
+                    format!("browser executor stderr: {}", line.trim_end()),
+                ),
+                Err(error) => {
+                    mark_browser_executor_failed(
+                        &stderr_state,
+                        format!("read browser executor stderr: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdout.read_line(&mut line) {
+            Ok(0) => {
+                mark_browser_executor_failed(&state, "browser executor exited".to_string());
+                break;
+            }
+            Ok(_) => {
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(message) => {
+                        handle_browser_executor_message(&session_id, &stdin, &state, message)
+                    }
+                    Err(error) => mark_browser_executor_failed(
+                        &state,
+                        format!("parse browser executor message: {error}: {trimmed}"),
+                    ),
+                }
+            }
+            Err(error) => {
+                mark_browser_executor_failed(
+                    &state,
+                    format!("read browser executor stdout: {error}"),
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn handle_browser_executor_message(
+    session_id: &str,
+    stdin: &Arc<Mutex<ChildStdin>>,
+    state: &Arc<BrowserExecutorSharedState>,
+    message: Value,
+) {
+    match message.get("type").and_then(Value::as_str).unwrap_or("") {
+        "cdp.call" => handle_browser_executor_cdp_call(session_id, stdin, message),
+        "run.log" => update_browser_job(state, &message, |job, message| {
+            if let Some(text) = message.get("text").and_then(Value::as_str) {
+                if !job.text.is_empty() && !job.text.ends_with('\n') {
+                    job.text.push('\n');
+                }
+                job.text.push_str(text);
+            }
+        }),
+        "run.checkpoint" => update_browser_job(state, &message, |job, message| {
+            job.summary.push(json!({
+                "kind": "checkpoint",
+                "label": message.get("label").cloned().unwrap_or(Value::Null),
+                "data": message.get("data").cloned().unwrap_or(Value::Null),
+            }));
+        }),
+        "run.output" => update_browser_job(state, &message, |job, message| {
+            if let Some(output) = message.get("output").cloned() {
+                job.outputs.push(output);
+            }
+        }),
+        "run.image" => update_browser_job(state, &message, |job, message| {
+            if let Some(image) = browser_job_image_artifact(job, message) {
+                job.images.push(image.clone());
+                job.artifacts.push(image);
+            }
+        }),
+        "run.artifact" => update_browser_job(state, &message, |job, message| {
+            if let Some(artifact) = message.get("artifact").cloned() {
+                job.artifacts.push(artifact);
+            }
+        }),
+        "run.result" => update_browser_job(state, &message, |job, message| {
+            job.ok = true;
+            job.status = "finished".to_string();
+            job.data = message.get("result").cloned().unwrap_or(Value::Null);
+        }),
+        "run.error" => update_browser_job(state, &message, |job, message| {
+            let error = message
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("browser_execute failed")
+                .to_string();
+            job.ok = false;
+            job.status = "failed".to_string();
+            job.error = Some(error.clone());
+            job.diagnosis = Some(browser_job_failure_diagnosis(&job.session_id, &error));
+        }),
+        "run.cancelled" => update_browser_job(state, &message, |job, _| {
+            job.ok = true;
+            job.status = "cancelled".to_string();
+            if job.text.trim().is_empty() {
+                job.text = "browser job cancelled.".to_string();
+            }
+        }),
+        "browser.set_current_target" => {
+            let target_id = message.get("target_id").and_then(Value::as_str);
+            let session = message.get("session_id").and_then(Value::as_str);
+            if let (Some(target_id), Some(cdp_session_id)) = (target_id, session) {
+                let _ = set_current_browser_target(session_id, target_id, cdp_session_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn update_browser_job<F>(state: &Arc<BrowserExecutorSharedState>, message: &Value, f: F)
+where
+    F: FnOnce(&mut BrowserJobState, &Value),
+{
+    let Some(run_id) = message.get("run_id").and_then(Value::as_str) else {
+        return;
+    };
+    let mut guard = state
+        .inner
+        .lock()
+        .expect("browser JS executor state poisoned");
+    if let Some(job) = guard.jobs.get_mut(run_id) {
+        f(job, message);
+        job.seq = job.seq.saturating_add(1);
+        state.changed.notify_all();
+    }
+}
+
+fn mark_browser_executor_failed(state: &Arc<BrowserExecutorSharedState>, error: String) {
+    let mut guard = state
+        .inner
+        .lock()
+        .expect("browser JS executor state poisoned");
+    guard.failed = Some(error.clone());
+    for job in guard
+        .jobs
+        .values_mut()
+        .filter(|job| job.status == "running")
+    {
+        job.ok = false;
+        job.status = "failed".to_string();
+        job.error = Some(error.clone());
+        job.diagnosis = Some(browser_job_failure_diagnosis(&job.session_id, &error));
+        job.seq = job.seq.saturating_add(1);
+    }
+    state.changed.notify_all();
+}
+
+fn handle_browser_executor_cdp_call(
+    session_id: &str,
+    stdin: &Arc<Mutex<ChildStdin>>,
+    message: Value,
+) {
+    let call_id = message
+        .get("call_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    let requested_session_id = message
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let timeout_ms = message
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(20_000)
+        .clamp(1, 120_000);
+    let stdin = Arc::clone(stdin);
+    let session_id = session_id.to_string();
+    thread::spawn(move || {
+        let response = match browser_executor_cdp_call(
+            &session_id,
+            &method,
+            requested_session_id.as_deref(),
+            params,
+            Duration::from_millis(timeout_ms),
+        ) {
+            Ok(result) => json!({
+                "type": "cdp.result",
+                "call_id": call_id,
+                "result": result,
+            }),
+            Err(error) => json!({
+                "type": "cdp.error",
+                "call_id": call_id,
+                "error": format!("{error:#}"),
+            }),
+        };
+        if let Ok(mut stdin) = stdin.lock() {
+            let _ = serde_json::to_writer(&mut *stdin, &response);
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+    });
+}
+
+fn browser_executor_cdp_call(
+    session_id: &str,
+    method: &str,
+    requested_session_id: Option<&str>,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    if method == "BrowserUse.drainEvents" {
+        let connection = {
+            let sessions = sessions()
+                .lock()
+                .expect("browser session registry poisoned");
+            let session = sessions.get(session_id).ok_or_else(|| {
+                anyhow!("browser is not connected or is busy; run browser_status")
+            })?;
+            session
+                .connection
+                .clone()
+                .ok_or_else(|| anyhow!("browser is not connected; run browser_status"))?
+        };
+        return Ok(json!({ "events": connection.drain_events() }));
+    }
+    let (connection, routed_session_id) = {
+        let sessions = sessions()
+            .lock()
+            .expect("browser session registry poisoned");
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("browser is not connected or is busy; run browser_status"))?;
+        let connection = session
+            .connection
+            .clone()
+            .ok_or_else(|| anyhow!("browser is not connected; run browser_status"))?;
+        let routed_session_id = requested_session_id.map(ToOwned::to_owned).or_else(|| {
+            (!is_browser_level_cdp_method(method))
+                .then(|| session.current_session_id.clone())
+                .flatten()
+        });
+        (connection, routed_session_id)
+    };
+    connection.call_with_timeout(method, routed_session_id.as_deref(), params, timeout)
+}
+
+fn is_browser_level_cdp_method(method: &str) -> bool {
+    method.starts_with("Target.")
+        || method.starts_with("Browser.")
+        || method.starts_with("Storage.")
+}
+
+fn browser_job_image_artifact(job: &BrowserJobState, message: &Value) -> Option<Value> {
+    let data = message.get("data").and_then(Value::as_str)?;
+    let mime_type = message
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    let extension = match mime_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let label = message
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("screenshot")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    let path = job.artifact_dir.join(format!(
+        "{}-{}.{}",
+        job.id,
+        label.trim_matches('-'),
+        extension
+    ));
+    let bytes = general_purpose::STANDARD.decode(data).ok()?;
+    if fs::write(&path, bytes).is_err() {
+        return None;
+    }
+    Some(json!({
+        "path": path.display().to_string(),
+        "label": label,
+        "mime_type": mime_type,
+        "detail": message.get("detail").and_then(Value::as_str).unwrap_or("auto"),
+    }))
+}
+
+fn wait_for_browser_job(
+    state: &Arc<BrowserExecutorSharedState>,
+    run_id: &str,
+    start_seq: u64,
+    wait: Duration,
+) -> Result<BrowserJobOutput> {
+    let deadline = Instant::now() + wait;
+    let mut guard = state
+        .inner
+        .lock()
+        .expect("browser JS executor state poisoned");
+    loop {
+        if let Some(job) = guard.jobs.get(run_id) {
+            if job.status != "running" || job.seq != start_seq {
+                return Ok(browser_job_output(job));
+            }
+        } else {
+            bail!("unknown browser job {run_id:?}");
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let job = guard
+                .jobs
+                .get(run_id)
+                .ok_or_else(|| anyhow!("unknown browser job {run_id:?}"))?;
+            return Ok(browser_job_output(job));
+        }
+        let timeout = deadline.saturating_duration_since(now);
+        let (next_guard, _) = state
+            .changed
+            .wait_timeout(guard, timeout)
+            .expect("browser JS executor state poisoned");
+        guard = next_guard;
+    }
+}
+
+fn browser_job_output(job: &BrowserJobState) -> BrowserJobOutput {
+    let mut output = BrowserJobOutput {
+        ok: job.ok,
+        status: Some(job.status.clone()),
+        run_id: Some(job.id.clone()),
+        next_observe_ms: (job.status == "running").then_some(BROWSER_JOB_DEFAULT_OBSERVE_MS),
+        text: job.text.clone(),
+        error: job.error.clone(),
+        diagnosis: job.diagnosis.clone(),
+        data: job.data.clone(),
+        outputs: job.outputs.clone(),
+        summary: job.summary.clone(),
+        artifacts: job.artifacts.clone(),
+        images: job.images.clone(),
+        browser_events: job.browser_events.clone(),
+    };
+    if output.status.as_deref() == Some("running") && output.text.trim().is_empty() {
+        output.text = format!(
+            "browser_execute is still running.\nrun_id: {}\nNext: call browser_observe with run_id=\"{}\".",
+            job.id, job.id
+        );
+    }
+    output
+}
+
+fn ensure_browser_session_has_connection(session_id: &str) -> Result<()> {
+    let sessions = sessions()
+        .lock()
+        .expect("browser session registry poisoned");
+    let session = sessions.get(session_id).ok_or_else(|| {
+        anyhow!("browser is not connected. Run browser_status or browser_configure.")
+    })?;
+    if session.connection.is_none() {
+        bail!("browser is not connected. Run browser_status or browser_configure.");
+    }
+    Ok(())
+}
+
+fn set_current_browser_target(
+    session_id: &str,
+    target_id: &str,
+    cdp_session_id: &str,
+) -> Result<()> {
+    let mut sessions = sessions()
+        .lock()
+        .expect("browser session registry poisoned");
+    let session = sessions
+        .get_mut(session_id)
+        .ok_or_else(|| anyhow!("browser is not connected. Run browser_status."))?;
+    session.current_target_id = Some(target_id.to_string());
+    session.current_session_id = Some(cdp_session_id.to_string());
+    session.connection_generation += 1;
+    Ok(())
+}
+
+fn browser_job_failure_diagnosis(session_id: &str, error: &str) -> BrowserIssueDiagnosis {
+    let state = browser_issue_state_for_session(session_id);
+    browser_issue_diagnosis(
+        classify_browser_job_failure(error),
+        state.browser_connected,
+        state.page_usable,
+        state.next_step.as_deref(),
+    )
+}
+
+fn new_browser_job_run_id() -> String {
+    let n = BROWSER_JOB_RUN_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("br-{}-{n}", unix_time_ms())
 }
 
 pub fn run_browser_command(
@@ -1199,6 +1946,7 @@ fn home_dir() -> Option<PathBuf> {
 
 pub fn cleanup_session(session_id: &str) -> usize {
     cancel_browser_script_runs_for_session(session_id);
+    stop_browser_js_executor(session_id);
     let mut sessions = sessions()
         .lock()
         .expect("browser session registry poisoned");
@@ -1210,6 +1958,23 @@ pub fn cleanup_session(session_id: &str) -> usize {
         1
     } else {
         0
+    }
+}
+
+fn stop_browser_js_executor(session_id: &str) {
+    let executor = browser_js_executors()
+        .lock()
+        .expect("browser JS executor registry poisoned")
+        .remove(session_id);
+    let Some(mut executor) = executor else {
+        return;
+    };
+    if let Ok(mut child) = executor.child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(reader) = executor.reader.take() {
+        let _ = reader.join();
     }
 }
 
@@ -1551,7 +2316,7 @@ impl BrowserSession {
             "reason": self.last_error,
             "loss_reason": self.last_error_kind,
             "last_issue": self.last_issue_diagnosis(),
-            "active_scripts": self.session_id.as_deref().map(active_browser_script_runs_json).unwrap_or_default(),
+            "active_jobs": self.session_id.as_deref().map(active_browser_jobs_json).unwrap_or_default(),
             "next_step": self.next_step(),
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
@@ -1563,6 +2328,7 @@ impl BrowserSession {
                 "candidate_id": endpoint.candidate_id,
             })),
             "page": page,
+            "cdp_event_buffered_count": self.connection.as_ref().map(CdpConnection::buffered_event_count).unwrap_or(0),
             "safety": {
                 "can_restart_browser": self.owner == BrowserOwner::Rust && self.mode == BrowserMode::Managed,
                 "can_close_browser": self.owner == BrowserOwner::Rust && self.mode == BrowserMode::Managed,
@@ -2347,46 +3113,19 @@ impl CdpConnection {
     fn connect(ws_url: &str) -> Result<Self> {
         let (mut socket, _) =
             connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
-        set_cdp_socket_timeouts(&mut socket);
-        Ok(Self { socket, next_id: 1 })
+        set_cdp_broker_socket_timeouts(&mut socket);
+        let (tx, rx) = mpsc::channel();
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let broker_events = Arc::clone(&events);
+        thread::Builder::new()
+            .name("browser-cdp-broker".to_string())
+            .spawn(move || run_cdp_broker(socket, rx, broker_events))
+            .context("spawn CDP broker")?;
+        Ok(Self { tx, events })
     }
 
     fn call(&mut self, method: &str, session_id: Option<&str>, params: Value) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut message = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        if let Some(session_id) = session_id {
-            message["sessionId"] = Value::String(session_id.to_string());
-        }
-        self.socket
-            .send(Message::Text(serde_json::to_string(&message)?))
-            .with_context(|| format!("send CDP {method}"))?;
-        loop {
-            match self
-                .socket
-                .read()
-                .with_context(|| format!("read CDP {method}"))?
-            {
-                Message::Text(text) => {
-                    let value: Value = serde_json::from_str(&text)?;
-                    if value.get("id").and_then(Value::as_u64) == Some(id) {
-                        if let Some(error) = value.get("error") {
-                            bail!("CDP {method} failed: {error}");
-                        }
-                        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-                    }
-                }
-                Message::Close(frame) => bail!("CDP websocket closed: {frame:?}"),
-                Message::Ping(bytes) => {
-                    let _ = self.socket.send(Message::Pong(bytes));
-                }
-                _ => {}
-            }
-        }
+        self.call_with_timeout(method, session_id, params, Duration::from_secs(20))
     }
 
     fn cdp_storage_cookies(&mut self) -> Result<Vec<Value>> {
@@ -2397,16 +3136,188 @@ impl CdpConnection {
             .cloned()
             .unwrap_or_default())
     }
+
+    fn call_with_timeout(
+        &self,
+        method: &str,
+        session_id: Option<&str>,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (response, response_rx) = mpsc::channel();
+        self.tx
+            .send(CdpBrokerCommand::Call(CdpBrokerCall {
+                method: method.to_string(),
+                session_id: session_id.map(ToOwned::to_owned),
+                params,
+                response,
+            }))
+            .with_context(|| format!("send CDP broker request {method}"))?;
+        match response_rx.recv_timeout(timeout) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => bail!(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!(
+                    "read CDP {method} timed out after {} ms",
+                    timeout.as_millis()
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("CDP broker disconnected while waiting for {method}")
+            }
+        }
+    }
+
+    fn buffered_event_count(&self) -> usize {
+        self.events.lock().map(|events| events.len()).unwrap_or(0)
+    }
+
+    fn drain_events(&self) -> Vec<Value> {
+        let Ok(mut events) = self.events.lock() else {
+            return Vec::new();
+        };
+        events.drain(..).collect()
+    }
 }
 
-fn set_cdp_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+fn run_cdp_broker(
+    mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    rx: mpsc::Receiver<CdpBrokerCommand>,
+    events: Arc<Mutex<VecDeque<Value>>>,
+) {
+    let mut next_id = 1u64;
+    let mut pending: HashMap<u64, (String, mpsc::Sender<std::result::Result<Value, String>>)> =
+        HashMap::new();
+    let mut input_closed = false;
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(CdpBrokerCommand::Call(call)) => {
+                    let id = next_id;
+                    next_id += 1;
+                    let mut message = json!({
+                        "id": id,
+                        "method": call.method,
+                        "params": call.params,
+                    });
+                    if let Some(session_id) = call.session_id {
+                        message["sessionId"] = Value::String(session_id);
+                    }
+                    let method = message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("CDP.call")
+                        .to_string();
+                    match serde_json::to_string(&message)
+                        .map_err(|error| error.to_string())
+                        .and_then(|text| {
+                            socket
+                                .send(Message::Text(text))
+                                .map_err(|error| format!("send CDP {method}: {error}"))
+                        }) {
+                        Ok(()) => {
+                            pending.insert(id, (method, call.response));
+                        }
+                        Err(error) => {
+                            let _ = call.response.send(Err(error));
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    input_closed = true;
+                    break;
+                }
+            }
+        }
+
+        if input_closed && pending.is_empty() {
+            break;
+        }
+
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let value = match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        push_cdp_event(
+                            &events,
+                            json!({
+                                "method": "BrowserUse.cdpParseError",
+                                "params": { "error": error.to_string(), "raw": text },
+                            }),
+                        );
+                        continue;
+                    }
+                };
+                if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                    if let Some((method, response)) = pending.remove(&id) {
+                        let result = if let Some(error) = value.get("error") {
+                            Err(format!("CDP {method} failed: {error}"))
+                        } else {
+                            Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                        };
+                        let _ = response.send(result);
+                    } else {
+                        push_cdp_event(&events, value);
+                    }
+                } else {
+                    push_cdp_event(&events, value);
+                }
+            }
+            Ok(Message::Close(frame)) => {
+                fail_pending_cdp(&mut pending, format!("CDP websocket closed: {frame:?}"));
+                break;
+            }
+            Ok(Message::Ping(bytes)) => {
+                let _ = socket.send(Message::Pong(bytes));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                fail_pending_cdp(&mut pending, format!("read CDP websocket: {error}"));
+                break;
+            }
+        }
+    }
+}
+
+fn push_cdp_event(events: &Arc<Mutex<VecDeque<Value>>>, event: Value) {
+    let Ok(mut events) = events.lock() else {
+        return;
+    };
+    if events.len() >= 1_000 {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn fail_pending_cdp(
+    pending: &mut HashMap<u64, (String, mpsc::Sender<std::result::Result<Value, String>>)>,
+    message: String,
+) {
+    for (_, (method, response)) in pending.drain() {
+        let _ = response.send(Err(format!("{message}; pending method: {method}")));
+    }
+}
+
+fn set_cdp_broker_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
         }
         MaybeTlsStream::Rustls(stream) => {
-            let _ = stream.sock.set_read_timeout(Some(Duration::from_secs(20)));
+            let _ = stream
+                .sock
+                .set_read_timeout(Some(Duration::from_millis(50)));
             let _ = stream.sock.set_write_timeout(Some(Duration::from_secs(20)));
         }
         _ => {}
@@ -2473,6 +3384,34 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         classify_browser_error(message)
     } else {
         "browser-script-error"
+    }
+}
+
+fn classify_browser_job_failure(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timed out") && lower.contains("browser_execute") {
+        "browser-job-timeout"
+    } else if lower.contains("read cdp")
+        || lower.contains("send cdp")
+        || lower.contains("cdp websocket")
+        || lower.contains("browser is not connected")
+        || lower.contains("connection refused")
+        || lower.contains("couldn't connect to server")
+        || lower.contains("unable to connect")
+        || lower.contains("operation timed out")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("websocket closed")
+        || lower.contains("already closed")
+        || (lower.contains("target")
+            && (lower.contains("not found")
+                || lower.contains("target-gone")
+                || lower.contains("no target with given id")))
+        || is_stale_session_error(message)
+    {
+        classify_browser_error(message)
+    } else {
+        "browser-job-error"
     }
 }
 
@@ -2548,6 +3487,40 @@ fn browser_issue_diagnosis(
             "The Python browser_script code raised an error before completing the call.",
             if page_usable {
                 "Fix the Python/browser_script code and rerun; keep using the same page state.".to_string()
+            } else {
+                fallback_next_step()
+            },
+            browser_connected,
+            page_usable,
+        ),
+        "browser-job-timeout" => (
+            if page_usable {
+                "The browser job timed out, but the browser page should still be reusable."
+            } else if browser_connected {
+                "The browser job timed out; browser is connected but page state needs checking."
+            } else {
+                "The browser job timed out and browser state needs a status check."
+            },
+            "The JavaScript browser job exceeded its timeout before returning a result.",
+            if page_usable {
+                "Retry with a shorter bounded browser_execute job and continue from the last checkpoint.".to_string()
+            } else {
+                fallback_next_step()
+            },
+            browser_connected,
+            page_usable,
+        ),
+        "browser-job-error" => (
+            if page_usable {
+                "The browser job failed, but the browser page should still be reusable."
+            } else if browser_connected {
+                "The browser job failed; browser is connected but page state needs checking."
+            } else {
+                "The browser job failed and browser state needs a status check."
+            },
+            "The JavaScript browser job raised an error before completing.",
+            if page_usable {
+                "Fix the browser_execute JavaScript and rerun; keep using the same page state.".to_string()
             } else {
                 fallback_next_step()
             },
@@ -4934,7 +5907,7 @@ mod tests {
         assert!(help.contains("browser status --json"));
         assert!(help.contains("browser connect local"));
         assert!(help.contains("browser domain skills --domain"));
-        assert!(help.contains("browser_script"));
+        assert!(help.contains("browser_execute"));
         assert!(help
             .to_ascii_lowercase()
             .contains("remote start means start and connect"));
@@ -5730,7 +6703,7 @@ print("finished")
     }
 
     #[test]
-    fn browser_status_lists_active_script_runs() {
+    fn browser_script_runs_command_lists_active_legacy_runs() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-status-active-runs";
         let started = start_browser_script(
@@ -5743,9 +6716,10 @@ print("finished")
         .unwrap();
         assert_eq!(started.status.as_deref(), Some("running"));
 
-        let status = run_browser_command(session_id, temp.path(), temp.path(), "status --json")
-            .unwrap()
-            .content;
+        let status =
+            run_browser_command(session_id, temp.path(), temp.path(), "script runs --json")
+                .unwrap()
+                .content;
         assert_eq!(
             status["active_scripts"][0]["run_id"],
             started.run_id.as_deref().unwrap()

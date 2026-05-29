@@ -1643,21 +1643,21 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
         return None;
     }
     let mut lines = Vec::new();
-    let browser_script_summary_lines = if name == "browser_script" {
+    let browser_script_summary_lines = if is_browser_interaction_tool(&name) {
         browser_script_summary_lines(event)
     } else {
         Vec::new()
     };
     let has_browser_script_summary = !browser_script_summary_lines.is_empty();
     lines.extend(browser_script_summary_lines);
-    if name == "browser_script" && !has_browser_script_summary {
+    if is_browser_interaction_tool(&name) && !has_browser_script_summary {
         lines.extend(browser_script_structured_output_lines(event));
     }
     if should_show_generic_tool_output_text(&name)
-        && !(name == "browser_script" && has_browser_script_summary)
+        && !(is_browser_interaction_tool(&name) && has_browser_script_summary)
     {
         if let Some(text) = payload_string(event, "text").filter(|text| !text.trim().is_empty()) {
-            if name == "browser_script" {
+            if is_browser_interaction_tool(&name) {
                 lines.extend(browser_script_text_preview_lines(&text));
             } else {
                 lines.extend(preview_lines(&text, 3));
@@ -1832,7 +1832,9 @@ fn browser_script_structured_output_lines(event: &EventRecord) -> Vec<String> {
 
 fn browser_script_text_preview_lines(text: &str) -> Vec<String> {
     let trimmed = text.trim();
-    if trimmed.starts_with("browser_script is still running.") {
+    if trimmed.starts_with("browser_script is still running.")
+        || trimmed.starts_with("browser_execute is still running.")
+    {
         return Vec::new();
     }
     let visible = text
@@ -1858,6 +1860,7 @@ fn is_browser_script_runtime_instruction_line(line: &str) -> bool {
         || line.starts_with("Next:")
         || line.starts_with("Next step:")
         || line == "browser_script is still running."
+        || line == "browser_execute is still running."
 }
 
 fn summary_value_string(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -1992,6 +1995,9 @@ fn artifact_created_node(event: &EventRecord, _state: &WorkbenchState) -> Option
 
 fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
+        "browser_execute" | "browser_observe" | "browser_cancel" => {
+            Some(("browser", "running browser job"))
+        }
         "browser_script" => Some(("browser", "running browser script")),
         "python" => Some(("python", "running browser Python")),
         "exec_command" => Some(("run", "running command")),
@@ -2010,10 +2016,17 @@ fn should_show_generic_tool_output_text(name: &str) -> bool {
 
 fn tool_output_group(name: &str) -> &str {
     match name {
-        "browser_script" => "browser",
+        "browser_execute" | "browser_observe" | "browser_cancel" | "browser_script" => "browser",
         "python" => "python",
         _ => "tool",
     }
+}
+
+fn is_browser_interaction_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_execute" | "browser_observe" | "browser_cancel" | "browser_script"
+    )
 }
 
 fn is_known_tool_with_domain_events(name: &str) -> bool {
@@ -3427,7 +3440,7 @@ fn tool_image_label(event: &EventRecord, state: &WorkbenchState) -> String {
             .payload
             .get("name")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name == "browser_script")
+            .is_some_and(is_browser_interaction_tool)
             .then(|| {
                 target
                     .clone()
@@ -3757,7 +3770,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_summary_hides_raw_page_info_text() {
+    fn browser_execute_summary_hides_raw_page_info_text() {
         let event = EventRecord {
             seq: 8,
             id: "event-8".to_string(),
@@ -3765,7 +3778,7 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.output".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "text": "{'url': 'https://login.gusto.com/realms/zenpayroll/protocol/openid-connect/auth?client_id=zenpayroll&device_uuid=secret', 'title': 'Gusto Login - Payroll, Benefits, HR | Gusto', 'readyState': 'complete', 'target': {'targetId': 'B6CDD9676BD0503360290CD36A12A4D1'}}",
                 "summary": [{
                     "kind": "page",
@@ -3878,7 +3891,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_summary_suppresses_running_transport_text() {
+    fn browser_execute_summary_suppresses_running_transport_text() {
         let event = EventRecord {
             seq: 9,
             id: "event-9".to_string(),
@@ -3886,8 +3899,8 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.output".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
-                "text": "browser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.",
+                "name": "browser_execute",
+                "text": "browser_execute is still running.\nrun_id: br-secret\nNext: observe this run again.",
                 "summary": [{
                     "kind": "inspected",
                     "message": "Sampled 5 comments from current thread"
@@ -3908,8 +3921,8 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("inspected Sampled"), "{text}");
-        assert!(!text.contains("browser_script is still running"), "{text}");
-        assert!(!text.contains("bs-secret"), "{text}");
+        assert!(!text.contains("browser_execute is still running"), "{text}");
+        assert!(!text.contains("br-secret"), "{text}");
     }
 
     #[test]
@@ -3928,23 +3941,23 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_running_text_fallback_hides_run_id() {
+    fn browser_execute_running_text_fallback_hides_run_id() {
         let preview = browser_script_text_preview_lines(
-            "browser_script is still running.\nNo new output in the last 50 ms.\nrun_id: bs-secret\nNext: observe this run again.",
+            "browser_execute is still running.\nNo new output in the last 50 ms.\nrun_id: br-secret\nNext: observe this run again.",
         );
 
         assert!(preview.is_empty(), "{preview:?}");
-        assert!(!preview.join("\n").contains("bs-secret"));
+        assert!(!preview.join("\n").contains("br-secret"));
     }
 
     #[test]
-    fn browser_script_partial_text_fallback_drops_runtime_instructions() {
+    fn browser_execute_partial_text_fallback_drops_runtime_instructions() {
         let preview = browser_script_text_preview_lines(
-            "chunk one\n\nbrowser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.",
+            "chunk one\n\nbrowser_execute is still running.\nrun_id: br-secret\nNext: observe this run again.",
         );
 
         assert_eq!(preview, vec!["chunk one"]);
-        assert!(!preview.join("\n").contains("bs-secret"));
+        assert!(!preview.join("\n").contains("br-secret"));
     }
 
     #[test]

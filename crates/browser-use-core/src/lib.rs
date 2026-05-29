@@ -13238,13 +13238,36 @@ fn dispatch_tool_call<P: ModelProvider>(
             options.browser_mode.as_deref(),
             tool_output_token_budget,
         ),
-        ToolHandlerKind::BrowserScript => dispatch_browser_script_tool(
+        ToolHandlerKind::BrowserExecute => dispatch_browser_execute_tool(
             store,
             session,
             call,
-            options.python_tool_timeout_seconds,
+            options.browser_mode.as_deref(),
             tool_output_token_budget,
         ),
+        ToolHandlerKind::BrowserObserve => {
+            dispatch_browser_observe_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::BrowserCancel => {
+            dispatch_browser_cancel_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::BrowserStatus => dispatch_browser_status_tool(
+            store,
+            session,
+            call,
+            options.browser_mode.as_deref(),
+            tool_output_token_budget,
+        ),
+        ToolHandlerKind::BrowserConfigure => dispatch_browser_configure_tool(
+            store,
+            session,
+            call,
+            options.browser_mode.as_deref(),
+            tool_output_token_budget,
+        ),
+        ToolHandlerKind::BrowserRecover => {
+            dispatch_browser_recover_tool(store, session, call, tool_output_token_budget)
+        }
         ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
@@ -21567,81 +21590,391 @@ fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     }
 }
 
-fn dispatch_browser_script_tool(
+fn dispatch_browser_execute_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
-    timeout_seconds: u64,
+    selected_browser_mode: Option<&str>,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    let action = browser_script_action(call)?;
     let code = call
         .arguments
         .get("code")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if code.trim().is_empty() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "browser_execute requires code",
+        );
+    }
     store.append_event(
         &session.id,
         "tool.started",
         serde_json::json!({
-            "name": "browser_script",
+            "name": "browser_execute",
             "tool_call_id": call.id,
             "arguments": call.arguments,
         }),
     )?;
-    let response = match action {
-        BrowserScriptAction::Start => {
-            if code.trim().is_empty() {
-                anyhow::bail!("browser_script action=start requires non-empty code");
-            }
-            browser_use_browser::start_browser_script(
+    ensure_browser_connected_for_interaction(store, session, selected_browser_mode)?;
+    let yield_time_ms = call
+        .arguments
+        .get("yield_time_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(1_000)
+        .clamp(1, 30_000);
+    let timeout_ms = call
+        .arguments
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(60_000)
+        .clamp(1, 120_000);
+    let response = browser_use_browser::execute_browser_js(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        code,
+        yield_time_ms,
+        timeout_ms,
+    )?;
+    record_browser_job_response_events(store, &session.id, &call.id, "browser_execute", &response)?;
+    append_browser_job_finished_event(store, &session.id, &call.id, "browser_execute", &response)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_execute",
+            browser_job_tool_message_content_value(&response)?,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_browser_observe_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    let run_id = call
+        .arguments
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("browser_observe requires run_id"))?;
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser_observe",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let yield_time_ms = call
+        .arguments
+        .get("yield_time_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(1_000)
+        .clamp(1, 30_000);
+    let response = browser_use_browser::observe_browser_job(&session.id, run_id, yield_time_ms)?;
+    record_browser_job_response_events(store, &session.id, &call.id, "browser_observe", &response)?;
+    append_browser_job_finished_event(store, &session.id, &call.id, "browser_observe", &response)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_observe",
+            browser_job_tool_message_content_value(&response)?,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_browser_cancel_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    let run_id = call
+        .arguments
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("browser_cancel requires run_id"))?;
+    let reason = call
+        .arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("cancelled by browser_cancel");
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser_cancel",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let response = browser_use_browser::cancel_browser_job(&session.id, run_id, reason)?;
+    record_browser_job_response_events(store, &session.id, &call.id, "browser_cancel", &response)?;
+    append_browser_job_finished_event(store, &session.id, &call.id, "browser_cancel", &response)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_cancel",
+            browser_job_tool_message_content_value(&response)?,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_browser_status_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    selected_browser_mode: Option<&str>,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    append_browser_tool_started_event(store, session, call, "browser_status")?;
+    let mut output = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        "browser status --json",
+    )?;
+    if call
+        .arguments
+        .get("include_logs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        output.content["logs"] = browser_use_browser::run_browser_command(
+            &session.id,
+            &session.cwd,
+            &session.artifact_root,
+            "browser runtime logs",
+        )
+        .map(|output| output.content)
+        .unwrap_or(Value::Null);
+    }
+    if call
+        .arguments
+        .get("include_candidates")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        output.content["local_candidates"] = browser_use_browser::run_browser_command(
+            &session.id,
+            &session.cwd,
+            &session.artifact_root,
+            "browser local list --json",
+        )
+        .map(|output| output.content)
+        .unwrap_or(Value::Null);
+    }
+    if call
+        .arguments
+        .get("include_profiles")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let mode = effective_browser_mode(store, selected_browser_mode).unwrap_or("local");
+        output.content["profiles"] = if mode == "cloud" {
+            browser_use_browser::run_browser_command(
                 &session.id,
                 &session.cwd,
                 &session.artifact_root,
-                code,
-                timeout_seconds,
-            )?
-        }
-        BrowserScriptAction::Observe => {
-            let run_id = call
-                .arguments
-                .get("run_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("browser_script action=observe requires run_id"))?;
-            let observe_timeout_ms = call
-                .arguments
-                .get("observe_timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(1_000)
-                .clamp(1, 10_000);
-            browser_use_browser::observe_browser_script(&session.id, run_id, observe_timeout_ms)?
-        }
-        BrowserScriptAction::Cancel => {
-            let run_id = call
-                .arguments
-                .get("run_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("browser_script action=cancel requires run_id"))?;
-            browser_use_browser::cancel_browser_script(&session.id, run_id)?
-        }
-    };
-    record_browser_script_response_events(store, &session.id, &call.id, &response)?;
+                "browser remote profiles --json",
+            )
+            .map(|output| output.content)
+            .unwrap_or(Value::Null)
+        } else {
+            browser_use_browser::run_browser_command(
+                &session.id,
+                &session.cwd,
+                &session.artifact_root,
+                "browser local profiles --json",
+            )
+            .map(|output| output.content)
+            .unwrap_or(Value::Null)
+        };
+    }
+    append_browser_tool_finished_event(store, session, call, "browser_status", &output.content)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_status",
+            output.content,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_browser_configure_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    selected_browser_mode: Option<&str>,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    append_browser_tool_started_event(store, session, call, "browser_configure")?;
+    let command = browser_configure_command(store, session, call, selected_browser_mode)?;
+    let output = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        &command,
+    )?;
+    append_browser_tool_finished_event(store, session, call, "browser_configure", &output.content)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_configure",
+            output.content,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_browser_recover_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    append_browser_tool_started_event(store, session, call, "browser_recover")?;
+    let action = call
+        .arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("browser_recover requires action"))?;
+    let output = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        &format!("browser recover {}", shell_quote_browser_arg(action)),
+    )?;
+    append_browser_tool_finished_event(store, session, call, "browser_recover", &output.content)?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_recover",
+            output.content,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn ensure_browser_connected_for_interaction(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    selected_browser_mode: Option<&str>,
+) -> Result<()> {
+    let status = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        "browser status --json",
+    )?;
+    if status.content.get("connection").and_then(Value::as_str) == Some("connected") {
+        return Ok(());
+    }
+    let connect =
+        resolve_browser_command_for_selected_mode(store, "browser connect", selected_browser_mode)?;
+    let connected = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        &connect,
+    )?;
+    if connected.content.get("status").and_then(Value::as_str) == Some("connected") {
+        return Ok(());
+    }
+    bail!(
+        "browser setup is required before browser_execute: {}",
+        connected.content
+    )
+}
+
+fn append_browser_tool_started_event(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    name: &str,
+) -> Result<()> {
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": name,
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_browser_tool_finished_event(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    name: &str,
+    output: &Value,
+) -> Result<()> {
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": name,
+            "tool_call_id": call.id,
+            "output": output,
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_browser_job_finished_event(
+    store: &Store,
+    session_id: &str,
+    tool_call_id: &str,
+    name: &str,
+    response: &browser_use_browser::BrowserJobOutput,
+) -> Result<()> {
     if response.ok {
         store.append_event(
-            &session.id,
+            session_id,
             "tool.finished",
             serde_json::json!({
-                "name": "browser_script",
-                "tool_call_id": call.id,
+                "name": name,
+                "tool_call_id": tool_call_id,
             }),
         )?;
     } else {
         store.append_event(
-            &session.id,
+            session_id,
             "tool.failed",
             serde_json::json!({
-                "name": "browser_script",
-                "tool_call_id": call.id,
+                "name": name,
+                "tool_call_id": tool_call_id,
                 "status": response.status,
                 "run_id": response.run_id,
                 "error": response.error,
@@ -21649,44 +21982,104 @@ fn dispatch_browser_script_tool(
             }),
         )?;
     }
-    Ok(ToolDispatchOutcome {
-        finished: false,
-        messages: vec![tool_content_message(
-            store,
-            session,
-            call,
-            "browser_script",
-            browser_script_tool_message_content_value(&response)?,
-            tool_output_token_budget,
-        )?],
-    })
+    Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrowserScriptAction {
-    Start,
-    Observe,
-    Cancel,
-}
-
-fn browser_script_action(call: &ToolCall) -> Result<BrowserScriptAction> {
-    match call.arguments.get("action").and_then(Value::as_str) {
-        Some("start") => Ok(BrowserScriptAction::Start),
-        Some("observe") => Ok(BrowserScriptAction::Observe),
-        Some("cancel") => Ok(BrowserScriptAction::Cancel),
-        Some(other) => anyhow::bail!("unknown browser_script action {other:?}"),
-        None if call.arguments.get("code").and_then(Value::as_str).is_some() => {
-            Ok(BrowserScriptAction::Start)
-        }
-        None if call
+fn browser_configure_command(
+    store: &Store,
+    _session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    selected_browser_mode: Option<&str>,
+) -> Result<String> {
+    let mode = call
+        .arguments
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(normalize_browser_preference_mode)
+        .transpose()?;
+    let mode = mode.or_else(|| {
+        selected_browser_mode.and_then(|mode| normalize_browser_preference_mode(mode).ok())
+    });
+    if let Some(api_key) = call
+        .arguments
+        .get("browser_use_api_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if call
             .arguments
-            .get("run_id")
+            .get("persist")
             .and_then(Value::as_str)
-            .is_some() =>
+            .is_some_and(|persist| persist == "user")
         {
-            Ok(BrowserScriptAction::Observe)
+            store.set_setting("browser_use_api_key", api_key)?;
         }
-        None => Ok(BrowserScriptAction::Start),
+    }
+    let connect_now = call
+        .arguments
+        .get("connect_now")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let Some(mode) = mode else {
+        return Ok("browser status --json".to_string());
+    };
+    if !connect_now {
+        store.set_setting(BROWSER_PREF_MODE, mode)?;
+        return Ok("browser preference --json".to_string());
+    }
+    match mode {
+        "remote-cdp" => {
+            let url = call
+                .arguments
+                .get("cdp_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("browser_configure remote-cdp requires cdp_url"))?;
+            if url.starts_with("ws://") || url.starts_with("wss://") {
+                Ok(format!(
+                    "browser connect remote-cdp --ws {}",
+                    shell_quote_browser_arg(url)
+                ))
+            } else {
+                Ok(format!(
+                    "browser connect remote-cdp --url {}",
+                    shell_quote_browser_arg(url)
+                ))
+            }
+        }
+        "managed-headed" => Ok("browser connect managed --headed".to_string()),
+        "managed-headless" => Ok("browser connect managed --headless".to_string()),
+        "cloud" => {
+            let mut command = "browser remote start".to_string();
+            if let Some(profile_id) = call.arguments.get("profile_id").and_then(Value::as_str) {
+                command.push_str(" --profile-id ");
+                command.push_str(&shell_quote_browser_arg(profile_id));
+            }
+            if let Some(profile_name) = call.arguments.get("profile_name").and_then(Value::as_str) {
+                command.push_str(" --profile-name ");
+                command.push_str(&shell_quote_browser_arg(profile_name));
+            }
+            if let Some(country) = call.arguments.get("proxy_country").and_then(Value::as_str) {
+                command.push_str(" --proxy-country ");
+                command.push_str(&shell_quote_browser_arg(country));
+            }
+            if let Some(timeout) = call
+                .arguments
+                .get("timeout_minutes")
+                .and_then(Value::as_u64)
+            {
+                command.push_str(" --timeout ");
+                command.push_str(&(timeout * 60).to_string());
+            }
+            Ok(command)
+        }
+        "local" => {
+            let profile_id = call.arguments.get("profile_id").and_then(Value::as_str);
+            if let Some(profile_id) = profile_id {
+                store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
+            }
+            Ok(browser_connect_command_for_mode("local", profile_id))
+        }
+        _ => bail!("unsupported browser_configure mode {mode:?}"),
     }
 }
 
@@ -22056,7 +22449,7 @@ fn dispatch_done_tool(
             store,
             session,
             call,
-            "done no longer supports persisted final-answer state. Pass result_file for saved browser_script output, or pass a non-empty result.",
+            "done no longer supports persisted final-answer state. Pass result_file for saved browser output, or pass a non-empty result.",
         );
     }
     if requested_result.is_empty() && result_file.is_none() {
@@ -25978,37 +26371,35 @@ fn python_tool_image_output_parts(response: &RunPythonResponse) -> Result<Option
     Ok(Some(parts))
 }
 
-fn browser_script_tool_message_content(
-    response: &browser_use_browser::BrowserScriptOutput,
-) -> String {
+fn browser_job_tool_message_content(response: &browser_use_browser::BrowserJobOutput) -> String {
     if response.status.as_deref() == Some("running") {
-        return browser_script_running_message(response);
+        return browser_job_running_message(response);
     }
     if response.status.as_deref() == Some("cancelled") {
-        return browser_script_cancelled_message(response);
+        return browser_job_cancelled_message(response);
     }
     if response.ok {
         let mut parts = Vec::new();
         if !response.text.trim().is_empty() {
             parts.push(response.text.trim().to_string());
         }
-        parts.extend(browser_script_structured_message_parts(response));
+        parts.extend(browser_job_structured_message_parts(response));
         if parts.is_empty() {
-            "browser_script completed".to_string()
+            "browser_execute completed".to_string()
         } else {
             parts.join("\n")
         }
     } else {
-        browser_script_failure_message(response)
+        browser_job_failure_message(response)
     }
 }
 
-fn browser_script_running_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+fn browser_job_running_message(response: &browser_use_browser::BrowserJobOutput) -> String {
     let mut parts = Vec::new();
     if !response.text.trim().is_empty() {
         parts.push(response.text.trim().to_string());
     } else {
-        parts.push("browser_script is still running.".to_string());
+        parts.push("browser_execute is still running.".to_string());
     }
     if let Some(run_id) = response.run_id.as_deref() {
         if !parts
@@ -26018,46 +26409,46 @@ fn browser_script_running_message(response: &browser_use_browser::BrowserScriptO
             parts.push(format!("run_id: {run_id}"));
         }
         parts.push(format!(
-            "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={}.",
+            "Next step: call browser_observe with run_id=\"{run_id}\" and yield_time_ms={}.",
             response.next_observe_ms.unwrap_or(1_000)
         ));
     }
-    parts.extend(browser_script_structured_message_parts(response));
+    parts.extend(browser_job_structured_message_parts(response));
     parts.join("\n")
 }
 
-fn browser_script_cancelled_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+fn browser_job_cancelled_message(response: &browser_use_browser::BrowserJobOutput) -> String {
     let mut parts = Vec::new();
     if response.text.trim().is_empty() {
-        parts.push("browser_script cancelled.".to_string());
+        parts.push("browser job cancelled.".to_string());
     } else {
         parts.push(response.text.trim().to_string());
     }
-    parts.extend(browser_script_structured_message_parts(response));
+    parts.extend(browser_job_structured_message_parts(response));
     parts.join("\n")
 }
 
-fn browser_script_failure_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
-    let mut parts = vec!["browser_script failed.".to_string()];
+fn browser_job_failure_message(response: &browser_use_browser::BrowserJobOutput) -> String {
+    let mut parts = vec!["browser_execute failed.".to_string()];
     if let Some(diagnosis) = response.diagnosis.as_ref() {
         parts.push(diagnosis.summary.clone());
         parts.push(format!("What happened: {}", diagnosis.what_happened));
         parts.push(format!("Next step: {}", diagnosis.next_step));
     }
     if let Some(error) = response.error.as_deref() {
-        let detail = browser_script_error_detail(error);
+        let detail = browser_error_detail(error);
         if !detail.is_empty() {
             parts.push(format!("Details: {detail}"));
         }
     } else if response.diagnosis.is_none() {
-        parts.push("Details: unknown browser_script error".to_string());
+        parts.push("Details: unknown browser_execute error".to_string());
     }
-    parts.extend(browser_script_structured_message_parts(response));
+    parts.extend(browser_job_structured_message_parts(response));
     parts.join("\n")
 }
 
-fn browser_script_structured_message_parts(
-    response: &browser_use_browser::BrowserScriptOutput,
+fn browser_job_structured_message_parts(
+    response: &browser_use_browser::BrowserJobOutput,
 ) -> Vec<String> {
     let mut parts = Vec::new();
     if !response.outputs.is_empty() {
@@ -26078,30 +26469,11 @@ fn browser_script_structured_message_parts(
     parts
 }
 
-fn browser_script_error_detail(error: &str) -> String {
-    const MAX_DETAIL_CHARS: usize = 500;
-    let detail = error
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or(error.trim());
-    if detail.chars().count() <= MAX_DETAIL_CHARS {
-        return detail.to_string();
-    }
-    let mut out = detail
-        .chars()
-        .take(MAX_DETAIL_CHARS.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
-}
-
-fn browser_script_tool_message_content_value(
-    response: &browser_use_browser::BrowserScriptOutput,
+fn browser_job_tool_message_content_value(
+    response: &browser_use_browser::BrowserJobOutput,
 ) -> Result<Value> {
-    let text = browser_script_tool_message_content(response);
-    let Some(image_parts) = browser_script_image_output_parts(response)? else {
+    let text = browser_job_tool_message_content(response);
+    let Some(image_parts) = browser_job_image_output_parts(response)? else {
         return Ok(Value::String(text));
     };
     let mut parts = vec![serde_json::json!({
@@ -26112,8 +26484,8 @@ fn browser_script_tool_message_content_value(
     Ok(Value::Array(parts))
 }
 
-fn browser_script_image_output_parts(
-    response: &browser_use_browser::BrowserScriptOutput,
+fn browser_job_image_output_parts(
+    response: &browser_use_browser::BrowserJobOutput,
 ) -> Result<Option<Vec<Value>>> {
     if response.images.is_empty() {
         return Ok(None);
@@ -26142,6 +26514,25 @@ fn browser_script_image_output_parts(
         return Ok(None);
     }
     Ok(Some(parts))
+}
+
+fn browser_error_detail(error: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 500;
+    let detail = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(error.trim());
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let mut out = detail
+        .chars()
+        .take(MAX_DETAIL_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 pub fn record_python_response_events(
@@ -26186,11 +26577,12 @@ fn record_python_response_final_event_with_budget(
     )
 }
 
-pub fn record_browser_script_response_events(
+pub fn record_browser_job_response_events(
     store: &Store,
     session_id: &str,
     tool_call_id: &str,
-    response: &browser_use_browser::BrowserScriptOutput,
+    tool_name: &str,
+    response: &browser_use_browser::BrowserJobOutput,
 ) -> Result<()> {
     for browser_event in &response.browser_events {
         record_python_browser_event(store, session_id, browser_event)?;
@@ -26201,13 +26593,7 @@ pub fn record_browser_script_response_events(
         .filter_map(|image| image.get("path").and_then(Value::as_str))
         .collect::<std::collections::HashSet<_>>();
     for image in &response.images {
-        record_tool_image_with_call_id(
-            store,
-            session_id,
-            "browser_script",
-            Some(tool_call_id),
-            image,
-        )?;
+        record_tool_image_with_call_id(store, session_id, tool_name, Some(tool_call_id), image)?;
     }
     for artifact in &response.artifacts {
         let Some(path) = artifact.get("path").and_then(Value::as_str) else {
@@ -26219,17 +26605,17 @@ pub fn record_browser_script_response_events(
         record_tool_artifact_with_call_id(
             store,
             session_id,
-            "browser_script",
+            tool_name,
             Some(tool_call_id),
             artifact,
         )?;
     }
-    let transcript_text = browser_script_transcript_text(response);
+    let transcript_text = browser_job_transcript_text(response);
     store.append_event(
         session_id,
         "tool.output",
         serde_json::json!({
-            "name": "browser_script",
+            "name": tool_name,
             "tool_call_id": tool_call_id,
             "ok": response.ok,
             "status": response.status,
@@ -26248,7 +26634,7 @@ pub fn record_browser_script_response_events(
     Ok(())
 }
 
-fn browser_script_transcript_text(response: &browser_use_browser::BrowserScriptOutput) -> String {
+fn browser_job_transcript_text(response: &browser_use_browser::BrowserJobOutput) -> String {
     if response.text.trim().is_empty() {
         return String::new();
     }
@@ -26257,14 +26643,14 @@ fn browser_script_transcript_text(response: &browser_use_browser::BrowserScriptO
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
-        .filter(|line| !is_browser_script_transport_line(line))
+        .filter(|line| !is_browser_job_transport_line(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn is_browser_script_transport_line(line: &str) -> bool {
+fn is_browser_job_transport_line(line: &str) -> bool {
     let line = line.trim_start();
-    line == "browser_script is still running."
+    line == "browser_execute is still running."
         || line.starts_with("run_id:")
         || line.starts_with("Next:")
         || line.starts_with("Next step:")
@@ -26538,13 +26924,12 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_failures_use_compact_diagnosis_for_model_output() {
-        let response = browser_use_browser::BrowserScriptOutput {
+    fn browser_job_failures_use_compact_diagnosis_for_model_output() {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: false,
             text: String::new(),
             error: Some(
-                "Traceback (most recent call last):\nRuntimeError: read CDP Runtime.evaluate: IO error"
-                    .to_string(),
+                "Error: read CDP Runtime.evaluate: IO error\n    at browser_execute".to_string(),
             ),
             diagnosis: Some(browser_use_browser::BrowserIssueDiagnosis {
                 summary: "Browser is still connected; the same page should still be usable."
@@ -26558,32 +26943,31 @@ mod tests {
             ..Default::default()
         };
 
-        let message = browser_script_tool_message_content(&response);
+        let message = browser_job_tool_message_content(&response);
 
-        assert!(message.contains("browser_script failed."));
+        assert!(message.contains("browser_execute failed."));
         assert!(message.contains("same page should still be usable"));
         assert!(message.contains("Next step: Continue on the same page"));
-        assert!(message.contains("Details: RuntimeError: read CDP Runtime.evaluate"));
-        assert!(!message.contains("Traceback (most recent call last)"));
+        assert!(message.contains("Details: at browser_execute"));
     }
 
     #[test]
-    fn browser_script_failure_can_still_return_images_to_model() -> Result<()> {
+    fn browser_job_failure_can_still_return_images_to_model() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let image_path = temp.path().join("before_failure.png");
         std::fs::write(&image_path, [0x89, b'P', b'N', b'G'])?;
-        let response = browser_use_browser::BrowserScriptOutput {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: false,
             text: String::new(),
             error: Some("RuntimeError: after screenshot".to_string()),
             diagnosis: Some(browser_use_browser::BrowserIssueDiagnosis {
                 summary: "The script failed, but the browser page should still be reusable."
                     .to_string(),
-                what_happened: "The Python browser_script code raised an error.".to_string(),
+                what_happened: "The JavaScript browser_execute job raised an error.".to_string(),
                 next_step: "Inspect the screenshot and retry a smaller step.".to_string(),
                 browser_usable: true,
                 page_usable: true,
-                error_kind: "browser-script-error".to_string(),
+                error_kind: "browser-job-error".to_string(),
             }),
             images: vec![serde_json::json!({
                 "path": image_path.display().to_string(),
@@ -26593,7 +26977,7 @@ mod tests {
             ..Default::default()
         };
 
-        let content = browser_script_tool_message_content_value(&response)?;
+        let content = browser_job_tool_message_content_value(&response)?;
         let parts = content.as_array().expect("expected multimodal content");
 
         assert!(parts.iter().any(|part| part["type"] == "output_text"));
@@ -26602,31 +26986,31 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_running_message_tells_model_to_observe() {
-        let response = browser_use_browser::BrowserScriptOutput {
+    fn browser_job_running_message_tells_model_to_observe() {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: true,
             status: Some("running".to_string()),
-            run_id: Some("bs-test".to_string()),
+            run_id: Some("br-test".to_string()),
             next_observe_ms: Some(1_000),
-            text: "browser_script is still running.".to_string(),
+            text: "browser_execute is still running.".to_string(),
             ..Default::default()
         };
 
-        let message = browser_script_tool_message_content(&response);
+        let message = browser_job_tool_message_content(&response);
 
-        assert!(message.contains("run_id: bs-test"));
-        assert!(message.contains("action=\"observe\""));
-        assert!(message.contains("observe_timeout_ms=1000"));
+        assert!(message.contains("run_id: br-test"));
+        assert!(message.contains("browser_observe"));
+        assert!(message.contains("yield_time_ms=1000"));
     }
 
     #[test]
-    fn browser_script_structured_outputs_are_model_visible() {
-        let response = browser_use_browser::BrowserScriptOutput {
+    fn browser_job_structured_outputs_are_model_visible() {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: true,
             status: Some("running".to_string()),
-            run_id: Some("bs-structured".to_string()),
+            run_id: Some("br-structured".to_string()),
             next_observe_ms: Some(1_000),
-            text: "browser_script is still running.".to_string(),
+            text: "browser_execute is still running.".to_string(),
             outputs: vec![serde_json::json!({
                 "label": "page_info",
                 "value": {
@@ -26642,9 +27026,9 @@ mod tests {
             ..Default::default()
         };
 
-        let message = browser_script_tool_message_content(&response);
+        let message = browser_job_tool_message_content(&response);
 
-        assert!(message.contains("action=\"observe\""));
+        assert!(message.contains("browser_observe"));
         assert!(message.contains("outputs:"));
         assert!(message.contains("page_info"));
         assert!(message.contains("https://login.example.test/realms/acme?token=secret"));
@@ -26652,7 +27036,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_response_events_preserve_call_id_and_structured_channels() -> Result<()> {
+    fn browser_job_response_events_preserve_call_id_and_structured_channels() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
@@ -26660,10 +27044,10 @@ mod tests {
         let artifact_path = temp.path().join("result.json");
         std::fs::write(&image_path, [0x89, b'P', b'N', b'G'])?;
         std::fs::write(&artifact_path, br#"{"ok":true}"#)?;
-        let response = browser_use_browser::BrowserScriptOutput {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: true,
             status: Some("finished".to_string()),
-            run_id: Some("bs-structured".to_string()),
+            run_id: Some("br-structured".to_string()),
             text: "{'url': 'https://login.example.test/realms/acme?token=secret'}".to_string(),
             outputs: vec![serde_json::json!({
                 "label": "page_info",
@@ -26690,7 +27074,13 @@ mod tests {
             ..Default::default()
         };
 
-        record_browser_script_response_events(&store, &session.id, "call-browser-1", &response)?;
+        record_browser_job_response_events(
+            &store,
+            &session.id,
+            "call-browser-1",
+            "browser_execute",
+            &response,
+        )?;
 
         let events = store.events_for_session(&session.id)?;
         let output = events
@@ -26714,16 +27104,16 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_response_events_strip_transport_text_from_transcript() -> Result<()> {
+    fn browser_job_response_events_strip_transport_text_from_transcript() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        let response = browser_use_browser::BrowserScriptOutput {
+        let response = browser_use_browser::BrowserJobOutput {
             ok: true,
             status: Some("running".to_string()),
-            run_id: Some("bs-secret".to_string()),
+            run_id: Some("br-secret".to_string()),
             next_observe_ms: Some(1_000),
-            text: "chunk one\n\nbrowser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.".to_string(),
+            text: "chunk one\n\nbrowser_execute is still running.\nrun_id: br-secret\nNext: observe this run again.".to_string(),
             summary: vec![serde_json::json!({
                 "kind": "extracted",
                 "message": "Read 7 HN discussion threads"
@@ -26731,8 +27121,14 @@ mod tests {
             ..Default::default()
         };
 
-        let model_message = browser_script_tool_message_content(&response);
-        record_browser_script_response_events(&store, &session.id, "call-browser-1", &response)?;
+        let model_message = browser_job_tool_message_content(&response);
+        record_browser_job_response_events(
+            &store,
+            &session.id,
+            "call-browser-1",
+            "browser_execute",
+            &response,
+        )?;
 
         let events = store.events_for_session(&session.id)?;
         let output = events
@@ -26744,9 +27140,9 @@ mod tests {
         assert!(!output.payload["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("bs-secret"));
+            .contains("br-secret"));
         assert!(
-            model_message.contains("bs-secret"),
+            model_message.contains("br-secret"),
             "model-visible output should still include observe instructions: {model_message}"
         );
         Ok(())
@@ -34067,11 +34463,11 @@ request_max_retries = 7
             namespace: None,
             arguments: serde_json::json!({"path": "/tmp/shot.png"}),
         };
-        let browser_script_call = ToolCall {
-            id: "browser_script".to_string(),
-            name: "browser_script".to_string(),
+        let browser_execute_call = ToolCall {
+            id: "browser_execute".to_string(),
+            name: "browser_execute".to_string(),
             namespace: None,
-            arguments: serde_json::json!({"code": "screenshot('current')"}),
+            arguments: serde_json::json!({"code": "await session.Page.captureScreenshot({format:'png'})"}),
         };
 
         let default_router = with_browser_use_terminal_home(&app_home, || {
@@ -34103,11 +34499,11 @@ request_max_retries = 7
             None
         );
         assert!(
-            !tool_call_supports_parallel(&default_router, &browser_script_call),
-            "browser_script mutates shared browser state and must stay serial"
+            !tool_call_supports_parallel(&default_router, &browser_execute_call),
+            "browser_execute mutates shared browser state and must stay serial"
         );
         assert_eq!(
-            tool_call_streaming_predispatch_kind(&default_router, &browser_script_call),
+            tool_call_streaming_predispatch_kind(&default_router, &browser_execute_call),
             None
         );
 
@@ -40053,13 +40449,12 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         assert!(
             message.contains("You are still the same browser-use agent after context compaction")
         );
-        assert!(message.contains("Raw CDP is the center"));
-        assert!(message.contains("Do not call `screenshot` repeatedly on an unchanged viewport"));
-        assert!(message.contains("The user does not see the pixels inline in the terminal"));
-        assert!(message.contains("Loaded Browser-Harness Interaction Skills"));
+        assert!(message.contains("browser_execute"));
+        assert!(message.contains("session.<Domain>.<method>(params)"));
+        assert!(message.contains("Loaded Browser-Harness-JS Interaction Skills"));
         assert!(message.contains("interaction-skills/screenshots.md"));
         assert!(message.contains("interaction-skills/tabs.md"));
-        assert!(message.contains("interaction-skills/forms.md"));
+        assert!(message.contains("interaction-skills/dialogs.md"));
         assert!(message.contains("Compacted prior browser-agent context"));
         assert!(message.contains("https://example.com"));
         Ok(())

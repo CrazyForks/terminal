@@ -4877,9 +4877,9 @@ pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
         ));
     instructions.push_str("\n\n## Browser Agent Contract\n\n");
     instructions.push_str(include_str!("../../../prompts/browser-agent-system.md").trim());
-    instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
+    instructions.push_str("\n\n## Loaded Browser-Harness-JS Interaction Skills");
     instructions.push_str(
-        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
+        "\n\nThese are CDP-first interaction playbooks from browser-harness-js. Apply the relevant section when the page mechanic appears.",
     );
     for (path, content) in browser_harness_interaction_skills() {
         instructions.push_str("\n\n### ");
@@ -5119,10 +5119,6 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
             include_str!("../../../prompts/interaction-skills/dropdowns.md"),
         ),
         (
-            "interaction-skills/forms.md",
-            include_str!("../../../prompts/interaction-skills/forms.md"),
-        ),
-        (
             "interaction-skills/iframes.md",
             include_str!("../../../prompts/interaction-skills/iframes.md"),
         ),
@@ -5133,10 +5129,6 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
         (
             "interaction-skills/print-as-pdf.md",
             include_str!("../../../prompts/interaction-skills/print-as-pdf.md"),
-        ),
-        (
-            "interaction-skills/profile-sync.md",
-            include_str!("../../../prompts/interaction-skills/profile-sync.md"),
         ),
         (
             "interaction-skills/screenshots.md",
@@ -6232,7 +6224,7 @@ fn visual_context_text(call_id: &str, tool_name: &str) -> String {
 
 fn omitted_visual_context_text(call_id: &str, tool_name: &str) -> String {
     format!(
-        "Visual output from tool call {call_id} ({tool_name}) was omitted because this model endpoint does not accept image content. Continue using text, DOM state, and browser_script inspection instead."
+        "Visual output from tool call {call_id} ({tool_name}) was omitted because this model endpoint does not accept image content. Continue using text, DOM state, and browser_execute inspection instead."
     )
 }
 
@@ -11886,28 +11878,22 @@ mod tests {
             "NEVER revert existing changes you did not make",
             "**NEVER** use destructive commands like `git reset --hard`",
             "If the user asks for a \"review\", default to a code review mindset",
-            "bitter lesson",
-            "Raw CDP is the center",
-            "source of truth",
-            "new_tab(url)",
-            "not `goto_url(url)`",
-            "Prefer coordinate clicks",
-            "Chrome hit-testing handles iframes",
-            "Never bulk-fill a live form by setting DOM values",
-            "screenshot(\"label\")",
-            "input_image",
-            "agent_helpers.py",
-            "Browser interaction tool",
-            "Loaded Browser-Harness Interaction Skills",
-            "Use helper agents only when the user explicitly asks",
-            "detailed codebase analysis do not by themselves authorize spawning",
+            "browser_execute",
+            "Rust-owned CDP access",
+            "session.<Domain>.<method>(params)",
+            "listPageTargets()",
+            "browser_observe",
+            "browser_cancel",
+            "browser_status",
+            "browser_configure",
+            "browser_recover",
+            "Loaded Browser-Harness-JS Interaction Skills",
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
-            "interaction-skills/forms.md",
-            "JS may inspect forms; browser input actions mutate forms",
-            "Do not build manager layers",
-            "Do not import or install Playwright",
+            "session.Page.captureScreenshot",
+            "session.Target.createTarget",
+            "session.Page.handleJavaScriptDialog",
         ] {
             assert!(
                 instructions.contains(expected),

@@ -1,16 +1,54 @@
 # Screenshots
 
-`screenshot(label)` and `capture_screenshot(...)` write a PNG of the current viewport and attach it to the next model turn. The user does not see the pixels inline in the terminal; inspect the image yourself and summarize what it shows, or provide the saved artifact path when the user asks for the screenshot. The file is in **device pixels** — on a 2x display a 2296x1143 CSS viewport produces a 4592x2286 PNG.
+`session.Page.captureScreenshot` is your default discovery and verification tool.
 
-That matters for two reasons:
+## Core calls
 
-1. **Click coordinates are CSS pixels.** Don't read a target off the image and pass it to `click_at_xy()` directly without dividing by `devicePixelRatio`. The simplest workflow is to take the screenshot, look at it in a viewer that shows CSS coordinates, or measure relative positions and use `js("window.devicePixelRatio")` to convert.
+```js
+// Viewport only (default) — fastest, matches what the user sees
+const { data } = await session.Page.captureScreenshot({ format: 'png' })
+// Cross-platform temp dir: /tmp on Linux, /var/folders/… on macOS, %TEMP% on Windows
+const { tmpdir } = await import('node:os')
+await Bun.write(`${tmpdir()}/shot.png`, Buffer.from(data, 'base64'))
 
-2. **Some LLMs reject images > 2000 px per side.** Long sessions on 2x displays can hit this. Prefer `screenshot_clip(...)` for a smaller CSS-pixel region when only part of the page matters.
+// Full page — stitched beyond the viewport
+await session.Page.captureScreenshot({ format: 'png', captureBeyondViewport: true })
 
-```python
-screenshot("before_submit")
-screenshot_clip("menu_area", x=20, y=80, width=460, height=520)
+// JPEG is ~5× smaller — good when you only need to eyeball
+await session.Page.captureScreenshot({ format: 'jpeg', quality: 70 })
+
+// A specific region (page coordinates)
+await session.Page.captureScreenshot({
+  format: 'png',
+  clip: { x: 0, y: 0, width: 800, height: 600, scale: 1 },
+})
 ```
 
-Use full-page screenshots (`full=True`) only when you need to see content below the fold — they are much larger and slower than viewport-only.
+## When to screenshot
+
+- **Discovery:** after navigating, before inventing a selector. A screenshot answers "is the thing I need visible and where?" faster than a DOM walk.
+- **Verification:** after every meaningful action. The DOM can lie about state; pixels cannot.
+- **Debugging coordinate clicks:** shot → read → `Input.dispatchMouseEvent` at (x, y) → shot again.
+
+## Element screenshots via `DOM.getBoxModel`
+
+When you want just one element:
+
+```js
+await session.DOM.enable()
+const { root } = await session.DOM.getDocument({})
+const { nodeId } = await session.DOM.querySelector({ nodeId: root.nodeId, selector: '.card' })
+const { model } = await session.DOM.getBoxModel({ nodeId })
+const [x, y] = model.border        // top-left
+const width = model.width
+const height = model.height
+await session.Page.captureScreenshot({ clip: { x, y, width, height, scale: 1 } })
+```
+
+`model.border` is `[x1,y1, x2,y1, x2,y2, x1,y2]` — 8 numbers, 4 corners. Take the first two for origin.
+
+## Traps
+
+- `captureBeyondViewport: true` re-layouts the page (fires resize). Don't use it in the middle of a user-driven flow — use viewport shots.
+- On high-DPI, `captureScreenshot` returns the device-pixel image. If you plan to coordinate-click on values read from the image, remember the CSS-pixel / device-pixel scale (see viewport.md).
+- Pages with fixed/sticky headers over `captureBeyondViewport` can produce duplicated headers down the stitched image.

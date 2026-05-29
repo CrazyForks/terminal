@@ -704,7 +704,7 @@ def smoke_double_escape_opens_message_selector(binary: Path) -> None:
         assert_no_legacy_dashboard_chrome(armed, "first escape should not restore old dashboard chrome")
         tmux_send(session, "Escape")
         selector = wait_for(session, "Messages", "double-escape-messages")
-        assert_contains(selector, "run", "message selector should show the submitted prompt")
+        assert_contains(selector, "start", "message selector should show the submitted prompt")
         assert_contains(
             selector,
             "Edit submitted prompts or cancel queued follow-ups",
@@ -739,7 +739,8 @@ def smoke_escape_reclaims_prompt_before_output(binary: Path) -> None:
         wait_for(session, f"> {prompt}", "esc-reclaim-submitted")
 
         tmux_send(session, "Escape")
-        reclaimed = wait_for(session, f"> {prompt}", "esc-reclaim-returned")
+        reclaimed = wait_for(session, "Message returned to composer.", "esc-reclaim-returned")
+        assert_contains(reclaimed, f"> {prompt}", "escape should return submitted text to composer")
         assert_not_contains(
             reclaimed,
             "esc again to edit messages",

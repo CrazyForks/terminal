@@ -1,31 +1,48 @@
 # Tabs
 
-Use **CDP for control**, **UI automation for user-visible order**.
+Use **CDP for control** (attach, activate known targets, inspect). Use **UI automation for visible order**.
 
-## Pure CDP (portable: macOS / Linux / Windows)
+## Pure CDP
 
-```python
-tabs = list_tabs()                    # includes chrome:// pages too
-real_tabs = list_tabs(include_chrome=False)
-tid = new_tab("https://example.com")  # create + attach
-switch_tab(tid)                       # attach harness to tab
-cdp("Target.activateTarget", targetId=tid)  # show it in Chrome
-print(current_tab())
-print(page_info())
+```js
+// List page targets (filtered; chrome:// / devtools:// dropped)
+const tabs = await listPageTargets()
+
+// Create a new tab and route subsequent calls to it
+const { targetId } = await session.Target.createTarget({ url: 'https://example.com' })
+await session.use(targetId)
+
+// Switch: route calls to another existing tab
+await session.use(otherTargetId)
+
+// Show this tab visibly in Chrome (different from `session.use` — which is CDP routing only)
+await session.Target.activateTarget({ targetId })
+
+// Close a tab
+await session.Target.closeTarget({ targetId })
+
+// What tab is session.use currently pointing at?
+const { targetInfo } = await session.Target.getTargetInfo({ targetId })
 ```
 
-What CDP is good at:
-- attach to a tab
-- open a tab
-- activate a known target
-- inspect URL/title/viewport
-- capture the attached tab's screenshot even if another tab is visibly frontmost
+**`session.use` is CDP-side routing; `Target.activateTarget` is Chrome-side focus.** They are independent. If the user expects Chrome to visibly change, call `activateTarget` too.
 
-What CDP is bad at:
-- matching the **left-to-right tab strip order** the user sees
-- telling whether the attached target is an omnibox popup / internal page without URL filtering
+## Two things `Target.createTarget` quietly gets wrong
 
-## Visible order (platform UI)
+1. **Race: `{ url }` in `createTarget` can resolve before navigation starts.** If you then poll `document.readyState`, you'll see `'complete'` for about:blank and move on. Safer:
+   ```js
+   const { targetId } = await session.Target.createTarget({ url: 'about:blank' })
+   await session.use(targetId)
+   await session.Page.enable()
+   await session.Page.navigate({ url: 'https://example.com' })
+   // now wait for Page.loadEventFired via session.waitFor
+   ```
+
+2. **New tab may open behind the active one.** Add `Target.activateTarget` if the user needs to see it.
+
+## Visible tab-strip order (platform UI)
+
+CDP's `Target.getTargets` returns an arbitrary order — not left-to-right.
 
 ### macOS
 
@@ -50,20 +67,9 @@ end tell
 
 ### Linux
 
-No AppleScript. Same split still applies:
-- use CDP for `new_tab`, attach, inspect, activate known targets
-- use window-manager / browser UI automation when the user means visible order
+No AppleScript. Use `xdotool`, `wmctrl`, or desktop-environment scripting. The split is the same — CDP for attach/activate-by-id, window manager for visible ordering.
 
-Typical tools:
-- `xdotool`
-- `wmctrl`
-- desktop-environment scripting (`gdbus`, KWin, GNOME Shell extensions, etc.)
+## Traps
 
-## Rules that held up in practice
-
-- `switch_tab()` is **not enough** if the user expects Chrome to visibly change.
-- `Target.activateTarget` is the CDP-side "show this tab".
-- `list_tabs()` includes `chrome://newtab/` by default; ask for `include_chrome=False` when you want only real pages.
-- `chrome://omnibox-popup.top-chrome/` can appear as a fake page target; ignore it for user-facing tab lists.
-- If a page has `w=0 h=0`, you may be attached to the wrong target or a non-window surface.
-- For dynamic UIs, re-read element rects after opening dropdowns / modals before coordinate-clicking.
+- `listPageTargets()` already drops `chrome://` and `devtools://`. If you call `Target.getTargets` raw, you must filter yourself, or you'll attach to a 1px omnibox popup.
+- If a page reports `innerWidth=0 innerHeight=0`, you're probably attached to a non-window surface (omnibox popup, background tab that never rendered).

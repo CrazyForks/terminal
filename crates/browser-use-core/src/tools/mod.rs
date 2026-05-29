@@ -38,7 +38,12 @@ eof_line: "*** End of File" LF
 pub(crate) enum ToolHandlerKind {
     Done,
     Browser,
-    BrowserScript,
+    BrowserExecute,
+    BrowserObserve,
+    BrowserCancel,
+    BrowserStatus,
+    BrowserConfigure,
+    BrowserRecover,
     Python,
     ShellCommand,
     ExecCommand,
@@ -488,8 +493,20 @@ impl ToolRegistry {
             ),
             ToolHandlerKind::RequestUserInput,
         );
-        registry.register(browser_tool_spec(), ToolHandlerKind::Browser);
-        registry.register(browser_script_tool_spec(), ToolHandlerKind::BrowserScript);
+        registry.register_with_exposure(
+            browser_tool_spec(),
+            ToolHandlerKind::Browser,
+            ToolExposure::Hidden,
+        );
+        registry.register(browser_execute_tool_spec(), ToolHandlerKind::BrowserExecute);
+        registry.register(browser_observe_tool_spec(), ToolHandlerKind::BrowserObserve);
+        registry.register(browser_cancel_tool_spec(), ToolHandlerKind::BrowserCancel);
+        registry.register(browser_status_tool_spec(), ToolHandlerKind::BrowserStatus);
+        registry.register(
+            browser_configure_tool_spec(),
+            ToolHandlerKind::BrowserConfigure,
+        );
+        registry.register(browser_recover_tool_spec(), ToolHandlerKind::BrowserRecover);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         match multi_agent_config.family {
             MultiAgentToolFamily::Disabled => {}
@@ -1583,7 +1600,7 @@ fn view_image_tool_spec(can_request_original_image_detail: bool) -> ToolSpec {
             "on disk, such as screenshots or artifacts. This tool is not parallel-safe: visual ",
             "context should be inspected in order with the browser actions that produced it. ",
             "It must not be called in parallel with browser actions or other image views. ",
-            "It is not a browser screenshot command; use browser_script screenshot helpers ",
+            "It is not a browser screenshot command; use browser_execute with Page.captureScreenshot ",
             "to create browser screenshots first."
         )
         .to_string(),
@@ -1622,37 +1639,166 @@ fn browser_tool_spec() -> ToolSpec {
     }
 }
 
-fn browser_script_tool_spec() -> ToolSpec {
+fn browser_execute_tool_spec() -> ToolSpec {
     ToolSpec {
-        name: "browser_script".to_string(),
+        name: "browser_execute".to_string(),
         namespace: None,
         namespace_description: None,
-        description: include_str!("../../../../prompts/browser-script-tool-description.md")
-            .trim()
-            .to_string(),
+        description: "Run JavaScript browser interaction code in the persistent browser executor. Rust owns Chrome/CDP; this tool starts a job, waits up to yield_time_ms, and returns either the final result or a run_id for browser_observe.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python code to run in a fresh process with browser helpers preimported. Omit when action is observe or cancel."
+                    "description": "JavaScript code to run with session, cdp, listPageTargets, sleep, checkpoint, and console available. session includes CDP domains plus use(targetId), waitFor(method, predicate, timeoutMs), and onEvent(listener)."
                 },
-                "action": {
-                    "type": "string",
-                    "enum": ["start", "observe", "cancel"],
-                    "description": "start launches code and returns either a final result or a run_id; observe listens for new output/final status; cancel stops a running script. Defaults to start when code is provided and observe when only run_id is provided."
-                },
-                "run_id": {
-                    "type": "string",
-                    "description": "Running browser_script id returned by a previous start call. Required for observe and cancel."
-                },
-                "observe_timeout_ms": {
+                "yield_time_ms": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 10000,
-                    "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
+                    "maximum": 30000,
+                    "description": "How long this tool call should wait for output before yielding control. Defaults to 1000."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120000,
+                    "description": "Maximum lifetime of the browser job. Defaults to 60000."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Short purpose of this browser job."
                 }
             },
+            "required": ["code"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn browser_observe_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_observe".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Observe a running browser_execute job and return new output or final status."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "Browser job id returned by browser_execute."
+                },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30000,
+                    "description": "How long to wait for new output or completion before returning. Defaults to 1000."
+                }
+            },
+            "required": ["run_id"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn browser_cancel_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_cancel".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description:
+            "Cancel a stale or no-longer-needed browser_execute job without restarting the browser."
+                .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "Browser job id returned by browser_execute."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this running job is stale, hung, or no longer needed."
+                }
+            },
+            "required": ["run_id"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn browser_status_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_status".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Return compact browser diagnostics: mode, connection, redacted endpoint, target/session, active jobs, last issue, and safe recovery actions.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "include_logs": { "type": "boolean", "description": "Include recent browser runtime logs. Defaults to false." },
+                "include_profiles": { "type": "boolean", "description": "Include available local/cloud profile candidates when supported. Defaults to false." },
+                "include_candidates": { "type": "boolean", "description": "Include local browser candidates when supported. Defaults to false." }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn browser_configure_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_configure".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Explicit user-directed browser setup only: mode, CDP URL, cloud key/profile, local profile, or persistence preference. Do not use for speculative recovery.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["local", "managed-headless", "managed-headed", "cloud", "remote-cdp"] },
+                "cdp_url": { "type": "string", "description": "HTTP or WebSocket CDP endpoint for remote-cdp mode." },
+                "browser_use_api_key": { "type": "string", "description": "Browser Use API key. Redacted in outputs." },
+                "profile_id": { "type": "string" },
+                "profile_name": { "type": "string" },
+                "proxy_country": { "type": "string" },
+                "timeout_minutes": { "type": "integer", "minimum": 1 },
+                "persist": { "type": "string", "enum": ["session", "workspace", "user"] },
+                "connect_now": { "type": "boolean" },
+                "reason": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn browser_recover_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_recover".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description:
+            "Run a gated browser lifecycle recovery action only after real browser/session failure."
+                .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["reconnect-websocket", "reattach-same-target", "restart-runtime", "restart-owned-browser", "stop-owned-remote"]
+                },
+                "reason": { "type": "string" }
+            },
+            "required": ["action"],
             "additionalProperties": false
         }),
         output_schema: None,
@@ -2374,29 +2520,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn browser_script_tool_description_preserves_raw_cdp_contract() {
-        let description = browser_script_tool_spec().description;
+    fn browser_execute_tool_description_preserves_job_contract() {
+        let spec = browser_execute_tool_spec();
+        let description = spec.description;
         for expected in [
-            "CDP is the source of truth",
-            "browser interaction tool",
-            "new_tab(url)",
-            "First navigation should usually be `new_tab(url)`",
-            "domain_skills_for_url",
-            "coordinate clicks",
-            "click_at_xy",
-            "screenshot(label)",
-            "The user does not see those pixels inline",
-            "status: running",
-            "action=\"observe\"",
-            "cdp(...)",
-            "Do not import Playwright",
-            "audit_artifact",
+            "JavaScript browser interaction code",
+            "persistent browser executor",
+            "Rust owns Chrome/CDP",
+            "yield_time_ms",
+            "run_id",
+            "browser_observe",
         ] {
             assert!(
                 description.contains(expected),
-                "missing {expected:?} from browser_script tool description:\n{description}"
+                "missing {expected:?} from browser_execute tool description:\n{description}"
             );
         }
+        assert_eq!(spec.input_schema["required"], serde_json::json!(["code"]));
+        assert!(spec.input_schema["properties"]["code"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("session")));
     }
 
     #[test]
@@ -2404,18 +2547,16 @@ mod tests {
         let description = browser_tool_spec().description;
         for expected in [
             "browser control plane",
-            "The input is a single CLI-like command string",
-            "Remote start means start and connect",
+            "typed tools",
             "Nothing reloads, relaunches, closes, or switches tabs silently",
             "browser connect local",
             "browser connect managed",
             "browser remote start",
-            "browser domain skills --domain",
             "browser doctor --json",
             "browser recover reconnect-websocket",
-            "browser script runs --json",
             "browser runtime ownership --json",
             "External user Chrome is never killed or relaunched",
+            "page interaction belongs to `browser_execute`",
         ] {
             assert!(
                 description.contains(expected),
@@ -3027,8 +3168,14 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"browser".to_string()));
-        assert!(names.contains(&"browser_script".to_string()));
+        assert!(!names.contains(&"browser".to_string()));
+        assert!(names.contains(&"browser_execute".to_string()));
+        assert!(names.contains(&"browser_observe".to_string()));
+        assert!(names.contains(&"browser_cancel".to_string()));
+        assert!(names.contains(&"browser_status".to_string()));
+        assert!(names.contains(&"browser_configure".to_string()));
+        assert!(names.contains(&"browser_recover".to_string()));
+        assert!(!names.contains(&"browser_script".to_string()));
         assert!(!names.contains(&"python".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"search_files".to_string()));
