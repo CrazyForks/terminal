@@ -10081,7 +10081,7 @@ wire_api = "responses"
             &session.id,
             "tool.image",
             serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "image": {
                     "path": image_path,
                     "mime_type": "image/png",

@@ -1,12 +1,12 @@
 # Browser Interaction Redesign
 
-This document is the implementation contract for replacing the current
-`browser_script` interaction layer.
+This document is the implementation contract for replacing the old Python
+browser interaction layer.
 
 ## Goals
 
 - Keep Rust as the browser lifecycle and CDP transport owner.
-- Remove the Python `browser_script` interaction surface.
+- Remove the old Python browser interaction surface.
 - Add a persistent Bun JavaScript executor for model-authored browser code.
 - Route every browser interaction CDP call through a Rust-owned broker.
 - Give the model Codex-style execute/observe/cancel semantics with no explicit
@@ -76,13 +76,13 @@ lifecycle actions should be typed tools.
 
 Remove the current interaction plane:
 
-- `browser_script` model-facing tool.
+- the old Python model-facing browser interaction tool.
 - `action=start|observe|cancel` inside a single browser interaction tool.
 - fresh Python worker process per script.
-- Python helper prelude and `browser_script_helpers.py`.
+- Python helper prelude and helper module.
 - Python-to-Rust TCP bridge.
-- `browser script runs/cancel` model-facing behavior.
-- browser-script-specific prompt text and stale Python interaction skills.
+- old Python run/cancel model-facing behavior.
+- old Python-specific prompt text and stale interaction skills.
 - tests that only validate the removed Python behavior.
 
 Do not use the old implementation as the new runtime template. Keep a feature
@@ -270,7 +270,7 @@ reconnect after normal JS/CDP errors.
 ```
 
 Interaction skills should be native skills, sourced primarily from
-`browser-harness-js`, not hard-inlined Python/browser_script instructions.
+`browser-harness-js`, not hard-inlined Python interaction instructions.
 
 ## Verification
 

@@ -6,12 +6,12 @@
 //!   CDP connection.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,10 +29,6 @@ use tungstenite::{connect, Message, WebSocket};
 
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
-const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
-const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
-const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
-const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_EXECUTOR_JS: &str = include_str!("browser_executor.js");
 const BROWSER_JOB_DEFAULT_OBSERVE_MS: u64 = 1_000;
 
@@ -40,33 +36,6 @@ const BROWSER_JOB_DEFAULT_OBSERVE_MS: u64 = 1_000;
 pub struct BrowserCommandOutput {
     pub content: Value,
     pub events: Vec<Value>,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct BrowserScriptOutput {
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_observe_ms: Option<u64>,
-    pub text: String,
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnosis: Option<BrowserIssueDiagnosis>,
-    #[serde(default)]
-    pub data: Value,
-    #[serde(default)]
-    pub outputs: Vec<Value>,
-    #[serde(default)]
-    pub summary: Vec<Value>,
-    #[serde(default)]
-    pub artifacts: Vec<Value>,
-    #[serde(default)]
-    pub images: Vec<Value>,
-    #[serde(default)]
-    pub browser_events: Vec<Value>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -257,8 +226,6 @@ impl Default for BrowserSession {
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, BrowserSession>>> = OnceLock::new();
-static BROWSER_SCRIPT_RUNS: OnceLock<Mutex<HashMap<String, BrowserScriptRun>>> = OnceLock::new();
-static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BROWSER_JS_EXECUTORS: OnceLock<Mutex<HashMap<String, BrowserJsExecutor>>> = OnceLock::new();
 static BROWSER_JOB_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -301,58 +268,8 @@ struct BrowserJobState {
     timeout_ms: u64,
 }
 
-struct BrowserScriptRun {
-    id: String,
-    session_id: String,
-    child: Child,
-    stdout_reader: Option<thread::JoinHandle<Vec<u8>>>,
-    stderr_reader: Option<thread::JoinHandle<Vec<u8>>>,
-    bridge_stop: Arc<AtomicBool>,
-    bridge: Option<thread::JoinHandle<()>>,
-    bridge_errors: Arc<Mutex<Vec<String>>>,
-    stream_path: PathBuf,
-    stream_offset: u64,
-    started_at_ms: u128,
-    timeout_seconds: u64,
-    deadline: Instant,
-}
-
-#[derive(Default)]
-struct BrowserScriptDelta {
-    text: String,
-    outputs: Vec<Value>,
-    summary: Vec<Value>,
-    artifacts: Vec<Value>,
-    images: Vec<Value>,
-    browser_events: Vec<Value>,
-    consumed_bytes: u64,
-}
-
-fn browser_script_runs() -> &'static Mutex<HashMap<String, BrowserScriptRun>> {
-    BROWSER_SCRIPT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn browser_js_executors() -> &'static Mutex<HashMap<String, BrowserJsExecutor>> {
     BROWSER_JS_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn active_browser_script_runs_json(session_id: &str) -> Value {
-    let runs = browser_script_runs()
-        .lock()
-        .expect("browser_script run registry poisoned");
-    Value::Array(
-        runs.values()
-            .filter(|run| run.session_id == session_id)
-            .map(|run| {
-                json!({
-                    "run_id": run.id,
-                    "status": "running",
-                    "started_at_ms": run.started_at_ms as u64,
-                    "next_step": format!("browser_script action=observe run_id={}", run.id),
-                })
-            })
-            .collect(),
-    )
 }
 
 fn active_browser_jobs_json(session_id: &str) -> Value {
@@ -1028,26 +945,6 @@ pub fn run_browser_command(
         argv.push("help".to_string());
     }
 
-    if argv.first().map(String::as_str) == Some("script") {
-        {
-            let mut sessions = sessions()
-                .lock()
-                .expect("browser session registry poisoned");
-            let session = sessions.entry(session_id.to_string()).or_default();
-            session.session_id = Some(session_id.to_string());
-            session.log(format!("browser {}", argv.join(" ")));
-        }
-        let content = dispatch_script_runtime(session_id, &argv)?;
-        let mut sessions = sessions()
-            .lock()
-            .expect("browser session registry poisoned");
-        let events = sessions
-            .get_mut(session_id)
-            .map(BrowserSession::browser_events)
-            .unwrap_or_default();
-        return Ok(BrowserCommandOutput { events, content });
-    }
-
     let mut sessions = sessions()
         .lock()
         .expect("browser session registry poisoned");
@@ -1061,394 +958,11 @@ pub fn run_browser_command(
     })
 }
 
-pub fn run_browser_script(
-    session_id: &str,
-    cwd: impl AsRef<Path>,
-    artifact_dir: impl AsRef<Path>,
-    code: &str,
-    timeout_seconds: u64,
-) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
-    loop {
-        if run.child.try_wait()?.is_some() {
-            return finish_browser_script_run(run, false);
-        }
-        if Instant::now() >= run.deadline {
-            return finish_browser_script_run(run, true);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-pub fn start_browser_script(
-    session_id: &str,
-    cwd: impl AsRef<Path>,
-    artifact_dir: impl AsRef<Path>,
-    code: &str,
-    timeout_seconds: u64,
-) -> Result<BrowserScriptOutput> {
-    let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
-    let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
-    loop {
-        if run.child.try_wait()?.is_some() {
-            return finish_browser_script_run(run, false);
-        }
-        if Instant::now() >= run.deadline {
-            return finish_browser_script_run(run, true);
-        }
-        if Instant::now() >= initial_deadline {
-            let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
-            let text = if delta.text.trim().is_empty() {
-                format!(
-                    "browser_script is still running.\nrun_id: {}\nNext: call browser_script with action=\"observe\" and run_id=\"{}\".",
-                    run.id, run.id
-                )
-            } else {
-                format!(
-                    "{}\n\nbrowser_script is still running.\nrun_id: {}\nNext: observe this run again.",
-                    delta.text.trim_end(),
-                    run.id
-                )
-            };
-            let run_id = run.id.clone();
-            let output = BrowserScriptOutput {
-                ok: true,
-                status: Some("running".to_string()),
-                run_id: Some(run_id.clone()),
-                next_observe_ms: Some(BROWSER_SCRIPT_DEFAULT_OBSERVE_MS),
-                text,
-                outputs: std::mem::take(&mut delta.outputs),
-                summary: std::mem::take(&mut delta.summary),
-                artifacts: std::mem::take(&mut delta.artifacts),
-                images: std::mem::take(&mut delta.images),
-                browser_events: std::mem::take(&mut delta.browser_events),
-                ..Default::default()
-            };
-            browser_script_runs()
-                .lock()
-                .expect("browser_script run registry poisoned")
-                .insert(run_id, run);
-            return Ok(output);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-pub fn observe_browser_script(
-    session_id: &str,
-    run_id: &str,
-    observe_timeout_ms: u64,
-) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
-        .lock()
-        .expect("browser_script run registry poisoned")
-        .remove(run_id)
-        .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
-    if run.session_id != session_id {
-        let owner = run.session_id.clone();
-        browser_script_runs()
-            .lock()
-            .expect("browser_script run registry poisoned")
-            .insert(run.id.clone(), run);
-        bail!("browser_script run {run_id} belongs to a different session ({owner})");
-    }
-
-    let timeout = Duration::from_millis(observe_timeout_ms.max(1));
-    let observe_deadline = Instant::now() + timeout;
-    loop {
-        if run.child.try_wait()?.is_some() {
-            return finish_browser_script_run(run, false);
-        }
-        if Instant::now() >= run.deadline {
-            return finish_browser_script_run(run, true);
-        }
-        let delta = drain_browser_script_delta(&mut run).unwrap_or_default();
-        if delta.has_content() {
-            let output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
-            browser_script_runs()
-                .lock()
-                .expect("browser_script run registry poisoned")
-                .insert(run.id.clone(), run);
-            return Ok(output);
-        }
-        if Instant::now() >= observe_deadline {
-            let output = browser_script_running_output(&run, None, observe_timeout_ms);
-            browser_script_runs()
-                .lock()
-                .expect("browser_script run registry poisoned")
-                .insert(run.id.clone(), run);
-            return Ok(output);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    let mut run = browser_script_runs()
-        .lock()
-        .expect("browser_script run registry poisoned")
-        .remove(run_id)
-        .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
-    if run.session_id != session_id {
-        let owner = run.session_id.clone();
-        browser_script_runs()
-            .lock()
-            .expect("browser_script run registry poisoned")
-            .insert(run.id.clone(), run);
-        bail!("browser_script run {run_id} belongs to a different session ({owner})");
-    }
-    let _ = run.child.kill();
-    finish_cancelled_browser_script_run(run)
-}
-
-fn spawn_browser_script(
-    session_id: &str,
-    cwd: impl AsRef<Path>,
-    artifact_dir: impl AsRef<Path>,
-    code: &str,
-    timeout_seconds: u64,
-) -> Result<BrowserScriptRun> {
-    fs::create_dir_all(artifact_dir.as_ref())
-        .with_context(|| format!("create artifact dir {}", artifact_dir.as_ref().display()))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind browser_script bridge")?;
-    let bridge_addr = listener.local_addr()?;
-    listener
-        .set_nonblocking(true)
-        .context("set browser_script bridge nonblocking")?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let bridge_errors = Arc::new(Mutex::new(Vec::new()));
-    let bridge_stop = stop.clone();
-    let bridge_error_sink = bridge_errors.clone();
-    let bridge_session_id = session_id.to_string();
-    let bridge = thread::spawn(move || {
-        run_bridge(listener, bridge_session_id, bridge_stop, bridge_error_sink)
-    });
-
-    let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
-    let domain_skill_roots = domain_skill_roots_for(&agent_workspace_dir);
-    let run_id = new_browser_script_run_id();
-    let stream_path = artifact_dir
-        .as_ref()
-        .join(format!(".{run_id}.events.ndjson"));
-    let prelude = browser_script_prelude(
-        bridge_addr.port(),
-        cwd.as_ref(),
-        artifact_dir.as_ref(),
-        &agent_workspace_dir,
-        &domain_skill_roots,
-        &stream_path,
-        code,
-    )?;
-    let mut command = browser_script_python_command();
-    let mut child = command
-        .arg("-c")
-        .arg(prelude)
-        .current_dir(cwd.as_ref())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn browser_script python")?;
-    let stdout_reader = child.stdout.take().map(read_browser_script_stdout);
-    let stderr_reader = child.stderr.take().map(read_browser_script_stderr);
-    Ok(BrowserScriptRun {
-        id: run_id,
-        session_id: session_id.to_string(),
-        child,
-        stdout_reader,
-        stderr_reader,
-        bridge_stop: stop,
-        bridge: Some(bridge),
-        bridge_errors,
-        stream_path,
-        stream_offset: 0,
-        started_at_ms: unix_time_ms(),
-        timeout_seconds: timeout_seconds.max(1),
-        deadline: Instant::now() + Duration::from_secs(timeout_seconds.max(1)),
-    })
-}
-
-fn finish_browser_script_run(
-    mut run: BrowserScriptRun,
-    timed_out: bool,
-) -> Result<BrowserScriptOutput> {
-    if timed_out {
-        let _ = run.child.kill();
-    }
-    let _ = run.child.wait().context("wait for browser_script python")?;
-    run.bridge_stop.store(true, Ordering::SeqCst);
-    let bridge_joined = run
-        .bridge
-        .take()
-        .map(|bridge| join_bridge_with_timeout(bridge, Duration::from_secs(5)))
-        .unwrap_or(true);
-    let mut bridge_errors = run
-        .bridge_errors
-        .lock()
-        .expect("browser_script bridge error registry poisoned")
-        .clone();
-    if !bridge_joined {
-        bridge_errors.push(
-            "browser_script bridge did not stop within 5 seconds after child exit".to_string(),
-        );
-    }
-    let stdout = join_reader(run.stdout_reader.take());
-    let stderr = join_reader(run.stderr_reader.take());
-    let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
-
-    if timed_out {
-        let error = format!(
-            "browser_script timed out after {} seconds",
-            run.timeout_seconds
-        );
-        return Ok(BrowserScriptOutput {
-            ok: false,
-            status: Some("failed".to_string()),
-            run_id: Some(run.id),
-            text: std::mem::take(&mut delta.text),
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
-            error: Some(error),
-            outputs: std::mem::take(&mut delta.outputs),
-            summary: std::mem::take(&mut delta.summary),
-            artifacts: std::mem::take(&mut delta.artifacts),
-            images: std::mem::take(&mut delta.images),
-            browser_events: std::mem::take(&mut delta.browser_events),
-            ..Default::default()
-        });
-    }
-
-    let marker = "__BROWSER_SCRIPT_RESULT__";
-    let result_line = stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix(marker))
-        .map(str::trim);
-    let Some(result_line) = result_line else {
-        let error = if stderr.trim().is_empty() {
-            "browser_script did not emit a result".to_string()
-        } else {
-            stderr
-        };
-        return Ok(BrowserScriptOutput {
-            ok: false,
-            status: Some("failed".to_string()),
-            run_id: Some(run.id),
-            text: if delta.text.trim().is_empty() {
-                truncate_text(&stdout, SCRIPT_MAX_OUTPUT_CHARS)
-            } else {
-                std::mem::take(&mut delta.text)
-            },
-            diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
-            error: Some(error),
-            outputs: std::mem::take(&mut delta.outputs),
-            summary: std::mem::take(&mut delta.summary),
-            artifacts: std::mem::take(&mut delta.artifacts),
-            images: std::mem::take(&mut delta.images),
-            browser_events: std::mem::take(&mut delta.browser_events),
-            ..Default::default()
-        });
-    };
-    let mut response: BrowserScriptOutput =
-        serde_json::from_str(result_line).context("parse browser_script result")?;
-    if !bridge_errors.is_empty() {
-        response.browser_events.push(json!({
-            "type": "browser.bridge_errors",
-            "payload": { "errors": bridge_errors },
-        }));
-        if !response.ok {
-            let details = response
-                .browser_events
-                .last()
-                .and_then(|event| event.pointer("/payload/errors"))
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            response.error = Some(match response.error.take() {
-                Some(error) => format!("{error}\n\nRust bridge errors: {details}"),
-                None => format!("Rust bridge errors: {details}"),
-            });
-        }
-    }
-    if !stderr.trim().is_empty() && response.error.is_none() && !response.ok {
-        response.error = Some(stderr);
-    }
-    if !delta.text.trim().is_empty() {
-        response.text = std::mem::take(&mut delta.text);
-    }
-    if !delta.outputs.is_empty() {
-        response.outputs = std::mem::take(&mut delta.outputs);
-    }
-    if !delta.summary.is_empty() {
-        response.summary = std::mem::take(&mut delta.summary);
-    }
-    if !delta.artifacts.is_empty() {
-        response.artifacts = std::mem::take(&mut delta.artifacts);
-    }
-    if !delta.images.is_empty() {
-        response.images = std::mem::take(&mut delta.images);
-    }
-    if !delta.browser_events.is_empty() {
-        response
-            .browser_events
-            .extend(std::mem::take(&mut delta.browser_events));
-    }
-    if !response.ok && response.diagnosis.is_none() {
-        let error = response
-            .error
-            .as_deref()
-            .unwrap_or("browser_script failed without an error message");
-        response.diagnosis = Some(browser_script_failure_diagnosis(&run.session_id, error));
-    }
-    response.status = Some(if response.ok { "finished" } else { "failed" }.to_string());
-    response.run_id = Some(run.id);
-    Ok(response)
-}
-
-fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<BrowserScriptOutput> {
-    let _ = run.child.wait().context("wait for browser_script python")?;
-    run.bridge_stop.store(true, Ordering::SeqCst);
-    if let Some(bridge) = run.bridge.take() {
-        let _ = join_bridge_with_timeout(bridge, Duration::from_secs(5));
-    }
-    let _ = join_reader(run.stdout_reader.take());
-    let _ = join_reader(run.stderr_reader.take());
-    let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
-    let text = if delta.text.trim().is_empty() {
-        "browser_script cancelled. Partial images/artifacts are preserved above.".to_string()
-    } else {
-        format!(
-            "{}\n\nbrowser_script cancelled. Partial images/artifacts are preserved above.",
-            delta.text.trim_end()
-        )
-    };
-    Ok(BrowserScriptOutput {
-        ok: true,
-        status: Some("cancelled".to_string()),
-        run_id: Some(run.id),
-        text,
-        outputs: std::mem::take(&mut delta.outputs),
-        summary: std::mem::take(&mut delta.summary),
-        artifacts: std::mem::take(&mut delta.artifacts),
-        images: std::mem::take(&mut delta.images),
-        browser_events: std::mem::take(&mut delta.browser_events),
-        ..Default::default()
-    })
-}
-
 #[derive(Debug, Default)]
 struct BrowserIssueState {
     browser_connected: bool,
     page_usable: bool,
     next_step: Option<String>,
-}
-
-fn browser_script_failure_diagnosis(session_id: &str, error: &str) -> BrowserIssueDiagnosis {
-    let state = browser_issue_state_for_session(session_id);
-    browser_issue_diagnosis(
-        classify_browser_script_failure(error),
-        state.browser_connected,
-        state.page_usable,
-        state.next_step.as_deref(),
-    )
 }
 
 fn browser_issue_state_for_session(session_id: &str) -> BrowserIssueState {
@@ -1468,194 +982,6 @@ fn browser_issue_state_for_session(session_id: &str) -> BrowserIssueState {
     }
 }
 
-fn new_browser_script_run_id() -> String {
-    let n = BROWSER_SCRIPT_RUN_COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("bs-{}-{n}", unix_time_ms())
-}
-
-fn read_browser_script_stdout(mut stdout: ChildStdout) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    })
-}
-
-fn read_browser_script_stderr(mut stderr: ChildStderr) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
-    })
-}
-
-fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> String {
-    reader
-        .and_then(|reader| reader.join().ok())
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .unwrap_or_default()
-}
-
-impl BrowserScriptDelta {
-    fn has_content(&self) -> bool {
-        !self.text.is_empty()
-            || !self.outputs.is_empty()
-            || !self.summary.is_empty()
-            || !self.artifacts.is_empty()
-            || !self.images.is_empty()
-            || !self.browser_events.is_empty()
-    }
-}
-
-fn browser_script_running_output(
-    run: &BrowserScriptRun,
-    delta: Option<BrowserScriptDelta>,
-    no_new_wait_ms: u64,
-) -> BrowserScriptOutput {
-    let mut output = BrowserScriptOutput {
-        ok: true,
-        status: Some("running".to_string()),
-        run_id: Some(run.id.clone()),
-        next_observe_ms: Some(BROWSER_SCRIPT_DEFAULT_OBSERVE_MS),
-        text: format!(
-            "browser_script is still running.\nrun_id: {}\nNext: call browser_script with action=\"observe\" and run_id=\"{}\".",
-            run.id, run.id
-        ),
-        ..Default::default()
-    };
-    if let Some(mut delta) = delta {
-        if !delta.text.trim().is_empty() {
-            output.text = format!(
-                "{}\n\nbrowser_script is still running.\nrun_id: {}\nNext: observe this run again.",
-                delta.text.trim_end(),
-                run.id
-            );
-        }
-        output.outputs = std::mem::take(&mut delta.outputs);
-        output.summary = std::mem::take(&mut delta.summary);
-        output.artifacts = std::mem::take(&mut delta.artifacts);
-        output.images = std::mem::take(&mut delta.images);
-        output.browser_events = std::mem::take(&mut delta.browser_events);
-    } else {
-        output.text = format!(
-            "browser_script is still running.\nNo new output in the last {} ms.\nrun_id: {}\nNext: observe this run again.",
-            no_new_wait_ms, run.id
-        );
-    }
-    output
-}
-
-fn drain_browser_script_delta(run: &mut BrowserScriptRun) -> Result<BrowserScriptDelta> {
-    let mut file = match File::open(&run.stream_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BrowserScriptDelta::default());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    file.seek(SeekFrom::Start(run.stream_offset))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    if bytes.is_empty() {
-        return Ok(BrowserScriptDelta::default());
-    }
-    let mut delta = BrowserScriptDelta::default();
-    let mut consumed = 0usize;
-    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        consumed += line.len();
-        let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_slice(trimmed)?;
-        match value.get("type").and_then(Value::as_str).unwrap_or("") {
-            "stdout" | "stderr" => {
-                if let Some(text) = value.get("text").and_then(Value::as_str) {
-                    delta.text.push_str(text);
-                }
-            }
-            "output" => delta
-                .outputs
-                .push(value.get("output").cloned().unwrap_or(value)),
-            "summary" => delta
-                .summary
-                .push(value.get("summary").cloned().unwrap_or(value)),
-            "artifact" => {
-                if let Some(artifact) = value.get("artifact").cloned() {
-                    delta.artifacts.push(artifact);
-                }
-            }
-            "image" => {
-                if let Some(image) = value.get("image").cloned() {
-                    delta.images.push(image);
-                }
-            }
-            "browser" => {
-                if let Some(event) = value.get("event").cloned() {
-                    delta.browser_events.push(event);
-                }
-            }
-            _ => {}
-        }
-    }
-    run.stream_offset = run.stream_offset.saturating_add(consumed as u64);
-    delta.consumed_bytes = consumed as u64;
-    Ok(delta)
-}
-
-fn browser_script_python_command() -> Command {
-    if let Some(configured) = nonempty_os_var("LLM_BROWSER_BROWSER_SCRIPT_PYTHON") {
-        return Command::new(configured);
-    }
-    if let Some(venv) = nonempty_os_var("VIRTUAL_ENV") {
-        let candidate = venv_python_path(Path::new(&venv));
-        if candidate.is_file() {
-            return Command::new(candidate);
-        }
-    }
-    if let Some(repo_root) = repo_root_from_manifest() {
-        let candidate = venv_python_path(&repo_root.join(".venv"));
-        if candidate.is_file() {
-            return Command::new(candidate);
-        }
-        if repo_root.join("pyproject.toml").is_file() && command_exists("uv") {
-            let mut command = Command::new("uv");
-            command
-                .arg("run")
-                .arg("--project")
-                .arg(repo_root)
-                .arg("python");
-            return command;
-        }
-    }
-    Command::new("python3")
-}
-
-fn nonempty_os_var(name: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(name).filter(|value| !value.is_empty())
-}
-
-fn venv_python_path(venv: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        venv.join("Scripts").join("python.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        venv.join("bin").join("python")
-    }
-}
-
-fn repo_root_from_manifest() -> Option<PathBuf> {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-}
-
 fn command_exists(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
@@ -1673,42 +999,6 @@ fn command_exists(name: &str) -> bool {
             }
         })
     })
-}
-
-fn join_bridge_with_timeout(bridge: thread::JoinHandle<()>, timeout: Duration) -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let _ = bridge.join();
-        let _ = tx.send(());
-    });
-    rx.recv_timeout(timeout).is_ok()
-}
-
-fn agent_workspace_dir_for(artifact_dir: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("BH_AGENT_WORKSPACE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-    {
-        return path;
-    }
-    if artifact_dir.file_name().and_then(|name| name.to_str()) == Some("artifacts") {
-        if let Some(state_dir) = artifact_dir.parent() {
-            return state_dir.join("agent-workspace");
-        }
-    }
-    if artifact_dir
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        == Some("artifacts")
-    {
-        if let Some(state_dir) = artifact_dir.parent().and_then(Path::parent) {
-            return state_dir.join("agent-workspace");
-        }
-    }
-    home_dir()
-        .map(|home| home.join(".browser-use-terminal").join("agent-workspace"))
-        .unwrap_or_else(|| PathBuf::from(".browser-use-terminal").join("agent-workspace"))
 }
 
 fn domain_skill_roots_for(agent_workspace_dir: &Path) -> Vec<PathBuf> {
@@ -1945,7 +1235,6 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn cleanup_session(session_id: &str) -> usize {
-    cancel_browser_script_runs_for_session(session_id);
     stop_browser_js_executor(session_id);
     let mut sessions = sessions()
         .lock()
@@ -1978,26 +1267,6 @@ fn stop_browser_js_executor(session_id: &str) {
     }
 }
 
-fn cancel_browser_script_runs_for_session(session_id: &str) {
-    let runs = {
-        let mut registry = browser_script_runs()
-            .lock()
-            .expect("browser_script run registry poisoned");
-        let run_ids = registry
-            .iter()
-            .filter_map(|(run_id, run)| (run.session_id == session_id).then(|| run_id.clone()))
-            .collect::<Vec<_>>();
-        run_ids
-            .into_iter()
-            .filter_map(|run_id| registry.remove(&run_id))
-            .collect::<Vec<_>>()
-    };
-    for mut run in runs {
-        let _ = run.child.kill();
-        let _ = finish_cancelled_browser_script_run(run);
-    }
-}
-
 fn sessions() -> &'static Mutex<HashMap<String, BrowserSession>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -2024,42 +1293,8 @@ fn dispatch_browser_command(
         "remote" => dispatch_remote(session, argv),
         "domain" => dispatch_domain(argv),
         "recover" => dispatch_recover(session, argv),
-        "script" => {
-            let session_id = session
-                .session_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("browser script runtime is missing session id"))?;
-            dispatch_script_runtime(session_id, argv)
-        }
         "runtime" => dispatch_runtime(session, argv),
         other => bail!("unknown browser command: {other}. Run `browser help`."),
-    }
-}
-
-fn dispatch_script_runtime(session_id: &str, argv: &[String]) -> Result<Value> {
-    match argv.get(1).map(String::as_str) {
-        Some("runs") => Ok(json!({
-            "status": "ok",
-            "active_scripts": active_browser_script_runs_json(session_id),
-        })),
-        Some("cancel") => {
-            let run_id = argv
-                .get(2)
-                .map(String::as_str)
-                .ok_or_else(|| anyhow!("browser script cancel requires <run_id>"))?;
-            let output = cancel_browser_script(session_id, run_id)?;
-            Ok(json!({
-                "status": output.status.unwrap_or_else(|| "cancelled".to_string()),
-                "run_id": output.run_id,
-                "text": output.text,
-                "outputs": output.outputs,
-                "summary": output.summary,
-                "images": output.images,
-                "artifacts": output.artifacts,
-            }))
-        }
-        Some(other) => bail!("unknown browser script command: {other}"),
-        None => bail!("browser script requires runs or cancel"),
     }
 }
 
@@ -2755,7 +1990,7 @@ impl BrowserSession {
                 "status": "target-gone",
                 "target_id": target_id,
                 "available_targets": targets,
-                "next_step": "Use browser_script list_tabs()/switch_tab(...) or browser_script new_tab(...).",
+                "next_step": "Use browser_execute listPageTargets() or open a new tab.",
             }));
         }
         let session_id = self.attach_target(&target_id)?;
@@ -3084,29 +2319,6 @@ impl BrowserSession {
             .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow!("Target.attachToTarget response missing sessionId"))
     }
-
-    fn current_page_probe_mut(&mut self) -> Result<Value> {
-        let title = self
-            .cdp_current(
-                "Runtime.evaluate",
-                json!({ "expression": "document.title", "returnByValue": true }),
-            )
-            .ok()
-            .and_then(|value| value.pointer("/result/value").cloned());
-        let url = self
-            .cdp_current(
-                "Runtime.evaluate",
-                json!({ "expression": "location.href", "returnByValue": true }),
-            )
-            .ok()
-            .and_then(|value| value.pointer("/result/value").cloned());
-        Ok(json!({
-            "target_id": self.current_target_id,
-            "session_id": self.current_session_id,
-            "title": title,
-            "url": url,
-        }))
-    }
 }
 
 impl CdpConnection {
@@ -3357,36 +2569,6 @@ fn classify_browser_error(message: &str) -> &'static str {
     }
 }
 
-fn classify_browser_script_failure(message: &str) -> &'static str {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("browser_script timed out") {
-        "browser-script-timeout"
-    } else if lower.contains("browser_script did not emit a result") {
-        "browser-script-no-result"
-    } else if lower.contains("read cdp")
-        || lower.contains("send cdp")
-        || lower.contains("cdp websocket")
-        || lower.contains("browser is not connected")
-        || lower.contains("connection refused")
-        || lower.contains("couldn't connect to server")
-        || lower.contains("unable to connect")
-        || lower.contains("operation timed out")
-        || lower.contains("broken pipe")
-        || lower.contains("connection reset")
-        || lower.contains("websocket closed")
-        || lower.contains("already closed")
-        || (lower.contains("target")
-            && (lower.contains("not found")
-                || lower.contains("target-gone")
-                || lower.contains("no target with given id")))
-        || is_stale_session_error(message)
-    {
-        classify_browser_error(message)
-    } else {
-        "browser-script-error"
-    }
-}
-
 fn classify_browser_job_failure(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("timed out") && lower.contains("browser_execute") {
@@ -3435,58 +2617,9 @@ fn browser_issue_diagnosis(
             } else {
                 "The CDP read timed out and browser state needs a status check."
             },
-            "A CDP read for this browser_script call timed out or returned would-block while waiting for Chrome.",
+            "A CDP read for this browser_execute call timed out or returned would-block while waiting for Chrome.",
             if page_usable {
-                "Continue on the same page, but rerun a smaller browser_script chunk or resume from the last checkpoint.".to_string()
-            } else {
-                fallback_next_step()
-            },
-            browser_connected,
-            page_usable,
-        ),
-        "browser-script-timeout" => (
-            if page_usable {
-                "The script timed out, but the browser page should still be reusable."
-            } else if browser_connected {
-                "The script timed out; browser is connected but page state needs checking."
-            } else {
-                "The script timed out and browser state needs a status check."
-            },
-            "The Python worker exceeded the browser_script timeout before returning a result.",
-            if page_usable {
-                "Retry with a shorter bounded script, write checkpoints to files, and continue from the last completed item.".to_string()
-            } else {
-                fallback_next_step()
-            },
-            browser_connected,
-            page_usable,
-        ),
-        "browser-script-no-result" => (
-            if page_usable {
-                "The script exited without a result; the browser page should still be reusable."
-            } else {
-                "The script exited without a result and browser state needs checking."
-            },
-            "The Python worker exited before emitting the browser_script result marker.",
-            if page_usable {
-                "Fix the script so it completes normally, then rerun on the same page.".to_string()
-            } else {
-                fallback_next_step()
-            },
-            browser_connected,
-            page_usable,
-        ),
-        "browser-script-error" => (
-            if page_usable {
-                "The script failed, but the browser page should still be reusable."
-            } else if browser_connected {
-                "The script failed; browser is connected but page state needs checking."
-            } else {
-                "The script failed and browser state needs a status check."
-            },
-            "The Python browser_script code raised an error before completing the call.",
-            if page_usable {
-                "Fix the Python/browser_script code and rerun; keep using the same page state.".to_string()
+                "Continue on the same page, but rerun a smaller browser_execute job or resume from the last checkpoint.".to_string()
             } else {
                 fallback_next_step()
             },
@@ -3638,7 +2771,7 @@ fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
         "permission-blocked" | "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
-        "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
+        "target-gone" => "Use browser_execute listPageTargets() or open a new tab",
         _ => "browser doctor --json",
     }
 }
@@ -5055,517 +4188,6 @@ fn stop_cloud_browser(browser_id: &str) -> Result<Value> {
     )
 }
 
-fn run_bridge(
-    listener: TcpListener,
-    session_id: String,
-    stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
-) {
-    while !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(error) = handle_bridge_stream(stream, &session_id) {
-                    errors
-                        .lock()
-                        .expect("browser_script bridge error registry poisoned")
-                        .push(format!("{error:#}"));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                errors
-                    .lock()
-                    .expect("browser_script bridge error registry poisoned")
-                    .push(format!(
-                        "accept browser_script bridge connection: {error:#}"
-                    ));
-                break;
-            }
-        }
-    }
-}
-
-fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
-    // The listener is nonblocking so the bridge thread can poll the stop flag.
-    // On macOS, accepted streams can still surface EWOULDBLOCK on large writes
-    // unless the child socket is forced back to blocking mode. Screenshots are
-    // ordinary JSON responses, often hundreds of KB, so partial nonblocking
-    // writes corrupt the bridge response seen by Python.
-    stream
-        .set_nonblocking(false)
-        .context("set browser_script bridge stream blocking")?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let request: Value = serde_json::from_str(&line)?;
-    let response = match bridge_request(session_id, &request) {
-        Ok(value) => json!({ "ok": true, "result": value }),
-        Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
-    };
-    let mut response_bytes = serde_json::to_vec(&response)?;
-    response_bytes.push(b'\n');
-    stream.write_all(&response_bytes)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
-    #[cfg(test)]
-    {
-        let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
-        if kind == "test_large_response" {
-            let bytes = request
-                .get("bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or(1_000_000) as usize;
-            return Ok(json!({ "blob": "x".repeat(bytes) }));
-        }
-    }
-
-    let mut session = {
-        let mut sessions = sessions()
-            .lock()
-            .expect("browser session registry poisoned");
-        sessions.remove(session_id).ok_or_else(|| {
-            anyhow!("browser is not connected or is busy; run `browser status --json`")
-        })?
-    };
-    session.session_id = Some(session_id.to_string());
-    let result = bridge_request_with_session(&mut session, request);
-    sessions()
-        .lock()
-        .expect("browser session registry poisoned")
-        .insert(session_id.to_string(), session);
-    result
-}
-
-fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) -> Result<Value> {
-    let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
-    match kind {
-        "cdp" => {
-            let method = request
-                .get("method")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("bridge cdp request missing method"))?;
-            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-            let session_id = request.get("session_id").and_then(Value::as_str);
-            let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
-            let current_session = session.current_session_id.clone();
-            let session_id = if use_browser_session {
-                current_session.as_deref()
-            } else {
-                session_id
-            };
-            session.cdp(method, session_id, params)
-        }
-        "meta" => {
-            let meta = request.get("meta").and_then(Value::as_str).unwrap_or("");
-            match meta {
-                "status" => Ok(session.status_json()),
-                "session" => Ok(json!({ "session_id": session.current_session_id })),
-                "current_tab" => session.current_page_probe_mut(),
-                "set_session" => {
-                    let session_id = request
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow!("set_session requires session_id"))?
-                        .to_string();
-                    let target_id = request
-                        .get("target_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow!("set_session requires target_id"))?
-                        .to_string();
-                    session.current_session_id = Some(session_id.clone());
-                    session.current_target_id = Some(target_id.clone());
-                    session.connection_generation += 1;
-                    Ok(json!({
-                        "session_id": session_id,
-                        "target_id": target_id,
-                        "browser": session.status_json(),
-                    }))
-                }
-                "pending_dialog" => Ok(json!({ "dialog": null })),
-                "drain_events" => Ok(json!({ "events": [] })),
-                other => bail!("unknown browser_script bridge meta request: {other}"),
-            }
-        }
-        "status" => Ok(session.status_json()),
-        other => bail!("unknown browser_script bridge request: {other}"),
-    }
-}
-
-fn browser_script_prelude(
-    bridge_port: u16,
-    cwd: &Path,
-    artifact_dir: &Path,
-    agent_workspace_dir: &Path,
-    domain_skill_roots: &[PathBuf],
-    stream_path: &Path,
-    user_code: &str,
-) -> Result<String> {
-    let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
-    let encoded_helpers = general_purpose::STANDARD.encode(BROWSER_SCRIPT_HELPERS.as_bytes());
-    let domain_skill_roots_json = serde_json::to_string(
-        &domain_skill_roots
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(format!(
-        r#"
-import base64, contextlib, io, json, os, pathlib, shutil, socket, sys, time, traceback, urllib.request
-
-BRIDGE_PORT = {bridge_port}
-CWD = pathlib.Path({cwd:?}).expanduser().resolve()
-ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
-STREAM_PATH = pathlib.Path({stream_path:?}).expanduser().resolve()
-AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
-DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
-ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
-OUTPUTS_DIR = CWD
-OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-__USER_CODE = base64.b64decode({encoded_code:?}).decode()
-
-def _stream_event(event):
-    try:
-        with STREAM_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, default=_jsonable) + "\n")
-            f.flush()
-    except Exception:
-        pass
-
-class _BrowserScriptStream:
-    def __init__(self, kind):
-        self.kind = kind
-        self._parts = []
-    def write(self, value):
-        value = str(value)
-        self._parts.append(value)
-        if value:
-            _stream_event({{"type": self.kind, "text": value}})
-        return len(value)
-    def flush(self):
-        pass
-    def isatty(self):
-        return False
-    def getvalue(self):
-        return "".join(self._parts)
-
-def _collectable_files(root):
-    if root.resolve() == OUTPUTS_DIR.resolve():
-        for path in root.iterdir():
-            if path.is_file():
-                yield path
-        return
-    for path in root.rglob("*"):
-        if path.is_file():
-            yield path
-
-def _scan_artifact_files():
-    files = set()
-    for root in (ARTIFACT_DIR, OUTPUTS_DIR):
-        if not root.exists():
-            continue
-        for path in _collectable_files(root):
-            files.add(str(path.resolve()))
-    return files
-
-__initial_artifact_files = _scan_artifact_files()
-__outputs = []
-__summary = []
-__artifacts = []
-__images = []
-
-def _jsonable(value):
-    try:
-        json.dumps(value)
-        return value
-    except TypeError:
-        return repr(value)
-
-def _parse_browser_summary_specs(source):
-    lines = source.splitlines()
-    block = []
-    in_block = False
-    for line in lines[:80]:
-        stripped = line.strip()
-        if not in_block:
-            if stripped.startswith('# browser_summary:'):
-                inline = stripped[len('# browser_summary:'):].strip()
-                if inline:
-                    block.append(inline)
-                in_block = True
-                continue
-            if stripped == "" or stripped.startswith('#!') or stripped.startswith('#'):
-                continue
-            break
-        if stripped.startswith('#'):
-            content = stripped[1:]
-            if content.startswith(" "):
-                content = content[1:]
-            block.append(content)
-            continue
-        break
-    if not block:
-        return {{}}
-    try:
-        parsed = json.loads("\n".join(block))
-    except Exception:
-        return {{}}
-    return parsed if isinstance(parsed, dict) else {{}}
-
-__browser_summary_specs = _parse_browser_summary_specs(__USER_CODE)
-
-def _path_get(value, path):
-    if path == "$":
-        return value
-    if not isinstance(path, str) or not path.startswith("$."):
-        return None
-    current = value
-    for part in path[2:].split("."):
-        if part == "length":
-            try:
-                current = len(current)
-            except Exception:
-                return None
-            continue
-        while "[" in part and part.endswith("]"):
-            field, _, index_text = part.partition("[")
-            if field:
-                if not isinstance(current, dict) or field not in current:
-                    return None
-                current = current[field]
-            try:
-                index = int(index_text[:-1])
-                current = current[index]
-            except Exception:
-                return None
-            part = ""
-        if not part:
-            continue
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        else:
-            return None
-    return current
-
-def _render_summary_value(template, output_value):
-    if not isinstance(template, str):
-        return _jsonable(template)
-    if template.startswith("$"):
-        return _jsonable(_path_get(output_value, template))
-    out = template
-    while "${{" in out:
-        start = out.find("${{")
-        end = out.find("}}", start + 2)
-        if end == -1:
-            break
-        path = out[start + 2:end]
-        value = _path_get(output_value, path)
-        out = out[:start] + ("" if value is None else str(value)) + out[end + 1:]
-    return out
-
-def _summary_from_output(label, output_value):
-    if label is None:
-        return None
-    label_text = str(label)
-    spec = __browser_summary_specs.get(label_text)
-    if spec is None:
-        return {{"kind": "observed", "message": f"Recorded {{label_text}}", "output_label": label_text}}
-    if isinstance(spec, str):
-        return {{"kind": spec, "output_label": label_text}}
-    if not isinstance(spec, dict):
-        return {{"kind": "observed", "message": f"Recorded {{label_text}}", "output_label": label_text}}
-    record = {{}}
-    for key, template in spec.items():
-        record[str(key)] = _render_summary_value(template, output_value)
-    record.setdefault("kind", "summary")
-    record.setdefault("output_label", label_text)
-    return record
-
-def emit_output(value, label=None):
-    output_value = _jsonable(value)
-    record = {{"value": output_value}}
-    if label is not None:
-        record["label"] = str(label)
-        summary_record = _summary_from_output(label, output_value)
-        if summary_record is not None:
-            record["summary"] = summary_record
-    __outputs.append(record)
-    _stream_event({{"type": "output", "output": record}})
-    if label is not None and record.get("summary") is not None:
-        __summary.append(record["summary"])
-        _stream_event({{"type": "summary", "summary": record["summary"]}})
-    return record
-
-def emit_summary(kind, message=None, **fields):
-    if isinstance(kind, dict):
-        record = dict(kind)
-        record.setdefault("kind", "summary")
-    else:
-        record = {{"kind": str(kind)}}
-        if message is not None:
-            record["message"] = str(message)
-        for key, value in fields.items():
-            record[str(key)] = _jsonable(value)
-    __summary.append(record)
-    _stream_event({{"type": "summary", "summary": record}})
-    return record
-
-def _bridge(payload):
-    with socket.create_connection(("127.0.0.1", BRIDGE_PORT), timeout=120) as sock:
-        sock.sendall((json.dumps(payload) + "\n").encode())
-        raw_response = bytearray()
-        while not raw_response.endswith(b"\n"):
-            data = sock.recv(65536)
-            if not data:
-                break
-            raw_response.extend(data)
-    if not raw_response:
-        raise RuntimeError("browser bridge closed before response")
-    try:
-        response = json.loads(raw_response.decode())
-    except json.JSONDecodeError as exc:
-        sample = raw_response[:200].decode("utf-8", "replace")
-        raise RuntimeError(f"browser bridge returned invalid JSON: {{exc}}; first bytes: {{sample!r}}") from exc
-    if not response.get("ok"):
-        raise RuntimeError(response.get("error") or "browser bridge failed")
-    return response.get("result")
-
-def _load_browser_script_helpers():
-    source = base64.b64decode({encoded_helpers:?}).decode()
-    exec(compile(source, "<browser_script_helpers>", "exec"), globals())
-
-def _artifact_meta(path, kind="file", mime_type=None):
-    meta = {{"path": str(path), "kind": kind}}
-    if mime_type:
-        meta["mime_type"] = mime_type
-    return meta
-
-def _remember_artifact(path, kind="file", mime_type=None):
-    path = pathlib.Path(path).expanduser().resolve()
-    path_text = str(path)
-    for artifact in __artifacts:
-        if artifact.get("path") == path_text:
-            return artifact
-    meta = _artifact_meta(path, kind, mime_type)
-    __artifacts.append(meta)
-    _stream_event({{"type": "artifact", "artifact": meta}})
-    return meta
-
-def _auto_collect_artifacts():
-    image_paths = {{str(pathlib.Path(image.get("path", "")).expanduser().resolve()) for image in __images if image.get("path")}}
-    stream_path = str(STREAM_PATH.resolve())
-    for root in (ARTIFACT_DIR, OUTPUTS_DIR):
-        if not root.exists():
-            continue
-        for path in sorted(_collectable_files(root)):
-            resolved = str(path.resolve())
-            if resolved in __initial_artifact_files:
-                continue
-            if resolved == stream_path:
-                continue
-            if resolved in image_paths:
-                continue
-            _remember_artifact(path)
-
-def copy_artifact(path, kind="file"):
-    src = pathlib.Path(path).expanduser()
-    dest = ARTIFACT_DIR / src.name
-    if src.resolve() != dest.resolve():
-        shutil.copy2(src, dest)
-    meta = _remember_artifact(dest, kind)
-    return str(dest)
-
-def emit_image(path, label=None):
-    path = pathlib.Path(path).expanduser().resolve()
-    meta = {{"path": str(path), "mime_type": "image/png", "detail": "auto", "label": label, "source": "emit_image"}}
-    __images.append(meta)
-    _stream_event({{"type": "image", "image": meta}})
-    return meta
-
-def audit_artifact(data=None, **requirements):
-    checks = {{}}
-    if data is not None:
-        checks["has_data"] = data is not None and data != [] and data != {{}}
-        if isinstance(data, list):
-            checks["record_count"] = len(data)
-    checks.update({{f"requirement_{{k}}": bool(v) for k, v in requirements.items()}})
-    return {{"generated_by": "audit_artifact", "checks": checks, "ready_for_done": all(checks.values()) if checks else True}}
-
-def artifact_root():
-    return str(ARTIFACT_DIR)
-
-def outputs_dir():
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    return str(OUTPUTS_DIR)
-
-def session_metadata():
-    return {{
-        "cwd": str(CWD),
-        "artifact_root": str(ARTIFACT_DIR),
-        "outputs_dir": str(OUTPUTS_DIR),
-        "agent_workspace": str(pathlib.Path(agent_workspace())),
-    }}
-
-def agent_workspace():
-    configured = os.environ.get("BH_AGENT_WORKSPACE")
-    if configured:
-        path = pathlib.Path(configured).expanduser()
-    else:
-        path = AGENT_WORKSPACE_DIR
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path)
-
-def load_agent_helpers():
-    helper = pathlib.Path(agent_workspace()) / "agent_helpers.py"
-    if helper.exists():
-        exec(helper.read_text(encoding="utf-8"), globals())
-    return helper.exists()
-
-def _run_user_code():
-    exec(compile(__USER_CODE, "<browser_script>", "exec"), globals())
-
-stdout = _BrowserScriptStream("stdout")
-stderr = _BrowserScriptStream("stderr")
-ok = True
-error = None
-try:
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        _load_browser_script_helpers()
-        load_agent_helpers()
-        _run_user_code()
-except Exception:
-    ok = False
-    error = traceback.format_exc()
-
-text = stdout.getvalue()
-if stderr.getvalue():
-    text += ("\n" if text else "") + stderr.getvalue()
-
-_auto_collect_artifacts()
-
-result = {{
-    "ok": ok,
-    "text": text[-{SCRIPT_MAX_OUTPUT_CHARS}:],
-    "error": error,
-    "data": {{"domain_skills": globals().get("__last_domain_skills", [])}} if globals().get("__last_domain_skills") else {{}},
-    "outputs": __outputs,
-    "summary": __summary,
-    "artifacts": __artifacts,
-    "images": __images,
-    "browser_events": [],
-}}
-sys.__stdout__.write("__BROWSER_SCRIPT_RESULT__" + json.dumps(result, default=_jsonable) + "\n")
-sys.__stdout__.flush()
-"#
-    ))
-}
-
 fn is_real_page_target(target: &Value) -> bool {
     if target.get("type").and_then(Value::as_str) != Some("page") {
         return false;
@@ -5697,15 +4319,6 @@ fn redact_ws_url(url: &str) -> String {
     }
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        text.to_string()
-    } else {
-        let keep_from = text.len().saturating_sub(max_chars);
-        format!("[truncated]\n{}", &text[keep_from..])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5812,30 +4425,13 @@ mod tests {
         assert!(diagnosis.browser_usable);
         assert!(diagnosis.page_usable);
         assert!(diagnosis.summary.contains("same page"));
-        assert!(diagnosis.next_step.contains("smaller browser_script chunk"));
-    }
-
-    #[test]
-    fn browser_script_tracebacks_are_not_treated_as_dropped_websockets() {
-        let message = "Traceback (most recent call last):\nNameError: name 'x' is not defined";
-        assert_eq!(
-            classify_browser_script_failure(message),
-            "browser-script-error"
-        );
-        let diagnosis =
-            browser_issue_diagnosis(classify_browser_script_failure(message), true, true, None);
-        assert!(diagnosis.browser_usable);
-        assert!(diagnosis.page_usable);
-        assert!(diagnosis.next_step.contains("Fix the Python"));
+        assert!(diagnosis.next_step.contains("smaller browser_execute job"));
     }
 
     #[test]
     fn runtime_evaluate_script_errors_are_not_websocket_drops() {
         let message = r#"RuntimeError: CDP Runtime.evaluate failed: {"code":-32000,"message":"Exception thrown"}"#;
-        assert_eq!(
-            classify_browser_script_failure(message),
-            "browser-script-error"
-        );
+        assert_eq!(classify_browser_job_failure(message), "browser-job-error");
     }
 
     #[test]
@@ -5971,826 +4567,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("no browser endpoint is configured"));
-    }
-
-    #[test]
-    fn browser_script_runs_fresh_python_without_browser_when_no_cdp_used() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-no-cdp",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-print('hello')
-answer = pathlib.Path(outputs_dir()) / 'answer.json'
-answer.write_text(json.dumps({'ok': True}), encoding='utf-8')
-print(session_metadata()["outputs_dir"])
-"#,
-            10,
-        )
-        .unwrap();
-        assert!(output.ok, "{:?}", output.error);
-        assert!(output.text.contains("hello"));
-        assert!(output
-            .artifacts
-            .iter()
-            .any(|artifact| artifact["path"].as_str().unwrap().ends_with("answer.json")));
-        assert!(output.text.contains(temp.path().to_str().unwrap()));
-        for artifact in &output.artifacts {
-            assert!(
-                Path::new(artifact["path"].as_str().unwrap()).is_absolute(),
-                "artifact path should be absolute: {artifact}"
-            );
-        }
-    }
-
-    #[test]
-    fn browser_script_summary_comment_maps_output_to_display_summary() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-summary-comment",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-# browser_summary:
-# {
-#   "page_info": {
-#     "kind": "page",
-#     "url": "$.url",
-#     "title": "$.title"
-#   }
-# }
-info = {"url": "https://example.test/path?token=secret", "title": "Example Page"}
-emit_output(info, label="page_info")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(
-            output.text.trim().is_empty(),
-            "structured output should not require stdout text: {:?}",
-            output.text
-        );
-        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
-        assert_eq!(
-            output.outputs[0].get("label").and_then(Value::as_str),
-            Some("page_info")
-        );
-        assert_eq!(
-            output.outputs[0]
-                .pointer("/value/url")
-                .and_then(Value::as_str),
-            Some("https://example.test/path?token=secret")
-        );
-        assert_eq!(
-            output.outputs[0]
-                .pointer("/summary/output_label")
-                .and_then(Value::as_str),
-            Some("page_info")
-        );
-        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
-        assert_eq!(
-            output.summary[0].get("kind").and_then(Value::as_str),
-            Some("page")
-        );
-        assert_eq!(
-            output.summary[0]
-                .get("output_label")
-                .and_then(Value::as_str),
-            Some("page_info")
-        );
-        assert_eq!(
-            output.summary[0].get("title").and_then(Value::as_str),
-            Some("Example Page")
-        );
-    }
-
-    #[test]
-    fn browser_script_emit_output_defaults_to_lossless_recorded_summary() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-output-default-summary",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-emit_output([{"name": "Ada"}, {"name": "Grace"}], label="rows")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
-        assert_eq!(output.outputs[0]["label"], "rows");
-        assert_eq!(output.outputs[0]["value"][0]["name"], "Ada");
-        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
-        assert_eq!(output.summary[0]["kind"], "observed");
-        assert_eq!(output.summary[0]["message"], "Recorded rows");
-        assert_eq!(output.summary[0]["output_label"], "rows");
-    }
-
-    #[test]
-    fn browser_script_summary_comment_renders_template_values() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-summary-template",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-# browser_summary:
-# {
-#   "rows": {
-#     "kind": "extracted",
-#     "message": "Read ${$.length} rows"
-#   }
-# }
-emit_output([{"name": "Ada"}, {"name": "Grace"}], label="rows")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
-        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
-        assert_eq!(output.summary[0]["kind"], "extracted");
-        assert_eq!(output.summary[0]["message"], "Read 2 rows");
-        assert_eq!(output.summary[0]["output_label"], "rows");
-    }
-
-    #[test]
-    fn browser_script_domain_skills_are_available_without_browser() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("domain-skills");
-        fs::create_dir_all(root.join("parity")).unwrap();
-        fs::write(
-            root.join("parity/scraping.md"),
-            "# Parity\n\nRead this before inventing selectors.",
-        )
-        .unwrap();
-        let root_text = root.display().to_string();
-        let _env = EnvRestore::set(&[
-            ("BH_DOMAIN_SKILLS_ROOT", &root_text),
-            ("BH_DOMAIN_SKILLS", "1"),
-        ]);
-        let output = run_browser_script(
-            "script-domain-skills",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-skills = domain_skills_for_url("https://www.parity.test/search", include_content=True)
-assert skills[0]["site"] == "parity", skills
-assert "before inventing selectors" in skills[0]["files"][0]["content"], skills
-print(json.dumps(skills))
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("before inventing selectors"));
-    }
-
-    #[test]
-    fn browser_script_helpers_survive_user_time_imports() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-time-shadow",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-from time import time
-path = _write_b64_artifact("time_shadow", base64.b64encode(b"ok").decode(), suffix=".bin", mime_type="application/octet-stream")
-assert pathlib.Path(path).read_bytes() == b"ok"
-print("time shadow ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("time shadow ok"));
-    }
-
-    #[test]
-    fn browser_script_js_return_detection_ignores_nested_callbacks() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-js-return-detection",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-assert _has_return_statement("const x = 1; return x")
-assert _has_return_statement("if (true) { return 1; }")
-assert not _has_return_statement("Array.from(items).map((el) => { return el.id; })")
-assert _has_return_statement("const ids = items.map((el) => { return el.id; }); return ids")
-print("return detection ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("return detection ok"));
-    }
-
-    #[test]
-    fn browser_script_uses_project_python_environment_when_available() {
-        let Some(repo_root) = repo_root_from_manifest() else {
-            eprintln!("skipping project python environment test: missing repo root");
-            return;
-        };
-        if !repo_root.join(".venv").is_dir() && !command_exists("uv") {
-            eprintln!("skipping project python environment test: no .venv or uv");
-            return;
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-project-python-env",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-import bs4
-print("bs4 available", bs4.__version__)
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("bs4 available"));
-    }
-
-    #[test]
-    fn browser_script_fill_input_uses_cdp_focus_and_input() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-fill-input-cdp",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-events = []
-
-def js(expression, *args, **kwargs):
-    raise AssertionError(f"fill_input should not use page JS: {expression}")
-
-def cdp(method, *args, **kwargs):
-    events.append((method, kwargs))
-    if method == "DOM.getDocument":
-        return {"root": {"nodeId": 1}}
-    if method == "DOM.querySelector":
-        assert kwargs["selector"] == "input", kwargs
-        return {"nodeId": 2}
-    if method == "DOM.getBoxModel":
-        return {"model": {"border": [10, 20, 110, 20, 110, 60, 10, 60]}}
-    return {}
-
-fill_input("input", "ab")
-
-mouse = [event for event in events if event[0] == "Input.dispatchMouseEvent"]
-assert len(mouse) == 2, events
-assert mouse[0][1]["type"] == "mousePressed", mouse
-assert mouse[0][1]["x"] == 60 and mouse[0][1]["y"] == 40, mouse
-assert mouse[1][1]["type"] == "mouseReleased", mouse
-
-assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "a" for event in events), events
-assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "Backspace" for event in events), events
-assert ("Input.insertText", {"text": "ab"}) in events, events
-assert not any(event[0] == "Runtime.evaluate" for event in events), events
-print("fill_input cdp ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("fill_input cdp ok"));
-    }
-
-    #[test]
-    fn browser_script_press_key_accepts_common_chord_strings() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-press-key-chords",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-seen = []
-
-def cdp(method, **params):
-    seen.append((method, params))
-    return {}
-
-press_key("Meta+A")
-events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
-assert events[0]["type"] == "rawKeyDown", events
-assert events[0]["key"] == "A", events
-assert events[0]["modifiers"] == 4, events
-assert "text" not in events[0], events
-assert not any(event.get("type") == "char" for event in events), events
-
-seen.clear()
-press_key("Ctrl+Shift+Tab")
-events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
-assert events[0]["key"] == "Tab", events
-assert events[0]["modifiers"] == 10, events
-print("press_key chords ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("press_key chords ok"));
-    }
-
-    #[test]
-    fn browser_script_press_key_does_not_emit_duplicate_char_events() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-press-key-no-char",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-seen = []
-
-def cdp(method, **params):
-    seen.append((method, params))
-    return {}
-
-press_key("a")
-events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
-assert [(event["type"], event["key"], event.get("text")) for event in events] == [
-    ("keyDown", "a", "a"),
-    ("keyUp", "a", None),
-], events
-assert not any(event.get("type") == "char" for event in events), events
-print("press_key no char ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("press_key no char ok"));
-    }
-
-    #[test]
-    fn browser_script_fill_input_matches_browser_harness_key_events() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-fill-input-key-events",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r##"
-import sys
-
-events = []
-
-def js(expression, *args, **kwargs):
-    raise AssertionError(f"fill_input should not use page JS: {expression}")
-
-def cdp(method, **params):
-    events.append((method, params))
-    if method == "DOM.getDocument":
-        return {"root": {"nodeId": 1}}
-    if method == "DOM.querySelector":
-        assert params["selector"] == "#inp", params
-        return {"nodeId": 2}
-    if method == "DOM.getBoxModel":
-        return {"model": {"border": [20, 40, 140, 40, 140, 80, 20, 80]}}
-    return {}
-
-fill_input("#inp", "CP23-29", clear_first=False)
-mouse = [params for method, params in events if method == "Input.dispatchMouseEvent"]
-assert len(mouse) == 2, events
-assert mouse[0]["type"] == "mousePressed" and mouse[0]["x"] == 80 and mouse[0]["y"] == 60, mouse
-assert ("Input.insertText", {"text": "CP23-29"}) in events, events
-assert not any(method == "Input.dispatchKeyEvent" for method, _ in events), events
-
-events.clear()
-fill_input("#inp", "x", clear_first=True)
-expected_mod = 4 if sys.platform == "darwin" else 2
-key_events = [params for method, params in events if method == "Input.dispatchKeyEvent"]
-a_events = [event for event in key_events if event.get("key") == "a"]
-assert a_events, events
-assert all(event.get("modifiers") == expected_mod for event in a_events), events
-assert not any(event.get("type") == "char" for event in key_events), events
-assert "Backspace" in [event.get("key") for event in key_events], events
-assert ("Input.insertText", {"text": "x"}) in events, events
-print("fill_input cdp/browser-harness events ok")
-"##,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output
-            .text
-            .contains("fill_input cdp/browser-harness events ok"));
-    }
-
-    #[test]
-    fn browser_script_type_text_maps_to_insert_text_and_fill_input_missing_selector_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-type-text-and-missing-input",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r##"
-seen = []
-
-def cdp(method, **params):
-    seen.append((method, params))
-    return {}
-
-type_text("go to google")
-assert seen == [("Input.insertText", {"text": "go to google"})], seen
-
-def js(expression, *args, **kwargs):
-    return False
-
-try:
-    fill_input("#missing", "hello")
-except RuntimeError as exc:
-    assert "element not found" in str(exc), exc
-else:
-    raise AssertionError("fill_input should reject a missing selector")
-print("type_text and missing selector ok")
-"##,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("type_text and missing selector ok"));
-    }
-
-    #[test]
-    fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-http-get",
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-import gzip
-import http.server
-import socketserver
-import threading
-import types
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def do_GET(self):
-        if self.path == "/gzip":
-            assert self.headers.get("X-Parity") == "yes", dict(self.headers)
-            body = gzip.compress(b"hello gzip")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if self.path == "/binary":
-            body = bytes([0, 159, 255])
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
-thread = threading.Thread(target=server.serve_forever, daemon=True)
-thread.start()
-base = f"http://127.0.0.1:{server.server_address[1]}"
-try:
-    text = http_get(base + "/gzip", headers={"X-Parity": "yes"})
-    assert text == "hello gzip"
-    assert text.status_code == 200
-    assert text.text == "hello gzip"
-    assert text.content == b"hello gzip"
-    blob = http_get(base + "/binary")
-    assert blob == bytes([0, 159, 255])
-    assert blob.status_code == 200
-    assert blob.content == bytes([0, 159, 255])
-finally:
-    server.shutdown()
-    server.server_close()
-
-class FakeFetchModule:
-    @staticmethod
-    def fetch_sync(url, headers=None, timeout_ms=None):
-        assert headers == {"X": "1"}
-        assert timeout_ms == 1234
-        if url.endswith("/binary"):
-            return types.SimpleNamespace(
-                text="",
-                content=bytes([0, 159, 255]),
-                status_code=202,
-                headers={"x-proxy": "yes"},
-                url=url,
-            )
-        return types.SimpleNamespace(text="proxied", status_code=202, headers={"x-proxy": "yes"}, url=url)
-
-sys.modules["fetch_use"] = FakeFetchModule
-os.environ["BROWSER_USE_API_KEY"] = "test"
-proxied = http_get("https://example.test/data", headers={"X": "1"}, timeout=1.234)
-assert proxied == "proxied"
-assert proxied.status_code == 202
-assert proxied.headers["x-proxy"] == "yes"
-proxied_binary = http_get("https://example.test/binary", headers={"X": "1"}, timeout=1.234, binary=True)
-assert proxied_binary == bytes([0, 159, 255])
-assert proxied_binary.status_code == 202
-assert proxied_binary.content == bytes([0, 159, 255])
-print("http_get parity ok")
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("http_get parity ok"));
-    }
-
-    #[test]
-    fn browser_script_timeout_returns_tool_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run_browser_script(
-            "script-timeout",
-            temp.path(),
-            temp.path().join("artifacts"),
-            "import time\ntime.sleep(5)",
-            1,
-        )
-        .unwrap();
-
-        assert!(!output.ok);
-        assert!(output
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("browser_script timed out after 1 seconds")));
-    }
-
-    #[test]
-    fn browser_script_start_returns_immediate_result_for_fast_scripts() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = start_browser_script(
-            "script-fast-start",
-            temp.path(),
-            temp.path().join("artifacts"),
-            "print('fast result')",
-            5,
-        )
-        .unwrap();
-
-        assert!(output.ok);
-        assert_eq!(output.status.as_deref(), Some("finished"));
-        assert!(output.text.contains("fast result"));
-        assert!(output.run_id.is_some());
-    }
-
-    #[test]
-    fn browser_script_start_observe_finishes_slow_scripts() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-start-observe";
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            "import time\nprint('chunk one')\ntime.sleep(1.2)\nprint('chunk two')",
-            5,
-        )
-        .unwrap();
-
-        assert!(started.ok);
-        assert_eq!(started.status.as_deref(), Some("running"));
-        assert!(started.text.contains("chunk one"));
-        let run_id = started.run_id.as_deref().unwrap();
-
-        let mut finished = observe_browser_script(session_id, run_id, 2_500).unwrap();
-        if finished.status.as_deref() == Some("running") {
-            finished = observe_browser_script(session_id, run_id, 2_500).unwrap();
-        }
-        assert!(finished.ok);
-        assert_eq!(finished.status.as_deref(), Some("finished"));
-        assert!(finished.text.contains("chunk two"));
-        assert!(
-            finished.artifacts.is_empty(),
-            "internal stream file leaked as artifact: {:?}",
-            finished.artifacts
-        );
-    }
-
-    #[test]
-    fn browser_script_observe_can_return_no_new_output() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-observe-empty";
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            "import time\ntime.sleep(1.2)\nprint('late')",
-            5,
-        )
-        .unwrap();
-
-        assert_eq!(started.status.as_deref(), Some("running"));
-        let run_id = started.run_id.as_deref().unwrap();
-        let observed = observe_browser_script(session_id, run_id, 50).unwrap();
-        assert!(observed.ok);
-        assert_eq!(observed.status.as_deref(), Some("running"));
-        assert!(observed.text.contains("No new output"));
-
-        let _ = cancel_browser_script(session_id, run_id);
-    }
-
-    #[test]
-    fn browser_script_observe_returns_images_before_final_result() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-observe-image";
-        let code = r#"
-import pathlib, time
-path = pathlib.Path(outputs_dir()) / "before_failure.png"
-path.write_bytes(b"\x89PNG")
-emit_image(path, label="before failure")
-time.sleep(1.2)
-print("finished")
-"#;
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            code,
-            5,
-        )
-        .unwrap();
-
-        assert_eq!(started.status.as_deref(), Some("running"));
-        assert_eq!(started.images.len(), 1);
-        assert_eq!(
-            started.images[0].get("label").and_then(Value::as_str),
-            Some("before failure")
-        );
-        assert_eq!(
-            started.images[0].get("source").and_then(Value::as_str),
-            Some("emit_image")
-        );
-        let run_id = started.run_id.as_deref().unwrap();
-        let _ = cancel_browser_script(session_id, run_id);
-    }
-
-    #[test]
-    fn browser_script_observe_returns_summary_before_final_result() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-observe-summary";
-        let code = r#"
-# browser_summary:
-# {
-#   "page_info": {
-#     "kind": "page",
-#     "url": "$.url",
-#     "title": "$.title"
-#   }
-# }
-import time
-info = {"url": "https://example.test/start", "title": "Start"}
-emit_output(info, label="page_info")
-time.sleep(1.2)
-print("finished")
-"#;
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            code,
-            5,
-        )
-        .unwrap();
-
-        assert_eq!(started.status.as_deref(), Some("running"));
-        assert_eq!(started.outputs.len(), 1, "{:?}", started.outputs);
-        assert_eq!(
-            started.outputs[0].get("label").and_then(Value::as_str),
-            Some("page_info")
-        );
-        assert_eq!(started.summary.len(), 1, "{:?}", started.summary);
-        assert_eq!(
-            started.summary[0].get("kind").and_then(Value::as_str),
-            Some("page")
-        );
-        assert_eq!(
-            started.summary[0]
-                .get("output_label")
-                .and_then(Value::as_str),
-            Some("page_info")
-        );
-        assert_eq!(
-            started.summary[0].get("url").and_then(Value::as_str),
-            Some("https://example.test/start")
-        );
-        let run_id = started.run_id.as_deref().unwrap();
-        let _ = cancel_browser_script(session_id, run_id);
-    }
-
-    #[test]
-    fn browser_script_runs_command_lists_active_legacy_runs() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-status-active-runs";
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            "import time\ntime.sleep(1.2)",
-            5,
-        )
-        .unwrap();
-        assert_eq!(started.status.as_deref(), Some("running"));
-
-        let status =
-            run_browser_command(session_id, temp.path(), temp.path(), "script runs --json")
-                .unwrap()
-                .content;
-        assert_eq!(
-            status["active_scripts"][0]["run_id"],
-            started.run_id.as_deref().unwrap()
-        );
-
-        let _ = cancel_browser_script(session_id, started.run_id.as_deref().unwrap());
-    }
-
-    #[test]
-    fn browser_script_cancel_command_stops_active_run() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "script-cancel-command";
-        let started = start_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            "import time\ntime.sleep(5)",
-            10,
-        )
-        .unwrap();
-        let run_id = started.run_id.as_deref().unwrap();
-
-        let cancelled = run_browser_command(
-            session_id,
-            temp.path(),
-            temp.path(),
-            &format!("script cancel {run_id}"),
-        )
-        .unwrap()
-        .content;
-
-        assert_eq!(cancelled["status"], "cancelled");
-        assert_eq!(cancelled["run_id"], run_id);
-    }
-
-    #[test]
-    fn browser_script_bridge_handles_large_json_responses() {
-        let temp = tempfile::tempdir().unwrap();
-        let session_id = "bridge-large-json";
-        {
-            let mut sessions = sessions()
-                .lock()
-                .expect("browser session registry poisoned");
-            sessions.insert(session_id.to_string(), BrowserSession::default());
-        }
-
-        let output = run_browser_script(
-            session_id,
-            temp.path(),
-            temp.path().join("artifacts"),
-            r#"
-data = _bridge({"kind": "test_large_response", "bytes": 2_000_000})
-assert len(data["blob"]) == 2_000_000, len(data["blob"])
-print("large response ok", len(data["blob"]))
-"#,
-            10,
-        )
-        .unwrap();
-
-        assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("large response ok 2000000"));
-        assert!(
-            output.browser_events.is_empty(),
-            "unexpected bridge events: {:?}",
-            output.browser_events
-        );
-
-        sessions()
-            .lock()
-            .expect("browser session registry poisoned")
-            .remove(session_id);
     }
 
     #[test]
@@ -7010,18 +4786,19 @@ print("large response ok", len(data["blob"]))
         .unwrap();
         assert_eq!(connect.content["status"], "connected");
 
-        let script = run_browser_script(
+        let job = execute_browser_js(
             session_id,
             temp.path(),
             &artifacts,
             r##"
-tid = new_tab("about:blank")
-assert isinstance(tid, str) and tid, tid
-assert current_tab()["targetId"] == tid, current_tab()
-assert all(tab.get("targetId") for tab in list_tabs()), list_tabs()
-switch_tab({"targetId": tid})
-goto_url("about:blank")
-js("""
+const created = await cdp("Target.createTarget", { url: "about:blank" });
+if (!created.targetId) throw new Error("missing created target id");
+await session.use(created.targetId);
+const targets = await listPageTargets();
+if (!targets.every(target => target.targetId)) throw new Error("target list missing ids");
+await session.Page.navigate({ url: "about:blank" });
+await session.waitFor("Page.loadEventFired", undefined, 5_000).catch(() => null);
+await session.Runtime.evaluate({ expression: `
 (() => {
   document.title = "Browser Smoke";
   document.body.style.margin = "0";
@@ -7045,36 +4822,24 @@ js("""
   ctx.putImageData(img, 0, 0);
   return true;
 })()
-""")
-wait_for_element("#ok")
-time.sleep(0.5)
-large = js("'x'.repeat(200000)")
-assert len(large) == 200000, len(large)
-info = page_info()
-print(info)
-screenshot("managed_smoke")
-(pathlib.Path(outputs_dir()) / "managed-smoke.json").write_text(json.dumps(info), encoding="utf-8")
+`, awaitPromise: true, returnByValue: true });
+const large = await session.Runtime.evaluate({ expression: "'x'.repeat(200000)", returnByValue: true });
+if (large.result.value.length !== 200000) throw new Error("large response length mismatch");
+const info = (await session.Runtime.evaluate({
+  expression: `({ url: location.href, title: document.title, readyState: document.readyState })`,
+  returnByValue: true
+})).result.value;
+checkpoint("page_info", info);
+await session.Page.captureScreenshot({ format: "png" });
+return info;
 "##,
-            30,
+            30_000,
+            30_000,
         )
         .unwrap();
-        assert!(script.ok, "{:?}\n{}", script.error, script.text);
-        let output_path = script
-            .artifacts
-            .iter()
-            .find_map(|artifact| {
-                artifact["path"]
-                    .as_str()
-                    .filter(|path| path.ends_with("managed-smoke.json"))
-            })
-            .expect("managed-smoke artifact");
-        let output: Value =
-            serde_json::from_str(&fs::read_to_string(output_path).unwrap()).unwrap();
-        assert_eq!(output["title"], "Browser Smoke");
-        assert!(
-            !script.images.is_empty(),
-            "expected screenshot image artifact"
-        );
+        assert!(job.ok, "{:?}\n{}", job.error, job.text);
+        assert_eq!(job.data["title"], "Browser Smoke");
+        assert!(!job.images.is_empty(), "expected screenshot image artifact");
 
         cleanup_session(session_id);
     }
@@ -7100,13 +4865,14 @@ screenshot("managed_smoke")
         .unwrap();
         assert_eq!(connect.content["status"], "connected");
 
-        let script = run_browser_script(
+        let job = execute_browser_js(
             session_id,
             temp.path(),
             &artifacts,
             r##"
-new_tab("about:blank")
-js("""
+const created = await cdp("Target.createTarget", { url: "about:blank" });
+await session.use(created.targetId);
+await session.Runtime.evaluate({ expression: `
 (() => {
   document.title = "Controlled Input Smoke";
   document.body.innerHTML = `
@@ -7131,10 +4897,20 @@ js("""
   render();
   return true;
 })()
-""")
-wait_for_element("#composer")
-fill_input("#composer", "go to google", timeout=2)
-state = js("""
+`, awaitPromise: true, returnByValue: true });
+await session.DOM.enable();
+const { root } = await session.DOM.getDocument({});
+const { nodeId } = await session.DOM.querySelector({ nodeId: root.nodeId, selector: "#composer" });
+const { model } = await session.DOM.getBoxModel({ nodeId });
+const xs = model.border.filter((_, idx) => idx % 2 === 0);
+const ys = model.border.filter((_, idx) => idx % 2 === 1);
+const x = (Math.min(...xs) + Math.max(...xs)) / 2;
+const y = (Math.min(...ys) + Math.max(...ys)) / 2;
+await session.Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+await session.Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+await session.Input.insertText({ text: "go to google" });
+await session.Runtime.evaluate({ expression: `document.querySelector("#composer").dispatchEvent(new Event("input", { bubbles: true })); true`, returnByValue: true });
+let state = (await session.Runtime.evaluate({ expression: `
 (() => {
   const textarea = document.querySelector("#composer");
   const send = document.querySelector("#send");
@@ -7145,20 +4921,20 @@ state = js("""
     result: result.textContent,
   };
 })()
-""")
-print("state", state)
-assert state["value"] == "go to google", state
-assert state["disabled"] is False, state
-js('document.querySelector("#send").click(); true')
-submitted = js('document.querySelector("#result").textContent')
-assert submitted == "go to google", submitted
-(pathlib.Path(outputs_dir()) / "controlled-input-smoke.json").write_text(json.dumps(state), encoding="utf-8")
+`, returnByValue: true })).result.value;
+if (state.value !== "go to google" || state.disabled !== false) throw new Error(JSON.stringify(state));
+await session.Runtime.evaluate({ expression: 'document.querySelector("#send").click(); true', returnByValue: true });
+const submitted = (await session.Runtime.evaluate({ expression: 'document.querySelector("#result").textContent', returnByValue: true })).result.value;
+if (submitted !== "go to google") throw new Error(`unexpected submitted value ${submitted}`);
+checkpoint("controlled_input", state);
+return state;
 "##,
-            30,
+            30_000,
+            30_000,
         )
         .unwrap();
-        assert!(script.ok, "{:?}\n{}", script.error, script.text);
-        assert!(script.text.contains("go to google"), "{}", script.text);
+        assert!(job.ok, "{:?}\n{}", job.error, job.text);
+        assert_eq!(job.data["value"], "go to google");
 
         cleanup_session(session_id);
     }
@@ -7189,19 +4965,23 @@ assert submitted == "go to google", submitted
             .expect("managed browser http url")
             .to_string();
 
-        let script = run_browser_script(
+        let job = execute_browser_js(
             source_session,
             temp.path(),
             &artifacts,
             r##"
-goto_url("data:text/html,<title>Remote CDP Smoke</title><h1 id='ok'>Remote CDP Smoke</h1>")
-wait_for_element("#ok")
-(pathlib.Path(outputs_dir()) / "remote-source.json").write_text(json.dumps(page_info()), encoding="utf-8")
+await session.Page.navigate({ url: "data:text/html,<title>Remote CDP Smoke</title><h1 id='ok'>Remote CDP Smoke</h1>" });
+await session.waitFor("Page.loadEventFired", undefined, 5_000).catch(() => null);
+return (await session.Runtime.evaluate({
+  expression: `({ url: location.href, title: document.title, readyState: document.readyState })`,
+  returnByValue: true
+})).result.value;
 "##,
-            30,
+            30_000,
+            30_000,
         )
         .unwrap();
-        assert!(script.ok, "{:?}\n{}", script.error, script.text);
+        assert!(job.ok, "{:?}\n{}", job.error, job.text);
 
         let connect_remote = run_browser_command(
             remote_session,
@@ -7239,30 +5019,22 @@ wait_for_element("#ok")
             );
         }
 
-        let probe = run_browser_script(
+        let probe = execute_browser_js(
             remote_session,
             temp.path(),
             &artifacts,
             r##"
-info = page_info()
-(pathlib.Path(outputs_dir()) / "remote-cdp-smoke.json").write_text(json.dumps(info), encoding="utf-8")
+return (await session.Runtime.evaluate({
+  expression: `({ url: location.href, title: document.title, readyState: document.readyState })`,
+  returnByValue: true
+})).result.value;
 "##,
-            30,
+            30_000,
+            30_000,
         )
         .unwrap();
         assert!(probe.ok, "{:?}\n{}", probe.error, probe.text);
-        let output_path = probe
-            .artifacts
-            .iter()
-            .find_map(|artifact| {
-                artifact["path"]
-                    .as_str()
-                    .filter(|path| path.ends_with("remote-cdp-smoke.json"))
-            })
-            .expect("remote-cdp-smoke artifact");
-        let output: Value =
-            serde_json::from_str(&fs::read_to_string(output_path).unwrap()).unwrap();
-        assert_eq!(output["title"], "Remote CDP Smoke");
+        assert_eq!(probe.data["title"], "Remote CDP Smoke");
 
         let ownership = run_browser_command(
             remote_session,

@@ -1643,22 +1643,22 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
         return None;
     }
     let mut lines = Vec::new();
-    let browser_script_summary_lines = if is_browser_interaction_tool(&name) {
-        browser_script_summary_lines(event)
+    let browser_job_summary_lines = if is_browser_interaction_tool(&name) {
+        browser_job_summary_lines(event)
     } else {
         Vec::new()
     };
-    let has_browser_script_summary = !browser_script_summary_lines.is_empty();
-    lines.extend(browser_script_summary_lines);
-    if is_browser_interaction_tool(&name) && !has_browser_script_summary {
-        lines.extend(browser_script_structured_output_lines(event));
+    let has_browser_job_summary = !browser_job_summary_lines.is_empty();
+    lines.extend(browser_job_summary_lines);
+    if is_browser_interaction_tool(&name) && !has_browser_job_summary {
+        lines.extend(browser_job_structured_output_lines(event));
     }
     if should_show_generic_tool_output_text(&name)
-        && !(is_browser_interaction_tool(&name) && has_browser_script_summary)
+        && !(is_browser_interaction_tool(&name) && has_browser_job_summary)
     {
         if let Some(text) = payload_string(event, "text").filter(|text| !text.trim().is_empty()) {
             if is_browser_interaction_tool(&name) {
-                lines.extend(browser_script_text_preview_lines(&text));
+                lines.extend(browser_job_text_preview_lines(&text));
             } else {
                 lines.extend(preview_lines(&text, 3));
             }
@@ -1716,7 +1716,7 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
     ))
 }
 
-fn browser_script_summary_lines(event: &EventRecord) -> Vec<String> {
+fn browser_job_summary_lines(event: &EventRecord) -> Vec<String> {
     let Some(summary) = event
         .payload
         .get("summary")
@@ -1726,7 +1726,7 @@ fn browser_script_summary_lines(event: &EventRecord) -> Vec<String> {
     };
     let mut lines = summary
         .iter()
-        .filter_map(browser_script_summary_record_line)
+        .filter_map(browser_job_summary_record_line)
         .take(6)
         .collect::<Vec<_>>();
     if summary.len() > lines.len() {
@@ -1735,7 +1735,7 @@ fn browser_script_summary_lines(event: &EventRecord) -> Vec<String> {
     lines
 }
 
-fn browser_script_summary_record_line(value: &serde_json::Value) -> Option<String> {
+fn browser_job_summary_record_line(value: &serde_json::Value) -> Option<String> {
     let kind = summary_value_string(value, "kind").unwrap_or_else(|| "summary".to_string());
     let message = summary_value_string(value, "message");
     match kind.as_str() {
@@ -1802,7 +1802,7 @@ fn browser_script_summary_record_line(value: &serde_json::Value) -> Option<Strin
     }
 }
 
-fn browser_script_structured_output_lines(event: &EventRecord) -> Vec<String> {
+fn browser_job_structured_output_lines(event: &EventRecord) -> Vec<String> {
     let Some(outputs) = event
         .payload
         .get("outputs")
@@ -1830,18 +1830,16 @@ fn browser_script_structured_output_lines(event: &EventRecord) -> Vec<String> {
     vec![line]
 }
 
-fn browser_script_text_preview_lines(text: &str) -> Vec<String> {
+fn browser_job_text_preview_lines(text: &str) -> Vec<String> {
     let trimmed = text.trim();
-    if trimmed.starts_with("browser_script is still running.")
-        || trimmed.starts_with("browser_execute is still running.")
-    {
+    if trimmed.starts_with("browser_execute is still running.") {
         return Vec::new();
     }
     let visible = text
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
-        .filter(|line| !is_browser_script_runtime_instruction_line(line))
+        .filter(|line| !is_browser_job_runtime_instruction_line(line))
         .collect::<Vec<_>>();
     let mut out = visible
         .iter()
@@ -1854,12 +1852,11 @@ fn browser_script_text_preview_lines(text: &str) -> Vec<String> {
     out
 }
 
-fn is_browser_script_runtime_instruction_line(line: &str) -> bool {
+fn is_browser_job_runtime_instruction_line(line: &str) -> bool {
     let line = line.trim_start();
     line.starts_with("run_id:")
         || line.starts_with("Next:")
         || line.starts_with("Next step:")
-        || line == "browser_script is still running."
         || line == "browser_execute is still running."
 }
 
@@ -1998,7 +1995,6 @@ fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
         "browser_execute" | "browser_observe" | "browser_cancel" => {
             Some(("browser", "running browser job"))
         }
-        "browser_script" => Some(("browser", "running browser script")),
         "python" => Some(("python", "running browser Python")),
         "exec_command" => Some(("run", "running command")),
         "write_stdin" => Some(("run", "writing to command")),
@@ -2016,7 +2012,7 @@ fn should_show_generic_tool_output_text(name: &str) -> bool {
 
 fn tool_output_group(name: &str) -> &str {
     match name {
-        "browser_execute" | "browser_observe" | "browser_cancel" | "browser_script" => "browser",
+        "browser_execute" | "browser_observe" | "browser_cancel" => "browser",
         "python" => "python",
         _ => "tool",
     }
@@ -2025,7 +2021,7 @@ fn tool_output_group(name: &str) -> &str {
 fn is_browser_interaction_tool(name: &str) -> bool {
     matches!(
         name,
-        "browser_execute" | "browser_observe" | "browser_cancel" | "browser_script"
+        "browser_execute" | "browser_observe" | "browser_cancel"
     )
 }
 
@@ -3733,7 +3729,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_failures_render_compact_diagnosis() {
+    fn browser_execute_failures_render_compact_diagnosis() {
         let event = EventRecord {
             seq: 7,
             id: "event-7".to_string(),
@@ -3741,7 +3737,7 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.failed".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "error": "Traceback (most recent call last):\nRuntimeError: read CDP Runtime.evaluate: IO error",
                 "diagnosis": {
                     "summary": "Browser is still connected; the same page should still be usable.",
@@ -3756,7 +3752,7 @@ mod tests {
 
         let lines = tool_failed_lines(&event);
 
-        assert_eq!(lines[0], "browser_script failed");
+        assert_eq!(lines[0], "browser_execute failed");
         assert!(lines.iter().any(|line| line.contains("same page")));
         assert!(lines
             .iter()
@@ -3814,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_screenshot_image_label_names_capture_source() {
+    fn browser_execute_screenshot_image_label_names_capture_source() {
         let state = test_workbench_state();
         let event = EventRecord {
             seq: 10,
@@ -3823,7 +3819,7 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.image".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "image": {
                     "path": "/tmp/hn_front_page.png",
                     "mime_type": "image/png",
@@ -3840,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_emit_image_label_names_attachment_source() {
+    fn browser_execute_emit_image_label_names_attachment_source() {
         let state = test_workbench_state();
         let event = EventRecord {
             seq: 11,
@@ -3849,7 +3845,7 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.image".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "image": {
                     "path": "/tmp/diagnostic.png",
                     "mime_type": "image/png",
@@ -3866,7 +3862,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_browser_script_image_label_stays_specific() {
+    fn browser_execute_image_label_stays_specific() {
         let state = test_workbench_state();
         let event = EventRecord {
             seq: 12,
@@ -3875,7 +3871,7 @@ mod tests {
             ts_ms: 0,
             event_type: "tool.image".to_string(),
             payload: serde_json::json!({
-                "name": "browser_script",
+                "name": "browser_execute",
                 "image": {
                     "path": "/tmp/latest_screenshot.png",
                     "mime_type": "image/png",
@@ -3926,14 +3922,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_script_raw_text_fallback_is_bounded() {
+    fn browser_execute_raw_text_fallback_is_bounded() {
         let line = format!(
             "{{'url': 'https://login.example.test/realms/acme/protocol/openid-connect/auth?client_id=zenpayroll&state={}', 'target': {{'targetId': '{}'}}}}",
             "x".repeat(240),
             "y".repeat(240)
         );
 
-        let preview = browser_script_text_preview_lines(&line);
+        let preview = browser_job_text_preview_lines(&line);
 
         assert_eq!(preview.len(), 1);
         assert!(preview[0].chars().count() <= 180, "{preview:?}");
@@ -3942,7 +3938,7 @@ mod tests {
 
     #[test]
     fn browser_execute_running_text_fallback_hides_run_id() {
-        let preview = browser_script_text_preview_lines(
+        let preview = browser_job_text_preview_lines(
             "browser_execute is still running.\nNo new output in the last 50 ms.\nrun_id: br-secret\nNext: observe this run again.",
         );
 
@@ -3952,7 +3948,7 @@ mod tests {
 
     #[test]
     fn browser_execute_partial_text_fallback_drops_runtime_instructions() {
-        let preview = browser_script_text_preview_lines(
+        let preview = browser_job_text_preview_lines(
             "chunk one\n\nbrowser_execute is still running.\nrun_id: br-secret\nNext: observe this run again.",
         );
 

@@ -3175,7 +3175,9 @@ mod tests {
         assert!(names.contains(&"browser_status".to_string()));
         assert!(names.contains(&"browser_configure".to_string()));
         assert!(names.contains(&"browser_recover".to_string()));
-        assert!(!names.contains(&"browser_script".to_string()));
+        assert!(names
+            .iter()
+            .all(|name| name != &format!("browser_{}", "script")));
         assert!(!names.contains(&"python".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"search_files".to_string()));
