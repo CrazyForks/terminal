@@ -107,7 +107,7 @@ impl MarkdownWriter {
                 }
             }
             Event::Code(code) => {
-                self.push_span(Span::styled(code.to_string(), markdown_code()));
+                self.push_inline_code(&code);
             }
             Event::SoftBreak | Event::HardBreak => self.flush_current(),
             Event::Rule => {
@@ -323,6 +323,32 @@ impl MarkdownWriter {
 
     fn push_code_text(&mut self, text: &str) {
         self.code_block_buffer.push_str(text);
+    }
+
+    fn push_inline_code(&mut self, code: &str) {
+        let without_leading = code.trim_start();
+        let leading_len = code.len().saturating_sub(without_leading.len());
+        let trimmed = without_leading.trim_end();
+        let trailing_len = without_leading.len().saturating_sub(trimmed.len());
+
+        let leading = &code[..leading_len];
+        let trailing_start = code.len().saturating_sub(trailing_len);
+        let trailing = &code[trailing_start..];
+        let style = if should_style_inline_code(trimmed) {
+            markdown_code()
+        } else {
+            self.current_style()
+        };
+
+        if !leading.is_empty() {
+            self.push_span(Span::styled(leading.to_string(), self.current_style()));
+        }
+        if !trimmed.is_empty() {
+            self.push_span(Span::styled(trimmed.to_string(), style));
+        }
+        if !trailing.is_empty() {
+            self.push_span(Span::styled(trailing.to_string(), self.current_style()));
+        }
     }
 
     fn flush_code_block(&mut self) {
@@ -815,6 +841,76 @@ fn looks_like_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("~/") || value.starts_with("./")
 }
 
+fn should_style_inline_code(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if !value.chars().any(char::is_whitespace) {
+        return true;
+    }
+    if starts_with_common_command(value) {
+        return true;
+    }
+    value.chars().any(is_inline_code_delimiter)
+}
+
+fn starts_with_common_command(value: &str) -> bool {
+    let command = value.split_whitespace().next().unwrap_or_default();
+    matches!(
+        command,
+        "awk"
+            | "brew"
+            | "bun"
+            | "cargo"
+            | "cat"
+            | "cd"
+            | "curl"
+            | "deno"
+            | "docker"
+            | "gh"
+            | "git"
+            | "go"
+            | "grep"
+            | "just"
+            | "kubectl"
+            | "make"
+            | "node"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "python"
+            | "python3"
+            | "rg"
+            | "sed"
+            | "sqlite3"
+            | "task"
+            | "uv"
+            | "yarn"
+    )
+}
+
+fn is_inline_code_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '/' | '\\'
+            | '$'
+            | '`'
+            | '{'
+            | '}'
+            | '['
+            | ']'
+            | '('
+            | ')'
+            | '<'
+            | '>'
+            | '='
+            | '|'
+            | '&'
+            | ';'
+    )
+}
+
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
     match kind {
         CodeBlockKind::Fenced(language) => {
@@ -1067,6 +1163,41 @@ mod tests {
             line.spans
                 .iter()
                 .any(|span| span.content == "/in/reaganh" && span.style == path_reference())
+        }));
+    }
+
+    #[test]
+    fn inline_code_plain_language_phrases_render_as_plain_text() {
+        let lines = render_markdown_lines("- `About LLMs at Zig Days` -", 80);
+        assert_eq!(plain(&lines), "- About LLMs at Zig Days -");
+        assert!(lines[0].spans.iter().any(|span| {
+            span.content == "About LLMs at Zig Days" && span.style == text_style()
+        }));
+        assert!(!lines[0]
+            .spans
+            .iter()
+            .any(|span| { span.content.contains("About LLMs") && span.style == markdown_code() }));
+    }
+
+    #[test]
+    fn inline_code_does_not_highlight_padding_spaces() {
+        let lines = render_markdown_lines("` About LLMs`", 80);
+        assert_eq!(plain(&lines), " About LLMs");
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content == " " && span.style == text_style()));
+        assert!(!lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content.starts_with(' ') && span.style == markdown_code()));
+    }
+
+    #[test]
+    fn inline_code_commands_keep_code_style() {
+        let lines = render_markdown_lines("Run `cargo test -p browser-use-tui`.", 80);
+        assert!(lines[0].spans.iter().any(|span| {
+            span.content == "cargo test -p browser-use-tui" && span.style == markdown_code()
         }));
     }
 
