@@ -85,7 +85,10 @@ impl HiddenAssistantMarkupStreamFilter {
         }
     }
 
-    pub(crate) fn push_provider_text(&mut self, incoming: &str) -> Option<(String, Option<String>)> {
+    pub(crate) fn push_provider_text(
+        &mut self,
+        incoming: &str,
+    ) -> Option<(String, Option<String>)> {
         let raw_delta = assistant_delta_to_append(&self.raw_text, incoming)?;
         self.raw_text.push_str(&raw_delta);
         let visible = strip_hidden_assistant_markup_for_stream(&self.raw_text, self.mode).0;

@@ -76,7 +76,10 @@ pub(crate) fn request_user_input_unavailable_message(
     }
 }
 
-pub(crate) fn active_request_user_input_turn_id(events: &[EventRecord], fallback_call_id: &str) -> String {
+pub(crate) fn active_request_user_input_turn_id(
+    events: &[EventRecord],
+    fallback_call_id: &str,
+) -> String {
     let terminal_turn_ids = events
         .iter()
         .filter(|event| {
