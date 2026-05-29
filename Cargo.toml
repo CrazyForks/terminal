@@ -3,6 +3,7 @@ members = [
   "crates/browser-use-browser",
   "crates/browser-use-cli",
   "crates/browser-use-core",
+  "crates/browser-use-llm",
   "crates/browser-use-providers",
   "crates/browser-use-python-worker",
   "crates/browser-use-protocol",

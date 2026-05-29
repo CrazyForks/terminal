@@ -18,7 +18,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` implemented **and** pari
 - [ ] **Gate 0** — compiles (sync), modules carved, interfaces frozen, harness runs
 
 **Phase 1 — `browser-use-llm`**
-- [ ] 1.1 `schema/` (LlmRequest/Message/ContentPart/LlmEvent/Usage/ids/options/error)
+- [x] 1.1 `schema/` (LlmRequest/Message/ContentPart/LlmEvent/Usage/ids/options/error) — 5 round-trip tests green
 - [ ] 1.2 `route/` traits + client + Lifecycle + ToolStream
 - [ ] 1.3 `protocols/openai_responses`
 - [ ] 1.4 `protocols/openai_chat` (Ollama/OpenRouter/DeepSeek/Fireworks)
