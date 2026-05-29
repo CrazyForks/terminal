@@ -49,6 +49,8 @@ use tools::{
     MultiAgentToolFamily, MultiAgentToolSpecConfig, ShellToolSpecConfig, SpawnAgentRoleDescription,
     ToolHandlerKind, ToolRegistry, ToolRouter,
 };
+#[cfg(test)]
+use browser_use_providers::CodexAuth;
 
 mod constants;
 pub(crate) use constants::*;
