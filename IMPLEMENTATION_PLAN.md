@@ -7,6 +7,81 @@
 
 ---
 
+## Implementation status — check off as each piece is implemented **and tested**
+
+Legend: `[ ]` not started · `[~]` in progress · `[x]` implemented **and** parity/e2e tests green. A phase is done only when every box under it (including its Gate) is `[x]`. Nothing gets `[x]` until it runs and passes tests (Rule 8). Keep this list in sync as WPs land.
+
+**Phase 0 — Carve**
+- [ ] 0.1 Module/crate skeleton (carve `lib.rs` → submodules/crates; sync; no behavior change)
+- [ ] 0.2 Freeze interfaces (provider/route, ToolRuntime/Approvable/Sandboxable, context, store, errors)
+- [ ] 0.3 Parity-test harness (cassettes, fixtures, corpus scaffold)
+- [ ] **Gate 0** — compiles (sync), modules carved, interfaces frozen, harness runs
+
+**Phase 1 — `browser-use-llm`**
+- [ ] 1.1 `schema/` (LlmRequest/Message/ContentPart/LlmEvent/Usage/ids/options/error)
+- [ ] 1.2 `route/` traits + client + Lifecycle + ToolStream
+- [ ] 1.3 `protocols/openai_responses`
+- [ ] 1.4 `protocols/openai_chat` (Ollama/OpenRouter/DeepSeek/Fireworks)
+- [ ] 1.5 `protocols/anthropic_messages` (+ Claude-Code OAuth)
+- [ ] 1.6 `route/executor` (retry / rate-limit / redaction)
+- [ ] 1.7 `providers/` facades + openai-compatible `{provider,base_url}` table
+- [ ] 1.8 `tool.rs` / `tool_runtime.rs`
+- [ ] 1.9 Drop codex/ChatGPT backend (de-codex)
+- [ ] **Gate 1** — 3 protocols pass cassette parity; live smoke (OpenAI/Anthropic/Ollama); codex backend gone
+
+**Phase 2 — Async spine + orchestrator seam**
+- [ ] 2.1 Async turn loop (codex parity)
+- [ ] 2.2 Context manager + **real** token accounting + context-message injection
+- [ ] 2.3 ToolOrchestrator + runtime/approval/sandbox seam (sandbox=None stub)
+- [ ] 2.4 Session/resume async over SQLite (write-sink)
+- [ ] **Gate 2** — full async turn end-to-end through orchestrator; persist + resume
+
+**Phase 3 — Tools → parity**
+- [ ] 3.1 shell + unified_exec
+- [ ] 3.2 apply_patch (+ turn_diff_tracker)
+- [ ] 3.3 view_image (KEEP sync/serial)
+- [ ] 3.4 update_plan
+- [ ] 3.5 request_user_input
+- [ ] 3.6 tool_search + deferred exposure
+- [ ] 3.7 web_search
+- [ ] 3.8 browser tools adapter
+- [ ] 3.9 python tool adapter
+- [ ] 3.10 mcp tool dispatch
+- [ ] **Gate 3** — every tool parity/divergence-tested
+
+**Phase 4 — Subsystems → parity**
+- [ ] 4.1 Compaction (codex parity, model-based; **no-LLM path removed**)
+- [ ] 4.2 Context-message system (reference_context alignment)
+- [ ] 4.3 MCP transports (HTTP/SSE/OAuth/elicitation; fix plugin-oauth bug)
+- [ ] 4.4 Subagents (roles-as-config, depth limits, **event-notify** mailbox)
+- [ ] 4.5 Goals/budget parity
+- [ ] 4.6 Skills & plugins parity (+ install/elicitation)
+- [ ] 4.7 Hooks (PermissionRequest event + Prompt/Agent handlers)
+- [ ] 4.8 Prompts (de-brand; selection parity)
+- [ ] 4.9 Rollout/resume hardening (archival/fork/truncation over SQLite)
+- [ ] **Gate 4** — subsystem parity tests green; no-LLM compaction gone
+
+**Phase 5 — Safety substrate**
+- [ ] 5.1 OS sandboxes (seatbelt/landlock+seccomp/bwrap/windows) + process-hardening
+- [ ] 5.2 execpolicy (Starlark) + amendments + command_canonicalization
+- [ ] 5.3 Network proxy/MITM + deferred network approval
+- [ ] 5.4 Guardian (LLM reviewer, circuit breaker, fork reviewer)
+- [ ] 5.5 Wire approvals into orchestrator; flip sandbox None→real; PermissionRequest precedence
+- [ ] **Gate 5** — commands sandboxed; approvals/guardian enforced; escalation works
+
+**Phase 6 — Advanced parity**
+- [ ] 6.1 code_mode (V8 tools-as-code)
+- [ ] 6.2 agent_jobs (CSV fan-out)
+- [ ] 6.3 shared-service subthreads (codex_delegate equiv)
+- [ ] 6.4 memories ingestion/storage
+- [ ] 6.5 connectors (OAuth MCP) + session prewarm
+
+**Cross-cutting**
+- [ ] De-codex audit (no residual `codex`/`CODEX_`/`oai`/`chatgpt` except intentional)
+- [ ] Final full e2e pass (browser + tools + compaction + subagents + resume, against a live model)
+
+---
+
 ## 0. How this plan is meant to be run
 
 - The unit of work is a **work package (WP)**. Each WP = one sub-agent task, going deep / first-principles.
