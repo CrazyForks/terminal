@@ -137,6 +137,19 @@ function makeSession(runId, job, cdp) {
     setActiveSession(sessionId) {
       sessionState.activeSessionId = sessionId || null;
     },
+    async connect(options = undefined) {
+      if (options && Object.keys(options).length > 0) {
+        throw new Error(
+          "session.connect(options) is not supported in browser_execute. " +
+          "Rust owns browser setup; use browser_configure to change the browser connection when explicitly requested.",
+        );
+      }
+      return {
+        status: "already-connected",
+        activeSessionId: sessionState.activeSessionId,
+        targets: await listPageTargets(cdp),
+      };
+    },
     async use(targetId) {
       const result = await cdp(
         "Target.attachToTarget",

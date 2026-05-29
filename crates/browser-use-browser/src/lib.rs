@@ -4510,6 +4510,24 @@ mod tests {
     }
 
     #[test]
+    fn connection_skill_uses_rust_owned_setup_contract() {
+        let skill = include_str!("../../../prompts/interaction-skills/connection.md");
+        assert!(skill.contains("Browser setup is Rust-owned"));
+        assert!(skill.contains("Do not connect from inside `browser_execute`"));
+        assert!(!skill.contains("Just call"));
+        assert!(!skill.contains("await session.connect()"));
+        assert!(!skill.contains("detectBrowsers"));
+    }
+
+    #[test]
+    fn browser_executor_has_connect_compatibility_without_setup_ownership() {
+        assert!(BROWSER_EXECUTOR_JS.contains("async connect"));
+        assert!(BROWSER_EXECUTOR_JS.contains("already-connected"));
+        assert!(BROWSER_EXECUTOR_JS.contains("Rust owns browser setup"));
+        assert!(BROWSER_EXECUTOR_JS.contains("session.connect(options) is not supported"));
+    }
+
+    #[test]
     fn browser_domain_skills_command_lists_matching_files() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("domain-skills");

@@ -4,6 +4,8 @@ Use `browser_observe` for a running `run_id` and `browser_cancel` only when a jo
 
 Use `browser_status` for diagnostics. Use `browser_configure` only when the user explicitly asks to change browser setup, CDP URL, profile, or cloud settings. Use `browser_recover` only after real browser lifecycle failure. Do not reconnect or restart after ordinary JavaScript or CDP errors.
 
+Do not call `session.connect()` inside `browser_execute`; setup is handled by the browser tools before JavaScript runs.
+
 Prefer raw CDP and visible verification: navigate with `session.Page.navigate`, inspect with `session.Runtime.evaluate`, act with `session.Input.*`, and capture screenshots with `session.Page.captureScreenshot`. Browser/page state persists; local `let`/`const` values do not, so put cross-call scratch state on `globalThis` or write files.
 
 Call `done` only when the user-facing task is complete and any requested file/result has been verified.
