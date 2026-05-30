@@ -81,7 +81,10 @@ pub fn browser_use_terminal_home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
-    home_dir().map(|home| home.join(".browser-use").join("terminal"))
+    // Legacy parity: browser-use-core's `browser_use_terminal_home_dir`
+    // (lib.rs:19003) resolves to `$HOME/.browser_use_terminal` — a single,
+    // underscored component. Existing history files live there.
+    home_dir().map(|home| home.join(".browser_use_terminal"))
 }
 
 /// Best-effort home-directory lookup using only `std`.
