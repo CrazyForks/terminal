@@ -13,3 +13,35 @@ pub use loop_decision::{
 };
 pub use retry::{backoff_ms, retry_decision, RetryAction};
 pub use tool_decision::{classify_parallelism, ToolParallelism};
+
+#[cfg(test)]
+mod tests {
+    //! Smoke tests for the public `decision::` re-export surface — every WP-A1
+    //! symbol must be reachable directly from the module root.
+    use super::*;
+
+    #[test]
+    fn reexports_are_reachable() {
+        // loop_decision surface.
+        assert!(needs_follow_up(true, false));
+        assert!(token_limit_reached(10, 10, false));
+        assert!(should_compact_mid_turn(true, true));
+        assert!(can_drain_after_compact(false));
+        assert!(initial_can_drain(false));
+        let out = SamplingOutcome::default();
+        let st = TokenStatus {
+            auto_compact_scope_tokens: 0,
+            auto_compact_scope_limit: 1,
+            full_context_window_limit_reached: false,
+            token_limit_reached: false,
+        };
+        assert_eq!(classify_loop_step(&out, false, &st), LoopStep::Complete);
+
+        // retry surface.
+        assert_eq!(retry_decision(0, 0, false, true, None), RetryAction::Fail);
+        assert_eq!(backoff_ms(0), 200);
+
+        // sibling tool_decision surface stays re-exported.
+        assert_eq!(classify_parallelism(true, true), ToolParallelism::Parallel);
+    }
+}
