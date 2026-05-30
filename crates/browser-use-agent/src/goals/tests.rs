@@ -1,7 +1,7 @@
 //! Network-free unit tests for the goals subsystem.
 //!
 //! Covers: event-sourcing (reduce/replay determinism, lifecycle transitions),
-//! the budget formula `input (incl. cached) + max(output, 0)` with clamping and
+//! the budget formula `max(input - cached, 0) + max(output, 0)` with clamping and
 //! boundaries, REUSE of the shared `context/accounting.rs` byte->token heuristic,
 //! steering emission (goal-set + threshold crossings, fire-once), and the
 //! `goal_context` message wire shape.
@@ -184,40 +184,54 @@ fn updated_overwrites_present_fields_only() {
 
 // --- budget formula --------------------------------------------------------
 
-// Parity: `browser-use-core/src/goals.rs:189-191`
-//   goal_tokens_from_usage(input, output) = input.saturating_add(output.max(0))
-// "input (incl. cached) + max(output, 0)".
+// Formula: max(input - cached, 0) + max(output, 0). FULL PARITY with codex
+// `core/src/goals.rs:1684-1688` (`non_cached_input() + output.max(0)`) and
+// legacy `browser-use-core/src/goals.rs:330-334`
+// (`input - cached_input + max(output, 0)`, clamped).
 #[test]
-fn budget_account_adds_input_plus_max_output() {
+fn budget_account_adds_non_cached_input_plus_max_output() {
     let mut b = BudgetState::new(Some(10_000));
-    // input 300 (of which 100 cached), output 200 -> 300 + 200 = 500.
+    // input 300 (of which 100 cached), output 200 -> (300-100) + 200 = 400.
     let added = b.account(&usage(300, 100, 200));
-    assert_eq!(added, 500);
-    assert_eq!(b.total_accounted(), 500);
+    assert_eq!(added, 400);
+    assert_eq!(b.total_accounted(), 400);
 }
 
 #[test]
 fn budget_clamps_negative_and_zero_output() {
-    // Negative output delta clamps to 0: 400 + max(-50, 0) = 400. The `Usage`
-    // wire type carries `u64` so a negative output can only arise from an
+    // Negative output delta clamps to 0: max(400-0, 0) + max(-50, 0) = 400. The
+    // `Usage` wire type carries `u64` so a negative output can only arise from an
     // already-computed `i64` delta; the raw helper is where the clamp lives.
-    assert_eq!(budget::tokens_from_usage(400, -50), 400);
-    // Zero output: 400 + 0 = 400.
-    assert_eq!(budget::tokens_from_usage(400, 0), 400);
+    assert_eq!(budget::tokens_from_usage(400, 0, -50), 400);
+    // Zero output: max(400-0, 0) + 0 = 400.
+    assert_eq!(budget::tokens_from_usage(400, 0, 0), 400);
     let mut b = BudgetState::new(None);
     b.account(&usage(400, 0, 0));
     assert_eq!(b.total_accounted(), 400);
 }
 
 #[test]
-fn budget_counts_cached_input() {
-    // Cached input IS counted (the WP-required formula does NOT subtract it).
-    // input=500 of which 500 cached, output=0 -> 500 (NOT 0, which is what a
-    // codex/legacy non-cached-input formula would yield).
+fn budget_subtracts_cached_input() {
+    // Cached input IS subtracted (parity with codex `non_cached_input()` /
+    // legacy `input - cached_input_tokens`).
+    // Required example: input=100, cached=40, output=10 -> (100-40)+10 = 70.
+    assert_eq!(budget::tokens_from_llm_usage(&usage(100, 40, 10)), 70);
     let mut b = BudgetState::new(None);
-    b.account(&usage(500, 500, 0));
-    assert_eq!(b.total_accounted(), 500);
-    assert_eq!(budget::tokens_from_llm_usage(&usage(500, 500, 0)), 500);
+    b.account(&usage(100, 40, 10));
+    assert_eq!(b.total_accounted(), 70);
+    // Fully-cached input bills only output: input=500, cached=500, output=0 -> 0.
+    assert_eq!(budget::tokens_from_llm_usage(&usage(500, 500, 0)), 0);
+}
+
+#[test]
+fn budget_clamps_non_cached_term_when_cached_exceeds_input() {
+    // Degenerate `cached > input`: non-cached term clamps to 0 (matching legacy's
+    // outer `.max(0)`), so only `max(output, 0)` is billed.
+    // input=40, cached=100, output=10 -> max(40-100, 0) + 10 = 0 + 10 = 10.
+    assert_eq!(budget::tokens_from_usage(40, 100, 10), 10);
+    assert_eq!(budget::tokens_from_llm_usage(&usage(40, 100, 10)), 10);
+    // And with zero output the whole delta is 0, never negative.
+    assert_eq!(budget::tokens_from_usage(40, 100, 0), 0);
 }
 
 #[test]
@@ -429,11 +443,11 @@ fn manager_budget_tracks_folded_tokens_used() {
     let sink = Arc::new(RecordingSink::default());
     let mut mgr = GoalManager::new("s", sink);
     mgr.set_goal("g", "t", Some(10_000), None);
-    mgr.record_usage(&usage(300, 100, 200), 1); // +500 (input incl cached + output)
-    mgr.record_usage(&usage(100, 0, 0), 2); // +100 (input only)
-    assert_eq!(mgr.state().tokens_used, 600);
-    assert_eq!(mgr.budget().total_accounted(), 600);
-    assert_eq!(mgr.budget().remaining(), Some(9_400));
+    mgr.record_usage(&usage(300, 100, 200), 1); // +400 ((300-100) + 200)
+    mgr.record_usage(&usage(100, 0, 0), 2); // +100 (non-cached input only)
+    assert_eq!(mgr.state().tokens_used, 500);
+    assert_eq!(mgr.budget().total_accounted(), 500);
+    assert_eq!(mgr.budget().remaining(), Some(9_500));
 }
 
 #[test]
