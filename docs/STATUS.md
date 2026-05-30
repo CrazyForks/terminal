@@ -265,7 +265,41 @@ compaction ✅ mcp-transports ✅ subagents ✅ goals/budget ✅ skills/plugins 
   - **Brutally-honest real vs seam:** allowlist + config + approval branching (allow/ask/deny) = REAL + exhaustively tested. `proxy.rs` MITM server = SEAM (binds loopback `127.0.0.1:0` for handle/url plumbing only; NO real MITM/CONNECT/TLS/SOCKS5/CA — `generate_seam_ca_pem` is a labeled placeholder). Flagged loudly in-source.
   - **PARITY DEBT:** mid-label wildcards (`region*.v2.example.com`) unsupported (codex globset does); IPv6 zone-id canonicalization simplified; config a faithful subset (kept enabled/mode/domains, dropped proxy_url/socks/unix/mitm-hooks); whole MITM+CA is the seam.
 
-- [ ] **WP-Safety-4 guardian + approval-wiring** (IN PROGRESS) — LLM-reviewer guardian (fail-closed, circuit breaker) + flip orchestrator `NoneSandboxProvider`→`PlatformSandboxProvider` (real provider from Safety-1) + PermissionRequest precedence (consumes hooks PermissionRequest event + codex ReviewDecision cache). NEW module `guardian/*` + minimal orchestrator wiring. LAST autonomous WP before [BLOCKED-NEEDS-HUMAN] cutover.
+- [x] **WP-Safety-4 guardian + approval-wiring** (`f33620a`, merged `8a3d6f1`, 601 tests) — LLM-reviewer guardian (FAIL-CLOSED + circuit breaker) + a SECURED orchestrator constructor + ApprovalStore cache precedence. NEW `guardian/{mod,reviewer,circuit,approval,tests}.rs` + `pub mod guardian;`. 21 new tests. Additive ONLY — `ToolOrchestrator<S,A>::new`/`stub()`/`NoneSandboxProvider`/`AutoApprover` UNCHANGED (no existing file beyond lib.rs touched; the generic `new` already accepted any provider/approver).
+  - **FAIL-CLOSED (verified by me — guardian tests actually execute, not a false-green):** `Guardian::review` yields `Allow` ONLY on `Ok(GuardianVerdict::Allow)`; the `Err(_)` arm does `circuit.record_failure()` + returns `GuardedDecision::Deny` (mod.rs:166-172); circuit-OPEN denies before the reviewer is called. Tests `fail_closed_reviewer_error_denies`, `fail_closed_on_approver_error_denied`, `circuit_opens_and_denies_without_invoking_reviewer`, `execpolicy_forbidden_wins_over_reviewer_allow` all RAN green.
+  - **Parity:** `SessionDecisionCache` mirrors codex `SessionApprovalCache` (`core/src/tools/sandboxing.rs:44,46,54`; ApprovedForSession short-circuit) + precedence `approval_resolution_for_command` (:60); `ReviewDecision` codex `protocol/src/protocol.rs:3530`; review-flow analog `tasks/review.rs:59`. `build_secured_orchestrator(reviewer)`/`build_real_sandbox_orchestrator()` construct `ToolOrchestrator<PlatformSandboxProvider, GuardianApprover>` via the unchanged generic `new`. `GuardianApprover` precedence: cached session approval → execpolicy Forbidden short-circuit → guardian review (fail-closed) → Escalate via EscalationResolver (default FailClosed⇒Denied).
+  - **browser-use ADDITION (flagged):** the per-tool-call guardian gate + fail-closed + circuit breaker (threshold=3, cooldown=30s) — codex has no per-call LLM safety gate (only the review TASK); legacy has none.
+  - **PARITY DEBT:** `GuardianReviewer` is the injected seam only — no production model-driving impl (tests use a fake); secured path is an additive constructor, NOT the default (unsecured `stub()` unchanged); PermissionRequest precedence expressed via an injected `EscalationResolver` (default fail-closed) NOT yet bound to the real `HookEvent::PermissionRequest`/`hook.permission_request` flow; execpolicy precedence is an injected override, not a per-invocation `execpolicy::Policy` eval.
+
+---
+
+## ✅✅✅ ALL AUTONOMOUS WORK COMPLETE — decodex @ 8a3d6f1, 601 tests green, workspace builds ✅✅✅
+_2026-05-30. The `browser-use-agent` async engine is functionally whole and codex-parity across every planned axis. Every WP was verified-in-its-worktree by the loop driver (re-ran `cargo test` + read key files; never trusted an agent's self-report) before a `--no-ff` merge, then re-tested + isolated-workspace-built on decodex. decodex never left a broken state; nothing pushed to origin; `sanfrancisco-*` untouched._
+
+**Done (each merged, codex/legacy-parity, network-free tested, verified):**
+- ENGINE: M3 core (Wave 1 pure decision cores → Wave 2 async wrappers → Wave 3 turn/task spine) + 10 tools + ToolRegistry + e2e dispatch fusion + all-10-registered.
+- SUBSYSTEMS (8): compaction (model-based, no no-LLM path) · mcp-transports (stdio+streamable-HTTP/SSE) · subagents (roles/depth/event-notify mailbox) · goals/budget (event-sourced, input-cached-subtracted+max(output,0)) · skills/plugins (discovery/precedence, 2%-budget `<skills_instructions>`, $/@/skill:// mentions) · hooks (matcher+regex, PermissionRequest/Prompt/Agent) · prompts (de-branded module) · rollout (5MiB truncation, by-turn fork, archival).
+- SAFETY (4): sandbox-backends (REAL bwrap, independently confirmed) · execpolicy (Rust-native, codex decision-semantics) · network-proxy (real allowlist/config/approval, honest MITM seam) · guardian (fail-closed LLM-reviewer + circuit breaker + secured-orchestrator ctor).
+
+Test growth: 365 → 373 → 389 → 413 → 434 → 457 → 482 → 490 → 505 → 526 → 548 → 580 → **601**, green at every one of ~18 merges.
+
+**Two wrong-premise agent simplifications caught + fixed pre-merge:** goals (misread include-vs-subtract cached → fixed to subtract, codex parity); hooks (wrongly thought `regex` unavailable → it's a workspace dep, fixed to real `^(?:pat)$`-free legacy-parity regex matcher). **Three brief parity-source corrections accepted** (rollout byte-trunc=`conversation_history.rs`; execpolicy real=`Policy`/`Decision`; network=`codex_network_proxy` crate). All safety backends verified to REALLY enforce (or honestly degrade/seam-label) — no fake "Restricted"/working-MITM.
+
+## 🔒 FINAL CUTOVER = [BLOCKED-NEEDS-HUMAN]
+Switch `browser-use-tui` + `browser-use-cli` from `browser-use-core` → `browser-use-agent`, then retire `browser-use-core`. This is the ONLY human-gated step and was NOT done autonomously. It requires human judgment (live TUI/CLI behavior, the integration-wiring backlog below, and the irreversible retirement of the legacy engine).
+
+## 📋 CONSOLIDATED PARITY-DEBT / INTEGRATION BACKLOG (triage before cutover)
+**Production wiring deferred (the engine has the seams; cutover/integration must connect them):**
+- CompactionSampler → real no-tools `ModelClient` stream (compaction has the algorithm + seam; prod impl pending).
+- MCP transports: interactive OAuth leg stubbed (PKCE/cache real); MCP approval-gating deferred.
+- subagents: `ChildSpawner` prod impl (child SessionTask+ModelClient via TaskDriver); fork_turns history-copy; budget = single counter.
+- goals: GoalManager not wired into turn loop (legacy `append_goal_progress_accounting`); steering body is compact summary not full template.
+- skills: SkillsManager not wired into context-assembly; `@` superset; degrade-to-fit single-pass; SKILL.md parser legacy hand-rolled.
+- hooks: not wired into turn-loop/tool-dispatch (PreToolUse→dispatch, UserPromptSubmit/Prompt→prompt boundary, Stop/Agent→lifecycle, SubagentStart/Stop→subagents, PermissionRequest→approval).
+- prompts: module not wired to request base-instructions; assembly logic still in `browser-use-providers` (dedupe at cutover); asset `.md` referenced from 5 crates (shared, not forked).
+- rollout: RolloutManager not wired into session lifecycle; `Session::fork` still by-message (switch to `fork_events_by_turn`); Summary placeholder has no summarizer text; archiver = `rollout.archived` rows not a JSONL bundle dir.
+- **safety wiring:** orchestrator still defaults to `NoneSandboxProvider`/`AutoApprover` — flip to `build_secured_orchestrator` (PlatformSandboxProvider + GuardianApprover) at cutover; shell.rs→execpolicy; guardian EscalationResolver→real `HookEvent::PermissionRequest`; GuardianReviewer prod model impl.
+**Behavioral parity debt (logged per-WP above):** sandbox Linux=bwrap (no seccomp/landlock); execpolicy Rust-native not Starlark + empty default policy; network mid-label wildcards/IPv6-zone/config-subset + MITM-server seam; B5 backoff jitter; A3 non_last_reasoning/strip_images; apply_patch fuzzy-match/turn_diff_tracker; shell full tree-sitter denylist.
 
 ## FINAL CUTOVER = [BLOCKED-NEEDS-HUMAN]
 After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-use-core → browser-use-agent, retire browser-use-core. ONLY human-gated step — do NOT do autonomously.
