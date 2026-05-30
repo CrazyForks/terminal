@@ -395,7 +395,10 @@ mod tests {
         // Pure, env-free: CODEX_HOME points directly at the .codex dir, else
         // fall back to $HOME/.codex.
         assert_eq!(
-            codex_auth_path_from(Some("/tmp/codex-home-x".into()), Some("/tmp/ignored".into())),
+            codex_auth_path_from(
+                Some("/tmp/codex-home-x".into()),
+                Some("/tmp/ignored".into())
+            ),
             Some(PathBuf::from("/tmp/codex-home-x/auth.json"))
         );
         assert_eq!(
@@ -425,7 +428,10 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v)
         };
-        assert_eq!(header("authorization").as_deref(), Some("Bearer dev-access"));
+        assert_eq!(
+            header("authorization").as_deref(),
+            Some("Bearer dev-access")
+        );
         assert_eq!(header("chatgpt-account-id").as_deref(), Some("dev-acct"));
         assert!(!format!("{route:?}").contains("dev-access"));
     }
