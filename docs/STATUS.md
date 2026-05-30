@@ -112,3 +112,25 @@ and relaunch; recover orphaned commits via `git merge <dangling-sha>` if a branc
 - B3 events/store_sink.rs (needs A5) · B4 session/{mod,sink,resume,notifier}.rs (needs A6)
 - B5 turn/sampling.rs (needs A1+A5)
 **Wave 3 (integration):** C1 turn/dispatch.rs · C2 turn/{loop_driver,mod}.rs · C3 task/{driver,abort,lifecycle}.rs
+
+---
+
+## M3 Wave 2 COMPLETE — decodex @ 8f3c9f2, 172 tests green, workspace builds
+
+- [x] B1 ToolOrchestrator (async, delegates to pure plan_attempts) — `acbf3b9`
+- [x] B2 ContextManager async wrapper + RESOLVED A4/A6 inject parity debt (inject now byte-identical to legacy builders) — `44ce457`
+- [x] B3 StoreSink (dedicated-OS-thread writer; rusqlite Connection is !Sync so NOT spawn_blocking) — `3ac6640`
+- [x] B4 Session lifecycle create/resume/fork/rollback + event-notify (not poll) over SQLite — `ab23a44`
+- [x] B5 SamplingDriver (stream+retry over pure decision; network-free via ScriptedTransport; I/O-layer jitter) — `9c33c5e`
+
+LESSONS (cost real time, now hard rules):
+- An agent CAN falsely report "green" (B5's first commit `ab11b76` didn't even compile). ALWAYS re-run `cargo test` myself in the agent's own worktree before merging, and again on decodex after merge.
+- `browser_use_store::Store` (rusqlite Connection) is `!Sync` — any SQLite-touching async WP must use a dedicated OS thread + channel, NOT Arc<Store> across tokio tasks.
+- Garbled shell-output buffer caused me to run merges repeatedly + a stray reset; recovered via reflog (no work lost). Use `git -C <abs>` everywhere; never rely on cwd; one git op per command.
+
+Wave-2 parity debt still open (revisit pre-cutover): B5 transport-switch is a no-op (WS fallback not wired in browser-use-llm); ForkMode::LastN truncates by message not turn-boundary; ForkMode::Summary==All; session/reconstruct.rs still has private copies of context-message builders (inject is now SoT, mechanical follow-up to dedupe).
+
+## Wave 3 (integration spine — SERIAL, each needs the prior): STARTING
+- C1 turn/dispatch.rs — FuturesOrdered ordered tool dispatch + RwLock parallel/serial gate (needs B1)
+- C2 turn/{loop_driver,mod}.rs — the unbounded turn loop wiring decision::classify_loop_step + sampling + dispatch + context (needs A1+B5+C1+B2)
+- C3 task/{driver,abort,lifecycle}.rs — task driver, spawn/abort, graceful-100ms-then-hard, lifecycle events (needs C2+B4+B3)
