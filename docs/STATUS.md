@@ -169,3 +169,8 @@ FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [
 - [x] T-web_search — hosted/provider-executed config+declaration (codex web_search.rs display helpers, mode Disabled/Enabled, passthrough run no real HTTP, parallel_safe=true) — 302 tests
 - [x] T-browser — thin adapter over browser-use-browser (BrowserBackend trait + FakeBackend for tests; command/execute/observe/cancel; parallel_safe=false; sanctioned divergence, no codex analog) — 314 tests
 - [x] T-python — thin adapter over browser-use-python-worker (PythonBackend trait + FakeBackend; run_with_timeout; parallel_safe=false; event-streaming/artifact-recording deferred) — 321 tests
+- [x] T-mcp — async MCP tool-dispatch handler over seam (McpClient trait + FakeMcp; namespaced mcp__server__tool; CallToolResult mapping; transport+approval-gating deferred) — 332 tests
+
+## ✅ TOOLS PHASE COMPLETE — decodex, 332 tests green, 10 handlers
+shell, apply_patch, view_image(sync/serial), update_plan, request_user_input, tool_search, web_search, browser, python, mcp.
+NEXT: INTEGRATION (real ToolRegistry/ToolSet dispatching all 10 by name + deferred catalog for tool_search; then wire ToolDispatcher→registry, SamplingDriver↔ToolDispatcher fusion, OrchestratorRunner real per-tool routing — un-stubs M3-core). THEN subsystems (compaction model-based, MCP transports, subagents, goals, skills/plugins, hooks+PermissionRequest, prompts de-brand, rollout). THEN safety (sandbox/execpolicy/network/guardian). FINAL cutover = [BLOCKED-NEEDS-HUMAN].
