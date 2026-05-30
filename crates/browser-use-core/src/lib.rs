@@ -26520,9 +26520,9 @@ fn browser_error_detail(error: &str) -> String {
     const MAX_DETAIL_CHARS: usize = 500;
     let detail = error
         .lines()
-        .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && !line.starts_with("at "))
+        .or_else(|| error.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or(error.trim());
     if detail.chars().count() <= MAX_DETAIL_CHARS {
         return detail.to_string();
@@ -26948,7 +26948,15 @@ mod tests {
         assert!(message.contains("browser_execute failed."));
         assert!(message.contains("same page should still be usable"));
         assert!(message.contains("Next step: Continue on the same page"));
-        assert!(message.contains("Details: at browser_execute"));
+        assert!(message.contains("Details: Error: read CDP Runtime.evaluate: IO error"));
+    }
+
+    #[test]
+    fn browser_error_detail_prefers_error_message_over_stack_tail() {
+        let detail = browser_error_detail(
+            "Error: button was not clickable\n    at clickButton (job.js:10:5)\n    at processTicksAndRejections (native:7:39)",
+        );
+        assert_eq!(detail, "Error: button was not clickable");
     }
 
     #[test]

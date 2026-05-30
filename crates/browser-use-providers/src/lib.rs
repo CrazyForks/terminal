@@ -5468,6 +5468,10 @@ fn response_item_type_is_responses_input_item(item_type: &str, item: &Value) -> 
 }
 
 fn strip_codex_skipped_response_item_fields(item: &mut Value, item_type: &str) {
+    if let Some(object) = item.as_object_mut() {
+        object.remove("metadata");
+    }
+
     if item_type != "image_generation_call" {
         if let Some(object) = item.as_object_mut() {
             object.remove("id");
@@ -7965,6 +7969,7 @@ mod tests {
             json!({
                 "type": "reasoning",
                 "id": "rs_123",
+                "metadata": {"trace": "local"},
                 "summary": [{"type": "summary_text", "text": "checked context"}],
                 "content": [{"type": "reasoning_text", "text": "hidden chain"}],
                 "encrypted_content": "encrypted-reasoning"
@@ -7972,12 +7977,14 @@ mod tests {
             json!({
                 "type": "web_search_call",
                 "id": "ws_123",
+                "metadata": {"trace": "local"},
                 "status": "completed",
                 "action": {"type": "search", "query": "Codex parity"}
             }),
             json!({
                 "type": "image_generation_call",
                 "id": "ig_123",
+                "metadata": {"trace": "local"},
                 "status": "completed",
                 "result": "image-bytes"
             }),
@@ -7996,6 +8003,7 @@ mod tests {
         assert_eq!(input[1]["status"], "completed");
         assert_eq!(input[2]["type"], "image_generation_call");
         assert_eq!(input[2]["id"], "ig_123");
+        assert!(input.iter().all(|item| item.get("metadata").is_none()));
         Ok(())
     }
 
