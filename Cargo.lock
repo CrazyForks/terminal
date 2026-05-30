@@ -216,6 +216,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-use-agent"
+version = "0.1.2"
+dependencies = [
+ "browser-use-llm",
+ "browser-use-protocol",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "browser-use-browser"
 version = "0.1.2"
 dependencies = [

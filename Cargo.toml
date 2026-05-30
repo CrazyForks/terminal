@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/browser-use-agent",
   "crates/browser-use-browser",
   "crates/browser-use-cli",
   "crates/browser-use-core",

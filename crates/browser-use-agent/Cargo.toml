@@ -1,0 +1,21 @@
+[package]
+name = "browser-use-agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The new async agent engine (rearchitecture Milestone 3, strategy B: parallel
+# rewrite). Built alongside the legacy sync `browser-use-core`; ported
+# subsystem-by-subsystem on top of the async `browser-use-llm`, with the TUI/CLI
+# cut over to it only at the end. Empty scaffold for WP 3.1.
+
+[dependencies]
+browser-use-llm = { path = "../browser-use-llm" }
+browser-use-protocol = { path = "../browser-use-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
