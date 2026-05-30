@@ -177,3 +177,6 @@ NEXT: INTEGRATION (real ToolRegistry/ToolSet dispatching all 10 by name + deferr
 
 ## INTEGRATION: ToolRegistry merged — decodex, 351 tests
 - [x] I-registry — real ToolRegistry (DynTool trait-objects, dispatch-by-name, model_visible_definitions, deferred catalog) + ToolDispatcher routes through registry via orchestrator — 351 tests
+
+### GAP (must fix): registry only dispatches 4/10 tools
+ToolRegistry requires Req: DeserializeOwned. Deserialize-derived: update_plan, request_user_input, tool_search, web_search. NOT yet: shell, apply_patch, view_image, browser, python, mcp (derive only Clone/Debug/PartialEq). FOLLOW-UP WP (after fusion): add #[derive(Deserialize)] (+serde rename to camelCase wire names matching codex/legacy) to those 6 Request types + register them. browser/mcp Req are parsed/namespaced forms — may need a raw-args adapter. Until then those 6 tools are built+unit-tested but NOT reachable via the registry/dispatch path.
