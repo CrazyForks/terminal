@@ -4,12 +4,12 @@
 //!   * [`state`]    — the event-sourced [`GoalState`] (a reducer over a
 //!     [`GoalEvent`] log), mirroring the legacy event-folding goal lifecycle
 //!     (`browser-use-core/src/goals.rs:28-87`).
-//!   * [`budget`]   — token-budget accounting with the WP-required formula
-//!     `input (INCLUDING cached) + max(output, 0)`; the `saturating_add(output
-//!     .max(0))` shape mirrors codex `core/src/goals.rs:1684-1688` and legacy
-//!     `browser-use-core/src/goals.rs:330-334` (which subtract cached — see the
-//!     budget module header for the deliberate divergence), reusing the shared
-//!     byte->token heuristic from `context/accounting.rs`.
+//!   * [`budget`]   — token-budget accounting with the formula
+//!     `max(input - cached, 0) + max(output, 0)`, in FULL PARITY with codex
+//!     `core/src/goals.rs:1684-1688` (`non_cached_input() + output.max(0)`) and
+//!     legacy `browser-use-core/src/goals.rs:330-334` (`input - cached_input +
+//!     max(output, 0)`), reusing the shared byte->token heuristic from
+//!     `context/accounting.rs`.
 //!   * [`steering`] — the `goal_context` context-message renderer (envelope
 //!     parity with legacy `lib.rs:9796-9805`) plus budget-threshold steering
 //!     events emitted through the [`EventSink`] seam.
@@ -193,10 +193,12 @@ impl GoalManager {
     /// Account a response's token usage against the active goal and emit any
     /// budget-threshold steering events that the increment crossed.
     ///
-    /// The increment is `input (incl. cached) + max(output, 0)`
-    /// (`budget::tokens_from_llm_usage` -> `goals.rs:189-191`). No-op (no event,
-    /// no accounting) when no goal is active, matching legacy
-    /// `maybe_append_goal_accounting` (`browser-use-core/src/goals.rs:202-204`).
+    /// The increment is `max(input - cached, 0) + max(output, 0)`
+    /// (`budget::tokens_from_llm_usage`, full parity with codex
+    /// `goals.rs:1684-1688` / legacy `goals.rs:330-334`). No-op (no event, no
+    /// accounting) when no goal is active, matching legacy
+    /// `append_goal_progress_accounting`'s active-goal guard
+    /// (`browser-use-core/src/goals.rs:210-215`).
     pub fn record_usage(&mut self, usage: &Usage, time_used_seconds: i64) -> Vec<PendingEvent> {
         if !self.state.is_active() {
             return Vec::new();
