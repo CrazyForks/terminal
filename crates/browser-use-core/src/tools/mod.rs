@@ -174,7 +174,12 @@ impl Default for MultiAgentToolSpecConfig {
             wait_max_timeout_ms: 3_600_000,
             usage_hint_enabled: true,
             usage_hint_text: None,
-            max_concurrent_threads_per_session: 4,
+            // 4 was a coding-agent default — too small for browser tasks
+            // where 5-12 parallel item lookups are common (price tables,
+            // store locators, paper lists, hospital directories). 10 covers
+            // the typical fan-out without saturating the model's parallel
+            // tool-call schedule.
+            max_concurrent_threads_per_session: 10,
             tool_namespace: None,
             non_code_mode_only: false,
             request_user_input_default_mode_enabled: false,
@@ -2050,9 +2055,9 @@ Spawned agents inherit your current model by default. Omit `model` to use that p
 
 fn default_spawn_agent_usage_hint() -> &'static str {
     "This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.\n\n\
-Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.\n\
-Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.\n\
-Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.\n\n\
+Spawn `spawn_agent` whenever the task naturally decomposes into N independent units: iterating over a list of items, cascading lookups (find X, then for each X find Y), comparing K sources, or any pattern where sequential execution would burn the per-session turn budget on item 6-10. Each helper gets its own browser session and its own turn budget — that's the only way to fit N>4 items in one run.\n\
+Triggers that should make you spawn before doing anything else: a numbered list of >=5 items in the user task; the phrase 'for each' over a list of 5+; explicit comparison across 3+ sites; cascade lookups (A->B->C). Do not iterate sequentially in one rollout for any of these — you will run out of turns.\n\
+The user does NOT need to explicitly ask for sub-agents — the right pattern is the one that completes the task within budget. Defaulting to sequential is the wrong default for multi-item / parallelisable work.\n\n\
 ### When to delegate vs. do the subtask yourself\n\
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.\n\
 - Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.\n\
