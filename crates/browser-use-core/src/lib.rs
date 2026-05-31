@@ -15196,10 +15196,29 @@ fn enforce_browser_command_matches_selected_mode(
                 };
                 enforce_selected_browser_mode(Some(selected_mode), requested_mode)
             }
-            Some("remote-cdp") => bail!(
-                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
-                browser_display_name(selected_mode),
-            ),
+            Some("remote-cdp") => {
+                // Allow remote-cdp through the lock when an external CDP URL
+                // is provisioned by the orchestrator (env LLM_BROWSER_REMOTE_CDP_URL
+                // or BUT_BROWSER_CDP_URL). Without this carve-out the wrapper
+                // had to UNSET LLM_BROWSER_BROWSER_MODE to let the agent
+                // attach to Unikraft / Browserbase / brightdata — which also
+                // disabled the include_browser=true path in
+                // default_base_instructions_for_model, so the agent silently
+                // lost the entire Browser Agent Contract (fan-out rules,
+                // attach directive, interaction skills, prompts). The wrapper
+                // can now keep mode=managed-headless (full browser prompt)
+                // while still letting the agent attach to the remote CDP.
+                if std::env::var("LLM_BROWSER_REMOTE_CDP_URL").is_ok()
+                    || std::env::var("BUT_BROWSER_CDP_URL").is_ok()
+                {
+                    Ok(())
+                } else {
+                    bail!(
+                        "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode (set LLM_BROWSER_REMOTE_CDP_URL to opt in)",
+                        browser_display_name(selected_mode),
+                    )
+                }
+            }
             Some(other) => bail!("unknown browser connect mode: {other}"),
         },
         "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
