@@ -150,60 +150,40 @@ impl AgentTelemetry {
             KeyValue::new("browser_use.turn_index", input.turn_idx as i64),
         ];
         if inner.capture_payloads {
-            // Build the messages array Laminar will display. Prepend a
-            // synthetic system message with the full instructions/codex
-            // prompt so the reviewer sees what the agent actually saw —
-            // providers send this via the separate `system` field, which
-            // never lands in the messages array.
-            let mut display_messages: Vec<Value> = Vec::with_capacity(input.messages.len() + 1);
-            if let Some(system_prompt) = input.system_prompt {
-                if !system_prompt.is_empty() {
-                    display_messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": system_prompt,
-                    }));
-                }
-            }
-            // For assistant messages, lift any OpenAI-style `tool_calls`
-            // into a sibling content block so Laminar's message UI shows
-            // the actual function name + arguments instead of a blank
-            // assistant turn. The original message format is preserved on
-            // the API call — this is purely a display transformation.
-            for msg in input.messages.iter() {
-                if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-                    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
-                        if !tool_calls.is_empty() {
-                            let mut display_msg = msg.clone();
-                            let mut content_parts: Vec<Value> = Vec::new();
-                            if let Some(text) = msg.get("content").and_then(Value::as_str) {
-                                if !text.is_empty() {
-                                    content_parts.push(serde_json::json!({
-                                        "type": "text",
-                                        "text": text,
-                                    }));
-                                }
-                            }
-                            for call in tool_calls {
-                                content_parts.push(serde_json::json!({
-                                    "type": "tool_use",
-                                    "id": call.get("id").cloned().unwrap_or(Value::Null),
-                                    "name": call.get("name").cloned().unwrap_or(Value::Null),
-                                    "input": call.get("arguments").cloned().unwrap_or(Value::Null),
-                                }));
-                            }
-                            display_msg["content"] = Value::Array(content_parts);
-                            display_messages.push(display_msg);
-                            continue;
-                        }
-                    }
-                }
-                display_messages.push(msg.clone());
-            }
+            // Convert messages into Laminar's canonical OTel GenAI format:
+            //   [{role, parts: [{type, content/...}]}]
+            // Part discriminators (verified against laminar/frontend/lib/spans/types/gen-ai.ts):
+            //   {type:"text", content:"..."}
+            //   {type:"thinking", content:"..."}           // renders as "Reasoning"
+            //   {type:"tool_call", id, name, arguments}
+            //   {type:"tool_call_response", id, name, result}
+            //   {type:"blob", content:<base64>, mime_type, modality:"image"}
+            //   {type:"uri", uri, mime_type, modality:"image"}
+            // System prompt goes in a SEPARATE attribute (gen_ai.system_instructions),
+            // not in the messages array — Laminar prepends it server-side.
+            let display_messages: Vec<Value> = input
+                .messages
+                .iter()
+                .map(messages_to_laminar_part_form)
+                .collect();
 
             let input_messages =
                 compact_json_value(&Value::Array(display_messages), inner.max_attr_chars);
             attrs.push(KeyValue::new(SPAN_INPUT, input_messages.clone()));
             attrs.push(KeyValue::new("gen_ai.input.messages", input_messages));
+
+            if let Some(system_prompt) = input.system_prompt {
+                if !system_prompt.is_empty() {
+                    let sys_blob = serde_json::json!([{
+                        "type": "text",
+                        "content": system_prompt,
+                    }]);
+                    attrs.push(KeyValue::new(
+                        "gen_ai.system_instructions",
+                        compact_json_value(&sys_blob, inner.max_attr_chars),
+                    ));
+                }
+            }
             attrs.push(KeyValue::new(
                 "gen_ai.request.tools",
                 compact_json_value(
@@ -927,6 +907,176 @@ fn compact_json_value(value: &Value, max_chars: usize) -> String {
     let serialized = serde_json::to_string(&scrubbed).unwrap_or_else(|_| "<unserializable>".into());
     truncate_chars(&serialized, max_chars)
 }
+
+/// Convert one OpenAI-style message into Laminar's canonical OTel GenAI
+/// `{role, parts: [...]}` form. Each kind of content gets its own
+/// discriminated part — Laminar's UI renders these inline:
+///   - tool_call / tool_call_response: structured tool call boxes
+///   - text / thinking: chat bubbles ("Reasoning" for thinking)
+///   - blob (base64) / uri: rendered as images when modality="image"
+/// Verified against laminar/frontend/lib/spans/types/gen-ai.ts.
+fn messages_to_laminar_part_form(msg: &Value) -> Value {
+    let role = msg
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+        .to_string();
+    let mut parts: Vec<Value> = Vec::new();
+
+    // Tool result message: convert to a single tool_call_response part.
+    if role == "tool" {
+        let call_id = msg.get("tool_call_id").cloned().unwrap_or(Value::Null);
+        let name = msg.get("name").cloned().unwrap_or(Value::Null);
+        let content = msg.get("content").cloned().unwrap_or(Value::Null);
+        let (text_parts, image_parts) = extract_tool_result_parts(&content);
+        parts.push(serde_json::json!({
+            "type": "tool_call_response",
+            "id": call_id,
+            "name": name,
+            "result": text_parts,
+        }));
+        // Images returned by a tool become standalone blob parts so
+        // the agent's view of "what the tool returned visually" is
+        // preserved in the trace.
+        parts.extend(image_parts);
+        return serde_json::json!({ "role": "user", "parts": parts });
+    }
+
+    // Text content (the simple OpenAI shape).
+    if let Some(text) = msg.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            parts.push(serde_json::json!({"type": "text", "content": text}));
+        }
+    } else if let Some(content_array) = msg.get("content").and_then(Value::as_array) {
+        // OpenAI structured content (Anthropic input format etc.).
+        for block in content_array {
+            if let Some(part) = block_to_part(block) {
+                parts.push(part);
+            }
+        }
+    }
+
+    // Reasoning_content (Codex / deepseek style) -> thinking part.
+    if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning.is_empty() {
+            parts.insert(0, serde_json::json!({"type": "thinking", "content": reasoning}));
+        }
+    }
+
+    // Assistant tool_calls -> tool_call parts.
+    if role == "assistant" {
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+            for call in tool_calls {
+                parts.push(serde_json::json!({
+                    "type": "tool_call",
+                    "id": call.get("id").cloned().unwrap_or(Value::Null),
+                    "name": call.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": call.get("arguments").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+    }
+
+    serde_json::json!({ "role": role, "parts": parts })
+}
+
+fn block_to_part(block: &Value) -> Option<Value> {
+    let block_type = block.get("type").and_then(Value::as_str)?;
+    match block_type {
+        "text" | "output_text" => {
+            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({"type": "text", "content": text}))
+            }
+        }
+        "input_image" | "image" => {
+            // Anthropic image block shape: {type:"image", source:{type:"base64",media_type,data}}
+            // OpenAI-style: {type:"input_image", image_url:"data:..."}
+            if let Some(source) = block.get("source") {
+                let media_type = source
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+                if !data.is_empty() {
+                    return Some(serde_json::json!({
+                        "type": "blob",
+                        "content": data,
+                        "mime_type": media_type,
+                        "modality": "image",
+                    }));
+                }
+            }
+            if let Some(url) = block.get("image_url").and_then(|v| {
+                v.as_str()
+                    .or_else(|| v.get("url").and_then(Value::as_str))
+            }) {
+                if let Some(stripped) = url.strip_prefix("data:") {
+                    // data:image/png;base64,XXXX
+                    if let Some((meta, b64)) = stripped.split_once(",") {
+                        let mime = meta.split(';').next().unwrap_or("image/png");
+                        return Some(serde_json::json!({
+                            "type": "blob",
+                            "content": b64,
+                            "mime_type": mime,
+                            "modality": "image",
+                        }));
+                    }
+                }
+                return Some(serde_json::json!({
+                    "type": "uri",
+                    "uri": url,
+                    "modality": "image",
+                }));
+            }
+            None
+        }
+        "tool_use" => Some(serde_json::json!({
+            "type": "tool_call",
+            "id": block.get("id").cloned().unwrap_or(Value::Null),
+            "name": block.get("name").cloned().unwrap_or(Value::Null),
+            "arguments": block.get("input").cloned().unwrap_or(Value::Null),
+        })),
+        "tool_result" => {
+            let call_id = block.get("tool_use_id").cloned().unwrap_or(Value::Null);
+            let content = block.get("content").cloned().unwrap_or(Value::Null);
+            Some(serde_json::json!({
+                "type": "tool_call_response",
+                "id": call_id,
+                "result": content,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Split a tool-result content into its text parts and image parts.
+/// Tool messages frequently have a `content` array mixing the text
+/// output and the screenshot the tool produced — we want both in the
+/// trace, but the image goes as a separate blob part so Laminar
+/// renders it inline.
+fn extract_tool_result_parts(content: &Value) -> (Value, Vec<Value>) {
+    let mut images = Vec::new();
+    if let Some(arr) = content.as_array() {
+        let mut text_blocks: Vec<Value> = Vec::new();
+        for block in arr {
+            if let Some(part) = block_to_part(block) {
+                if part.get("type").and_then(Value::as_str) == Some("blob")
+                    || part.get("type").and_then(Value::as_str) == Some("uri")
+                {
+                    images.push(part);
+                } else {
+                    text_blocks.push(part);
+                }
+            }
+        }
+        return (Value::Array(text_blocks), images);
+    }
+    (content.clone(), images)
+}
+
 
 fn scrub_value(value: &Value, max_chars: usize) -> Value {
     match value {
