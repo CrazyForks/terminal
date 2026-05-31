@@ -417,6 +417,19 @@ pub fn session_result_from_events(events: &[EventRecord]) -> Option<String> {
 }
 
 fn session_done_result_text(payload: &Value) -> Option<String> {
+    // Prefer the inline `result` field. dispatch_done_tool auto-inlines small
+    // result_file contents into result, and when the agent passes BOTH
+    // result and result_file, the actual answer lives in result. Falling
+    // through to the result_file placeholder ("Saved result file. ...")
+    // silently drops the real answer and judges score 0 — see real_v8 task 11
+    // where the agent produced a 46KB markdown answer in result=... that this
+    // function discarded because result_file= was also present.
+    if let Some(text) = payload.get("result").and_then(Value::as_str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(normalize_result_text(text));
+        }
+    }
     if payload.get("result_file").is_some() {
         let file = payload
             .get("result_file_url")
@@ -438,10 +451,7 @@ fn session_done_result_text(payload: &Value) -> Option<String> {
         }
         return Some(text);
     }
-    payload
-        .get("result")
-        .and_then(Value::as_str)
-        .map(normalize_result_text)
+    None
 }
 
 pub fn normalize_result_text(text: &str) -> String {
