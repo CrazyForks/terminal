@@ -1230,6 +1230,14 @@ fn run_new_session_from_config(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
+    // Print session_id IMMEDIATELY (and flush) so external orchestrators —
+    // notably the brust Python wrapper — can correlate events even when the
+    // agent crashes mid-run (e.g. "agent exceeded maximum provider turns").
+    // Previously the println at the end was unreachable on crash and the
+    // wrapper saw zero events with no session_id to query.
+    println!("{}", session.id);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
     append_workspace_context_event_with_options(store, &session, &config.options)?;
     store.append_event(
         &session.id,
@@ -1237,8 +1245,7 @@ fn run_new_session_from_config(
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     maybe_append_message_history(&session.id, &text, &cwd, &config.options);
-    let session_id = run_existing_session_from_config(store, &session.id, config)?;
-    println!("{session_id}");
+    let _session_id = run_existing_session_from_config(store, &session.id, config)?;
     Ok(())
 }
 
