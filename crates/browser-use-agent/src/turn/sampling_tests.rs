@@ -478,3 +478,139 @@ impl SamplingTransport for RetryThenRecordTransport {
         Ok(stream)
     }
 }
+
+// ---- (7) the fused driver advertises the dispatcher's tool specs -----------
+
+/// A trivial [`CallRunner`] for wiring a fused driver in a tool-defs test: it
+/// never actually runs (these tests stream only text, so no tool call is
+/// dispatched) — it exists solely so the driver can be built with a
+/// [`ToolDispatcher`] that carries specs.
+struct NoopRunner;
+
+#[async_trait::async_trait]
+impl crate::turn::dispatch::CallRunner for NoopRunner {
+    fn parallel_safe(&self, _call: &ContentPart) -> bool {
+        false
+    }
+    async fn run(&self, call: ContentPart) -> Message {
+        // Unreachable in these tests (no tool call is emitted), but satisfy the
+        // trait with a benign tool-result so the type checks.
+        let id = match &call {
+            ContentPart::ToolCall { id, .. } => id.clone(),
+            _ => String::new(),
+        };
+        Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: id,
+                content: vec![ContentPart::text("noop")],
+                is_error: false,
+            }],
+        )
+    }
+}
+
+/// A no-op [`FusionRecorder`] (the fused path requires both a dispatcher AND a
+/// recorder; these tests never dispatch, so nothing is ever recorded).
+struct NoopRecorder;
+
+#[async_trait::async_trait]
+impl crate::turn::sampling::FusionRecorder for NoopRecorder {
+    async fn record(&self, _messages: &[Message]) {}
+}
+
+/// A tool definition with an empty input schema; the request only needs the
+/// `name` to be carried through to the wire, so the schema content is irrelevant
+/// to what this test proves.
+fn tool_def(name: &str) -> browser_use_llm::schema::ToolDefinition {
+    browser_use_llm::schema::ToolDefinition {
+        name: name.to_string(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }
+}
+
+#[tokio::test]
+async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    // The dispatcher carries the SAME `Vec<ToolDefinition>` the registry would
+    // advertise (here: the three product tools, order-stable). The fused driver
+    // must copy these into `LlmRequest::tools` so the model receives the tool
+    // catalog and can actually emit browser/python/shell tool calls — without
+    // this the model gets no tools and fusion never fires on a real turn.
+    let specs = vec![tool_def("browser"), tool_def("python"), tool_def("shell")];
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner, /* model_supports */ true, specs,
+    ));
+    // Sanity: the accessor returns exactly what we stored, order-stable.
+    assert_eq!(
+        dispatcher
+            .tool_specs()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["browser", "python", "shell"],
+        "dispatcher must carry the registry's specs verbatim (order-stable)"
+    );
+
+    // Record the request the driver hands to the transport. The stream is
+    // text-only (no tool call), so nothing is dispatched/recorded — we only care
+    // about the request the driver built.
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one open for one successful turn"
+    );
+    let req = &captured[0];
+    // The whole point of this WP: the per-turn request the provider receives now
+    // carries the registered tool definitions.
+    assert!(
+        !req.tools.is_empty(),
+        "fused driver must advertise the dispatcher's tool specs — req.tools is EMPTY"
+    );
+    let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["browser", "python", "shell"],
+        "req.tools must carry the registered tool names, in the registry's order"
+    );
+}
+
+#[tokio::test]
+async fn text_only_driver_sends_no_tool_specs() {
+    // The text-only driver (no dispatcher) must send NO tools — codex sends the
+    // tool catalog only when the turn's toolset is non-empty, and this is the
+    // counterpart that proves the fused path's behavior is dispatcher-gated.
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        captured[0].tools.is_empty(),
+        "a driver with no dispatcher must not advertise any tools"
+    );
+}

@@ -516,7 +516,16 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // per-turn request from the input here and hand it to `open_stream`, which
         // installs it into the transport before opening — so the provider receives
         // the populated conversation, not an empty body.
-        let req = build_request(&self.ctx, input);
+        let mut req = build_request(&self.ctx, input);
+        // Advertise the tool catalog. When a dispatcher is attached (the fused
+        // path), it carries the registry's model-visible definitions; we copy them
+        // verbatim (order-stable) into `req.tools` so the model can actually emit
+        // browser/python/shell tool calls. The text-only driver has no dispatcher,
+        // so it sends no tools — which is correct (codex sends tools only when the
+        // turn's toolset is non-empty).
+        if let Some(dispatcher) = &self.dispatcher {
+            req.tools = dispatcher.tool_specs().to_vec();
+        }
         let mut attempt: u32 = 0;
         loop {
             // ---- open the stream (codex: `client.stream(&prompt).await`) ----
@@ -625,12 +634,12 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// [`SamplingTransport::open_stream`], so it MUST carry the real conversation —
 /// the transport now uses *this* request (not a fixed empty one) on every open.
 ///
-/// NOTE (tool-defs gap, see report): `req.tools` is left empty here. The tool
-/// catalog is not reachable from this layer without editing `dispatch.rs` /
-/// `model_path.rs` (off-limits for this WP) — `ToolDispatcher` exposes neither
-/// its runner nor `ToolRegistry::specs()`. Until that is threaded, the model
-/// receives no tool definitions, so it cannot emit browser/python/shell tool
-/// calls. Kept as a free fn so it is unit-reachable.
+/// `req.tools` is left empty here and is populated by the caller
+/// ([`run_sampling_request`](ModelSamplingDriver::run_sampling_request)) from the
+/// attached [`ToolDispatcher`]'s model-visible specs
+/// (`ToolDispatcher::tool_specs`), which the dispatcher captured from the
+/// registry at construction. That keeps this builder pure (no toolset access) and
+/// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
     req.messages = input;
