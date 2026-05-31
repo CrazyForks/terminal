@@ -16,8 +16,17 @@ use opentelemetry_sdk::Resource;
 use serde_json::Value;
 
 const DEFAULT_LAMINAR_HTTP_ENDPOINT: &str = "https://api.lmnr.ai/v1/traces";
-const DEFAULT_MAX_ATTR_CHARS: usize = 16_000;
-const DEFAULT_MAX_PROMPT_ATTRS: usize = 24;
+// Bumped from 16K → 200K so the full system prompt + tool descriptions +
+// recent conversation history are visible in the Laminar UI. The previous
+// limit truncated the message array mid-stream, which made the Laminar UI
+// show "[truncated]" on the input field for any turn past step 5 or so —
+// you could no longer audit what the agent actually saw. 200K covers a full
+// 80-turn Claude Sonnet session with full system + tools + ~10 recent turns.
+const DEFAULT_MAX_ATTR_CHARS: usize = 200_000;
+// Bumped from 24 → 200 so per-message gen_ai.prompt.{idx}.{role,content}
+// attributes are written for every message in a long conversation, not just
+// the first 24.
+const DEFAULT_MAX_PROMPT_ATTRS: usize = 200;
 const DEFAULT_BATCH_DELAY_MS: u64 = 1_000;
 const DEFAULT_BATCH_QUEUE_SIZE: usize = 2_048;
 const DEFAULT_BATCH_EXPORT_SIZE: usize = 128;
