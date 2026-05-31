@@ -22071,9 +22071,22 @@ fn dispatch_done_tool(
         return dispatch_tool_validation_error(store, session, call, &error);
     }
     let result_uses_file = requested_result.is_empty();
+    // Auto-inline file contents when the agent only provided result_file but
+    // the file is small enough to fit in the user-visible answer. Graders /
+    // users don't have filesystem access — pointing them at a file path is a
+    // failure mode (see real_v8 Sziget task: agent ran 17 turns of scraping,
+    // saved sziget_tickets.json, then answered "Saved result file. File:
+    // file:///..." which the judge scored 0). Limit: 200KB protects context.
+    const DONE_AUTO_INLINE_MAX_BYTES: u64 = 200 * 1024;
     let result = match (result_uses_file, result_file.as_ref()) {
         (false, _) => requested_result,
-        (true, Some(result_file)) => done_result_file_message(result_file),
+        (true, Some(rf)) if rf.bytes <= DONE_AUTO_INLINE_MAX_BYTES => {
+            std::fs::read_to_string(&rf.path)
+                .map(|s| s.trim_end().to_string())
+                .map(|s| if s.is_empty() { done_result_file_message(rf) } else { s })
+                .unwrap_or_else(|_| done_result_file_message(rf))
+        }
+        (true, Some(rf)) => done_result_file_message(rf),
         (true, None) => unreachable!("done validation requires result or result_file"),
     };
     store.append_event(

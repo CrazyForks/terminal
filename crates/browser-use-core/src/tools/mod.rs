@@ -1671,11 +1671,11 @@ fn done_tool_spec() -> ToolSpec {
             "properties": {
                 "result": {
                     "type": "string",
-                    "description": "Final answer for the user. If the task requests an exact inline format such as JSON, CSV, a table, markdown, or a schema-shaped response, put that content here. When both result and result_file are supplied, result remains the final answer."
+                    "description": "Final answer for the user — the actual data, inline. The grader / user sees only what is in `result`; the filesystem is not accessible to them. If the task asks for a list of N items, put all N items here. If it asks for a structured format (JSON/CSV/markdown table), put that exact content here."
                 },
                 "result_file": {
                     "type": "string",
-                    "description": "Optional path to a text/JSON/CSV result file saved as an artifact. Relative paths resolve against the current working directory. Use this by itself only when a file pointer or artifact summary is an acceptable final answer."
+                    "description": "Optional attachment path. The runtime AUTO-INLINES file contents (up to ~200KB) into `result` if `result` is empty/short — so passing only `result_file` for reasonable-size artifacts is acceptable. For very large outputs (>200KB) include a brief summary in `result` and the file as the attachment."
                 },
                 "finish_and_close_children": {
                     "type": "boolean",
