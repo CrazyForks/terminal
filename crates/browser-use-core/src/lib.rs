@@ -3680,8 +3680,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 // gives Laminar the actual context the model saw, which would
                 // otherwise be invisible (the provider's `system` field never
                 // lands in the `messages` array).
-                let turn_instructions_for_telemetry =
-                    options.base_instructions.as_deref().unwrap_or("");
+                //
+                // turn_instructions is the per-turn resolved instructions
+                // (resolved by provider_base_instructions_for_session above
+                // at line ~3353), NOT options.base_instructions (which the
+                // CLI flow never sets — it's a caller override path).
+                let turn_instructions_for_telemetry = turn_instructions
+                    .as_deref()
+                    .unwrap_or("");
                 let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
                     parent: &step_span,
                     session_id: &session.id,

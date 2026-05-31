@@ -932,10 +932,21 @@ fn scrub_value(value: &Value, max_chars: usize) -> Value {
     match value {
         Value::String(text) => {
             if looks_like_data_url(text) {
-                Value::String(format!(
-                    "[omitted data URL, chars={}]",
-                    text.chars().count()
-                ))
+                // Preserve the data URL so Laminar's UI can render the
+                // actual screenshot the agent saw. Cap at 2MB per image
+                // (per-screenshot at 1920x1080 PNG ~ 0.5-1.5MB) so we
+                // don't push gigabytes of base64 per session. Above that
+                // we still omit. The reviewer needs to SEE what the agent
+                // saw — replacing every screenshot with "[omitted]" makes
+                // the trace useless for visual debugging.
+                let len = text.chars().count();
+                if len <= 2_000_000 {
+                    Value::String(text.clone())
+                } else {
+                    Value::String(format!(
+                        "[omitted data URL, chars={len}, >2MB cap]"
+                    ))
+                }
             } else {
                 Value::String(truncate_chars(text, max_chars))
             }
