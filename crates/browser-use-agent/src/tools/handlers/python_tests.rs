@@ -203,23 +203,119 @@ async fn empty_code_rejected_without_calling_backend() {
     assert_eq!(backend.last_code(), None);
 }
 
-// Deferred-surface counts (artifacts/images/browser_events) are summarized on
-// stderr so nothing is silently dropped.
+// Produced artifacts and images are surfaced to the MODEL as a structured stdout
+// manifest (path / kind / mime / size), not a bare count, so the model can act
+// on the files the snippet created.
 #[tokio::test]
-async fn deferred_artifact_surfaces_are_noted_on_stderr() {
+async fn artifacts_and_images_are_surfaced_as_a_stdout_manifest() {
     let mut canned = ok_response("done", true);
-    canned.artifacts = vec![json!({ "kind": "file", "name": "out.csv" })];
-    canned.images = vec![json!({ "base64_png": "AAAA" })];
+    canned.artifacts = vec![json!({
+        "kind": "file",
+        "path": "out/report.csv",
+        "mime": "text/csv",
+        "bytes": 2048
+    })];
+    canned.images = vec![json!({
+        "path": "out/plot.png",
+        "mime_type": "image/png",
+        "bytes": 9000
+    })];
     let backend = Arc::new(FakeBackend::new(canned));
     let tool = tool_with(Arc::clone(&backend));
 
-    let req = PythonRequest::new("copy_artifact('out.csv')");
+    let req = PythonRequest::new("copy_artifact('out/report.csv')");
     let out = run_direct(&tool, &req).await.unwrap();
     assert_eq!(out.exit_code, 0);
+    // Manifest is on stdout (the model-facing result), with concrete details.
     assert!(
-        out.stderr.contains("artifact(s)") && out.stderr.contains("image(s)"),
-        "deferred surfaces should be noted, got: {:?}",
+        out.stdout.contains("[python:artifacts (1)]"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("file: out/report.csv"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("text/csv"), "{:?}", out.stdout);
+    assert!(out.stdout.contains("2048 bytes"), "{:?}", out.stdout);
+    assert!(
+        out.stdout.contains("[python:images (1)]"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("image: out/plot.png"),
+        "{:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("image/png"), "{:?}", out.stdout);
+    // The original text is preserved ahead of the manifest.
+    assert!(out.stdout.starts_with("done"), "{:?}", out.stdout);
+}
+
+// A structured `result = ...` value (the worker's `data`) is rendered into the
+// model-facing stdout so the model sees the actual value, not just a count.
+#[tokio::test]
+async fn structured_result_is_rendered_into_stdout() {
+    let mut canned = ok_response("", true);
+    canned.data = json!({ "answer": 42, "items": ["a", "b"] });
+    let backend = Arc::new(FakeBackend::new(canned));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = PythonRequest::new("result = {'answer': 42, 'items': ['a','b']}");
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("[python:result]"), "{:?}", out.stdout);
+    assert!(out.stdout.contains("\"answer\": 42"), "{:?}", out.stdout);
+    assert!(out.stdout.contains("\"items\""), "{:?}", out.stdout);
+}
+
+// An uncaught-exception traceback (`error`) and a browser-harness setup error
+// are surfaced distinctly on stderr.
+#[tokio::test]
+async fn traceback_and_harness_error_are_surfaced_distinctly() {
+    let mut canned = ok_response("partial output", false);
+    canned.error = Some("Traceback (most recent call last):\n  ValueError: nope".to_string());
+    canned.browser_harness_error = Some("harness failed to start".to_string());
+    let backend = Arc::new(FakeBackend::new(canned));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = PythonRequest::new("raise ValueError('nope')");
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 1);
+    // The pre-failure stdout is preserved.
+    assert!(out.stdout.contains("partial output"), "{:?}", out.stdout);
+    // The traceback is on stderr verbatim.
+    assert!(out.stderr.contains("Traceback"), "{:?}", out.stderr);
+    assert!(out.stderr.contains("ValueError: nope"), "{:?}", out.stderr);
+    // The harness error is labeled distinctly (not folded into the traceback).
+    assert!(
         out.stderr
+            .contains("[python:browser_harness_error] harness failed to start"),
+        "{:?}",
+        out.stderr
+    );
+}
+
+// Oversized stdout is capped (the full text is persisted durably elsewhere) so a
+// runaway snippet cannot flood the model context.
+#[tokio::test]
+async fn oversized_stdout_is_capped() {
+    use super::python::MAX_INLINE_STDOUT_BYTES;
+    let big = "x".repeat(MAX_INLINE_STDOUT_BYTES + 5_000);
+    let canned = ok_response(&big, true);
+    let backend = Arc::new(FakeBackend::new(canned));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = PythonRequest::new("print('x' * 99999)");
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.len() < big.len(), "should be capped");
+    assert!(
+        out.stdout.contains("[stdout truncated"),
+        "{:?}",
+        &out.stdout[..200]
     );
 }
 
