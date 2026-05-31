@@ -70,6 +70,12 @@ pub(crate) struct ModelTurnSpanInput<'a> {
     pub(crate) model_name: &'a str,
     pub(crate) messages: &'a [Value],
     pub(crate) tools: &'a [ToolSpec],
+    /// Full system prompt (codex base prompt + tool descriptions + developer
+    /// context). Sent to the model via the provider-specific `system` field
+    /// (Anthropic) or as a leading message (OpenAI). Without including it
+    /// here, the Laminar trace shows only the conversation history and the
+    /// reviewer cannot audit what instructions the agent actually saw.
+    pub(crate) system_prompt: Option<&'a str>,
 }
 
 impl AgentTelemetry {
@@ -144,8 +150,58 @@ impl AgentTelemetry {
             KeyValue::new("browser_use.turn_index", input.turn_idx as i64),
         ];
         if inner.capture_payloads {
+            // Build the messages array Laminar will display. Prepend a
+            // synthetic system message with the full instructions/codex
+            // prompt so the reviewer sees what the agent actually saw —
+            // providers send this via the separate `system` field, which
+            // never lands in the messages array.
+            let mut display_messages: Vec<Value> = Vec::with_capacity(input.messages.len() + 1);
+            if let Some(system_prompt) = input.system_prompt {
+                if !system_prompt.is_empty() {
+                    display_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": system_prompt,
+                    }));
+                }
+            }
+            // For assistant messages, lift any OpenAI-style `tool_calls`
+            // into a sibling content block so Laminar's message UI shows
+            // the actual function name + arguments instead of a blank
+            // assistant turn. The original message format is preserved on
+            // the API call — this is purely a display transformation.
+            for msg in input.messages.iter() {
+                if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                        if !tool_calls.is_empty() {
+                            let mut display_msg = msg.clone();
+                            let mut content_parts: Vec<Value> = Vec::new();
+                            if let Some(text) = msg.get("content").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    content_parts.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": text,
+                                    }));
+                                }
+                            }
+                            for call in tool_calls {
+                                content_parts.push(serde_json::json!({
+                                    "type": "tool_use",
+                                    "id": call.get("id").cloned().unwrap_or(Value::Null),
+                                    "name": call.get("name").cloned().unwrap_or(Value::Null),
+                                    "input": call.get("arguments").cloned().unwrap_or(Value::Null),
+                                }));
+                            }
+                            display_msg["content"] = Value::Array(content_parts);
+                            display_messages.push(display_msg);
+                            continue;
+                        }
+                    }
+                }
+                display_messages.push(msg.clone());
+            }
+
             let input_messages =
-                compact_json_value(&Value::Array(input.messages.to_vec()), inner.max_attr_chars);
+                compact_json_value(&Value::Array(display_messages), inner.max_attr_chars);
             attrs.push(KeyValue::new(SPAN_INPUT, input_messages.clone()));
             attrs.push(KeyValue::new("gen_ai.input.messages", input_messages));
             attrs.push(KeyValue::new(
@@ -994,6 +1050,7 @@ mod tests {
             model_name: "gpt-test",
             messages: &messages,
             tools: &tools,
+            system_prompt: None,
         });
         telemetry.record_model_events(
             &llm,
@@ -1030,6 +1087,7 @@ mod tests {
             model_name: "gpt-5.5",
             messages: &messages,
             tools: &tools,
+            system_prompt: None,
         });
         telemetry.record_model_events(
             &responses,

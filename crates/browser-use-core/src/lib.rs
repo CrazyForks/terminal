@@ -3674,6 +3674,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     provider.supports_hosted_web_search(),
                     provider.supports_hosted_image_generation(),
                 )?;
+                // Pull the resolved instructions (codex system prompt + tool
+                // descriptions + developer context) the provider will send via
+                // its `system` parameter. Adding it to the telemetry messages
+                // gives Laminar the actual context the model saw, which would
+                // otherwise be invisible (the provider's `system` field never
+                // lands in the `messages` array).
+                let turn_instructions_for_telemetry =
+                    options.base_instructions.as_deref().unwrap_or("");
                 let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
                     parent: &step_span,
                     session_id: &session.id,
@@ -3682,6 +3690,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     model_name: provider.model_name(),
                     messages: &turn_messages,
                     tools: &turn_tools,
+                    system_prompt: if turn_instructions_for_telemetry.is_empty() {
+                        None
+                    } else {
+                        Some(turn_instructions_for_telemetry)
+                    },
                 });
                 let provider_turn_result = start_provider_turn_with_retries(
                     store,
