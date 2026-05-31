@@ -20,10 +20,36 @@
 //! Legacy `dispatch_python_tool` (browser-use-core `src/lib.rs:20204`, called at
 //! lib.rs:11661) streams worker events, records artifacts, and returns
 //! text + image content parts. For THIS thin WP we do a synchronous
-//! `run -> ExecOutput` mapping mirroring the legacy request/response shape; the
-//! richer `outputs` / `artifacts` / `images` / `browser_events` are surfaced as
-//! text on stdout/stderr. Event STREAMING and artifact RECORDING are deferred
-//! (see the TODO on [`map_response`]).
+//! `run -> ExecOutput` mapping mirroring the legacy request/response shape.
+//!
+//! ## Two observability surfaces (and which one this file owns)
+//!
+//! A python run produces two distinct observability surfaces:
+//!
+//! 1. The DURABLE event log (created files, images, browser events, streamed
+//!    stdout chunks, oversized-text spill artifacts). Those are persisted as
+//!    `tool.output` / `tool.image` / `artifact.created` events with registered
+//!    [`browser_use_store`] artifacts by
+//!    [`crate::infra::persistence`] (`record_python_response_events` /
+//!    `record_python_worker_event`) — at full legacy parity. This handler does
+//!    NOT re-implement that; the host wires those recorders around the run.
+//!
+//! 2. The MODEL-FACING result ([`ExecOutput`]). This file owns that mapping.
+//!    The seam's [`ExecOutput`] carries only `exit_code` / `stdout` / `stderr`
+//!    (shared by every tool), so — exactly like `tool_search` / `view_image` /
+//!    `update_plan`, which also have richer info than three text fields — we
+//!    encode the richer python signal AS structured text inside that seam rather
+//!    than widening it:
+//!    * the structured `result` (`data`) value, when the snippet set one;
+//!    * a manifest of produced ARTIFACTS (created files) and IMAGES, listing each
+//!      one's path / kind / mime / size so the model can act on the files it
+//!      created (not just a bare count);
+//!    * the uncaught-exception/traceback and any browser-harness error, surfaced
+//!      distinctly on stderr;
+//!    * an oversized-`text` cap so a runaway snippet cannot flood the model
+//!      context (the FULL text is still persisted durably by persistence.rs).
+//!
+//! See [`map_response`] for the mapping.
 //!
 //! ## Testability without Python / Bun / network
 //!
@@ -195,6 +221,13 @@ impl PythonBackend for RealBackend {
     }
 }
 
+/// Maximum bytes of the snippet's `text` (stdout) inlined into the model-facing
+/// [`ExecOutput`]. A runaway snippet can print megabytes; the model only needs a
+/// bounded view (the FULL text is still persisted durably by
+/// [`crate::infra::persistence`], which spills oversized text to an artifact).
+/// 16 KiB is generous for a tool result while bounding context blow-up.
+pub const MAX_INLINE_STDOUT_BYTES: usize = 16 * 1024;
+
 /// Join the `text` field of structured worker entries (outputs / events) onto a
 /// single newline-separated string, falling back to the raw JSON for entries
 /// that are not `{ "text": ... }` shaped.
@@ -209,21 +242,118 @@ fn join_text_entries(entries: &[Value]) -> String {
         .join("\n")
 }
 
+/// Truncate `text` to [`MAX_INLINE_STDOUT_BYTES`] on a UTF-8 char boundary,
+/// appending a marker noting how many bytes were elided. Returns the text
+/// unchanged when it fits.
+fn cap_inline_stdout(text: String) -> String {
+    if text.len() <= MAX_INLINE_STDOUT_BYTES {
+        return text;
+    }
+    let mut end = MAX_INLINE_STDOUT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let elided = text.len() - end;
+    let mut out = text[..end].to_string();
+    out.push_str(&format!(
+        "\n... [stdout truncated, {elided} more bytes; full output persisted]"
+    ));
+    out
+}
+
+/// One human-readable manifest line for a produced file/image artifact, listing
+/// the fields the worker attaches (`path`, `kind`, `mime` / `mime_type`,
+/// `bytes`) so the model can act on the file it created rather than seeing only
+/// a count. Falls back to the raw JSON for an entry with no `path`.
+fn describe_artifact(entry: &Value, default_kind: &str) -> String {
+    let Some(path) = entry.get("path").and_then(Value::as_str) else {
+        return entry.to_string();
+    };
+    let kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or(default_kind);
+    let mime = entry
+        .get("mime")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("mime_type").and_then(Value::as_str));
+    let mut detail = format!("{kind}: {path}");
+    if let Some(mime) = mime {
+        detail.push_str(&format!(" ({mime})"));
+    }
+    if let Some(bytes) = entry.get("bytes").and_then(Value::as_u64) {
+        detail.push_str(&format!(" [{bytes} bytes]"));
+    }
+    detail
+}
+
+/// Render the structured `result` (`data`) value, the artifact/image manifest,
+/// and browser-event count into a compact model-readable block appended to
+/// stdout. Returns an empty string when there is nothing structured to show.
+///
+/// This is the model-facing surface of the rich python signal. The seam's
+/// [`ExecOutput`] has only three text fields (shared by every tool), so — like
+/// `tool_search` / `view_image`, which also encode richer info as text in this
+/// seam — the manifest is structured TEXT, not new struct fields. The durable
+/// `tool.image` / `artifact.created` events (with registered store artifacts)
+/// are emitted separately by [`crate::infra::persistence`].
+fn render_result_block(resp: &RunPythonResponse) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // Structured result(): the snippet's `result = ...` value. Pretty-printed so
+    // the model gets the actual value, not just "1 result".
+    if !resp.data.is_null() {
+        let rendered =
+            serde_json::to_string_pretty(&resp.data).unwrap_or_else(|_| resp.data.to_string());
+        sections.push(format!("[python:result]\n{rendered}"));
+    }
+
+    // Artifact manifest: each created file, one line, with path/kind/mime/size.
+    if !resp.artifacts.is_empty() {
+        let mut block = format!("[python:artifacts ({})]", resp.artifacts.len());
+        for artifact in &resp.artifacts {
+            block.push_str(&format!("\n- {}", describe_artifact(artifact, "file")));
+        }
+        sections.push(block);
+    }
+
+    // Image manifest: produced images (e.g. matplotlib plots), one line each.
+    if !resp.images.is_empty() {
+        let mut block = format!("[python:images ({})]", resp.images.len());
+        for image in &resp.images {
+            block.push_str(&format!("\n- {}", describe_artifact(image, "image")));
+        }
+        sections.push(block);
+    }
+
+    // Browser events are a streaming/durable surface; here just note the count so
+    // the model knows side effects happened without flooding the result.
+    if !resp.browser_events.is_empty() {
+        sections.push(format!(
+            "[python:browser_events ({})]",
+            resp.browser_events.len()
+        ));
+    }
+
+    sections.join("\n")
+}
+
 /// Map a [`RunPythonResponse`] into [`ExecOutput`].
 ///
-/// Mapping (mirrors the legacy result shape):
-/// - `stdout`: the snippet's `text` (the model-facing output), with any
-///   expression `outputs` appended.
-/// - `stderr`: the snippet's `error` message (if any).
+/// Mapping:
+/// - `stdout`: the snippet's `text` (capped to [`MAX_INLINE_STDOUT_BYTES`]),
+///   then any expression `outputs`, then a structured result/artifact/image
+///   manifest (see [`render_result_block`]).
+/// - `stderr`: the snippet's uncaught-exception `error` (traceback), plus any
+///   `browser_harness_error`, surfaced distinctly.
 /// - `exit_code`: `0` when `ok`, else `1`.
 ///
-/// TODO(streaming/artifacts): the legacy `dispatch_python_tool`
-/// (browser-use-core lib.rs:20204) streams `browser_events` and records
-/// `artifacts` / `images` as image/text content parts. That richer surface is
-/// deferred to a later WP; here `artifacts` / `images` / `browser_events` are
-/// summarized as text on stderr so nothing is silently dropped.
+/// The richer artifact/image RECORDING (durable `tool.image` /
+/// `artifact.created` store events) is handled by [`crate::infra::persistence`];
+/// here those same artifacts are surfaced to the MODEL as a structured text
+/// manifest so it can act on the files the snippet produced.
 pub fn map_response(resp: RunPythonResponse) -> ExecOutput {
-    let mut stdout = resp.text;
+    let mut stdout = cap_inline_stdout(resp.text.clone());
     if !resp.outputs.is_empty() {
         let joined = join_text_entries(&resp.outputs);
         if !joined.is_empty() {
@@ -234,30 +364,29 @@ pub fn map_response(resp: RunPythonResponse) -> ExecOutput {
         }
     }
 
-    let mut stderr = String::new();
-    if let Some(err) = resp.error {
-        stderr.push_str(&err);
-    }
-    // Surface deferred-surface counts so artifacts/images/browser_events are not
-    // silently dropped (full recording is a later WP — see map_response docs).
-    let mut notes = Vec::new();
-    if !resp.artifacts.is_empty() {
-        notes.push(format!("{} artifact(s)", resp.artifacts.len()));
-    }
-    if !resp.images.is_empty() {
-        notes.push(format!("{} image(s)", resp.images.len()));
-    }
-    if !resp.browser_events.is_empty() {
-        notes.push(format!("{} browser event(s)", resp.browser_events.len()));
-    }
-    if !notes.is_empty() {
-        if !stderr.is_empty() && !stderr.ends_with('\n') {
-            stderr.push('\n');
+    // Append the structured result / artifact / image manifest so the rich
+    // python signal reaches the model (not just a bare count).
+    let result_block = render_result_block(&resp);
+    if !result_block.is_empty() {
+        if !stdout.is_empty() && !stdout.ends_with('\n') {
+            stdout.push('\n');
         }
-        stderr.push_str(&format!(
-            "[python: {} (recording deferred)]",
-            notes.join(", ")
-        ));
+        stdout.push_str(&result_block);
+    }
+
+    // stderr carries failures distinctly: the uncaught-exception traceback
+    // (`error`) and, separately, any browser-harness setup error.
+    let mut stderr = String::new();
+    if let Some(err) = resp.error.as_deref() {
+        stderr.push_str(err);
+    }
+    if let Some(harness_err) = resp.browser_harness_error.as_deref() {
+        if !harness_err.trim().is_empty() {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!("[python:browser_harness_error] {harness_err}"));
+        }
     }
 
     ExecOutput {
