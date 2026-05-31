@@ -95,19 +95,42 @@ pub trait SamplingTransport: Send + Sync {
 ///
 /// `ModelClient::stream` is an async fn that returns `Result<Stream, LlmError>`
 /// (setup/transport failures surface as the outer `Err`; decode errors surface as
-/// `Err` items inside the stream). It owns the per-turn request so the borrowed
-/// stream can reference it.
+/// `Err` items inside the stream).
+///
+/// ## Per-call request (the fix)
+/// The request lives behind a [`std::sync::Mutex`] so each [`open_stream`] call
+/// can install the *driver's real per-turn request* (populated input + tools)
+/// before opening the stream. Previously this transport held a fixed request
+/// built once with empty messages and ignored the per-call `req`, so production
+/// turns sent an EMPTY body to the provider (HTTP 400: "One of
+/// input/previous_response_id/prompt/conversation_id must be provided"). The cell
+/// is seeded by [`new`](ModelClientTransport::new) (so the very first open is well
+/// defined even before the driver writes) and overwritten on every open.
+///
+/// A `Mutex` (not `RefCell`) is required: the driver is `Send + Sync`, and the
+/// transport is shared across the multi-thread runtime.
+///
+/// [`open_stream`]: SamplingTransport::open_stream
 pub struct ModelClientTransport {
     client: Arc<ModelClient>,
     route: Route,
-    /// The request is owned here so the stream `ModelClient::stream` produces can
-    /// be awaited per attempt; the driver's threaded request is identical.
-    req: LlmRequest,
+    /// The request the next stream open will use. Interior-mutable so each
+    /// `open_stream(&req)` can install the driver's real per-turn request before
+    /// the blocking open clones it out (see [`open_blocking`]).
+    ///
+    /// [`open_blocking`]: ModelClientTransport::open_blocking
+    req: std::sync::Mutex<LlmRequest>,
 }
 
 impl ModelClientTransport {
     pub fn new(client: Arc<ModelClient>, route: Route, req: LlmRequest) -> Self {
-        Self { client, route, req }
+        // Seed the cell with the initial request so the first open is well-defined
+        // even if the driver has not written yet; every `open_stream` overwrites it.
+        Self {
+            client,
+            route,
+            req: std::sync::Mutex::new(req),
+        }
     }
 
     /// Open a stream by awaiting `ModelClient::stream` on the current runtime.
@@ -116,14 +139,30 @@ impl ModelClientTransport {
     /// sync (so the scripted test transport stays trivial). We bridge with
     /// `block_in_place` + the current handle. This is the only place that blocks,
     /// and it runs on the multi-thread runtime the agent uses.
+    ///
+    /// ## Clone soundness
+    /// We snapshot the cell's request into a *local* `LlmRequest` and stream the
+    /// local clone. This is sound because `ModelClient::stream` borrows
+    /// `&LlmRequest` only to build the wire body (`prepare` → `Protocol::build_body`)
+    /// and POST it (`send_with_retry`) *upfront*, before it returns. The stream it
+    /// hands back is a `Box::pin`'d `Stream` whose state owns the reqwest byte
+    /// stream + decoders — it does NOT borrow `req` (it is `Send + 'static`). So
+    /// dropping the local clone once `block_on` returns is safe. Cloning also keeps
+    /// the `Mutex` guard from being held across the blocking `block_on`.
     fn open_blocking(&self) -> Result<EventStream<'_>, LlmError> {
+        let req = self.req.lock().unwrap().clone();
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| handle.block_on(self.client.stream(&self.route, &self.req)))
+        tokio::task::block_in_place(|| handle.block_on(self.client.stream(&self.route, &req)))
     }
 }
 
 impl SamplingTransport for ModelClientTransport {
-    fn open_stream<'a>(&'a self, _req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
+    fn open_stream<'a>(&'a self, req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
+        // Install the driver's real per-turn request (populated input + tools)
+        // before opening, so the provider receives a non-empty body. This is the
+        // fix for the empty-request bug: the passed `req` is now used instead of a
+        // fixed empty one held at construction.
+        *self.req.lock().unwrap() = req.clone();
         self.open_blocking()
     }
 }
@@ -301,9 +340,10 @@ pub struct ModelSamplingDriver<
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
     /// Build a text-only driver (no tool dispatch). `ctx` carries session/model
-    /// identity for emitted events. The transport owns the per-turn
-    /// [`LlmRequest`] / [`Route`] (see [`ModelClientTransport`]); the driver only
-    /// threads the input through.
+    /// identity for emitted events. The transport owns the [`Route`] and the
+    /// *current* [`LlmRequest`] cell (see [`ModelClientTransport`]); the driver
+    /// builds the real per-turn request (model/provider + input messages) and
+    /// installs it via [`SamplingTransport::open_stream`] on each open.
     ///
     /// Tool calls the model emits set `model_needs_follow_up` but are NOT
     /// executed; attach a dispatcher with [`ModelSamplingDriver::with_fusion`]
@@ -472,8 +512,10 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         cancel: CancellationToken,
     ) -> Result<SamplingOutcome, AgentError> {
         // `attempt` == retries already performed (codex `retries`). The outer
-        // loop re-opens the stream on each retryable failure. The transport owns
-        // the actual request; we thread the input through for parity / future use.
+        // loop re-opens the stream on each retryable failure. We build the REAL
+        // per-turn request from the input here and hand it to `open_stream`, which
+        // installs it into the transport before opening — so the provider receives
+        // the populated conversation, not an empty body.
         let req = build_request(&self.ctx, input);
         let mut attempt: u32 = 0;
         loop {
@@ -577,9 +619,18 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 
 /// Build the per-turn [`LlmRequest`] from the input messages + turn identity.
 ///
-/// The model / provider come from the [`TurnCtx`]; tool schema and sampling knobs
-/// are owned by the transport (the real transport fixes the full request at
-/// construction). Kept as a free fn so it is unit-reachable.
+/// The model / provider come from the [`TurnCtx`] and the per-turn `input`
+/// messages are installed here. This request is what
+/// [`run_sampling_request`](ModelSamplingDriver::run_sampling_request) hands to
+/// [`SamplingTransport::open_stream`], so it MUST carry the real conversation —
+/// the transport now uses *this* request (not a fixed empty one) on every open.
+///
+/// NOTE (tool-defs gap, see report): `req.tools` is left empty here. The tool
+/// catalog is not reachable from this layer without editing `dispatch.rs` /
+/// `model_path.rs` (off-limits for this WP) — `ToolDispatcher` exposes neither
+/// its runner nor `ToolRegistry::specs()`. Until that is threaded, the model
+/// receives no tool definitions, so it cannot emit browser/python/shell tool
+/// calls. Kept as a free fn so it is unit-reachable.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
     req.messages = input;
