@@ -786,6 +786,7 @@ fn committed_node_for_event(
             })
         }
         "model.turn.response" => pre_tool_commentary_node(root, events, event),
+        "model.response.continued" => continued_response_commentary_node(root, events, event),
         "plan.proposed" => {
             let text = payload_string(event, "text")?;
             Some(TranscriptNode {
@@ -1176,6 +1177,21 @@ fn pre_tool_commentary_node(
     event: &EventRecord,
 ) -> Option<TranscriptNode> {
     if event.session_id != root.id || model_response_tool_call_count(event) == 0 {
+        return None;
+    }
+    streaming_commentary_node_before_event(root, events, event)
+}
+
+fn continued_response_commentary_node(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> Option<TranscriptNode> {
+    let reason = event
+        .payload
+        .get("reason")
+        .and_then(serde_json::Value::as_str)?;
+    if reason != "active_turn_queue_drained" {
         return None;
     }
     streaming_commentary_node_before_event(root, events, event)

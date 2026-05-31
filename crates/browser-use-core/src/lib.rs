@@ -8551,12 +8551,6 @@ fn append_new_external_session_messages_with_phase(
         .filter(|_| !active_turn_phase_accepts_after_next_tool_call(phase))
         .map(|event| event.seq)
         .min();
-    let max_seen_seq = session_events
-        .iter()
-        .filter(|event| event.seq > *last_seq)
-        .filter(|event| deferred_after_next_seq.map_or(true, |seq| event.seq < seq))
-        .map(|event| event.seq)
-        .max();
     let mut checkpoint_messages = Vec::new();
     let mut events =
         rollback_filtered_events_after(&session_events, *last_seq, &mut checkpoint_messages)
@@ -8564,12 +8558,20 @@ fn append_new_external_session_messages_with_phase(
             .filter(|event| session_event_is_active_turn_queue_input(&session_events, event, phase))
             .collect::<Vec<_>>();
     events.sort_by_key(|event| event.seq);
+    let first_input_seq = events.first().map(|event| event.seq);
+    let max_seen_seq = session_events
+        .iter()
+        .filter(|event| event.seq > *last_seq)
+        .filter(|event| deferred_after_next_seq.map_or(true, |seq| event.seq < seq))
+        .filter(|event| first_input_seq.map_or(true, |seq| event.seq <= seq))
+        .map(|event| event.seq)
+        .max();
+    events.truncate(1);
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
         if event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT {
             let committed =
                 append_committed_followup_for_pending_active_input(store, session_id, event)?;
-            *last_seq = (*last_seq).max(committed.seq);
             messages.extend(session_event_user_messages(&committed.payload));
         } else {
             messages.extend(session_event_user_messages(&event.payload));
@@ -8666,6 +8668,9 @@ fn session_event_is_active_turn_queue_input(
     match event.event_type.as_str() {
         "session.input" => true,
         "session.followup" | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT => {
+            if event.payload.get("pending_from_seq").is_some() {
+                return false;
+            }
             !after_next_tool_call_followup_is_cancelled(events, event.seq)
                 && (!pending_after_next_tool_call_followup(events, event)
                     || active_turn_phase_accepts_after_next_tool_call(phase))
@@ -8694,6 +8699,8 @@ fn active_turn_phase_accepts_after_next_tool_call(phase: &str) -> bool {
             | "after_tool_call"
             | "after_parallel_tool_batch"
             | "after_streaming_tool_call"
+            | "before_finalization"
+            | "before_assistant_text_finalization"
     )
 }
 
@@ -37312,7 +37319,83 @@ for line in sys.stdin:
             Some(pending.seq)
         );
         assert!(committed.payload.get("delivery").is_none());
-        assert!(last_seq >= committed.seq);
+        assert_eq!(last_seq, pending.seq);
+        Ok(())
+    }
+
+    #[test]
+    fn active_turn_queue_delivers_multiple_pending_followups_one_at_a_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let input = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        let first = store.append_event(
+            &session.id,
+            SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+            serde_json::json!({
+                "text": "first steer",
+                "delivery": "after_next_tool_call",
+            }),
+        )?;
+        let second = store.append_event(
+            &session.id,
+            SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+            serde_json::json!({
+                "text": "second steer",
+                "delivery": "after_next_tool_call",
+            }),
+        )?;
+
+        let mut first_messages = Vec::new();
+        let mut last_seq = input.seq;
+        let first_drain = append_new_external_session_messages_with_phase(
+            &store,
+            &session.id,
+            &mut first_messages,
+            &mut last_seq,
+            "after_tool_outputs",
+            Some(0),
+        )?;
+
+        assert_eq!(first_drain.session_messages, 1);
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(first_messages[0]["content"], "first steer");
+        assert_eq!(last_seq, first.seq);
+
+        let mut second_messages = Vec::new();
+        let second_drain = append_new_external_session_messages_with_phase(
+            &store,
+            &session.id,
+            &mut second_messages,
+            &mut last_seq,
+            "after_tool_outputs",
+            Some(1),
+        )?;
+
+        assert_eq!(second_drain.session_messages, 1);
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(second_messages[0]["content"], "second steer");
+        assert_eq!(last_seq, second.seq);
+
+        let events = store.events_for_session(&session.id)?;
+        let committed = events
+            .iter()
+            .filter(|event| event.event_type == "session.followup")
+            .filter_map(|event| {
+                Some((
+                    event.payload.get("text")?.as_str()?,
+                    event.payload.get("pending_from_seq")?.as_i64()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            committed,
+            vec![("first steer", first.seq), ("second steer", second.seq)]
+        );
         Ok(())
     }
 
@@ -37766,6 +37849,55 @@ for line in sys.stdin:
         Ok(())
     }
 
+    #[test]
+    fn provider_loop_delivers_after_next_followups_before_plain_text_finish_one_at_a_time(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        let provider = AfterNextFollowupsBeforeFinalProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+            turns: std::sync::Mutex::new(0),
+        };
+
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let done_results = events
+            .iter()
+            .filter(|event| event.event_type == "session.done")
+            .filter_map(|event| event.payload.get("result").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(done_results, vec!["handled all followups"]);
+        let drained = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "agent.turn_queue_drained"
+                    && event.payload["phase"] == "before_finalization"
+                    && event.payload["session_messages"] == 1
+            })
+            .count();
+        assert_eq!(drained, 2);
+        let committed = events
+            .iter()
+            .filter(|event| event.event_type == "session.followup")
+            .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(committed, vec!["first steer", "second steer"]);
+        Ok(())
+    }
+
     struct FollowupBeforeFinalProvider {
         state_dir: std::path::PathBuf,
         session_id: String,
@@ -37811,6 +37943,95 @@ for line in sys.stdin:
                 },
                 ModelEvent::Done,
             ])
+        }
+    }
+
+    struct AfterNextFollowupsBeforeFinalProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        turns: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for AfterNextFollowupsBeforeFinalProvider {
+        fn provider_name(&self) -> &'static str {
+            "after-next-followups-before-final"
+        }
+
+        fn model_name(&self) -> &str {
+            "after-next-followups-before-final"
+        }
+
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut turns = self.turns.lock().expect("turn lock");
+            let user_messages = turn
+                .messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .map(message_content_text)
+                .collect::<Vec<_>>();
+            let events = match *turns {
+                0 => {
+                    Store::open(&self.state_dir)?.append_event(
+                        &self.session_id,
+                        SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                        serde_json::json!({
+                            "text": "first steer",
+                            "delivery": "after_next_tool_call",
+                        }),
+                    )?;
+                    Store::open(&self.state_dir)?.append_event(
+                        &self.session_id,
+                        SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                        serde_json::json!({
+                            "text": "second steer",
+                            "delivery": "after_next_tool_call",
+                        }),
+                    )?;
+                    vec![
+                        ModelEvent::TextDelta {
+                            text: "premature final one".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                1 => {
+                    let expected = ["initial task", "first steer"].map(str::to_string);
+                    assert!(
+                        user_messages.ends_with(&expected),
+                        "second provider turn should receive the initial task and first steer: {user_messages:?}"
+                    );
+                    vec![
+                        ModelEvent::TextDelta {
+                            text: "premature final two".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                2 => {
+                    let expected =
+                        ["initial task", "first steer", "second steer"].map(str::to_string);
+                    assert!(
+                        user_messages.ends_with(&expected),
+                        "third provider turn should receive both steers in order: {user_messages:?}"
+                    );
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "done_after_followups".to_string(),
+                                name: "done".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "result": "handled all followups",
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                _ => bail!("after-next followups should finish after three turns"),
+            };
+            *turns += 1;
+            Ok(events)
         }
     }
 

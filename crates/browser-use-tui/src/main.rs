@@ -13148,6 +13148,101 @@ wire_api = "responses"
     }
 
     #[test]
+    fn active_followup_continuation_preserves_streamed_text_before_next_turn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "text after one", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "session.followup",
+            serde_json::json!({"text": "1", "pending_from_seq": 10}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.response.continued",
+            serde_json::json!({
+                "turn_idx": 0,
+                "reason": "active_turn_queue_drained",
+                "phase": "before_finalization",
+                "session_messages": 1,
+                "mailbox_messages": 0,
+            }),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 1}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "text after two", "turn_idx": 1}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "session.followup",
+            serde_json::json!({"text": "2", "pending_from_seq": 11}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.response.continued",
+            serde_json::json!({
+                "turn_idx": 1,
+                "reason": "active_turn_queue_drained",
+                "phase": "before_finalization",
+                "session_messages": 1,
+                "mailbox_messages": 0,
+            }),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 2}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "session.followup",
+            serde_json::json!({"text": "3", "pending_from_seq": 12}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "session.done",
+            serde_json::json!({"result": "final text"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        let one_idx = screen.find("> 1").context("first follow-up")?;
+        let one_text_idx = screen.find("text after one").context("first text")?;
+        let two_idx = screen.find("> 2").context("second follow-up")?;
+        let two_text_idx = screen.find("text after two").context("second text")?;
+        let three_idx = screen.find("> 3").context("third follow-up")?;
+        assert!(one_idx < one_text_idx, "{screen}");
+        assert!(one_text_idx < two_idx, "{screen}");
+        assert!(two_idx < two_text_idx, "{screen}");
+        assert!(two_text_idx < three_idx, "{screen}");
+        assert_eq!(screen.matches("text after one").count(), 1, "{screen}");
+        assert_eq!(screen.matches("text after two").count(), 1, "{screen}");
+        Ok(())
+    }
+
+    #[test]
     fn active_followup_preview_stays_below_live_streaming_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
