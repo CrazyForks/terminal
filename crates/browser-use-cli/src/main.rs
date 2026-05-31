@@ -97,26 +97,36 @@ enum Command {
         text: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        max_turns: Option<usize>,
     },
     RunCodex {
         text: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        max_turns: Option<usize>,
     },
     RunAnthropic {
         text: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
+        #[arg(long)]
+        max_turns: Option<usize>,
     },
     RunOpenrouter {
         text: String,
         #[arg(long, default_value = "openai/gpt-5.5")]
         model: String,
+        #[arg(long)]
+        max_turns: Option<usize>,
     },
     RunDeepseek {
         text: String,
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
+        #[arg(long)]
+        max_turns: Option<usize>,
     },
     RunOpenaiSession {
         task_id: String,
@@ -604,45 +614,50 @@ fn main() -> Result<()> {
     match args.command {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
-        Command::RunOpenai { text, model } => run_openai(
+        Command::RunOpenai { text, model, max_turns } => run_openai(
             &store,
             text,
             model,
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            max_turns,
         ),
-        Command::RunCodex { text, model } => run_codex(
+        Command::RunCodex { text, model, max_turns } => run_codex(
             &store,
             text,
             model,
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            max_turns,
         ),
-        Command::RunAnthropic { text, model } => run_anthropic(
+        Command::RunAnthropic { text, model, max_turns } => run_anthropic(
             &store,
             text,
             model,
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            max_turns,
         ),
-        Command::RunOpenrouter { text, model } => run_openrouter(
+        Command::RunOpenrouter { text, model, max_turns } => run_openrouter(
             &store,
             text,
             model,
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            max_turns,
         ),
-        Command::RunDeepseek { text, model } => run_deepseek(
+        Command::RunDeepseek { text, model, max_turns } => run_deepseek(
             &store,
             text,
             model,
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            max_turns,
         ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
@@ -1376,6 +1391,15 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
         .replace(['_', ' '], "-")
 }
 
+fn _with_max_turns(mut opts: AgentRunOptions, max_turns: Option<usize>) -> AgentRunOptions {
+    if let Some(n) = max_turns {
+        if n > 0 {
+            opts.max_turns = n;
+        }
+    }
+    opts
+}
+
 fn run_openai(
     store: &Store,
     text: String,
@@ -1383,6 +1407,7 @@ fn run_openai(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    max_turns: Option<usize>,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Openai,
@@ -1392,11 +1417,10 @@ fn run_openai(
     )?;
     let config = ProviderRunConfig::new(ProviderBackend::Openai, model)
         .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
-        )?);
+        .with_options(_with_max_turns(
+            cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+            max_turns,
+        ));
     run_new_session_from_config(store, text, config)
 }
 
@@ -1407,6 +1431,7 @@ fn run_codex(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    max_turns: Option<usize>,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Codex,
@@ -1416,11 +1441,10 @@ fn run_codex(
     )?;
     let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
         .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
-        )?);
+        .with_options(_with_max_turns(
+            cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+            max_turns,
+        ));
     run_new_session_from_config(store, text, config)
 }
 
@@ -1431,9 +1455,13 @@ fn run_anthropic(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    max_turns: Option<usize>,
 ) -> Result<()> {
     let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+        _with_max_turns(
+            cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+            max_turns,
+        ),
     );
     run_new_session_from_config(store, text, config)
 }
@@ -1445,9 +1473,13 @@ fn run_openrouter(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    max_turns: Option<usize>,
 ) -> Result<()> {
     let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+        _with_max_turns(
+            cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+            max_turns,
+        ),
     );
     run_new_session_from_config(store, text, config)
 }
@@ -1459,9 +1491,13 @@ fn run_deepseek(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    max_turns: Option<usize>,
 ) -> Result<()> {
     let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+        _with_max_turns(
+            cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+            max_turns,
+        ),
     );
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
