@@ -1286,9 +1286,11 @@ fn cli_agent_options(
 ) -> Result<AgentRunOptions> {
     let mut options = AgentRunOptions::default()
         .with_collaboration_mode(collaboration_mode)
-        .with_browser_mode(cli_browser_mode())
         .with_model_compaction(true)
         .with_analytics_source("cli");
+    if let Some(mode) = cli_browser_mode_opt() {
+        options = options.with_browser_mode(mode);
+    }
     if let Some(profile) = config_profile {
         options = options.with_config_profile(profile.to_string());
     }
@@ -1385,6 +1387,18 @@ fn cli_browser_mode() -> String {
         .ok()
         .filter(|mode| !mode.trim().is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+/// Same as cli_browser_mode but returns None when the env var is unset/empty,
+/// so callers that want to opt out of the "Browser mode locked to X for this
+/// run" enforcement (e.g. when an external CDP URL is provided by the wrapper
+/// and the agent needs to `browser connect remote-cdp ...`) can simply skip
+/// the with_browser_mode call. The previous unconditional default-to-"local"
+/// meant the wrapper had no way to disable the lock from outside the binary.
+fn cli_browser_mode_opt() -> Option<String> {
+    std::env::var("LLM_BROWSER_BROWSER_MODE")
+        .ok()
+        .filter(|mode| !mode.trim().is_empty())
 }
 
 fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
