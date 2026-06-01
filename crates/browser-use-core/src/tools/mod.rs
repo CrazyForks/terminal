@@ -1722,7 +1722,7 @@ fn done_tool_spec() -> ToolSpec {
         name: "done".to_string(),
         namespace: None,
         namespace_description: None,
-        description: "Finish the browser task with a final user-facing result.".to_string(),
+        description: "Finish the browser task with a final user-facing result. If browser/data fan-out has produced enough results and only straggler child agents remain active, set finish_and_close_children=true so the final answer is recorded instead of being rejected by active children.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -1736,7 +1736,7 @@ fn done_tool_spec() -> ToolSpec {
                 },
                 "finish_and_close_children": {
                     "type": "boolean",
-                    "description": "If true, cancel active child agents before finishing. Otherwise done() is rejected while children are active."
+                    "description": "If true, cancel active child agents before finishing. Use this after collecting enough fan-out results or when the task budget requires a partial answer; otherwise done() is rejected while children are active."
                 }
             },
             "required": [],
@@ -2129,7 +2129,7 @@ The user does NOT need to explicitly ask for sub-agents — the right pattern is
 - When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.\n\
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.\n\n\
 ### After you delegate\n\
-- For browser/data fan-out tasks, collecting helper outputs is part of the critical path: after spawning the item/document/site helpers, call `wait_agent` and integrate completed statuses. In V1, pass the helper ids and repeat with unfinished ids. In V2, call `wait_agent` without targets, read the returned `agents` array, and use each `agent_status.completed` value as the helper's result.\n\
+- For browser/data fan-out tasks, collecting helper outputs is part of the critical path: after spawning the item/document/site helpers, call `wait_agent` and integrate completed statuses. In V1, pass the helper ids and repeat with unfinished ids. In V2, call `wait_agent` without targets, read the returned `agents` array, and use each `agent_status.completed` value as the helper's result. If you have enough helper results but some child agents are still running, call `done` with `finish_and_close_children=true` so stragglers do not block the final answer.\n\
 - Outside fan-out collection, call wait_agent sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.\n\
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.\n\
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.\n\
@@ -2559,6 +2559,9 @@ mod tests {
         assert!(spec
             .description
             .contains("In V2, call `wait_agent` without targets"));
+        assert!(spec
+            .description
+            .contains("finish_and_close_children=true"));
         assert!(!spec.description.contains("Call wait_agent very sparingly"));
         assert!(!spec
             .description
@@ -2597,6 +2600,17 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("worker: {"));
+    }
+
+    #[test]
+    fn done_tool_description_mentions_fanout_straggler_close() {
+        let spec = done_tool_spec();
+        assert!(spec.description.contains("browser/data fan-out"));
+        assert!(spec.description.contains("finish_and_close_children=true"));
+        assert!(spec.input_schema["properties"]["finish_and_close_children"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("collecting enough fan-out results"));
     }
 
     #[test]
