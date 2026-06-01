@@ -623,6 +623,7 @@ impl Drop for ActiveSpan {
 fn set_usage_attrs(span: &ActiveSpan, usage: &ModelUsage) {
     if let Some(input_tokens) = usage.input_tokens {
         span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", input_tokens));
+        span.set_attribute(KeyValue::new("llm.usage.prompt_tokens", input_tokens));
     }
     if let Some(input_cached_tokens) = usage.input_cached_tokens {
         span.set_attribute(KeyValue::new(
@@ -638,6 +639,7 @@ fn set_usage_attrs(span: &ActiveSpan, usage: &ModelUsage) {
     }
     if let Some(output_tokens) = usage.output_tokens {
         span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", output_tokens));
+        span.set_attribute(KeyValue::new("llm.usage.completion_tokens", output_tokens));
     }
     if let Some(reasoning_output_tokens) = usage.reasoning_output_tokens {
         span.set_attribute(KeyValue::new(
@@ -646,6 +648,7 @@ fn set_usage_attrs(span: &ActiveSpan, usage: &ModelUsage) {
         ));
     }
     if let Some(total_tokens) = usage.total_tokens {
+        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", total_tokens));
         span.set_attribute(KeyValue::new("llm.usage.total_tokens", total_tokens));
     }
     if let Some(cost_usd) = usage.cost_usd {
@@ -1319,6 +1322,11 @@ mod tests {
             Some("gpt-test")
         );
         assert_eq!(attr_i64(llm, "gen_ai.usage.input_tokens"), Some(10));
+        assert_eq!(attr_i64(llm, "llm.usage.prompt_tokens"), Some(10));
+        assert_eq!(attr_i64(llm, "gen_ai.usage.output_tokens"), Some(2));
+        assert_eq!(attr_i64(llm, "llm.usage.completion_tokens"), Some(2));
+        assert_eq!(attr_i64(llm, "gen_ai.usage.total_tokens"), Some(12));
+        assert_eq!(attr_i64(llm, "llm.usage.total_tokens"), Some(12));
         assert!(attr_string(llm, SPAN_INPUT)
             .as_deref()
             .is_some_and(|value| value.contains("call the tool")));
