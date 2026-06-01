@@ -1,0 +1,46 @@
+[package]
+name = "browser-use-agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# The new async agent engine (rearchitecture Milestone 3, strategy B: parallel
+# rewrite). Built alongside the legacy sync `browser-use-core`; ported
+# subsystem-by-subsystem on top of the async `browser-use-llm`, with the TUI/CLI
+# cut over to it only at the end. WP-A0 lands the frozen compiling scaffold.
+
+[dependencies]
+browser-use-browser = { path = "../browser-use-browser" }
+browser-use-llm = { path = "../browser-use-llm" }
+browser-use-providers = { path = "../browser-use-providers" }
+browser-use-protocol = { path = "../browser-use-protocol" }
+browser-use-python-worker = { path = "../browser-use-python-worker" }
+browser-use-store = { path = "../browser-use-store" }
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bm25.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net"] }
+tokio-util.workspace = true
+futures-util.workspace = true
+portable-pty.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tempfile.workspace = true
+
+[features]
+# Opt-in flag gating the live multi-provider smoke test so it is never compiled
+# into the default `cargo test` binary. The live call needs a real provider key
+# in the environment (OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_BROWSER_*). Run:
+#   cargo test -p browser-use-agent --features live -- --ignored live_model_smoke
+live = []

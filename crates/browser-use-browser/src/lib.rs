@@ -256,22 +256,51 @@ fn browser_script_runs() -> &'static Mutex<HashMap<String, BrowserScriptRun>> {
 }
 
 fn active_browser_script_runs_json(session_id: &str) -> Value {
-    let runs = browser_script_runs()
+    let mut runs = browser_script_runs()
         .lock()
         .expect("browser_script run registry poisoned");
     Value::Array(
-        runs.values()
+        runs.values_mut()
             .filter(|run| run.session_id == session_id)
             .map(|run| {
+                let child_exited = run.child.try_wait().ok().flatten().is_some();
+                let timed_out = !child_exited && Instant::now() >= run.deadline;
+                let status = if child_exited {
+                    "finished"
+                } else if timed_out {
+                    "timed_out"
+                } else {
+                    "running"
+                };
+                let next_step = match status {
+                    "finished" => format!(
+                        "browser_script action=observe run_id={} to collect the completed result",
+                        run.id
+                    ),
+                    "timed_out" => format!(
+                        "browser_script action=observe run_id={} to collect the timeout result",
+                        run.id
+                    ),
+                    _ => format!("browser_script action=observe run_id={}", run.id),
+                };
                 json!({
                     "run_id": run.id,
-                    "status": "running",
+                    "status": status,
                     "started_at_ms": run.started_at_ms as u64,
-                    "next_step": format!("browser_script action=observe run_id={}", run.id),
+                    "next_step": next_step,
                 })
             })
             .collect(),
     )
+}
+
+fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
+    active_scripts
+        .as_array()
+        .and_then(|scripts| scripts.first())
+        .and_then(|script| script.get("next_step"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 pub fn run_browser_command(
@@ -1752,6 +1781,13 @@ impl BrowserSession {
 
     fn status_json(&self) -> Value {
         let connected = self.connection.is_some();
+        let active_scripts = self
+            .session_id
+            .as_deref()
+            .map(active_browser_script_runs_json)
+            .unwrap_or_default();
+        let next_step = active_browser_script_next_step(&active_scripts)
+            .or_else(|| self.next_step().map(ToOwned::to_owned));
         let page = json!({
             "target_id": self.current_target_id,
             "session_id": self.current_session_id,
@@ -1764,8 +1800,8 @@ impl BrowserSession {
             "reason": self.last_error,
             "loss_reason": self.last_error_kind,
             "last_issue": self.last_issue_diagnosis(),
-            "active_scripts": self.session_id.as_deref().map(active_browser_script_runs_json).unwrap_or_default(),
-            "next_step": self.next_step(),
+            "active_scripts": active_scripts,
+            "next_step": next_step,
             "owner": self.owner.as_str(),
             "browser": self.browser_name,
             "profile": self.profile,
@@ -7915,6 +7951,38 @@ print("finished")
         );
 
         let _ = cancel_browser_script(session_id, started.run_id.as_deref().unwrap());
+    }
+
+    #[test]
+    fn browser_status_marks_completed_background_scripts_for_observe() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-status-completed-runs";
+        let started = start_browser_script(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('begin')\ntime.sleep(1.0)\nprint('done')",
+            5,
+        )
+        .unwrap();
+        assert_eq!(started.status.as_deref(), Some("running"));
+        let run_id = started.run_id.as_deref().unwrap().to_string();
+
+        thread::sleep(Duration::from_millis(1_300));
+        let status = run_browser_command(session_id, temp.path(), temp.path(), "status --json")
+            .unwrap()
+            .content;
+        assert_eq!(status["active_scripts"][0]["run_id"], run_id);
+        assert_eq!(status["active_scripts"][0]["status"], "finished");
+        assert!(status["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("action=observe"));
+
+        let observed = observe_browser_script(session_id, &run_id, 2_500).unwrap();
+        assert!(observed.ok, "{:?}", observed.error);
+        assert_eq!(observed.status.as_deref(), Some("finished"));
+        assert!(observed.text.contains("done"));
     }
 
     #[test]
