@@ -628,6 +628,200 @@ def navigation_snapshot(keywords=None, limit=80):
     return js(expression)
 
 
+def embedded_data_snapshot(limit=80, max_sources=12):
+    """Extract compact records from page-embedded structured/hydration data.
+
+    Use this on ecommerce, directory, listing, investor/document, and SPA pages
+    before doing brittle visual scraping. It scans JSON-LD, Next.js/Nuxt payloads,
+    and product/document meta tags, then returns normalized product/listing-like
+    records plus compact source metadata.
+    """
+    expression = f"""
+(() => {{
+  const limit = {int(limit)};
+  const maxSources = {int(max_sources)};
+  const clean = (value, max = 500) => String(value == null ? '' : value).replace(/\\s+/g, ' ').trim().slice(0, max);
+  const absolute = (value) => {{
+    const text = clean(value, 1200);
+    if (!text) return '';
+    try {{ return new URL(text, location.href).href; }} catch (err) {{ return text; }}
+  }};
+  const firstString = (value) => {{
+    if (typeof value === 'string' || typeof value === 'number') return clean(value, 500);
+    if (Array.isArray(value)) {{
+      for (const item of value) {{
+        const found = firstString(item);
+        if (found) return found;
+      }}
+      return '';
+    }}
+    if (value && typeof value === 'object') {{
+      for (const key of ['name', 'title', 'text', 'url', '@id', 'src', 'content']) {{
+        const found = firstString(value[key]);
+        if (found) return found;
+      }}
+    }}
+    return '';
+  }};
+  const typeName = (obj) => clean(obj && (obj['@type'] || obj.type || obj.__typename || obj.kind), 120);
+  const scalarKeys = (obj) => Object.entries(obj || {{}})
+    .filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value))
+    .slice(0, 12)
+    .reduce((out, [key, value]) => {{ out[key] = clean(value, 240); return out; }}, {{}});
+  const priceFrom = (obj) => {{
+    if (!obj || typeof obj !== 'object') return '';
+    for (const key of ['price', 'priceText', 'currentPrice', 'salePrice', 'regularPrice', 'amount', 'value']) {{
+      const value = obj[key];
+      if (typeof value === 'string' || typeof value === 'number') return clean(value, 120);
+      if (value && typeof value === 'object') {{
+        const nested = priceFrom(value);
+        if (nested) return nested;
+      }}
+    }}
+    if (obj.offers) return priceFrom(Array.isArray(obj.offers) ? obj.offers[0] : obj.offers);
+    return '';
+  }};
+  const imageFrom = (obj) => {{
+    if (!obj || typeof obj !== 'object') return '';
+    for (const key of ['image', 'images', 'thumbnail', 'thumbnailUrl', 'mainImage', 'media']) {{
+      const value = obj[key];
+      if (typeof value === 'string') return absolute(value);
+      if (Array.isArray(value)) {{
+        for (const item of value) {{
+          const found = imageFrom({{image: item}});
+          if (found) return found;
+        }}
+      }} else if (value && typeof value === 'object') {{
+        const found = firstString(value.url || value.src || value.contentUrl || value);
+        if (found) return absolute(found);
+      }}
+    }}
+    return '';
+  }};
+  const urlFrom = (obj) => {{
+    if (!obj || typeof obj !== 'object') return '';
+    for (const key of ['url', 'href', 'link', 'permalink', 'canonicalUrl', '@id']) {{
+      if (typeof obj[key] === 'string' || typeof obj[key] === 'number') return absolute(obj[key]);
+    }}
+    if (typeof obj.handle === 'string' && /^\\/?[a-z0-9][a-z0-9-_/]*$/i.test(obj.handle)) return absolute(obj.handle);
+    return '';
+  }};
+  const recordFrom = (obj, source, path) => {{
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    const name = firstString(obj.name || obj.title || obj.headline || obj.productName || obj.displayName || obj.companyName);
+    const url = urlFrom(obj);
+    const image = imageFrom(obj);
+    const price = priceFrom(obj);
+    const documentUrl = firstString(obj.fileUrl || obj.documentUrl || obj.downloadUrl || obj.pdfUrl || obj.href);
+    const kind = typeName(obj);
+    const hasUsefulKeys = Object.keys(obj).some(key => /^(?:name|title|headline|url|href|price|offers|image|images|brand|sku|description|date|published|file|document|pdf|website)$/i.test(key));
+    if (!name && !url && !image && !price && !documentUrl) return null;
+    if (!hasUsefulKeys && !kind) return null;
+    const record = {{
+      source,
+      path,
+      type: kind,
+      name,
+      url: url || absolute(documentUrl),
+      image,
+      price,
+      brand: firstString(obj.brand || obj.manufacturer || obj.vendor),
+      description: firstString(obj.description || obj.summary || obj.subtitle),
+      date: firstString(obj.datePublished || obj.dateModified || obj.publishedAt || obj.published_on || obj.date),
+      raw_keys: Object.keys(obj).slice(0, 30),
+      fields: scalarKeys(obj),
+    }};
+    return Object.fromEntries(Object.entries(record).filter(([, value]) => Array.isArray(value) ? value.length : Boolean(value)));
+  }};
+  const walk = (value, source, path, records, seen, depth = 0) => {{
+    if (records.length >= limit || depth > 8 || value == null) return;
+    if (typeof value !== 'object') return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {{
+      for (let i = 0; i < Math.min(value.length, 400) && records.length < limit; i++) {{
+        walk(value[i], source, `${{path}}[${{i}}]`, records, seen, depth + 1);
+      }}
+      return;
+    }}
+    const record = recordFrom(value, source, path);
+    if (record) records.push(record);
+    for (const [key, child] of Object.entries(value).slice(0, 80)) {{
+      if (records.length >= limit) break;
+      if (child && typeof child === 'object') walk(child, source, path ? `${{path}}.${{key}}` : key, records, seen, depth + 1);
+    }}
+  }};
+  const parseJson = (text) => {{
+    try {{ return JSON.parse(text); }} catch (err) {{ return null; }}
+  }};
+  const sources = [];
+  const records = [];
+  const addSource = (source) => {{
+    if (sources.length < maxSources) sources.push(source);
+  }};
+  const consume = (label, text, path) => {{
+    const trimmed = String(text == null ? '' : text).trim().slice(0, 2000000);
+    if (!trimmed) return;
+    const parsed = parseJson(trimmed);
+    if (!parsed) return;
+    const before = records.length;
+    walk(parsed, label, path || '', records, new WeakSet());
+    addSource({{label, path: path || '', size: trimmed.length, record_count: records.length - before}});
+  }};
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {{
+    consume('json-ld', script.textContent || '', script.id || script.getAttribute('data-rh') || '');
+  }}
+  const next = document.getElementById('__NEXT_DATA__');
+  if (next) consume('__NEXT_DATA__', next.textContent || '', '#__NEXT_DATA__');
+  const nuxt = document.getElementById('__NUXT_DATA__');
+  if (nuxt) consume('__NUXT_DATA__', nuxt.textContent || '', '#__NUXT_DATA__');
+  for (const script of Array.from(document.querySelectorAll('script[type="application/json"],script[type="application/graphql-response+json"]')).slice(0, 20)) {{
+    if (script.id === '__NEXT_DATA__' || script.id === '__NUXT_DATA__') continue;
+    consume(script.id ? `json-script#${{script.id}}` : 'json-script', script.textContent || '', script.id || '');
+  }}
+  const metaRecord = {{}};
+  for (const meta of document.querySelectorAll('meta[property],meta[name],link[rel]')) {{
+    const key = clean(meta.getAttribute('property') || meta.getAttribute('name') || meta.getAttribute('rel'), 120);
+    const value = clean(meta.getAttribute('content') || meta.getAttribute('href'), 1000);
+    if (!key || !value) continue;
+    if (/^(?:og:|product:|twitter:|article:|citation_|dc\\.|schema:|canonical$)/i.test(key)) metaRecord[key] = value;
+  }}
+  if (Object.keys(metaRecord).length) {{
+    const obj = {{
+      name: metaRecord['og:title'] || metaRecord['twitter:title'] || metaRecord.title,
+      url: metaRecord['og:url'] || metaRecord.canonical,
+      image: metaRecord['og:image'] || metaRecord['twitter:image'],
+      price: metaRecord['product:price:amount'] || metaRecord['product:sale_price:amount'],
+      description: metaRecord['og:description'] || metaRecord.description || metaRecord['twitter:description'],
+      datePublished: metaRecord['article:published_time'] || metaRecord['citation_publication_date'],
+      meta: metaRecord,
+    }};
+    const record = recordFrom(obj, 'meta', 'head');
+    if (record) records.push(record);
+    addSource({{label: 'meta', path: 'head', size: JSON.stringify(metaRecord).length, record_count: record ? 1 : 0}});
+  }}
+  const deduped = [];
+  const seenKeys = new Set();
+  for (const record of records) {{
+    const key = [record.url || '', record.name || '', record.price || '', record.image || ''].join('|').toLowerCase();
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    deduped.push(record);
+    if (deduped.length >= limit) break;
+  }}
+  return {{
+    url: location.href,
+    title: document.title || '',
+    source_count: sources.length,
+    sources,
+    record_count: deduped.length,
+    records: deduped,
+  }};
+}})()
+"""
+    return js(expression)
+
+
 def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     """Find repeated visible record/card groups and suggest an extraction selector.
 
