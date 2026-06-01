@@ -665,6 +665,7 @@ fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, Strin
         mime_type: mime_type.to_string(),
         data: Some(general_purpose::STANDARD.encode(bytes)),
         url: None,
+        detail: None,
     }))
 }
 

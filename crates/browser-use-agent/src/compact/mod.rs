@@ -570,12 +570,14 @@ fn message_to_item(message: &Message) -> Item {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 content_parts.push(json!({
                     "type": "image",
                     "mime_type": mime_type,
                     "data": data,
                     "url": url,
+                    "detail": detail,
                 }));
             }
             ContentPart::ToolCall {
@@ -617,11 +619,15 @@ fn tool_result_content_to_item_content(content: &[ContentPart]) -> Value {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 has_non_text = true;
-                if let Some(media) =
-                    media_item_content_part(mime_type, data.as_deref(), url.as_deref())
-                {
+                if let Some(media) = media_item_content_part(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     parts.push(media);
                 }
             }
@@ -655,6 +661,7 @@ fn media_item_content_part(
     mime_type: &str,
     data: Option<&str>,
     url: Option<&str>,
+    detail: Option<&str>,
 ) -> Option<Value> {
     let resolved = match (url, data) {
         (Some(url), _) => url.to_string(),
@@ -665,7 +672,7 @@ fn media_item_content_part(
         Some(json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": "high",
+            "detail": detail.unwrap_or("high"),
         }))
     } else {
         Some(json!({

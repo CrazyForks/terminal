@@ -69,15 +69,6 @@ pub use config_model::FakeAgentOptions;
 pub use config_model::ModelCatalog;
 pub use config_model::ModelCatalogEntry;
 
-// The run-entrypoint facade (Wave-3 cutover): the binary-facing call tui/cli use
-// to run a session on the new async engine. It assembles
-// config -> provider/driver -> context seed -> turn loop -> store persistence and
-// is the first production caller of `turn::model_path::build_sampling_driver`.
-pub use entrypoint::{
-    cleanup_all_unified_exec_managers, cleanup_unified_exec_manager_for_session_id,
-    run_session_with_config, run_session_with_config_with_cancel,
-};
-
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -88,9 +79,18 @@ pub(crate) mod test_env {
         ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(|err| err.into_inner())
     }
 }
+
+// The run-entrypoint facade (Wave-3 cutover): the binary-facing call tui/cli use
+// to run a session on the new async engine. It assembles
+// config -> provider/driver -> context seed -> turn loop -> store persistence and
+// is the first production caller of `turn::model_path::build_sampling_driver`.
+pub use entrypoint::{
+    cleanup_all_unified_exec_managers, cleanup_unified_exec_manager_for_session_id,
+    run_session_with_config, run_session_with_config_with_cancel,
+};
 
 #[cfg(test)]
 mod tests {

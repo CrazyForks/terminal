@@ -200,9 +200,14 @@ where
         // conservative serial default for calls whose tool isn't registered (an
         // unknown name then errors serially, under the write guard).
         match call {
-            ContentPart::ToolCall { name, .. } => {
-                self.registry.parallel_safe(name).unwrap_or(false)
-            }
+            ContentPart::ToolCall {
+                name,
+                provider_metadata,
+                ..
+            } => self
+                .registry
+                .parallel_safe_namespaced(tool_call_namespace(provider_metadata).as_deref(), name)
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -210,14 +215,19 @@ where
     async fn run(&self, call: ContentPart, cancel: CancellationToken) -> Message {
         match &call {
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
                 let mut ctx = self.ctx.clone();
                 ctx.call_id = id.clone();
-                ctx.tool_name = name.clone();
+                let namespace = tool_call_namespace(provider_metadata);
+                ctx.tool_name = tool_display_name(namespace.as_deref(), name);
                 match self
                     .registry
-                    .dispatch_with_cancel(
+                    .dispatch_namespaced_with_cancel(
+                        namespace.as_deref(),
                         name,
                         input,
                         &ctx,
@@ -246,6 +256,26 @@ where
             }
             _ => result_message_for(&call, "not a tool call", true),
         }
+    }
+}
+
+fn tool_call_namespace(provider_metadata: &Option<serde_json::Value>) -> Option<String> {
+    provider_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("namespace"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn tool_display_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => {
+            let mut display = String::with_capacity(namespace.len() + name.len());
+            display.push_str(namespace);
+            display.push_str(name);
+            display
+        }
+        None => name.to_string(),
     }
 }
 
@@ -312,6 +342,7 @@ fn media_part_from_view_image_stdout(text: &str) -> Option<ContentPart> {
         mime_type: mime_type.to_string(),
         data: Some(data.to_string()),
         url: None,
+        detail: None,
     })
 }
 

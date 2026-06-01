@@ -339,6 +339,7 @@ async fn script_images_are_appended_as_structured_stdout_payload() {
                 mime_type,
                 data,
                 url,
+                ..
             } => Some((mime_type, data, url)),
             _ => None,
         })
