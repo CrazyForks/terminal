@@ -4548,12 +4548,59 @@ def emit_image(path, label=None):
 
 def audit_artifact(data=None, **requirements):
     checks = {{}}
+    details = {{}}
     if data is not None:
         checks["has_data"] = data is not None and data != [] and data != {{}}
         if isinstance(data, list):
-            checks["record_count"] = len(data)
+            count = len(data)
+            details["record_count"] = count
+            min_count = requirements.pop("min_count", None)
+            if min_count is not None:
+                checks["min_count"] = count >= int(min_count)
+                details["min_count"] = int(min_count)
+            exact_count = requirements.pop("exact_count", None)
+            if exact_count is not None:
+                checks["exact_count"] = count == int(exact_count)
+                details["exact_count"] = int(exact_count)
+            required_fields = requirements.pop("required_fields", None) or requirements.pop("required_keys", None)
+            if required_fields:
+                fields = list(required_fields)
+                missing = []
+                for index, row in enumerate(data):
+                    for field in fields:
+                        value = row.get(field) if isinstance(row, dict) else None
+                        if value is None or value == "":
+                            missing.append({{"index": index, "field": field}})
+                checks["required_fields"] = not missing
+                details["required_fields"] = fields
+                if missing:
+                    details["missing_fields"] = missing[:20]
+            unique_by = requirements.pop("unique_by", None) or requirements.pop("dedupe_field", None)
+            if unique_by:
+                fields = [unique_by] if isinstance(unique_by, str) else list(unique_by)
+                seen = set()
+                duplicates = []
+                for index, row in enumerate(data):
+                    if not isinstance(row, dict):
+                        continue
+                    key = tuple(row.get(field) for field in fields)
+                    if key in seen:
+                        duplicates.append({{"index": index, "key": list(key)}})
+                    seen.add(key)
+                checks["unique_by"] = not duplicates
+                details["unique_by"] = fields
+                if duplicates:
+                    details["duplicates"] = duplicates[:20]
+    path = requirements.pop("path", None) or requirements.pop("file_path", None)
+    if path:
+        file_path = pathlib.Path(path).expanduser()
+        checks["file_exists"] = file_path.exists()
+        details["file_path"] = str(file_path)
+        if requirements.pop("nonempty_file", False):
+            checks["nonempty_file"] = file_path.exists() and file_path.stat().st_size > 0
+            details["file_size"] = file_path.stat().st_size if file_path.exists() else 0
     checks.update({{f"requirement_{{k}}": bool(v) for k, v in requirements.items()}})
-    return {{"generated_by": "audit_artifact", "checks": checks, "ready_for_done": all(checks.values()) if checks else True}}
+    return {{"generated_by": "audit_artifact", "checks": checks, "details": details, "ready_for_done": all(checks.values()) if checks else True}}
 
 def artifact_root():
     return str(ARTIFACT_DIR)
@@ -5159,6 +5206,41 @@ emit_output([{"name": "Ada"}, {"name": "Grace"}], label="rows")
         assert_eq!(output.summary[0]["kind"], "observed");
         assert_eq!(output.summary[0]["message"], "Recorded rows");
         assert_eq!(output.summary[0]["output_label"], "rows");
+    }
+
+    #[test]
+    fn browser_script_audit_artifact_checks_structured_requirements() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-audit-artifact",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+bad_rows = [{"name": "Ada", "url": "https://example.test/a"}, {"name": "", "url": "https://example.test/a"}]
+bad = audit_artifact(bad_rows, min_count=3, required_fields=["name", "url"], unique_by="url")
+assert bad["ready_for_done"] is False, bad
+assert bad["checks"]["min_count"] is False, bad
+assert bad["checks"]["required_fields"] is False, bad
+assert bad["checks"]["unique_by"] is False, bad
+assert bad["details"]["missing_fields"][0]["field"] == "name", bad
+assert bad["details"]["duplicates"][0]["key"] == ["https://example.test/a"], bad
+
+path = pathlib.Path(outputs_dir()) / "result.json"
+path.write_text(json.dumps([{"name": "Ada", "url": "https://example.test/a"}, {"name": "Grace", "url": "https://example.test/b"}]), encoding="utf-8")
+good_rows = json.loads(path.read_text(encoding="utf-8"))
+good = audit_artifact(good_rows, min_count=2, exact_count=2, required_fields=["name", "url"], unique_by="url", path=str(path), nonempty_file=True)
+assert good["ready_for_done"] is True, good
+assert good["checks"]["file_exists"] is True, good
+assert good["checks"]["nonempty_file"] is True, good
+assert good["details"]["record_count"] == 2, good
+print("audit_artifact ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("audit_artifact ok"));
     }
 
     #[test]

@@ -11993,6 +11993,7 @@ mod tests {
         assert!(!none.contains("Python namespace persists"));
         assert!(none.contains("browser_fetch"));
         assert!(none.contains("browser_fetch_many"));
+        assert!(none.contains("required_fields"));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
             "custom-model",
