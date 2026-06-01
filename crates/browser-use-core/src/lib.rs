@@ -221,7 +221,11 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 const DEFAULT_AGENT_NICKNAMES: &str = include_str!("agent_names.txt");
 const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
 const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
+// Browser eval fan-out tasks routinely need one helper per item for 5-10 item
+// lists/cascades. Keeping the V2 runtime default at 4 contradicted the
+// browser-agent prompt's mandatory N>=5 fan-out rule and made the fifth helper
+// fail before the agent could collect enough coverage.
+const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 10;
 const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
 // 30s was the old default; browser sub-agents commonly run 30-90s per item
@@ -43237,6 +43241,17 @@ developer_instructions = "Research carefully"
     fn multi_agent_v2_config_table_parses_and_validates_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let default_config = with_browser_use_terminal_home(&app_home, || {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+        assert_eq!(
+            default_config
+                .multi_agent_v2
+                .max_concurrent_threads_per_session,
+            10
+        );
+
         std::fs::write(
             app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             r#"[features.multi_agent_v2]
