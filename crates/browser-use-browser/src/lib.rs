@@ -5283,7 +5283,10 @@ def js(expression, returnByValue=True):
         assert "buttonNodes" in expression
         assert "aria-label" in expression
         assert "img[alt]" in expression
+        assert "imageRecords" in expression
+        assert "currentSrc" in expression
         assert "labels" in expression
+        assert "images" in expression
         return [
             {
                 "index": 0,
@@ -5293,6 +5296,7 @@ def js(expression, returnByValue=True):
                 "prices": ["19,90 €/kk"],
                 "links": [{"text": "DNA Netti 300M", "href": "https://example.test/dna-300"}],
                 "buttons": ["Valitse"],
+                "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "width": 200, "height": 120}],
             }
         ]
     assert "el.matches('a[href]')" in expression
@@ -5304,6 +5308,8 @@ def js(expression, returnByValue=True):
     assert "flex|grid|block" in expression
     assert "for (const cls of classes)" in expression
     assert "for (const selector of selectorCandidates(el))" in expression
+    assert "image_count" in expression
+    assert "picture source[srcset]" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
@@ -5314,6 +5320,7 @@ def js(expression, returnByValue=True):
                 "count": 3,
                 "price_signal_count": 3,
                 "link_count": 0,
+                "image_count": 3,
                 "samples": ["DNA Netti 300M 19,90 €/kk"],
             }
         ],
@@ -5326,6 +5333,7 @@ records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
 assert records["records"][0]["labels"] == ["DNA Netti 300M product card"]
+assert records["records"][0]["images"][0]["src"] == "https://example.test/dna.png"
 assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))

@@ -420,14 +420,16 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     const priceSignals = samples.filter(text => priceRe.test(text)).length;
     const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
     const links = new Set();
+    let imageCount = 0;
     for (const el of items.slice(0, 10)) {{
       if (el.matches('a[href]')) links.add(el.href);
       for (const a of el.querySelectorAll('a[href]')) links.add(a.href);
+      imageCount += el.querySelectorAll('img[src],img[srcset],picture source[srcset]').length;
     }}
-    let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8);
+    let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8) + Math.min(imageCount, 6);
     if (priceSignals) score += priceSignals * 6;
     if (/^(li|div|article|section|tr)($|[.#])/.test(selector)) score += 1;
-    return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, score, samples }};
+    return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, image_count: imageCount, score, samples }};
   }};
   const groups = new Map();
   for (const el of document.querySelectorAll('article, section, li, tr, a[href], button, [role="button"], [class]')) {{
@@ -468,6 +470,15 @@ def extract_repeated_items(selector, limit=50, include_html=False):
   const includeHtml = {json.dumps(bool(include_html))};
   const clean = (text, max = 2000) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
   const imageAlts = (el) => Array.from(el.querySelectorAll('img[alt]')).map(img => clean(img.getAttribute('alt'), 200)).filter(Boolean).slice(0, 8);
+  const imageRecords = (el) => Array.from(el.querySelectorAll('img[src],img[srcset]')).map(img => {{
+    const rect = img.getBoundingClientRect();
+    return {{
+      alt: clean(img.getAttribute('alt'), 200),
+      src: img.currentSrc || img.src || img.getAttribute('src') || '',
+      width: Math.round(rect.width || img.naturalWidth || 0),
+      height: Math.round(rect.height || img.naturalHeight || 0),
+    }};
+  }}).filter(img => img.src || img.alt).slice(0, 8);
   const recordText = (el) => clean([
     el.innerText || el.textContent || '',
     el.getAttribute('aria-label') || '',
@@ -489,7 +500,8 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     }}).slice(0, 8).map(a => ({{ text: clean(a.textContent || a.value, 160), href: a.href }}));
     const buttons = buttonNodes.slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
-    const record = {{ index, text, headings, labels, prices, links, buttons }};
+    const images = imageRecords(el);
+    const record = {{ index, text, headings, labels, prices, links, buttons, images }};
     if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
     return record;
   }});
