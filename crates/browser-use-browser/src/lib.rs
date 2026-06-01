@@ -5292,6 +5292,7 @@ def js(expression, returnByValue=True):
             }
         ]
     assert "el.matches('a[href]')" in expression
+    assert expression.index("if (classes.length)") < expression.index("if (el.id)")
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",

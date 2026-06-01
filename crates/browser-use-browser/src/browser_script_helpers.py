@@ -397,9 +397,9 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
   const clean = (text, max = 240) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
   const cssPath = (el) => {{
     if (!el || !el.tagName) return '';
-    if (el.id) return `${{el.tagName.toLowerCase()}}#${{CSS.escape(el.id)}}`;
     const classes = [...el.classList].filter(c => c && !/^ng-|^css-|^sc-|^_[a-z0-9]/i.test(c)).slice(0, 2);
     if (classes.length) return `${{el.tagName.toLowerCase()}}.${{classes.map(c => CSS.escape(c)).join('.')}}`;
+    if (el.id) return `${{el.tagName.toLowerCase()}}#${{CSS.escape(el.id)}}`;
     return el.tagName.toLowerCase();
   }};
   const scoreGroup = (items, selector) => {{
