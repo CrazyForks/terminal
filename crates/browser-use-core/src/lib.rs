@@ -24829,6 +24829,7 @@ pub fn resolve_agent_reference_in_tree(
                     .unwrap_or_else(|_| agent.child_session_id.clone())
             });
             (agent.child_session_id == reference
+                || agent.agent_nickname.as_deref() == Some(reference)
                 || agent.agent_path.as_deref() == Some(reference)
                 || agent.agent_path.as_deref() == Some(canonical.as_str()))
             .then(|| ResolvedAgentReference {
@@ -24928,17 +24929,22 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
     let Some(target_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "send_input requires target");
     };
-    let target_session = match store.load_session(target_session_id)? {
-        Some(target_session) => target_session,
-        None => {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                &format!("agent id `{target_session_id}` not found"),
-            )
-        }
+    let Some(target_agent) = resolve_agent_reference_in_tree(store, &session.id, target_session_id)?
+    else {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("live agent `{target_session_id}` not found"),
+        );
     };
+    if target_agent.is_root {
+        return dispatch_tool_validation_error(store, session, call, "root is not a spawned agent");
+    };
+    let target_session_id = target_agent.session_id;
+    let target_session = store
+        .load_session(&target_session_id)?
+        .with_context(|| format!("unknown child session id: {target_session_id}"))?;
     let input = match collab_input_from_call(call) {
         Ok(input) => input,
         Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
@@ -24958,11 +24964,11 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        store.request_cancel(target_session_id, "interrupted by parent agent")?;
+        store.request_cancel(&target_session_id, "interrupted by parent agent")?;
     }
     let followup_payload =
         collab_input_event_payload_with_context(&input, Path::new(&target_session.cwd))?;
-    let followup = store.append_event(target_session_id, "session.followup", followup_payload)?;
+    let followup = store.append_event(&target_session_id, "session.followup", followup_payload)?;
     store.append_event(
         &session.id,
         "agent.message",
@@ -24989,7 +24995,7 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
             start_child_agent_background(
                 store,
                 &session.id,
-                target_session_id,
+                &target_session_id,
                 None,
                 None,
                 None,
@@ -24999,10 +25005,10 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
         }
     } else {
         let run_error =
-            run_existing_session_with_provider(store, provider, target_session_id, options.clone())
+            run_existing_session_with_provider(store, provider, &target_session_id, options.clone())
                 .err()
                 .map(|error| format!("{error:#}"));
-        update_parent_from_child_run(store, &session.id, target_session_id, run_error)?;
+        update_parent_from_child_run(store, &session.id, &target_session_id, run_error)?;
     }
     Ok(ToolDispatchOutcome {
         finished: false,
@@ -25811,37 +25817,25 @@ fn dispatch_close_agent_v1_tool(
     {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
-    let Some(child_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
+    let Some(child_ref) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
     };
-    if !is_local_agent_id(child_session_id) {
+    let Some(target_agent) = resolve_agent_reference_in_tree(store, &session.id, child_ref)? else {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            &format!("invalid agent id `{child_session_id}`"),
+            &format!("live agent `{child_ref}` not found"),
         );
-    }
-    let child = match store.load_session(child_session_id)? {
-        Some(child) if child.parent_id.is_some() => child,
-        Some(_) => {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                "root is not a spawned agent",
-            )
-        }
-        None => {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                &format!("agent id `{child_session_id}` not found"),
-            )
-        }
     };
-    let agent_summary = store.agent_summary_for_child(child_session_id)?;
+    if target_agent.is_root {
+        return dispatch_tool_validation_error(store, session, call, "root is not a spawned agent");
+    }
+    let child_session_id = target_agent.session_id;
+    let child = store
+        .load_session(&child_session_id)?
+        .with_context(|| format!("unknown child session id: {child_session_id}"))?;
+    let agent_summary = target_agent.summary;
     store.append_event(
         &session.id,
         "tool.started",
@@ -25852,8 +25846,8 @@ fn dispatch_close_agent_v1_tool(
         }),
     )?;
     let previous_status = local_agent_status_value(store, &child, agent_summary.as_ref())?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, child_session_id)?;
-    store.close_child_agent(child_session_id, "closed by parent agent")?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_session_id)?;
+    store.close_child_agent(&child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
         "agent.cancelled",
@@ -44793,7 +44787,7 @@ description = "Missing developer instructions"
             name: "send_input".to_string(),
             namespace: Some("multi_agent_v1".to_string()),
             arguments: serde_json::json!({
-                "target": child.id,
+                "target": "typed_child",
                 "items": [
                     {"type": "text", "text": "look at this"},
                     {"type": "image", "image_url": "data:image/png;base64,abc"},
@@ -45363,11 +45357,12 @@ command = "explicit-mcp"
     }
 
     #[test]
-    fn multi_agent_v1_resume_and_close_use_id_tree_edges_like_codex() -> Result<()> {
+    fn multi_agent_v1_resume_and_close_use_returned_refs_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
-        let child = store.create_child_session(&parent.id, temp.path(), None, None, None)?;
+        let child =
+            store.create_child_session(&parent.id, temp.path(), None, Some("Atlas"), None)?;
         let grandchild = store.create_child_session(&child.id, temp.path(), None, None, None)?;
 
         let close = dispatch_close_agent_v1_tool(
@@ -45377,7 +45372,7 @@ command = "explicit-mcp"
                 id: "close_v1_child".to_string(),
                 name: "close_agent".to_string(),
                 namespace: Some("multi_agent_v1".to_string()),
-                arguments: serde_json::json!({ "target": child.id }),
+                arguments: serde_json::json!({ "target": "Atlas" }),
             },
         )?;
         let close_payload =
