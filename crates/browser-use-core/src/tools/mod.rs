@@ -2108,7 +2108,8 @@ The user does NOT need to explicitly ask for sub-agents — the right pattern is
 - When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.\n\
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.\n\n\
 ### After you delegate\n\
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.\n\
+- For browser/data fan-out tasks, collecting helper outputs is part of the critical path: after spawning the item/document/site helpers, call `wait_agent` with the helper ids, integrate any completed statuses, then repeat for remaining helpers until you have enough results for the final answer.\n\
+- Outside fan-out collection, call wait_agent sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.\n\
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.\n\
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.\n\
 - Do not repeatedly wait by reflex.\n\
@@ -2218,14 +2219,14 @@ fn wait_agent_v1_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> Too
         name: "wait_agent".to_string(),
         namespace: Some(MULTI_AGENT_V1_NAMESPACE.to_string()),
         namespace_description: Some(MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string()),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait for one or more agents to reach a final status. Completed statuses may include each agent's final message. When waiting on multiple fan-out helpers, the response may include only the helpers that finished before the timeout; integrate those results, then call wait_agent again with the remaining ids until the final answer has enough data. Returns empty status when timed out. Once an agent reaches a final status, a notification message will be received containing the same completed status."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "targets": {
                     "type": "array",
-                    "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.",
+                    "description": "Agent ids to wait on. Pass multiple ids during fan-out collection; the tool returns statuses for whichever target(s) finish first, so repeat with unfinished ids.",
                     "items": {
                         "type": "string"
                     }
@@ -2531,6 +2532,12 @@ mod tests {
         assert!(spec
             .description
             .contains("Run multiple independent information-seeking subtasks in parallel"));
+        assert!(spec
+            .description
+            .contains("For browser/data fan-out tasks, collecting helper outputs"));
+        assert!(!spec
+            .description
+            .contains("Call wait_agent very sparingly"));
         assert!(!spec
             .description
             .contains("spawn a read-only helper with role \"explorer\" before answering"));
@@ -2715,6 +2722,17 @@ mod tests {
                 "expected flat dispatch handler for {tool_name}"
             );
         }
+        let flat_wait = flat_specs
+            .iter()
+            .find(|spec| spec.namespace.is_none() && spec.name == "wait_agent")
+            .expect("flat V1 wait_agent spec");
+        assert!(flat_wait
+            .description
+            .contains("call wait_agent again with the remaining ids"));
+        assert!(flat_wait.input_schema["properties"]["targets"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("repeat with unfinished ids"));
 
         let loaded = registry.search_deferred_tools("spawn subagent", 8);
         assert_eq!(loaded.len(), 1);
