@@ -2453,6 +2453,8 @@ mod tests {
             "action=\"observe\"",
             "cdp(...)",
             "Do not import Playwright",
+            "Each `browser_script` call starts a fresh Python process.",
+            "Python variables do not persist across calls.",
             "audit_artifact",
         ] {
             assert!(
@@ -2460,6 +2462,10 @@ mod tests {
                 "missing {expected:?} from browser_script tool description:\n{description}"
             );
         }
+        assert!(
+            !description.contains("Python namespace persists"),
+            "browser_script description must not tell the model Python variables persist:\n{description}"
+        );
     }
 
     #[test]

@@ -11989,6 +11989,8 @@ mod tests {
         assert!(!none.contains("supportive teammate as much as code quality"));
         assert!(!none.contains("deeply pragmatic, effective software engineer"));
         assert!(none.contains("Browser Agent Contract"));
+        assert!(none.contains("Python variables do not persist across calls"));
+        assert!(!none.contains("Python namespace persists"));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
             "custom-model",
