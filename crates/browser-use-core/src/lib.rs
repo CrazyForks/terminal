@@ -13339,7 +13339,7 @@ fn dispatch_tool_call<P: ModelProvider>(
             true,
         ),
         ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call, options),
-        ToolHandlerKind::WaitAgentV1 => dispatch_wait_agent_v1_tool(store, session, call),
+        ToolHandlerKind::WaitAgentV1 => dispatch_wait_agent_v1_tool(store, session, call, options),
         ToolHandlerKind::SendInputV1 => {
             dispatch_send_input_v1_tool(store, provider, session, call, options)
         }
@@ -24938,6 +24938,7 @@ fn dispatch_wait_agent_v1_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     if let Err(error) =
         validate_tool_arguments_object(&call.arguments, "wait_agent", &["targets", "timeout_ms"])
@@ -24961,11 +24962,17 @@ fn dispatch_wait_agent_v1_tool(
             &format!("invalid agent id `{invalid}`"),
         );
     }
+    let config = match load_provider_config_for_session(session, options) {
+        Ok(config) => config.multi_agent_v2,
+        Err(error) => {
+            return dispatch_tool_validation_error(store, session, call, &error.to_string())
+        }
+    };
     let timeout_ms = call
         .arguments
         .get("timeout_ms")
         .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS);
+        .unwrap_or(config.default_wait_timeout_ms);
     if timeout_ms <= 0 {
         return dispatch_tool_validation_error(
             store,
@@ -24974,10 +24981,7 @@ fn dispatch_wait_agent_v1_tool(
             "timeout_ms must be greater than zero",
         );
     }
-    let timeout_ms = timeout_ms.clamp(
-        DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
-        DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
-    );
+    let timeout_ms = timeout_ms.clamp(config.min_wait_timeout_ms, config.max_wait_timeout_ms);
     store.append_event(
         &session.id,
         "tool.started",
@@ -45305,6 +45309,51 @@ command = "explicit-mcp"
         assert!(!message_content_text(&outcome.messages[0])
             .contains("max_concurrent_threads_per_session"));
         assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v1_uses_configured_default_timeout_like_visible_schema() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(&parent.id, temp.path(), None, None, None)?;
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "still running"}),
+        )?;
+        let started = Instant::now();
+
+        let outcome = dispatch_wait_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_v1_config_default".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"targets": [child.id]}),
+            },
+            &AgentRunOptions::default().with_config_overrides(vec![
+                (
+                    "features.multi_agent_v2.min_wait_timeout_ms".to_string(),
+                    toml::Value::Integer(1),
+                ),
+                (
+                    "features.multi_agent_v2.default_wait_timeout_ms".to_string(),
+                    toml::Value::Integer(1),
+                ),
+                (
+                    "features.multi_agent_v2.max_wait_timeout_ms".to_string(),
+                    toml::Value::Integer(10),
+                ),
+            ]),
+        )?;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["timed_out"], true);
+        assert_eq!(payload["status"], serde_json::json!({}));
         Ok(())
     }
 
