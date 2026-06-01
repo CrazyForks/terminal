@@ -25219,6 +25219,9 @@ fn dispatch_wait_agent_tool(
         if !store.messages_for_agent(&session.id)?.is_empty() {
             break false;
         }
+        if has_final_child_agent_status_for_wait(store, session)? {
+            break false;
+        }
         if started.elapsed() >= timeout {
             break true;
         }
@@ -25257,6 +25260,36 @@ fn dispatch_wait_agent_tool(
             }),
         )?],
     })
+}
+
+fn has_final_child_agent_status_for_wait(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+) -> Result<bool> {
+    let root_id = root_session_id(store, &session.id)?;
+    for agent in collect_agent_tree(store, &root_id)? {
+        if agent.status == "closed" {
+            continue;
+        }
+        let Some(child) = store.load_session(&agent.child_session_id)? else {
+            continue;
+        };
+        if !child.status.is_active() && child.status != SessionStatus::Created {
+            return Ok(true);
+        }
+        let status = local_agent_status_value(store, &child, Some(&agent))?;
+        if agent_status_is_final_for_wait(&status) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn agent_status_is_final_for_wait(status: &Value) -> bool {
+    status
+        .as_object()
+        .is_some_and(|object| object.contains_key("completed") || object.contains_key("errored"))
+        || status.as_str() == Some("shutdown")
 }
 
 fn live_agents_in_root_tree(store: &Store, session_id: &str) -> Result<Vec<AgentSummary>> {
@@ -45831,6 +45864,62 @@ command = "explicit-mcp"
         assert_eq!(data["timed_out"], false);
         assert_eq!(data["message"], "Wait completed.");
         assert!(content.contains("second finished"));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v2_wakes_on_final_child_status_without_mailbox() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/no_mailbox_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "finish without parent notification"}),
+        )?;
+        let state_dir = store.state_dir().to_path_buf();
+        let child_id = child.id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let store = Store::open(&state_dir).expect("open store");
+            store
+                .append_event(
+                    &child_id,
+                    "session.done",
+                    serde_json::json!({"result": "finished without mailbox"}),
+                )
+                .expect("finish child");
+            store
+                .set_child_agent_status(&child_id, "done")
+                .expect("set child status");
+        });
+
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_no_mailbox".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
+            },
+            &AgentRunOptions::default(),
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        assert_eq!(data["timed_out"], false);
+        assert_eq!(data["message"], "Wait completed.");
+        assert!(content.contains("finished without mailbox"));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
         Ok(())
     }
 
