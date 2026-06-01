@@ -1,4 +1,4 @@
-use browser_use_core::CollaborationModeKind;
+use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_protocol::{
     normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
     WorkbenchState,
@@ -459,10 +459,11 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
     let session = state.current_session.as_ref()?;
     let raw_events = app.cached_events_for_session(&session.id);
     let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
-    let events = browser_use_core::rollback_filtered_event_records(raw_events)
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let events =
+        browser_use_agent::context::workspace_context::rollback_filtered_event_records(raw_events)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
     let events = events.as_slice();
     let mut committed = Vec::new();
     let mut terminal_committed = Vec::new();
@@ -835,13 +836,124 @@ fn committed_node_for_event(
                 root, events, event, node,
             ))
         }
+        "collab_agent_spawn_begin"
+        | "collab_agent_interaction_begin"
+        | "collab_close_begin"
+        | "collab_resume_begin" => None,
+        "collab_agent_spawn_end" => {
+            if has_later_root_event(events, event, "agent.spawned") {
+                None
+            } else {
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "started",
+                    NodeStyle::Normal,
+                ))
+            }
+        }
+        "collab_agent_interaction_end" => {
+            if has_agent_message_for_collab_receiver(events, event) {
+                None
+            } else {
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "messaged",
+                    NodeStyle::Muted,
+                ))
+            }
+        }
+        "collab_waiting_begin" => {
+            if has_later_root_event(events, event, "agent.wait.started") {
+                None
+            } else {
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "waiting",
+                    NodeStyle::Muted,
+                ))
+            }
+        }
+        "collab_waiting_end" => {
+            if has_later_root_event(events, event, "agent.wait.finished") {
+                None
+            } else {
+                Some(timeline_node(
+                    event,
+                    "subagent wait finished",
+                    Vec::new(),
+                    NodeStyle::Muted,
+                ))
+            }
+        }
+        "collab_close_end" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "stopped",
+            NodeStyle::Muted,
+        )),
+        "collab_resume_end" => {
+            if has_later_root_event(events, event, "agent.resumed") {
+                None
+            } else {
+                Some(subagent_lifecycle_node(
+                    app,
+                    event,
+                    "resumed",
+                    NodeStyle::Normal,
+                ))
+            }
+        }
         "agent.spawned" => Some(subagent_lifecycle_node(
             app,
             event,
             "started",
             NodeStyle::Normal,
         )),
-        "agent.wait.started" | "agent.wait.finished" => None,
+        "agent.message" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            if event
+                .payload
+                .get("trigger_turn")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "sent task"
+            } else {
+                "messaged"
+            },
+            NodeStyle::Muted,
+        )),
+        "agent.wait.started" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "waiting",
+            NodeStyle::Muted,
+        )),
+        "agent.wait.finished" => Some(timeline_node(
+            event,
+            if event
+                .payload
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "subagent wait timed out"
+            } else {
+                "subagent wait finished"
+            },
+            Vec::new(),
+            NodeStyle::Muted,
+        )),
+        "agent.resumed" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "resumed",
+            NodeStyle::Normal,
+        )),
         "agent.completed" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -869,6 +981,12 @@ fn committed_node_for_event(
             "error",
             tool_failed_lines(event),
             NodeStyle::Failed,
+        )),
+        "tool.aborted" => Some(timeline_node(
+            event,
+            "run",
+            tool_failed_lines(event),
+            NodeStyle::Muted,
         )),
         "tool.output_spilled" => {
             let path = event
@@ -1085,7 +1203,6 @@ fn committed_node_for_event(
         | "session.cancel_requested"
         | "agent.context"
         | "agent.updated"
-        | "agent.message"
         | "telemetry.trace"
         | "telemetry.failed"
         | "command.cleaned_up" => None,
@@ -1589,6 +1706,7 @@ fn is_live_output_event(event: &EventRecord) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
         "command.waiting"
+        | "tool.output_delta"
         | "tool.started"
         | "browser.page"
         | "browser.state"
@@ -1649,7 +1767,48 @@ fn active_node_for_event(
             vec!["retrying model request".to_string()],
             NodeStyle::Muted,
         )),
-        "agent.wait.started" => None,
+        "collab_agent_spawn_begin" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["spawning".to_string()],
+            NodeStyle::Muted,
+        )),
+        "collab_agent_interaction_begin" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["messaging".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.wait.started" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["waiting".to_string()],
+            NodeStyle::Muted,
+        )),
+        "collab_waiting_begin" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["waiting".to_string()],
+            NodeStyle::Muted,
+        )),
+        "collab_close_begin" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["stopping".to_string()],
+            NodeStyle::Muted,
+        )),
+        "collab_resume_begin" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["resuming".to_string()],
+            NodeStyle::Muted,
+        )),
         "command.waiting" => Some(active_status_node(
             root,
             events,
@@ -2154,6 +2313,7 @@ fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "browser_script" => Some(("browser", "running browser script")),
         "python" => Some(("python", "running browser Python")),
+        "shell" => Some(("run", "running command")),
         "exec_command" => Some(("run", "running command")),
         "write_stdin" => Some(("run", "writing to command")),
         "apply_patch" => Some(("edit", "applying patch")),
@@ -2172,6 +2332,7 @@ fn tool_output_group(name: &str) -> &str {
     match name {
         "browser_script" => "browser",
         "python" => "python",
+        "shell" | "exec_command" | "write_stdin" => "run",
         _ => "tool",
     }
 }
@@ -2181,8 +2342,6 @@ fn is_known_tool_with_domain_events(name: &str) -> bool {
         name,
         "done"
             | "python"
-            | "exec_command"
-            | "write_stdin"
             | "apply_patch"
             | "read_file"
             | "search_files"
@@ -3490,6 +3649,38 @@ fn is_subagent_management_tool(name: &str) -> bool {
     )
 }
 
+fn has_later_root_event(events: &[EventRecord], event: &EventRecord, event_type: &str) -> bool {
+    events.iter().any(|candidate| {
+        candidate.session_id == event.session_id
+            && candidate.seq > event.seq
+            && candidate.event_type == event_type
+    })
+}
+
+fn has_agent_message_for_collab_receiver(events: &[EventRecord], event: &EventRecord) -> bool {
+    let Some(receiver_thread_id) = event
+        .payload
+        .get("receiver_thread_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    events.iter().any(|candidate| {
+        candidate.session_id == event.session_id
+            && candidate.event_type == "agent.message"
+            && (candidate
+                .payload
+                .get("target_session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(receiver_thread_id)
+                || candidate
+                    .payload
+                    .get("child_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(receiver_thread_id))
+    })
+}
+
 fn subagent_lifecycle_node(
     app: &App,
     event: &EventRecord,
@@ -3510,6 +3701,18 @@ fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
         .or_else(|| {
             event
                 .payload
+                .get("new_thread_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            event
+                .payload
+                .get("receiver_thread_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            event
+                .payload
                 .get("payload")
                 .and_then(|payload| payload.get("child_session_id"))
                 .and_then(serde_json::Value::as_str)
@@ -3522,22 +3725,55 @@ fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
         }
     }
 
-    ["nickname", "role", "task_name", "agent_path"]
-        .into_iter()
-        .find_map(|key| {
-            event
-                .payload
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .and_then(normalize_subagent_label)
-                .or_else(|| {
-                    event
-                        .payload
-                        .get("payload")
-                        .and_then(|payload| payload.get(key))
+    if let Some(label) = [
+        "nickname",
+        "role",
+        "task_name",
+        "agent_path",
+        "recipient_path",
+        "new_agent_nickname",
+        "new_agent_role",
+        "receiver_agent_nickname",
+        "receiver_agent_role",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        event
+            .payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(normalize_subagent_label)
+            .or_else(|| {
+                event
+                    .payload
+                    .get("payload")
+                    .and_then(|payload| payload.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(normalize_subagent_label)
+            })
+    }) {
+        return Some(label);
+    }
+
+    event
+        .payload
+        .get("receiver_agents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|agents| {
+            if agents.len() == 1 {
+                agents.first().and_then(|agent| {
+                    agent
+                        .get("agent_nickname")
                         .and_then(serde_json::Value::as_str)
+                        .or_else(|| agent.get("agent_role").and_then(serde_json::Value::as_str))
+                        .or_else(|| agent.get("thread_id").and_then(serde_json::Value::as_str))
                         .and_then(normalize_subagent_label)
                 })
+            } else if agents.len() > 1 {
+                Some(format!("{} subagents", agents.len()))
+            } else {
+                None
+            }
         })
 }
 
@@ -3875,6 +4111,32 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("Traceback (most recent call last)")));
+    }
+
+    #[test]
+    fn shell_tool_output_uses_run_group_and_shows_text() {
+        let event = EventRecord {
+            seq: 8,
+            id: "event-8".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "shell",
+                "text": "hello from command\nsecond line"
+            }),
+        };
+
+        let node = tool_output_node(&event).expect("tool output node");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("• run"), "{text}");
+        assert!(text.contains("hello from command"), "{text}");
     }
 
     #[test]
