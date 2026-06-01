@@ -22199,7 +22199,13 @@ fn dispatch_done_tool(
         (true, Some(rf)) if rf.bytes <= DONE_AUTO_INLINE_MAX_BYTES => {
             std::fs::read_to_string(&rf.path)
                 .map(|s| s.trim_end().to_string())
-                .map(|s| if s.is_empty() { done_result_file_message(rf) } else { s })
+                .map(|s| {
+                    if s.is_empty() {
+                        done_result_file_message(rf)
+                    } else {
+                        s
+                    }
+                })
                 .unwrap_or_else(|_| done_result_file_message(rf))
         }
         (true, Some(rf)) => done_result_file_message(rf),
@@ -22345,14 +22351,50 @@ fn done_result_file_info(
 
 fn done_result_file_message(result_file: &DoneResultFile) -> String {
     let directory = result_file.path.parent().unwrap_or_else(|| Path::new("."));
-    format!(
+    let mut message = format!(
         "Saved result file.\n\nFile:\n{}\n\nDirectory:\n{}\n\nLocal path:\n{}\nSize: {} bytes\nMIME: {}\n\nThe full result is in the file above. It is not inlined here so the terminal stays responsive.",
         file_url(&result_file.path),
         file_url(directory),
         result_file.path.display(),
         result_file.bytes,
         result_file.mime,
-    )
+    );
+    if let Some(preview) = done_result_file_preview(result_file) {
+        message.push_str("\n\nPreview of the saved result:\n");
+        message.push_str(&preview);
+    }
+    message
+}
+
+fn done_result_file_preview(result_file: &DoneResultFile) -> Option<String> {
+    if !matches!(
+        result_file.mime,
+        "application/json" | "text/csv" | "text/html" | "text/markdown" | "text/plain"
+    ) {
+        return None;
+    }
+    const DONE_RESULT_FILE_PREVIEW_MAX_BYTES: u64 = 16 * 1024;
+    const DONE_RESULT_FILE_PREVIEW_MAX_CHARS: usize = 12_000;
+    let mut file = File::open(&result_file.path).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(DONE_RESULT_FILE_PREVIEW_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut preview = String::from_utf8_lossy(&bytes).trim().to_string();
+    if preview.is_empty() {
+        return None;
+    }
+    if preview.chars().count() > DONE_RESULT_FILE_PREVIEW_MAX_CHARS {
+        preview = preview
+            .chars()
+            .take(DONE_RESULT_FILE_PREVIEW_MAX_CHARS)
+            .collect();
+    }
+    if result_file.bytes > DONE_RESULT_FILE_PREVIEW_MAX_BYTES {
+        preview.push_str("\n...[truncated preview]");
+    }
+    Some(preview)
 }
 
 fn guess_mime_from_path(path: &Path) -> &'static str {
@@ -40626,9 +40668,8 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             .find(|event| event.event_type == "session.done")
             .context("missing session.done")?;
         let result = done.payload["result"].as_str().context("result text")?;
-        assert!(result.contains("Saved result file."));
-        assert!(result.contains("answer.json"));
-        assert!(!result.contains("\"id\":2"));
+        assert!(result.contains("\"id\":2"));
+        assert!(!result.contains("Saved result file."));
         assert!(done.payload["result_file_path"]
             .as_str()
             .is_some_and(|path| path.ends_with("answer.json")));
@@ -40653,6 +40694,43 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
                     .as_str()
                     .is_some_and(|path| path.ends_with("answer.json"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_result_file_large_text_includes_preview() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let mut large = String::from("id,name\n1,visible preview row\n");
+        large.push_str(&"2,extra row\n".repeat(25_000));
+        std::fs::write(Path::new(&session.cwd).join("large.csv"), large)?;
+
+        let outcome = dispatch_done_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "done_large_result_file".to_string(),
+                name: "done".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "result_file": "large.csv",
+                }),
+            },
+        )?;
+        assert!(outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        let done = events
+            .iter()
+            .find(|event| event.event_type == "session.done")
+            .context("missing session.done")?;
+        let result = done.payload["result"].as_str().context("result text")?;
+        assert!(result.contains("Saved result file."));
+        assert!(result.contains("Preview of the saved result:"));
+        assert!(result.contains("visible preview row"));
+        assert!(result.contains("...[truncated preview]"));
+        assert_eq!(done.payload["source"], "done.result_file");
+        assert_eq!(done.payload["result_file"], "large.csv");
         Ok(())
     }
 
