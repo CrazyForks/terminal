@@ -222,10 +222,9 @@ const DEFAULT_AGENT_NICKNAMES: &str = include_str!("agent_names.txt");
 const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
 const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 // Browser eval fan-out tasks routinely need one helper per item for 5-10 item
-// lists/cascades. Keeping the V2 runtime default at 4 contradicted the
-// browser-agent prompt's mandatory N>=5 fan-out rule and made the fifth helper
-// fail before the agent could collect enough coverage.
-const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 10;
+// lists/cascades. The runtime cap counts the root thread too, so 11 total
+// threads are required to allow the parent plus 10 helpers.
+const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 11;
 const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
 // 30s was the old default; browser sub-agents commonly run 30-90s per item
@@ -43249,7 +43248,7 @@ developer_instructions = "Research carefully"
             default_config
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
-            10
+            11
         );
 
         std::fs::write(
@@ -43633,6 +43632,75 @@ usage_hint_enabled = false
             .unwrap_or_default()
             .contains("max_concurrent_threads_per_session = 2"));
         assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn default_v2_fanout_cap_allows_ten_helpers_plus_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::with_text("child result");
+        let options = AgentRunOptions::default();
+
+        for index in 0..10 {
+            let outcome = with_browser_use_terminal_home(&app_home, || {
+                dispatch_spawn_agent_tool(
+                    &store,
+                    &provider,
+                    &session,
+                    &ToolCall {
+                        id: format!("spawn_{index}"),
+                        name: "spawn_agent".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({
+                            "message": format!("inspect item {index}"),
+                            "task_name": format!("item_{index}"),
+                        }),
+                    },
+                    &options,
+                    &None,
+                )
+            })?;
+            assert!(
+                !outcome.messages[0]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("max_concurrent_threads_per_session"),
+                "helper {index} should fit under default cap"
+            );
+        }
+
+        assert_eq!(store.list_child_agents(&session.id)?.len(), 10);
+
+        let rejected = with_browser_use_terminal_home(&app_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &ToolCall {
+                    id: "spawn_over_default_cap".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "message": "inspect overflow item",
+                        "task_name": "item_10",
+                    }),
+                },
+                &options,
+                &None,
+            )
+        })?;
+        assert!(rejected.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_concurrent_threads_per_session = 11"));
+        assert_eq!(store.list_child_agents(&session.id)?.len(), 10);
         Ok(())
     }
 
