@@ -2461,6 +2461,7 @@ mod tests {
             "audit_artifact",
             "audit_artifact(path=\"result.json\", ...)",
             "records_path=\"payload.results\"",
+            "\"source.url\"",
             "required_fields",
             "unique_by",
         ] {

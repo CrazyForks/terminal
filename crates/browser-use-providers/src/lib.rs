@@ -11996,6 +11996,7 @@ mod tests {
         assert!(none.contains("required_fields"));
         assert!(none.contains("audit_artifact(path=\"result.json\""));
         assert!(none.contains("records_path=\"payload.results\""));
+        assert!(none.contains("\"source.url\""));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
             "custom-model",

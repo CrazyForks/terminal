@@ -4573,6 +4573,23 @@ def _audit_path_get(data, records_path):
             return None
     return current
 
+def _audit_normalize_fields(fields):
+    if isinstance(fields, str):
+        return [fields]
+    return list(fields)
+
+def _audit_field_value(row, field):
+    if not isinstance(row, dict):
+        return None
+    current = row
+    for part in str(field).split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
 def _audit_select_records(data, requirements, details):
     if isinstance(data, list):
         return data
@@ -4643,11 +4660,11 @@ def audit_artifact(data=None, **requirements):
             required_fields = requirements.pop("required_fields", None) or requirements.pop("required_keys", None)
             if required_fields:
                 checks["required_fields"] = False
-                details["required_fields"] = list(required_fields)
+                details["required_fields"] = _audit_normalize_fields(required_fields)
             unique_by = requirements.pop("unique_by", None) or requirements.pop("dedupe_field", None)
             if unique_by:
                 checks["unique_by"] = False
-                details["unique_by"] = [unique_by] if isinstance(unique_by, str) else list(unique_by)
+                details["unique_by"] = _audit_normalize_fields(unique_by)
         if isinstance(records, list):
             count = len(records)
             details["record_count"] = count
@@ -4661,11 +4678,11 @@ def audit_artifact(data=None, **requirements):
                 details["exact_count"] = int(exact_count)
             required_fields = requirements.pop("required_fields", None) or requirements.pop("required_keys", None)
             if required_fields:
-                fields = list(required_fields)
+                fields = _audit_normalize_fields(required_fields)
                 missing = []
                 for index, row in enumerate(records):
                     for field in fields:
-                        value = row.get(field) if isinstance(row, dict) else None
+                        value = _audit_field_value(row, field)
                         if value is None or value == "":
                             missing.append({{"index": index, "field": field}})
                 checks["required_fields"] = not missing
@@ -4674,13 +4691,13 @@ def audit_artifact(data=None, **requirements):
                     details["missing_fields"] = missing[:20]
             unique_by = requirements.pop("unique_by", None) or requirements.pop("dedupe_field", None)
             if unique_by:
-                fields = [unique_by] if isinstance(unique_by, str) else list(unique_by)
+                fields = _audit_normalize_fields(unique_by)
                 seen = set()
                 duplicates = []
                 for index, row in enumerate(records):
                     if not isinstance(row, dict):
                         continue
-                    key = tuple(row.get(field) for field in fields)
+                    key = tuple(_audit_field_value(row, field) for field in fields)
                     if key in seen:
                         duplicates.append({{"index": index, "key": list(key)}})
                     seen.add(key)
@@ -5342,6 +5359,25 @@ nested = audit_artifact(path=str(nested_path), records_path="payload.results", e
 assert nested["ready_for_done"] is True, nested
 assert nested["details"]["records_path"] == "payload.results", nested
 assert nested["details"]["record_count"] == 2, nested
+
+nested_fields_path = pathlib.Path(outputs_dir()) / "nested-fields.json"
+nested_fields_path.write_text(json.dumps({
+    "items": [
+        {"name": "Ada", "source": {"url": "https://example.test/a"}},
+        {"name": "Grace", "source": {"url": "https://example.test/b"}},
+    ]
+}), encoding="utf-8")
+nested_fields = audit_artifact(path=str(nested_fields_path), min_count=2, required_fields="source.url", unique_by="source.url", nonempty_file=True)
+assert nested_fields["ready_for_done"] is True, nested_fields
+assert nested_fields["details"]["required_fields"] == ["source.url"], nested_fields
+assert nested_fields["details"]["unique_by"] == ["source.url"], nested_fields
+
+missing_nested_path = pathlib.Path(outputs_dir()) / "missing-nested-fields.json"
+missing_nested_path.write_text(json.dumps({"items": [{"name": "Ada", "source": {}}, {"name": "Grace", "source": {"url": "https://example.test/b"}}]}), encoding="utf-8")
+missing_nested = audit_artifact(path=str(missing_nested_path), required_fields="source.url", unique_by="source.url", nonempty_file=True)
+assert missing_nested["ready_for_done"] is False, missing_nested
+assert missing_nested["checks"]["required_fields"] is False, missing_nested
+assert missing_nested["details"]["missing_fields"][0]["field"] == "source.url", missing_nested
 
 wrong_shape_path = pathlib.Path(outputs_dir()) / "wrong-shape.json"
 wrong_shape_path.write_text(json.dumps({"summary": {"count": 2}}), encoding="utf-8")
