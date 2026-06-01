@@ -112,6 +112,8 @@ impl AgentTelemetry {
             KeyValue::new(SESSION_ID, session_id.to_string()),
             KeyValue::new("browser_use.session_id", session_id.to_string()),
             KeyValue::new("browser_use.cwd", cwd.to_string()),
+            KeyValue::new("browser_use.turn_phase", "agent"),
+            KeyValue::new("browser_use.turn_order", -1_i64),
         ];
         if let Some(parent_session_id) = parent_session_id {
             attrs.push(KeyValue::new(
@@ -146,6 +148,11 @@ impl AgentTelemetry {
             KeyValue::new("gen_ai.request.model", input.model_name.to_string()),
             KeyValue::new("gen_ai.response.model", input.model_name.to_string()),
             KeyValue::new("browser_use.turn_index", input.turn_idx as i64),
+            KeyValue::new("browser_use.turn_phase", "llm"),
+            KeyValue::new(
+                "browser_use.turn_order",
+                turn_order(input.turn_idx, 100),
+            ),
             KeyValue::new("browser_use.llm.provider", input.provider_name.to_string()),
         ];
         if inner.capture_payloads {
@@ -256,6 +263,8 @@ impl AgentTelemetry {
             KeyValue::new(SPAN_TYPE, "DEFAULT"),
             KeyValue::new(SESSION_ID, session_id.to_string()),
             KeyValue::new("browser_use.turn_index", turn_idx as i64),
+            KeyValue::new("browser_use.turn_phase", "step"),
+            KeyValue::new("browser_use.turn_order", turn_order(turn_idx, 0)),
         ];
         if inner.capture_payloads {
             attrs.push(KeyValue::new(
@@ -286,6 +295,8 @@ impl AgentTelemetry {
             KeyValue::new(SPAN_TYPE, "TOOL"),
             KeyValue::new(SESSION_ID, session_id.to_string()),
             KeyValue::new("browser_use.turn_index", turn_idx as i64),
+            KeyValue::new("browser_use.turn_phase", "tool"),
+            KeyValue::new("browser_use.turn_order", turn_order(turn_idx, 200)),
             KeyValue::new("browser_use.tool_call_id", call.id.clone()),
             KeyValue::new("ai.toolCall.id", call.id.clone()),
             KeyValue::new("ai.toolCall.name", call.name.clone()),
@@ -669,6 +680,10 @@ fn set_usage_attrs(span: &ActiveSpan, usage: &ModelUsage) {
     if let Some(output_cost_usd) = usage.output_cost_usd {
         span.set_attribute(KeyValue::new("gen_ai.usage.output_cost", output_cost_usd));
     }
+}
+
+fn turn_order(turn_idx: usize, phase_offset: i64) -> i64 {
+    (turn_idx as i64).saturating_mul(1_000) + phase_offset
 }
 
 fn llm_span_name(provider_name: &str) -> &'static str {
@@ -1304,11 +1319,26 @@ mod tests {
         telemetry.force_flush();
 
         let spans = exporter.spans();
+        let agent = spans
+            .iter()
+            .find(|span| span.name.as_ref() == "browser_use.agent")
+            .expect("agent span");
+        assert_eq!(
+            attr_string(agent, "browser_use.turn_phase").as_deref(),
+            Some("agent")
+        );
+        assert_eq!(attr_i64(agent, "browser_use.turn_order"), Some(-1));
+
         let step = spans
             .iter()
             .find(|span| span.name.as_ref() == "step.1")
             .expect("step span");
         assert_eq!(attr_string(step, SPAN_TYPE).as_deref(), Some("DEFAULT"));
+        assert_eq!(
+            attr_string(step, "browser_use.turn_phase").as_deref(),
+            Some("step")
+        );
+        assert_eq!(attr_i64(step, "browser_use.turn_order"), Some(0));
         assert_eq!(
             attr_string_array(step, SPAN_PATH),
             vec!["browser_use.agent", "step.1"]
@@ -1322,6 +1352,11 @@ mod tests {
             .find(|span| span.name.as_ref() == "openai.chat")
             .expect("openai chat span");
         assert_eq!(attr_string(llm, SPAN_TYPE).as_deref(), Some("LLM"));
+        assert_eq!(
+            attr_string(llm, "browser_use.turn_phase").as_deref(),
+            Some("llm")
+        );
+        assert_eq!(attr_i64(llm, "browser_use.turn_order"), Some(100));
         assert_eq!(
             attr_string_array(llm, SPAN_PATH),
             vec!["browser_use.agent", "step.1", "openai.chat"]
@@ -1394,6 +1429,11 @@ mod tests {
             .find(|span| span.name.as_ref() == "python")
             .expect("python tool span");
         assert_eq!(attr_string(tool, SPAN_TYPE).as_deref(), Some("TOOL"));
+        assert_eq!(
+            attr_string(tool, "browser_use.turn_phase").as_deref(),
+            Some("tool")
+        );
+        assert_eq!(attr_i64(tool, "browser_use.turn_order"), Some(200));
         assert_eq!(
             attr_string_array(tool, SPAN_PATH),
             vec!["browser_use.agent", "step.1", "python"]
