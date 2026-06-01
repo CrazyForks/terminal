@@ -276,6 +276,78 @@ def browser_fetch(url, headers=None, method="GET", body=None, timeout=20.0, bina
     return js(expression)
 
 
+def browser_fetch_many(urls, headers=None, method="GET", body=None, timeout=20.0, binary=False, max_concurrent=8):
+    """Fetch many URLs from the current page context with browser credentials.
+
+    Results preserve input order and include per-URL errors so one blocked API
+    endpoint does not discard the whole batch.
+    """
+    urls = list(urls or [])
+    expression = f"""
+(async () => {{
+  const urls = {json.dumps(urls)};
+  const maxConcurrent = Math.max(1, Math.min(Number({int(max_concurrent or 1)}) || 1, 16));
+  const requestInit = {{
+    method: {json.dumps(method)},
+    headers: {json.dumps(headers or {})},
+    body: {json.dumps(body) if body is not None else "undefined"},
+    credentials: 'include',
+  }};
+  const timeoutMs = {int(float(timeout) * 1000)};
+  const binary = {json.dumps(bool(binary))};
+  const encodeBytes = (bytes) => {{
+    let raw = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {{
+      raw += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }}
+    return btoa(raw);
+  }};
+  const fetchOne = async (url, index) => {{
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      const response = await fetch(url, {{...requestInit, signal: controller.signal}});
+      const responseHeaders = Object.fromEntries(Array.from(response.headers.entries()));
+      const out = {{
+        index,
+        url,
+        final_url: response.url,
+        ok: response.ok,
+        status_code: response.status,
+        status: response.status,
+        status_text: response.statusText,
+        headers: responseHeaders,
+      }};
+      if (binary) {{
+        out.content_base64 = encodeBytes(new Uint8Array(await response.arrayBuffer()));
+      }} else {{
+        out.text = await response.text();
+        if ((responseHeaders['content-type'] || '').toLowerCase().includes('json')) {{
+          try {{ out.json = JSON.parse(out.text); }} catch (err) {{}}
+        }}
+      }}
+      return out;
+    }} catch (err) {{
+      return {{index, url, ok: false, error: String(err && (err.message || err))}};
+    }} finally {{
+      clearTimeout(timeoutId);
+    }}
+  }};
+  const results = new Array(urls.length);
+  let next = 0;
+  const workers = Array.from({{length: Math.min(maxConcurrent, urls.length)}}, async () => {{
+    while (next < urls.length) {{
+      const index = next++;
+      results[index] = await fetchOne(urls[index], index);
+    }}
+  }});
+  await Promise.all(workers);
+  return results;
+}})()
+"""
+    return js(expression)
+
+
 def _truthy_env(name, default=False):
     value = os.environ.get(name)
     if value is None:

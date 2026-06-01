@@ -2446,6 +2446,7 @@ mod tests {
             "First navigation should usually be `new_tab(url)`",
             "domain_skills_for_url",
             "browser_fetch",
+            "browser_fetch_many",
             "browser cookies/session",
             "coordinate clicks",
             "click_at_xy",

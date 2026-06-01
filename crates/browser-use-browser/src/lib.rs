@@ -5283,6 +5283,11 @@ def js(expression, target_id=None, returnByValue=True):
     assert "content_base64" in expression
     assert "JSON.parse" in expression
     assert '"X-Test": "yes"' in expression
+    if "const urls =" in expression:
+        return [
+            {"index": 0, "url": "/api/a", "ok": True, "status_code": 200, "json": {"answer": 42}},
+            {"index": 1, "url": "/api/b", "ok": True, "status_code": 200, "json": {"answer": 42}},
+        ]
     return {
         "ok": True,
         "status_code": 200,
@@ -5298,6 +5303,14 @@ result = browser_fetch("https://example.test/api", headers={"X-Test": "yes"}, ti
 assert result["ok"] is True
 assert result["json"]["answer"] == 42
 assert calls and "1500" in calls[0]
+calls.clear()
+many = browser_fetch_many(["/api/a", "/api/b"], headers={"X-Test": "yes"}, timeout=2, max_concurrent=2)
+assert many[0]["index"] == 0 and many[0]["json"]["answer"] == 42
+assert many[1]["index"] == 1 and many[1]["json"]["answer"] == 42
+assert "maxConcurrent" in calls[0]
+assert "Promise.all(workers)" in calls[0]
+assert "results[index]" in calls[0]
+assert "return {index, url, ok: false, error:" in calls[0]
 print("browser_fetch ok")
 "#,
             10,
