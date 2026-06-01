@@ -224,7 +224,13 @@ const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
 const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
-const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+// 30s was the old default; browser sub-agents commonly run 30-90s per item
+// (page load + 2-4 browser_script turns + screenshot + done). 30s gave us
+// "Wait timed out." on real_v8 task 7 (10 arxiv papers in 2 batches) where
+// each sub-agent needed ~2-3 min to walk its batch. 5 min default lets a
+// typical fan-out complete; the agent can still pass a smaller timeout
+// explicitly when it knows the work is fast.
+const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 300_000;
 const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS_UPPER_BOUND: i64 =
     DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
 const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
