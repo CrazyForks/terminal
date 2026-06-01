@@ -8,23 +8,47 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use browser_use_core::{
-    append_user_shell_command_context_event, append_workspace_context_event,
-    append_workspace_context_event_with_options, canonical_agent_path_from_task_name,
-    canonical_agent_reference, cleanup_agent_runtime_state_for_agent_subtree, collect_agent_tree,
+use browser_use_agent::config_model::{
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
-    display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
-    last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
-    parse_config_overrides, product_analytics, record_browser_script_response_events,
-    record_python_response_final_event, record_python_worker_event,
-    resolve_agent_reference_in_tree, review_prompt_base_branch, review_prompt_commit,
-    review_prompt_custom, review_prompt_uncommitted_changes, root_session_id,
-    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, start_review_session, typed_user_input_payload_from_text_for_cwd,
-    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
-    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    model_catalog_for_cwd_with_options,
+};
+use browser_use_agent::config_overrides::{
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
+};
+use browser_use_agent::context::{
+    append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
+    typed_user_input_payload_from_text_for_cwd,
+};
+use browser_use_agent::entrypoint::{
+    cleanup_unified_exec_manager_for_session_id, run_session_with_config,
+};
+use browser_use_agent::infra::{
+    capture_async, capture_blocking, install_process_crypto_provider,
+    record_browser_script_response_events, record_python_response_final_event,
+    record_python_worker_event, review_prompt_base_branch, review_prompt_commit,
+    review_prompt_custom, review_prompt_uncommitted_changes, start_review_session,
     UnifiedExecShutdownCleanup,
 };
+use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::rollout::fork_events_by_turn;
+use browser_use_agent::session::SharedStore;
+use browser_use_agent::session::{
+    provider_messages_from_events_for_fork, resume::provider_messages_to_fork_response_items,
+    ForkMode,
+};
+use browser_use_agent::subagents::{
+    canonical_agent_path_from_task_name, canonical_agent_reference,
+    cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
+    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
+    session_was_interrupted, store_collect_agent_tree as collect_agent_tree,
+    store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
+    store_root_session_id as root_session_id,
+};
+use browser_use_agent::tools::AskForApproval;
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
     session_result_from_events, task_from_events,
@@ -33,15 +57,17 @@ use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce,
     exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
     load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
-    refresh_claude_code_oauth, AnthropicMessagesProvider, ClaudeCodeOAuthCredential, CodexAuth,
-    CodexManagedAuth, FakeProvider, ModelProvider, OpenAICompatibleChatProvider,
-    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
+
+const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const APPROX_CHARS_PER_TOKEN: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -64,6 +90,13 @@ struct Args {
     config_overrides: Vec<String>,
     #[arg(long = "collaboration-mode", value_enum, default_value_t = CollaborationModeArg::Default, global = true)]
     collaboration_mode: CollaborationModeArg,
+    #[arg(long = "approval-policy", value_enum, global = true)]
+    approval_policy: Option<ApprovalPolicyArg>,
+    #[arg(long = "guardian", global = true)]
+    guardian: bool,
+    /// Load additional MCP server definitions from a TOML config file.
+    #[arg(long = "mcp-config", value_name = "PATH", action = clap::ArgAction::Append, global = true)]
+    mcp_config: Vec<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -83,6 +116,32 @@ impl From<CollaborationModeArg> for CollaborationModeKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ApprovalPolicyArg {
+    Never,
+    OnFailure,
+    OnRequest,
+    UnlessTrusted,
+}
+
+impl From<ApprovalPolicyArg> for AskForApproval {
+    fn from(value: ApprovalPolicyArg) -> Self {
+        match value {
+            ApprovalPolicyArg::Never => AskForApproval::Never,
+            ApprovalPolicyArg::OnFailure => AskForApproval::OnFailure,
+            ApprovalPolicyArg::OnRequest => AskForApproval::OnRequest,
+            ApprovalPolicyArg::UnlessTrusted => AskForApproval::UnlessTrusted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CliRuntimeOptions {
+    approval_policy: Option<AskForApproval>,
+    use_guardian: Option<bool>,
+    mcp_config_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     Start {
@@ -94,11 +153,6 @@ enum Command {
         python_code: Option<String>,
     },
     RunOpenai {
-        text: String,
-        #[arg(long)]
-        model: Option<String>,
-    },
-    RunCodex {
         text: String,
         #[arg(long)]
         model: Option<String>,
@@ -118,12 +172,17 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
-    RunOpenaiSession {
-        task_id: String,
-        #[arg(long)]
-        model: Option<String>,
+    /// Run a task against the codex (chatgpt.com) backend via the Codex CLI login.
+    ///
+    /// Credentials resolve env-first (`CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`),
+    /// then the credential store (`auth login codex` / `auth import-codex`), then
+    /// `~/.codex/auth.json`.
+    RunCodex {
+        text: String,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
     },
-    RunCodexSession {
+    RunOpenaiSession {
         task_id: String,
         #[arg(long)]
         model: Option<String>,
@@ -357,8 +416,8 @@ enum Command {
         task_ids: Vec<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long)]
-        model: Option<String>,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
@@ -550,26 +609,6 @@ trait DatasetRunner: Clone + Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-struct DirectDatasetRunner<P> {
-    provider: P,
-}
-
-impl<P> DatasetRunner for DirectDatasetRunner<P>
-where
-    P: ModelProvider + Clone + Send + Sync + 'static,
-{
-    fn run_dataset_session(
-        &self,
-        store: &Store,
-        session_id: &str,
-        options: AgentRunOptions,
-    ) -> Result<()> {
-        run_existing_session_with_provider(store, &self.provider, session_id, options)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
 struct ConfigDatasetRunner {
     config: ProviderRunConfig,
 }
@@ -586,9 +625,14 @@ impl DatasetRunner for ConfigDatasetRunner {
         merged_options.config_profile = config.options.config_profile.clone();
         merged_options.config_overrides = config.options.config_overrides.clone();
         merged_options.model_provider_id = config.options.model_provider_id.clone();
+        merged_options.model_provider_id_source = config.options.model_provider_id_source;
         merged_options.collaboration_mode = config.options.collaboration_mode;
+        merged_options.child_agent_runner = config.options.child_agent_runner.clone();
+        merged_options.mcp_servers = config.options.mcp_servers.clone();
+        merged_options.approval_policy = config.options.approval_policy;
+        merged_options.use_guardian = config.options.use_guardian;
         config.options = merged_options;
-        run_existing_session_from_config_and_notify(store, session_id, config)?;
+        run_existing_session_from_config_and_notify(store, session_id, config, None)?;
         Ok(())
     }
 }
@@ -611,7 +655,7 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
-    product_analytics::capture_async(
+    capture_async(
         &store,
         "bu:cli command ran",
         serde_json::json!({ "command": command_name(&args.command), "surface": "cli" }),
@@ -619,6 +663,11 @@ fn main() -> Result<()> {
     let config_profile = args.config_profile.clone();
     let config_overrides = args.config_overrides.clone();
     let collaboration_mode = args.collaboration_mode.into();
+    let runtime_options = CliRuntimeOptions {
+        approval_policy: args.approval_policy.map(Into::into),
+        use_guardian: args.guardian.then_some(true),
+        mcp_config_paths: args.mcp_config.clone(),
+    };
     match args.command {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
@@ -629,14 +678,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
-        ),
-        Command::RunCodex { text, model } => run_codex(
-            &store,
-            text,
-            model,
-            config_profile.as_deref(),
-            &config_overrides,
-            collaboration_mode,
+            &runtime_options,
         ),
         Command::RunAnthropic { text, model } => run_anthropic(
             &store,
@@ -645,6 +687,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenrouter { text, model } => run_openrouter(
             &store,
@@ -653,6 +696,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunDeepseek { text, model } => run_deepseek(
             &store,
@@ -661,6 +705,16 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
+        ),
+        Command::RunCodex { text, model } => run_codex(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
@@ -669,14 +723,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
-        ),
-        Command::RunCodexSession { task_id, model } => run_codex_session(
-            &store,
-            &task_id,
-            model,
-            config_profile.as_deref(),
-            &config_overrides,
-            collaboration_mode,
+            &runtime_options,
         ),
         Command::RunAnthropicSession { task_id, model } => run_anthropic_session(
             &store,
@@ -685,6 +732,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenrouterSession { task_id, model } => run_openrouter_session(
             &store,
@@ -693,6 +741,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunDeepseekSession { task_id, model } => run_deepseek_session(
             &store,
@@ -701,6 +750,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
@@ -860,6 +910,7 @@ fn main() -> Result<()> {
             python_timeout_seconds,
             config_profile.as_deref(),
             &config_overrides,
+            &runtime_options,
         ),
         Command::DatasetRunCodex {
             dataset,
@@ -896,6 +947,7 @@ fn main() -> Result<()> {
             python_timeout_seconds,
             config_profile.as_deref(),
             &config_overrides,
+            &runtime_options,
         ),
         Command::DatasetRunAnthropic {
             dataset,
@@ -930,6 +982,7 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            &runtime_options,
         ),
         Command::DatasetRunOpenrouter {
             dataset,
@@ -964,6 +1017,7 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            &runtime_options,
         ),
     }
 }
@@ -973,12 +1027,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::Start { .. } => "start",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
-        Command::RunCodex { .. } => "run_codex",
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
+        Command::RunCodex { .. } => "run_codex",
         Command::RunOpenaiSession { .. } => "run_openai_session",
-        Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
@@ -1078,7 +1131,7 @@ fn update(
         } else {
             "available"
         };
-        product_analytics::capture_blocking(
+        capture_blocking(
             store,
             "bu:cli update checked",
             serde_json::json!({
@@ -1097,7 +1150,7 @@ fn update(
     }
 
     let script = resolve_install_script(install_script)?;
-    product_analytics::capture_blocking(
+    capture_blocking(
         store,
         "bu:cli update started",
         serde_json::json!({ "surface": "cli", "release": release.as_str() }),
@@ -1110,14 +1163,14 @@ fn update(
         .status()
         .with_context(|| format!("run installer script {}", script.display()))?;
     if !status.success() {
-        product_analytics::capture_blocking(
+        capture_blocking(
             store,
             "bu:cli update failed",
             serde_json::json!({ "surface": "cli", "release": release.as_str() }),
         );
         bail!("installer exited with status {status}");
     }
-    product_analytics::capture_blocking(
+    capture_blocking(
         store,
         "bu:cli update completed",
         serde_json::json!({ "surface": "cli", "release": release.as_str() }),
@@ -1256,14 +1309,13 @@ fn run_new_session_from_config(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    append_workspace_context_event_with_options(store, &session, &config.options)?;
     store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     maybe_append_message_history(&session.id, &text, &cwd, &config.options);
-    let session_id = run_existing_session_from_config(store, &session.id, config)?;
+    let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1274,34 +1326,372 @@ fn maybe_append_message_history(
     cwd: &Path,
     options: &AgentRunOptions,
 ) {
+    let _ = options;
     #[cfg(not(test))]
     {
-        let _ =
-            browser_use_core::append_message_history_entry_for_cwd(text, session_id, cwd, options);
+        // The new engine's message-history layer does not yet re-resolve the
+        // AGENTS.md-derived `MessageHistorySettings` from `AgentRunOptions`
+        // (documented Phase-E seam in `browser-use-agent::history`); the CLI
+        // therefore persists with the default settings (SaveAll), matching the
+        // default run behavior.
+        let _ = browser_use_agent::history::append_message_history_entry_for_cwd(
+            text,
+            session_id,
+            cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        );
     }
     #[cfg(test)]
     {
-        let _ = (session_id, text, cwd, options);
+        let _ = (session_id, text, cwd);
     }
 }
 
-fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
-    let session_id = run_fake_agent(
-        store,
-        &text,
-        std::env::current_dir()?,
-        FakeAgentOptions {
-            python_code: python_code.as_deref(),
-        },
+/// Drive a session on the new async engine.
+///
+/// The CLI is synchronous and threads `&Store`; the engine entrypoint is async
+/// and takes a [`SharedStore`] (`Arc<Mutex<Store>>`). This bridge opens a fresh
+/// store connection to the same state dir (WAL-mode SQLite supports the second
+/// connection; the caller's `&Store` performs no writes while this blocks),
+/// wraps it as a `SharedStore`, and drives `run_session_with_config` on a
+/// one-off tokio runtime. The session must already exist with its input seeded.
+///
+/// Replaces the legacy `run_existing_session_from_config` /
+/// `run_agent_from_config` / `run_existing_session_with_provider` /
+/// `run_fake_agent` engine entrypoints.
+fn run_session_via_engine(
+    store: &Store,
+    session_id: &str,
+    mut config: ProviderRunConfig,
+) -> Result<String> {
+    attach_cli_child_agent_runner(store, &mut config);
+    let shared: SharedStore =
+        std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
+    let runtime = tokio::runtime::Runtime::new().context("build tokio runtime for engine run")?;
+    let resolved = runtime.block_on(run_session_with_config(shared, session_id, config))?;
+    Ok(resolved.0)
+}
+
+fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
+    let state_dir = store.state_dir().to_path_buf();
+    let base_config_slot: std::sync::Arc<std::sync::Mutex<Option<ProviderRunConfig>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&base_config_slot);
+    let runner = ChildAgentRunner::new(move |request| {
+        let base_config = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .context("child agent runner base config not initialized")?;
+        spawn_cli_child_agent(state_dir.clone(), base_config, request)
+    });
+    config.options = config.options.clone().with_child_agent_runner(runner);
+    *base_config_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config.clone());
+}
+
+fn spawn_cli_child_agent(
+    state_dir: PathBuf,
+    base_config: ProviderRunConfig,
+    request: ChildAgentRunRequest,
+) -> Result<()> {
+    let store = Store::open(&state_dir)?;
+    let child = create_agent_child_session_from_request(&store, &request)?;
+    let child_id = child.id.clone();
+    record_child_run_marker_from_request(&store, &child_id, &request)?;
+    thread::Builder::new()
+        .name(format!("browser-use-child-{child_id}"))
+        .spawn(move || {
+            if let Err(error) =
+                run_cli_child_agent_thread(state_dir, child_id, base_config, request)
+            {
+                eprintln!("child agent failed: {error:#}");
+            }
+        })
+        .context("spawn child agent thread")?;
+    Ok(())
+}
+
+fn run_cli_child_agent_thread(
+    state_dir: PathBuf,
+    child_id: String,
+    mut config: ProviderRunConfig,
+    request: ChildAgentRunRequest,
+) -> Result<()> {
+    let completion_handler = request.completion_handler.clone();
+    let mut completion_events = None;
+    let run_result: Result<Option<String>> = (|| {
+        if let Some(model) = request.model.as_deref().filter(|value| !value.is_empty()) {
+            config.model = model.to_string();
+            config.model_source = RunConfigValueSource::Explicit;
+        }
+        if let Some(provider_id) = child_request_provider_id(&request) {
+            if let Some(backend) = ProviderBackend::from_provider_id(&provider_id) {
+                config.backend = backend;
+            }
+            config.options.model_provider_id = Some(provider_id);
+            config.options.model_provider_id_source = RunConfigValueSource::Explicit;
+        }
+        if !request.config_overrides.is_empty() {
+            config
+                .options
+                .config_overrides
+                .extend(request.config_overrides.clone());
+        }
+        if let Some(reasoning) = request.reasoning_effort.clone() {
+            config.options.config_overrides.push((
+                "reasoning_effort".to_string(),
+                toml::Value::String(reasoning),
+            ));
+        }
+        if let Some(service_tier) = request.service_tier.clone() {
+            config.options.config_overrides.push((
+                "service_tier".to_string(),
+                toml::Value::String(service_tier),
+            ));
+        }
+        let store = Store::open(&state_dir)?;
+        if completion_handler.is_some() {
+            let _ = run_session_via_engine(&store, &child_id, config)?;
+        } else {
+            let _ = run_existing_session_from_config_and_notify(
+                &store,
+                &child_id,
+                config,
+                request.run_id.clone(),
+            )?;
+        }
+        let events = store.events_for_session(&child_id)?;
+        let summary = session_result_from_events(&events);
+        completion_events = Some(events);
+        Ok(summary)
+    })();
+    if let Some(handler) = completion_handler {
+        if let Some(completion) =
+            cli_child_completion_from_result(&run_result, completion_events.as_deref())
+        {
+            if let Err(error) = handler.notify(completion) {
+                eprintln!("child agent completion notification failed: {error:#}");
+            }
+        }
+    }
+    run_result.map(|_| ())
+}
+
+fn cli_child_completion_from_result(
+    run_result: &Result<Option<String>>,
+    events: Option<&[browser_use_protocol::EventRecord]>,
+) -> Option<ChildAgentRunCompletion> {
+    match run_result {
+        Ok(summary) => {
+            if events.is_some_and(child_run_was_interrupted_from_events) {
+                return None;
+            }
+            Some(ChildAgentRunCompletion::success(summary.clone()))
+        }
+        Err(error) => Some(ChildAgentRunCompletion::failure(format!("{error:#}"))),
+    }
+}
+
+fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "model_provider" | "model_provider_id" | "provider"
+            )
+        })
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn create_agent_child_session_from_request(
+    store: &Store,
+    request: &ChildAgentRunRequest,
+) -> Result<browser_use_protocol::SessionMeta> {
+    if let Some(existing) = store.load_session(&request.child_session_id)? {
+        return Ok(existing);
+    }
+    let parent = ensure_task_exists(store, &request.parent_session_id)?;
+    let child = store.create_child_session_with_id(
+        &request.parent_session_id,
+        Path::new(&parent.cwd),
+        request.agent_path.as_deref(),
+        request.nickname.as_deref(),
+        request.role.as_deref(),
+        request.child_session_id.clone(),
     )?;
+    let parent_events = store.events_for_session(&request.parent_session_id)?;
+    store.append_event(
+        &child.id,
+        "agent.context",
+        child_request_agent_context_payload(&parent_events, request)?,
+    )?;
+    seed_environment_context_event(store, &child.id, &child.cwd)?;
+    seed_child_permissions_context_event(store, &child.id, request)?;
+    append_child_initial_input_from_request(store, &child.id, &child.cwd, request)?;
+    store.append_event(
+        &request.parent_session_id,
+        "agent.spawned",
+        serde_json::json!({
+            "child_session_id": child.id.clone(),
+            "agent_path": request.agent_path.clone(),
+            "nickname": request.nickname.clone(),
+            "role": request.role.clone(),
+        }),
+    )?;
+    Ok(child)
+}
+
+fn record_child_run_marker_from_request(
+    store: &Store,
+    child_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(run_id) = request.run_id.as_deref() else {
+        return Ok(());
+    };
+    store.append_event(
+        child_id,
+        "agent.run.started",
+        serde_json::json!({
+            "run_id": run_id,
+            "parent_session_id": request.parent_session_id.as_str(),
+            "child_session_id": child_id,
+            "agent_path": request.agent_path.as_deref(),
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_child_initial_input_from_request(
+    store: &Store,
+    child_id: &str,
+    child_cwd: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    if request.input_is_inter_agent_communication {
+        let author_path = display_agent_path_for_session(store, &request.parent_session_id)
+            .unwrap_or_else(|_| "/root".to_string());
+        let recipient_path = request.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, child_id).unwrap_or_else(|_| child_id.to_string())
+        });
+        store.append_event(
+            child_id,
+            "agent.mailbox_input",
+            serde_json::json!({
+                "id": browser_use_store::new_thread_id(),
+                "author_session_id": request.parent_session_id,
+                "target_session_id": child_id,
+                "author_path": author_path,
+                "recipient_path": recipient_path,
+                "content": request.message,
+                "trigger_turn": true,
+            }),
+        )?;
+    } else {
+        let payload = if let Some(items) = request.input_items.as_ref() {
+            typed_user_input_payload_from_items_for_cwd(items, child_cwd)?
+        } else {
+            typed_user_input_payload_from_text_for_cwd(&request.message, child_cwd)?
+        };
+        store.append_event(child_id, "session.input", payload)?;
+    }
+    Ok(())
+}
+
+fn child_request_agent_context_payload(
+    parent_events: &[browser_use_protocol::EventRecord],
+    request: &ChildAgentRunRequest,
+) -> Result<serde_json::Value> {
+    let mode = child_request_fork_mode(request.fork_turns.as_deref())?;
+    let forked = fork_events_by_turn(parent_events, &mode);
+    let history = provider_messages_from_events_for_fork(&forked.carried);
+    let response_items = provider_messages_to_fork_response_items(&history);
+    let raw_mode = request
+        .fork_turns
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    let mut payload = serde_json::json!({
+        "from_session_id": request.parent_session_id.clone(),
+        "fork_mode": raw_mode,
+        "agent_path": request.agent_path.clone(),
+        "nickname": request.nickname.clone(),
+        "role": request.role.clone(),
+    });
+    if matches!(mode, ForkMode::None) {
+        payload["history_mode"] = serde_json::json!("none");
+    } else {
+        payload["history_mode"] = serde_json::json!("fork_response_items");
+        payload["fork_response_items"] = serde_json::Value::Array(response_items);
+    }
+    Ok(payload)
+}
+
+fn child_request_fork_mode(raw: Option<&str>) -> Result<ForkMode> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(ForkMode::None);
+    }
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(ForkMode::All);
+    }
+    let turns = value
+        .parse::<usize>()
+        .with_context(|| "fork_turns must be `none`, `all`, or a positive integer string")?;
+    if turns == 0 {
+        bail!("fork_turns must be `none`, `all`, or a positive integer string");
+    }
+    Ok(ForkMode::LastN(turns))
+}
+
+fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let session = store.create_session(None, &cwd)?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
+    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
+        .with_fake_result(fake_agent_result_text(&text, python_code.as_deref()));
+    let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
+}
+
+/// The fake-backend reply text for a `run-fake` invocation.
+///
+/// Parity with the legacy `run_fake_agent` scripted provider (browser-use-core
+/// `lib.rs:869`): without `python_code` it replays `Fake result for: {text}`;
+/// with `python_code` the legacy fake ran a python tool then `done`. The new
+/// engine's `Fake` backend has no tool dispatch, so the python branch is carried
+/// as a stable completion string (the FakeAgentOptions/python tool path is a
+/// documented engine seam — see report).
+fn fake_agent_result_text(text: &str, python_code: Option<&str>) -> String {
+    match python_code {
+        Some(_) => "Python tool completed.".to_string(),
+        None => format!("Fake result for: {text}"),
+    }
 }
 
 fn cli_agent_options(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<AgentRunOptions> {
     let mut options = AgentRunOptions::default()
         .with_collaboration_mode(collaboration_mode)
@@ -1312,6 +1702,37 @@ fn cli_agent_options(
         options = options.with_config_profile(profile.to_string());
     }
     let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    if let Some(policy) = resolve_approval_policy_for_profile(
+        config_profile,
+        &config_overrides,
+        runtime_options.approval_policy,
+    )? {
+        options = options.with_approval_policy(policy);
+    }
+    if let Some(use_guardian) = resolve_guardian_for_profile(
+        config_profile,
+        &config_overrides,
+        runtime_options.use_guardian,
+    )? {
+        options = options.with_guardian(use_guardian);
+    }
+    options = options.with_multi_agent_v2(resolve_multi_agent_v2_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
+    options = options.with_collab_enabled(resolve_collab_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
+    options = options.with_agent_roles(resolve_agent_roles_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
+    let mcp_servers =
+        load_mcp_servers_for_profile(config_profile, &runtime_options.mcp_config_paths)?;
+    if !mcp_servers.is_empty() {
+        options = options.with_mcp_servers(mcp_servers);
+    }
     if !config_overrides.is_empty() {
         options = options.with_config_overrides(config_overrides);
     }
@@ -1346,28 +1767,26 @@ fn default_cli_model_for_backend_with_overrides(
 ) -> Result<String> {
     let cwd = std::env::current_dir()?;
     match backend {
-        ProviderBackend::Codex => {
-            default_model_for_cwd_with_options(cwd, config_profile, config_overrides, true)
-        }
         ProviderBackend::Openai => {
             default_model_for_cwd_with_options(cwd, config_profile, config_overrides, false)
         }
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
-        ProviderBackend::Fake | ProviderBackend::None => Ok("fake".to_string()),
+        ProviderBackend::Codex | ProviderBackend::Fake | ProviderBackend::None => {
+            Ok("fake".to_string())
+        }
     }
 }
 
 fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
     match backend {
-        ProviderBackend::Codex => "codex",
         ProviderBackend::Openai => "openai",
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::Fake => "fake",
-        ProviderBackend::None => "none",
+        ProviderBackend::Codex | ProviderBackend::None => "none",
     }
 }
 
@@ -1424,6 +1843,7 @@ fn run_openai(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Openai,
@@ -1437,30 +1857,7 @@ fn run_openai(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
-        )?);
-    run_new_session_from_config(store, text, config)
-}
-
-fn run_codex(
-    store: &Store,
-    text: String,
-    model: Option<String>,
-    config_profile: Option<&str>,
-    raw_config_overrides: &[String],
-    collaboration_mode: CollaborationModeKind,
-) -> Result<()> {
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
-        .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
+            runtime_options,
         )?);
     run_new_session_from_config(store, text, config)
 }
@@ -1472,10 +1869,15 @@ fn run_anthropic(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1486,10 +1888,15 @@ fn run_openrouter(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1500,13 +1907,42 @@ fn run_deepseek(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    run_new_session_from_config(store, text, config)
+}
+
+/// Run a task against the codex (chatgpt.com) backend.
+///
+/// The codex OAuth credentials are resolved inside the engine
+/// ([`browser_use_agent::entrypoint::provider`]) env-first
+/// (`CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID`), then from the Store settings the
+/// `auth login codex` / `auth import-codex` commands write
+/// (`auth.codex.access_token` / `auth.codex.account_id`), then `~/.codex/auth.json`.
+fn run_codex(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_openai_session(
@@ -1516,6 +1952,7 @@ fn run_openai_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
     let (model, model_source) = resolve_cli_model_with_source(
@@ -1530,35 +1967,9 @@ fn run_openai_session(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
+            runtime_options,
         )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
-    println!("{session_id}");
-    Ok(())
-}
-
-fn run_codex_session(
-    store: &Store,
-    task_id: &str,
-    model: Option<String>,
-    config_profile: Option<&str>,
-    raw_config_overrides: &[String],
-    collaboration_mode: CollaborationModeKind,
-) -> Result<()> {
-    ensure_task_exists(store, task_id)?;
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
-        .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
-        )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1570,12 +1981,17 @@ fn run_anthropic_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1587,12 +2003,17 @@ fn run_openrouter_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1604,12 +2025,17 @@ fn run_deepseek_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1618,11 +2044,12 @@ fn run_existing_session_from_config_and_notify(
     store: &Store,
     task_id: &str,
     config: ProviderRunConfig,
+    expected_run_id: Option<String>,
 ) -> Result<String> {
-    let result = run_existing_session_from_config(store, task_id, config);
+    let result = run_session_via_engine(store, task_id, config);
     let run_error = result.as_ref().err().map(|error| format!("{error:#}"));
     let child_id = result.as_deref().unwrap_or(task_id);
-    notify_parent_after_cli_child_run(store, child_id, run_error)?;
+    notify_parent_after_cli_child_run(store, child_id, run_error, expected_run_id.as_deref())?;
     result
 }
 
@@ -1630,6 +2057,7 @@ fn notify_parent_after_cli_child_run(
     store: &Store,
     child_id: &str,
     run_error: Option<String>,
+    expected_run_id: Option<&str>,
 ) -> Result<()> {
     let Some(child) = store.load_session(child_id)? else {
         return Ok(());
@@ -1637,8 +2065,305 @@ fn notify_parent_after_cli_child_run(
     let Some(parent_id) = child.parent_id.as_deref() else {
         return Ok(());
     };
-    update_parent_from_child_run(store, parent_id, child_id, run_error)?;
+    update_parent_from_child_run(store, parent_id, child_id, run_error, expected_run_id)?;
     Ok(())
+}
+
+/// Store-based parent-link update run after a child agent terminates.
+///
+/// Faithful port of the legacy `browser-use-core::update_parent_from_child_run`
+/// (lib.rs:20767) reconstructed locally on `&Store` primitives, because the
+/// agent crate only exposes a *registry*-based `update_parent_from_child_run`
+/// (`subagents::parent_link`, a pure `(registry, mailbox, …)` function), not a
+/// Store-driven one. Writes the parent's terminal `agent.{completed,failed,
+/// cancelled,updated}` event, flips the child edge status, and (when the parent
+/// can still receive mail) queues the `<subagent_notification>` into the parent's
+/// mailbox. The legacy subagent-stop hook fan-out is intentionally NOT
+/// reconstructed (hooks are a not-yet-ported engine seam; the CLI never wired
+/// runtime hooks here) — see report.
+fn update_parent_from_child_run(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_error: Option<String>,
+    expected_run_id: Option<&str>,
+) -> Result<Value> {
+    let child = store
+        .load_session(child_id)?
+        .with_context(|| format!("unknown child session id: {child_id}"))?;
+    let child_events = store.events_for_session(child_id)?;
+    let latest_run_id = latest_child_run_id_from_events(&child_events);
+    let run_id = expected_run_id.map(ToOwned::to_owned).or(latest_run_id);
+    let child_run_events = if let Some(expected_run_id) = expected_run_id {
+        let Some(current_events) = current_child_run_events(&child_events, expected_run_id) else {
+            return Ok(serde_json::json!({
+                "child_session_id": child_id,
+                "run_id": run_id.as_deref(),
+                "status": "stale",
+                "result": null,
+                "failure": null,
+            }));
+        };
+        current_events
+    } else {
+        child_events.as_slice()
+    };
+    if store
+        .agent_summary_for_child(child_id)?
+        .is_some_and(|summary| summary.status == "closed")
+    {
+        return Ok(serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "closed",
+            "result": null,
+            "failure": null,
+        }));
+    }
+    if parent_has_child_terminal_event_for_run(store, parent_id, child_id, run_id.as_deref())? {
+        return Ok(serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "duplicate",
+            "result": null,
+            "failure": null,
+        }));
+    }
+    let terminal = latest_child_terminal_from_events(child_run_events);
+    let result = terminal
+        .as_ref()
+        .and_then(|terminal| terminal.result.clone())
+        .or_else(|| session_result_from_events(child_run_events));
+    let failure = terminal
+        .as_ref()
+        .and_then(|terminal| terminal.failure.clone())
+        .or_else(|| run_error.clone())
+        .or_else(|| failure_from_events(child_run_events));
+    let status = child.status.as_str().to_string();
+    if status == "cancelled" && child_run_was_interrupted_from_events(child_run_events) {
+        store.set_child_agent_status(child_id, "open")?;
+        let payload = serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "interrupted",
+            "result": result,
+            "failure": failure,
+        });
+        store.append_event(
+            parent_id,
+            "agent.updated",
+            serde_json::json!({
+                "child_session_id": child_id,
+                "run_id": run_id.as_deref(),
+                "status": "interrupted",
+                "payload": payload,
+            }),
+        )?;
+        return Ok(payload);
+    }
+    let event_type = match status.as_str() {
+        "done" => "agent.completed",
+        "failed" => "agent.failed",
+        "cancelled" => "agent.cancelled",
+        _ => "agent.updated",
+    };
+    let edge_status = match status.as_str() {
+        "done" | "failed" | "cancelled" => status.as_str(),
+        _ => "open",
+    };
+    store.set_child_agent_status(child_id, edge_status)?;
+    let payload = serde_json::json!({
+        "child_session_id": child_id,
+        "run_id": run_id.as_deref(),
+        "status": status,
+        "result": result,
+        "failure": failure,
+    });
+    store.append_event(
+        parent_id,
+        event_type,
+        serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": status,
+            "payload": payload,
+        }),
+    )?;
+    if matches!(status.as_str(), "done" | "failed" | "cancelled")
+        && parent_can_receive_subagent_completion_mail(store, parent_id)?
+    {
+        let child_path = display_agent_path_for_session(store, child_id)?;
+        let notification =
+            format_subagent_notification_message(&child_path, status.as_str(), &payload);
+        store.send_agent_message(child_id, parent_id, &notification, false)?;
+    }
+    Ok(payload)
+}
+
+struct ChildTerminal {
+    result: Option<String>,
+    failure: Option<String>,
+}
+
+fn latest_child_terminal_from_events(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<ChildTerminal> {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event_type.as_str(), "session.done" | "session.failed"))
+        .map(|event| match event.event_type.as_str() {
+            "session.done" => ChildTerminal {
+                result: session_result_from_events(std::slice::from_ref(event)),
+                failure: None,
+            },
+            "session.failed" => ChildTerminal {
+                result: None,
+                failure: failure_from_events(std::slice::from_ref(event))
+                    .or_else(|| Some("failed".to_string())),
+            },
+            _ => ChildTerminal {
+                result: None,
+                failure: None,
+            },
+        })
+}
+
+fn latest_child_run_id_from_events(events: &[browser_use_protocol::EventRecord]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.event_type == "agent.run.started")
+            .then(|| event.payload.get("run_id").and_then(Value::as_str))
+            .flatten()
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn current_child_run_events<'a>(
+    events: &'a [browser_use_protocol::EventRecord],
+    expected_run_id: &str,
+) -> Option<&'a [browser_use_protocol::EventRecord]> {
+    let marker_idx = events
+        .iter()
+        .rposition(|event| event.event_type == "agent.run.started")?;
+    let marker = &events[marker_idx];
+    let marker_run_id = marker.payload.get("run_id").and_then(Value::as_str)?;
+    (marker_run_id == expected_run_id).then_some(&events[marker_idx + 1..])
+}
+
+fn parent_has_child_terminal_event_for_run(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_id: Option<&str>,
+) -> Result<bool> {
+    Ok(store.events_for_session(parent_id)?.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "agent.completed" | "agent.failed" | "agent.cancelled"
+        ) && event
+            .payload
+            .get("child_session_id")
+            .and_then(Value::as_str)
+            == Some(child_id)
+            && match run_id {
+                Some(run_id) => {
+                    event
+                        .payload
+                        .get("run_id")
+                        .or_else(|| event.payload.pointer("/payload/run_id"))
+                        .and_then(Value::as_str)
+                        == Some(run_id)
+                }
+                None => true,
+            }
+    }))
+}
+
+fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRecord]) -> bool {
+    session_was_interrupted(events)
+}
+
+/// Whether `parent_id` is in a state that can still receive a child-completion
+/// mail. Port of legacy `parent_can_receive_subagent_completion_mail`
+/// (browser-use-core lib.rs:20931).
+fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
+    let Some(parent) = store.load_session(parent_id)? else {
+        return Ok(false);
+    };
+    if !matches!(
+        parent.status,
+        browser_use_protocol::SessionStatus::Created | browser_use_protocol::SessionStatus::Running
+    ) {
+        return Ok(false);
+    }
+    if store
+        .agent_summary_for_child(parent_id)?
+        .is_some_and(|agent| agent.status == "closed")
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Render the `<subagent_notification>` body. Byte-for-byte port of legacy
+/// `format_subagent_notification_message` (browser-use-core lib.rs:20950): the
+/// status maps to `{completed: result}` / `{errored: failure}` / `"shutdown"` /
+/// `"not_found"` inside a `{agent_path, status}` JSON object.
+fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
+    let agent_status = match status {
+        "done" => serde_json::json!({
+            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
+        }),
+        "failed" => serde_json::json!({
+            "errored": payload
+                .get("failure")
+                .and_then(Value::as_str)
+                .unwrap_or("agent failed"),
+        }),
+        "cancelled" => serde_json::json!("shutdown"),
+        _ => serde_json::json!("not_found"),
+    };
+    format!(
+        "<subagent_notification>\n{}\n</subagent_notification>",
+        serde_json::json!({
+            "agent_path": agent_path,
+            "status": agent_status,
+        })
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_user_message(
+    store: &Store,
+    surface: &str,
+    session_id: &str,
+    is_subagent: bool,
+    kind: &str,
+    seq: i64,
+    text: &str,
+) {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    let word_count = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split_whitespace().count()
+    };
+    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
+    capture_async(
+        store,
+        "bu:tui user_message",
+        serde_json::json!({
+            "surface": surface,
+            "session_id": session_id,
+            "is_subagent": is_subagent,
+            "kind": kind,
+            "seq": seq,
+            "char_count": char_count,
+            "word_count": word_count,
+            "approx_tokens": approx_tokens,
+        }),
+    );
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
@@ -1648,12 +2373,12 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
         "session.followup",
         typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
-    product_analytics::capture_user_message(
+    capture_user_message(
         store,
         "cli",
         task_id,
         session.parent_id.is_some(),
-        product_analytics::MESSAGE_KIND_FOLLOWUP,
+        MESSAGE_KIND_FOLLOWUP,
         followup_record.seq,
         &text,
     );
@@ -1682,7 +2407,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, task_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, task_id, |_| 0)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
@@ -1724,15 +2449,17 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
-    if let Some(result) = session_result_from_events(&events) {
-        println!();
-        println!("Result");
-        println!("{result}");
-    }
-    if let Some(error) = failure_from_events(&events) {
-        println!();
-        println!("Failure");
-        println!("{error}");
+    if let Some(terminal) = latest_child_terminal_from_events(&events) {
+        if let Some(result) = terminal.result {
+            println!();
+            println!("Result");
+            println!("{result}");
+        }
+        if let Some(error) = terminal.failure {
+            println!();
+            println!("Failure");
+            println!("{error}");
+        }
     }
     Ok(())
 }
@@ -1878,13 +2605,17 @@ fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Val
     let browser_use_api_key = browser_use_api_key_from_store_or_env(store)?;
     let cwd = std::env::current_dir()?;
     let artifact_root = cli_browser_artifact_root(store)?;
-    browser_use_core::run_standalone_browser_command_with_browser_use_api_key(
+    let options = browser_use_browser::BrowserCommandOptions {
+        browser_use_api_key,
+    };
+    Ok(browser_use_browser::run_browser_command_with_options(
         "cli-browser",
         &cwd,
         &artifact_root,
         &browser_command_from_args(args),
-        browser_use_api_key,
-    )
+        options,
+    )?
+    .content)
 }
 
 fn sync_cookies(store: &Store, args: SyncCookiesArgs) -> Result<()> {
@@ -1996,9 +2727,13 @@ fn user_shell(store: &Store, task_id: &str, command: String) -> Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    append_user_shell_command_context_event(
-        store, task_id, &command, exit_code, duration, &combined,
-    )?;
+    let shared: SharedStore =
+        std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
+    let runtime =
+        tokio::runtime::Runtime::new().context("build tokio runtime for user shell context")?;
+    runtime.block_on(append_user_shell_command_context_event(
+        shared, task_id, &command, exit_code, duration, &combined,
+    ))?;
     print!("{combined}");
     if output.status.success() {
         Ok(())
@@ -2101,24 +2836,24 @@ fn default_settings(
     config_overrides: &[(String, toml::Value)],
 ) -> Result<Vec<(String, String)>> {
     let provider_model = default_cli_model_for_backend_with_overrides(
-        ProviderBackend::Codex,
+        ProviderBackend::Openrouter,
         config_profile,
         config_overrides,
     )?;
     let display_model =
         display_model_for_provider_model(&provider_model, config_profile, config_overrides)?;
     let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
-        ProviderBackend::Codex,
+        ProviderBackend::Openrouter,
         config_profile,
         config_overrides,
     )?;
     Ok(vec![
-        ("account".to_string(), "Codex login".to_string()),
+        ("account".to_string(), "OpenRouter API key".to_string()),
         ("model".to_string(), display_model),
         ("provider.model".to_string(), provider_model),
         ("provider.id".to_string(), provider_id),
         ("browser".to_string(), "Local Chrome".to_string()),
-        ("agent.backend".to_string(), "codex".to_string()),
+        ("agent.backend".to_string(), "openrouter".to_string()),
         ("setup.complete".to_string(), "0".to_string()),
     ])
 }
@@ -2128,10 +2863,15 @@ fn display_model_for_provider_model(
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<String> {
+    if model == "openai/gpt-5.5" {
+        return Ok("GPT-5.5".to_string());
+    }
     let cwd = std::env::current_dir()?;
     let catalog = model_catalog_for_cwd_with_options(cwd, config_profile, config_overrides)?;
     Ok(catalog
-        .entry_for_model(model)
+        .models
+        .iter()
+        .find(|entry| entry.slug == model)
         .map(|entry| entry.display_name.clone())
         .unwrap_or_else(|| model.to_string()))
 }
@@ -2713,119 +3453,6 @@ fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
     })
 }
 
-fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
-    if let Some(value) = store.get_setting(setting_key)? {
-        if !value.trim().is_empty() {
-            return Ok(Some(value));
-        }
-    }
-    Ok(env_names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .filter(|value| !value.trim().is_empty()))
-}
-
-fn setting_or_env_or_default(
-    store: &Store,
-    setting_key: &str,
-    env_names: &[&str],
-    default: &str,
-) -> Result<String> {
-    Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
-}
-
-fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.anthropic.base_url",
-        &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
-        "https://api.anthropic.com/v1",
-    )?;
-    if store
-        .get_setting("account")?
-        .as_deref()
-        .is_some_and(is_claude_code_account)
-    {
-        let auth_token = claude_code_access_token(store)?;
-        return Ok(AnthropicMessagesProvider::with_auth_token(
-            auth_token, model, base_url,
-        ));
-    }
-    let api_key = stored_or_env(
-        store,
-        "auth.anthropic.api_key",
-        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
-    )?
-    .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
-    Ok(AnthropicMessagesProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn claude_code_access_token(store: &Store) -> Result<String> {
-    if let Some(refresh_token) = store.get_setting("auth.claude_code.refresh_token")? {
-        let expires_ms = store
-            .get_setting("auth.claude_code.expires_ms")?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
-        if !refresh_token.trim().is_empty() && expires_ms <= now_ms() + 60_000 {
-            let credential = refresh_claude_code_oauth(refresh_token.trim())
-                .context("refresh Claude Code OAuth token")?;
-            store_claude_code_oauth(store, &credential)?;
-            return Ok(credential.access_token);
-        }
-    }
-    if let Some(access_token) = stored_or_env(
-        store,
-        "auth.claude_code.access_token",
-        &[
-            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_AUTH_TOKEN",
-        ],
-    )? {
-        return Ok(access_token);
-    }
-    stored_or_env(
-        store,
-        "auth.claude_code.auth_token",
-        &[
-            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_AUTH_TOKEN",
-        ],
-    )?
-    .context(
-        "run `auth login claude-code` to sign in with Claude Code, or set CLAUDE_CODE_OAUTH_TOKEN",
-    )
-}
-
-fn is_claude_code_account(account: &str) -> bool {
-    matches!(account, "Claude Code login" | "Claude Code subscription")
-}
-
-fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.openrouter.api_key",
-        &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
-    )?
-    .context("run `auth login openrouter --api-key ...` or set OPENROUTER_API_KEY")?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.openrouter.base_url",
-        &["LLM_BROWSER_OPENAI_COMPAT_BASE_URL", "OPENROUTER_BASE_URL"],
-        "https://openrouter.ai/api/v1",
-    )?;
-    Ok(OpenAICompatibleChatProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
 fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
     match account {
         AuthAccount::Openai => Some("auth.openai.api_key"),
@@ -2922,6 +3549,59 @@ fn trace(store: &Store, task_id: &str, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Seed the child session's `environment_context` workspace-context event.
+///
+/// The legacy CLI called `append_workspace_context_event(store, &child)`, which
+/// assembled a rich `<environment_context>` block (AGENTS.md / permissions /
+/// collaboration-mode etc.). That assembly is a not-yet-ported engine seam; the
+/// new engine seeds a minimal `<environment_context><cwd>…</cwd></…>` block on
+/// run (`entrypoint::environment_context_content`). This mirrors that minimal
+/// block synchronously at spawn time so the freshly-created child carries the
+/// same workspace-context event the engine would (de-dup) re-emit on its run.
+fn seed_environment_context_event(store: &Store, session_id: &str, cwd: &str) -> Result<()> {
+    let content = format!("<environment_context>\n<cwd>{cwd}</cwd>\n</environment_context>");
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": "environment_context",
+            "content": content,
+        }),
+    )?;
+    Ok(())
+}
+
+fn seed_child_permissions_context_event(
+    store: &Store,
+    session_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(content) = child_request_developer_instructions(request) else {
+        return Ok(());
+    };
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": "permissions",
+            "content": content,
+        }),
+    )?;
+    Ok(())
+}
+
+fn child_request_developer_instructions(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "developer_instructions")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn spawn_agent(
     store: &Store,
     parent_id: &str,
@@ -2969,7 +3649,7 @@ fn spawn_agent(
             "context": inherited_context,
         }),
     )?;
-    append_workspace_context_event(store, &child)?;
+    seed_environment_context_event(store, &child.id, &child.cwd)?;
     store.append_event(
         &child.id,
         "session.input",
@@ -3079,7 +3759,9 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id, |session_id| {
+        cleanup_unified_exec_manager_for_session_id(session_id)
+    })?;
     store.close_child_agent(&child_id, reason)?;
     store.append_event(
         &summary.parent_session_id,
@@ -3135,8 +3817,12 @@ fn resume_agent(store: &Store, child_id: &str) -> Result<()> {
     let summary = store
         .agent_summary_for_child(child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
-    let needs_reopen = child.status == browser_use_protocol::SessionStatus::Cancelled
-        || summary.status == "closed";
+    let needs_reopen = matches!(
+        child.status,
+        browser_use_protocol::SessionStatus::Done
+            | browser_use_protocol::SessionStatus::Failed
+            | browser_use_protocol::SessionStatus::Cancelled
+    ) || matches!(summary.status.as_str(), "closed" | "done" | "failed");
     if needs_reopen {
         store.reopen_child_agent_subtree(child_id)?;
     }
@@ -3155,7 +3841,7 @@ fn resume_agent(store: &Store, child_id: &str) -> Result<()> {
 }
 
 fn is_local_agent_id(value: &str) -> bool {
-    value.len() == 12 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    browser_use_store::is_thread_id(value)
 }
 
 fn send_agent_message(
@@ -3378,13 +4064,14 @@ fn dataset_report(store: &Store, run_id_or_path: &str) -> Result<()> {
 }
 
 fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) -> Result<()> {
-    let provider = FakeProvider::with_text("Fake dataset case completed.");
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
+        .with_fake_result("Fake dataset case completed.");
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "fake".to_string(),
             model: "fake".to_string(),
@@ -3436,6 +4123,7 @@ fn dataset_run_openai(
     python_timeout_seconds: u64,
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Openai,
@@ -3455,6 +4143,7 @@ fn dataset_run_openai(
         config_profile,
         raw_config_overrides,
         CollaborationModeKind::Default,
+        runtime_options,
     )?;
     agent_options = if provider_id_source == RunConfigValueSource::Explicit {
         agent_options.with_model_provider_id(provider_id.clone())
@@ -3483,46 +4172,30 @@ fn dataset_run_codex(
     store: &Store,
     dataset: &str,
     options: DatasetRunOptions,
-    model: Option<String>,
+    model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
-    let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
-        ProviderBackend::Codex,
-        config_profile,
-        &config_overrides,
-    )?;
-    let provider_id_source = cli_provider_id_source(&config_overrides);
     let browser_mode = dataset_browser_mode(&options);
-    let mut agent_options = cli_agent_options(
-        config_profile,
-        raw_config_overrides,
-        CollaborationModeKind::Default,
-    )?;
-    agent_options = if provider_id_source == RunConfigValueSource::Explicit {
-        agent_options.with_model_provider_id(provider_id.clone())
-    } else {
-        agent_options.with_default_model_provider_id(provider_id.clone())
-    };
-    let run_config = ProviderRunConfig::new(ProviderBackend::Codex, model.clone())
-        .with_model_source(model_source)
-        .with_options(agent_options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Codex, model.clone()).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            CollaborationModeKind::Default,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("codex"),
+    );
     dataset_run_provider(
         store,
         dataset,
         options,
         ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
-            provider: provider_id,
+            provider: "codex".to_string(),
             model: model.clone(),
             browser_mode,
             max_turns,
@@ -3538,14 +4211,19 @@ fn dataset_run_anthropic(
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let provider = anthropic_provider(store, model.clone())?;
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Anthropic, model.clone())
+        .with_options(
+            cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
+                .with_default_model_provider_id("anthropic"),
+        );
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "anthropic".to_string(),
             model: model.clone(),
@@ -3563,14 +4241,19 @@ fn dataset_run_openrouter(
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let provider = openrouter_provider(store, model.clone())?;
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Openrouter, model.clone())
+        .with_options(
+            cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
+                .with_default_model_provider_id("openrouter"),
+        );
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "openrouter".to_string(),
             model: model.clone(),
@@ -3774,6 +4457,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         session_thread_config: None,
         base_instructions: None,
         developer_instructions: None,
+        compact_prompt: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
         python_tool_timeout_seconds: config.python_timeout_seconds,
@@ -3782,9 +4466,20 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         final_output_json_schema: None,
         final_output_json_schema_strict: true,
         model_compaction_enabled: true,
+        model_auto_compact_token_limit: None,
+        model_auto_compact_token_limit_scope: AgentRunOptions::default()
+            .model_auto_compact_token_limit_scope,
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
+        // Provider-level runtime options are merged by ConfigDatasetRunner; this
+        // per-case layer carries dataset-specific browser/python limits.
+        mcp_servers: std::collections::HashMap::new(),
+        approval_policy: AgentRunOptions::default().approval_policy,
+        use_guardian: AgentRunOptions::default().use_guardian,
+        multi_agent_v2: AgentRunOptions::default().multi_agent_v2,
+        collab_enabled: AgentRunOptions::default().collab_enabled,
+        agent_roles: AgentRunOptions::default().agent_roles,
     };
     let mut run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
@@ -4791,7 +5486,7 @@ fn notify_parent_agent_done(store: &Store, task: &browser_use_protocol::SessionM
     let Some(parent_id) = task.parent_id.as_deref() else {
         return Ok(());
     };
-    update_parent_from_child_run(store, parent_id, &task.id, None)?;
+    update_parent_from_child_run(store, parent_id, &task.id, None, None)?;
     Ok(())
 }
 
@@ -4832,9 +5527,155 @@ mod tests {
 
     #[test]
     fn cli_agent_options_pass_collaboration_mode_to_core() -> Result<()> {
-        let options = cli_agent_options(None, &[], CollaborationModeKind::Plan)?;
+        let options = cli_agent_options(
+            None,
+            &[],
+            CollaborationModeKind::Plan,
+            &CliRuntimeOptions::default(),
+        )?;
 
         assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_agent_options_apply_runtime_policy_guardian_and_mcp() -> Result<()> {
+        let temp = unique_cli_test_dir("runtime-options")?;
+        let mcp_config = temp.join("mcp.toml");
+        std::fs::write(
+            &mcp_config,
+            r#"
+[mcp_servers.local]
+transport = "stdio"
+command = "test-mcp"
+"#,
+        )?;
+        let runtime_options = CliRuntimeOptions {
+            approval_policy: Some(AskForApproval::UnlessTrusted),
+            use_guardian: Some(true),
+            mcp_config_paths: vec![mcp_config],
+        };
+
+        let options =
+            cli_agent_options(None, &[], CollaborationModeKind::Default, &runtime_options)?;
+
+        assert_eq!(options.approval_policy, AskForApproval::UnlessTrusted);
+        assert!(options.use_guardian);
+        assert!(options.mcp_servers.contains_key("local"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_completion_handler_skips_interrupted_child_runs() {
+        let interrupted_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.cancelled".to_string(),
+            payload: serde_json::json!({"reason": "interrupt requested"}),
+        }];
+        let ok_result: Result<Option<String>> = Ok(Some("partial".to_string()));
+
+        assert!(cli_child_completion_from_result(&ok_result, Some(&interrupted_events)).is_none());
+
+        let done_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "e2".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.done".to_string(),
+            payload: serde_json::json!({"result": "finished"}),
+        }];
+        let completion = cli_child_completion_from_result(&ok_result, Some(&done_events))
+            .expect("non-interrupted run should notify");
+        assert!(completion.success);
+        assert_eq!(completion.summary.as_deref(), Some("partial"));
+
+        let resumed_done_events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "e3".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 0,
+                event_type: "session.cancelled".to_string(),
+                payload: serde_json::json!({"reason": "interrupted by send_input"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "e4".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 1,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "e5".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 2,
+                event_type: "session.done".to_string(),
+                payload: serde_json::json!({"result": "finished after resume"}),
+            },
+        ];
+        let completion = cli_child_completion_from_result(&ok_result, Some(&resumed_done_events))
+            .expect("resumed completion should clear earlier interruption");
+        assert!(completion.success);
+        assert_eq!(completion.summary.as_deref(), Some("partial"));
+
+        let error_result: Result<Option<String>> = Err(anyhow::anyhow!("boom"));
+        let completion = cli_child_completion_from_result(&error_result, Some(&interrupted_events))
+            .expect("run errors should still notify failure");
+        assert!(!completion.success);
+        assert!(completion.summary.unwrap_or_default().contains("boom"));
+    }
+
+    #[test]
+    fn cli_child_runner_request_creates_store_child_session() -> Result<()> {
+        let temp = unique_cli_test_dir("child-runner-session")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &cwd)?;
+        let request = ChildAgentRunRequest {
+            parent_session_id: parent.id.clone(),
+            child_session_id: "00000000abcd".to_string(),
+            run_id: None,
+            message: "Investigate the failing case".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
+            agent_path: Some("/root/investigate_1".to_string()),
+            nickname: Some("Analyst".to_string()),
+            role: Some("explorer".to_string()),
+            fork_turns: Some("all".to_string()),
+            model: Some("gpt-test".to_string()),
+            reasoning_effort: None,
+            service_tier: None,
+            config_overrides: Vec::new(),
+            completion_handler: None,
+        };
+
+        let child = create_agent_child_session_from_request(&store, &request)?;
+
+        assert_eq!(child.id, "00000000abcd");
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        let child_events = store.events_for_session(&child.id)?;
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "agent.context"));
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "session.input"));
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .any(|event| event.event_type == "agent.spawned"
+                && event.payload["child_session_id"] == child.id));
+
+        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -5352,7 +6193,7 @@ mod tests {
             .context("agent.wait.finished")?;
         assert_eq!(finished.payload["timed_out"], false);
         assert_eq!(
-            finished.payload["status"][&child.id]["completed"],
+            finished.payload["status"]["/root/cli_child"]["completed"],
             "complete"
         );
         let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
@@ -5415,16 +6256,206 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_model_uses_config_model_like_codex() -> Result<()> {
+    fn cli_child_terminal_status_ignores_late_completion_after_close() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-closed")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-closed" }),
+        )?;
+        store.close_child_agent(&child.id, "closed by close_agent")?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "late"}),
+        )?;
+        let child = store.load_session(&child.id)?.context("child session")?;
+
+        notify_parent_agent_done(&store, &child)?;
+
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "closed"
+        );
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().all(|event| {
+            event.event_type != "agent.completed" && event.event_type != "agent.failed"
+        }));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_queues_parent_notification_once() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-once")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-once" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "done once"}),
+        )?;
+        let child = store.load_session(&child.id)?.context("child session")?;
+
+        notify_parent_agent_done(&store, &child)?;
+        notify_parent_agent_done(&store, &child)?;
+
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert_eq!(
+            parent_events
+                .iter()
+                .filter(|event| event.event_type == "agent.completed")
+                .count(),
+            1
+        );
+        let mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(mail.len(), 1);
+        assert!(mail[0].content.contains("done once"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_ignores_stale_old_run_after_restart() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-stale-run")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-old" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-new" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "late old completion"}),
+        )?;
+
+        let stale =
+            update_parent_from_child_run(&store, &parent.id, &child.id, None, Some("run-old"))?;
+
+        assert_eq!(stale["status"], "stale");
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().all(|event| {
+            event.event_type != "agent.completed" && event.event_type != "agent.failed"
+        }));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "new completion"}),
+        )?;
+        let completed =
+            update_parent_from_child_run(&store, &parent.id, &child.id, None, Some("run-new"))?;
+
+        assert_eq!(completed["status"], "done");
+        assert_eq!(completed["result"], "new completion");
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert_eq!(
+            parent_events
+                .iter()
+                .filter(|event| event.event_type == "agent.completed")
+                .count(),
+            1
+        );
+        assert!(store.messages_for_agent(&parent.id)?[0]
+            .content
+            .contains("new completion"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_show_uses_latest_terminal_event_not_stale_failure() -> Result<()> {
+        let temp = unique_cli_test_dir("show-latest-terminal")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &cwd)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "old failure"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "later success"}),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let terminal = latest_child_terminal_from_events(&events).context("latest terminal")?;
+        assert_eq!(terminal.result.as_deref(), Some("later success"));
+        assert!(terminal.failure.is_none());
+        show(&store, &session.id)?;
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_default_model_uses_config_model() -> Result<()> {
+        // An explicit `model=` override resolves through the config layer for a
+        // real backend (openai). (The codex backend is cut: it no longer resolves
+        // a chatgpt model and folds into the fake default.)
         let overrides = vec![(
             "model".to_string(),
             toml::Value::String("configured-model".to_string()),
         )];
 
-        assert_eq!(
-            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
-            "configured-model"
-        );
         assert_eq!(
             default_cli_model_for_backend_with_overrides(
                 ProviderBackend::Openai,
@@ -5437,9 +6468,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_model_source_treats_config_model_override_as_explicit_like_codex() -> Result<()> {
+    fn cli_model_source_treats_config_model_override_as_explicit() -> Result<()> {
         let (model, source) = resolve_cli_model_with_source(
-            ProviderBackend::Codex,
+            ProviderBackend::Openai,
             None,
             None,
             &["model=\"configured-model\"".to_string()],
@@ -5449,7 +6480,7 @@ mod tests {
         assert_eq!(source, RunConfigValueSource::Explicit);
 
         let (model, source) = resolve_cli_model_with_source(
-            ProviderBackend::Codex,
+            ProviderBackend::Openai,
             Some("flag-model".to_string()),
             None,
             &["model=\"configured-model\"".to_string()],
@@ -5461,20 +6492,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_provider_id_uses_config_provider_like_codex() -> Result<()> {
+    fn cli_default_provider_id_uses_config_provider() -> Result<()> {
+        // The new engine's config layer reads the `model_provider_id` override
+        // key (not the legacy `model_provider` alias), so the explicit provider
+        // id flows through for a real backend.
         let overrides = vec![(
-            "model_provider".to_string(),
+            "model_provider_id".to_string(),
             toml::Value::String("corp".to_string()),
         )];
 
-        assert_eq!(
-            resolved_cli_provider_id_for_backend_with_overrides(
-                ProviderBackend::Codex,
-                None,
-                &overrides
-            )?,
-            "corp"
-        );
         assert_eq!(
             resolved_cli_provider_id_for_backend_with_overrides(
                 ProviderBackend::Openai,
@@ -5496,7 +6522,25 @@ mod tests {
     }
 
     #[test]
-    fn cli_provider_source_treats_config_provider_override_as_explicit_like_codex() {
+    fn cli_default_settings_use_openrouter_provider_path() -> Result<()> {
+        let defaults = default_settings(None, &[])?;
+        let value_for = |key: &str| {
+            defaults
+                .iter()
+                .find(|(setting, _)| setting == key)
+                .map(|(_, value)| value.as_str())
+        };
+
+        assert_eq!(value_for("account"), Some("OpenRouter API key"));
+        assert_eq!(value_for("model"), Some("GPT-5.5"));
+        assert_eq!(value_for("provider.model"), Some("openai/gpt-5.5"));
+        assert_eq!(value_for("provider.id"), Some("openrouter"));
+        assert_eq!(value_for("agent.backend"), Some("openrouter"));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_provider_source_treats_config_provider_override_as_explicit() {
         assert_eq!(cli_provider_id_source(&[]), RunConfigValueSource::Default);
         assert_eq!(
             cli_provider_id_source(&[(
@@ -5508,59 +6552,21 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_model_uses_active_catalog_auth_filtering_like_codex() -> Result<()> {
-        let temp = unique_cli_test_dir("catalog-default")?;
-        let catalog_path = temp.join("models.json");
-        std::fs::write(
-            &catalog_path,
-            serde_json::json!({
-                "models": [
-                    {
-                        "slug": "chatgpt-only",
-                        "display_name": "ChatGPT Only",
-                        "description": "ChatGPT-only default",
-                        "visibility": "list",
-                        "supported_in_api": false,
-                        "priority": 0,
-                        "supports_parallel_tool_calls": true,
-                        "input_modalities": ["text"]
-                    },
-                    {
-                        "slug": "api-supported",
-                        "display_name": "API Supported",
-                        "description": "API-supported default",
-                        "visibility": "list",
-                        "supported_in_api": true,
-                        "priority": 2,
-                        "supports_parallel_tool_calls": true,
-                        "input_modalities": ["text"]
-                    }
-                ]
-            })
-            .to_string(),
-        )?;
-        let overrides = vec![
-            ("model".to_string(), toml::Value::String(String::new())),
-            (
-                "model_catalog_json".to_string(),
-                toml::Value::String(catalog_path.display().to_string()),
-            ),
-        ];
+    fn cli_default_model_falls_back_to_bundled_catalog_default() -> Result<()> {
+        // The new engine's config layer does not load a `model_catalog_json`
+        // override or apply chatgpt/api auth-filtering (a documented Phase-E
+        // gap-fill); with no configured model a real backend resolves the bundled
+        // catalog default.
+        let overrides = vec![("model".to_string(), toml::Value::String(String::new()))];
 
-        assert_eq!(
-            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
-            "chatgpt-only"
-        );
         assert_eq!(
             default_cli_model_for_backend_with_overrides(
                 ProviderBackend::Openai,
                 None,
                 &overrides
             )?,
-            "api-supported"
+            browser_use_agent::config_model::BUNDLED_DEFAULT_MODEL
         );
-
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 

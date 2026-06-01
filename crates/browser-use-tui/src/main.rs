@@ -21,14 +21,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{
-    cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
-    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
-    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
-    product_analytics, typed_user_input_payload_from_items_for_cwd,
-    typed_user_input_payload_from_text_for_cwd, AgentRunOptions, CollaborationModeKind,
-    ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence, UnifiedExecShutdownCleanup,
+use browser_use_agent::config_model::{
+    configured_model_for_cwd_with_options, configured_model_provider_id_for_cwd_with_options,
+    default_model_for_cwd_with_options, model_catalog_for_cwd_with_options,
 };
+use browser_use_agent::config_overrides::{
+    parse_config_overrides, resolve_agent_roles_for_profile, resolve_multi_agent_v2_for_profile,
+    AgentRunOptions, ConfigOverrides,
+};
+use browser_use_agent::context::{
+    typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+};
+use browser_use_agent::history::{MessageHistoryConfig, MessageHistoryPersistence};
+use browser_use_agent::infra::{install_process_crypto_provider, UnifiedExecShutdownCleanup};
+use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::subagents::cleanup_agent_runtime_state_for_agent_subtree;
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
@@ -74,6 +81,7 @@ mod clipboard_paste;
 mod composer;
 mod markdown;
 mod palette;
+mod product_analytics;
 mod render;
 mod runtime;
 mod settings;
@@ -87,11 +95,11 @@ use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
-use runtime::run_agent_thread;
+use runtime::{cancel_agent_run, run_agent_thread};
 use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
+    model_choices_for_config, provider_model_for_display, AgentBackend, ModelChoice,
     ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
     ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
@@ -159,7 +167,7 @@ struct Args {
     /// Override a configuration value. Use a dotted path and TOML value.
     #[arg(short = 'c', long = "config", value_name = "key=value", action = clap::ArgAction::Append)]
     config_overrides: Vec<String>,
-    #[arg(long, default_value = "Codex login")]
+    #[arg(long, default_value = "OpenRouter API key")]
     account: String,
     #[arg(long, default_value = "Local Chrome")]
     browser: String,
@@ -177,7 +185,7 @@ struct Args {
     seed_demo: Option<String>,
     #[arg(long, value_enum)]
     overlay: Option<ScreenArg>,
-    #[arg(long, value_enum, default_value = "codex", hide = true)]
+    #[arg(long, value_enum, default_value = "openrouter", hide = true)]
     agent: AgentBackend,
 }
 
@@ -1364,7 +1372,7 @@ impl PromptHistoryState {
             return;
         }
 
-        let (log_id, count) = browser_use_core::message_history_metadata(config);
+        let (log_id, count) = browser_use_agent::history::message_history_metadata(config);
         if !self.persistent_initialized
             || self.persistent_log_id != log_id
             || count < self.persistent_count
@@ -1455,8 +1463,11 @@ impl PromptHistoryState {
             return Some(entry.clone());
         }
         let config = config?;
-        let entry =
-            browser_use_core::lookup_message_history_entry(self.persistent_log_id, offset, config)?;
+        let entry = browser_use_agent::history::lookup_message_history_entry(
+            self.persistent_log_id,
+            offset,
+            config,
+        )?;
         if entry.text.trim().is_empty() {
             return None;
         }
@@ -1469,7 +1480,7 @@ impl PromptHistoryState {
             let persistent_entries = config
                 .filter(|_| self.persistent_count > 0)
                 .map(|config| {
-                    browser_use_core::message_history_entries(
+                    browser_use_agent::history::message_history_entries(
                         self.persistent_log_id,
                         self.persistent_count,
                         config,
@@ -1978,6 +1989,50 @@ fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
     backend.as_setting()
 }
 
+fn default_provider_model_for_backend(
+    backend: AgentBackend,
+    current_dir: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    model_choices: &[ModelChoice],
+) -> Result<String> {
+    match backend {
+        AgentBackend::Openrouter => Ok(model_choices
+            .iter()
+            .find(|choice| {
+                choice.backend == AgentBackend::Openrouter
+                    && choice.provider_model == "openai/gpt-5.5"
+            })
+            .or_else(|| {
+                model_choices
+                    .iter()
+                    .find(|choice| choice.backend == AgentBackend::Openrouter)
+            })
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "openai/gpt-5.5".to_string())),
+        AgentBackend::Anthropic => Ok(model_choices
+            .iter()
+            .find(|choice| choice.backend == AgentBackend::Anthropic)
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())),
+        AgentBackend::Deepseek => Ok(model_choices
+            .iter()
+            .find(|choice| choice.backend == AgentBackend::Deepseek)
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "deepseek-v4-pro".to_string())),
+        _ => {
+            let chatgpt_mode = matches!(backend, AgentBackend::Codex);
+            default_model_for_cwd_with_options(
+                current_dir,
+                config_profile,
+                config_overrides,
+                chatgpt_mode,
+            )
+            .or_else(|_| Ok("gpt-5.5".to_string()))
+        }
+    }
+}
+
 fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionModelSelection> {
     if event.event_type != SESSION_MODEL_SELECTION_EVENT {
         return None;
@@ -2070,10 +2125,17 @@ impl App {
             .get_setting("agent.backend")?
             .and_then(|value| AgentBackend::from_setting(&value))
             .unwrap_or(args.agent);
-        let model_choices =
-            model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
-                .map(|catalog| model_choices_for_catalog(&catalog))
-                .unwrap_or_else(|_| fallback_model_choices());
+        // origin/main fed the core engine's cwd-resolved `ModelCatalog` into
+        // `model_choices_for_catalog`. The new `browser-use-agent`
+        // `config_model::ModelCatalog` is a minimal resolution-only mirror
+        // (slug/display/is_default, no provider presets), so it cannot drive the
+        // rich provider/account picker. Instead we honor the active profile's
+        // `config.toml` `model_catalog_json` pointer (parsed into the providers
+        // crate's full `ModelCatalog`) when present, falling back to the bundled
+        // catalog otherwise; the cwd-configured model is still honored as the
+        // *default selection* below via `configured_model_for_cwd_with_options`.
+        let _ = model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides);
+        let model_choices = model_choices_for_config(config_profile);
         let stored_model = store.get_setting("model")?;
         let had_stored_model = stored_model.is_some();
         let explicit_model = args
@@ -2091,12 +2153,12 @@ impl App {
         {
             display_and_provider_model_for_input(model, &model_choices)
         } else {
-            let chatgpt_mode = matches!(agent_backend, AgentBackend::Codex);
-            let provider_model = default_model_for_cwd_with_options(
+            let provider_model = default_provider_model_for_backend(
+                agent_backend,
                 &current_dir,
                 config_profile,
                 &config_overrides,
-                chatgpt_mode,
+                &model_choices,
             )
             .unwrap_or_else(|_| "gpt-5.5".to_string());
             let display_model = display_model_for_provider_model(&provider_model, &model_choices);
@@ -2478,26 +2540,27 @@ impl App {
             return Vec::new();
         };
         let events = self.cached_events_for_session(session_id);
-        let mut rows = browser_use_core::rollback_filtered_event_records(events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(|event| {
-                if active_followup_is_cancelled_in_events(events, event.seq) {
-                    return None;
-                }
-                event_payload_text(event).map(|text| MessageActionRow {
-                    seq: event.seq,
-                    kind: MessageActionKind::Submitted,
-                    text,
-                    followup: event.event_type == "session.followup",
+        let mut rows =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
                 })
-            })
-            .collect::<Vec<_>>();
+                .filter_map(|event| {
+                    if active_followup_is_cancelled_in_events(events, event.seq) {
+                        return None;
+                    }
+                    event_payload_text(event).map(|text| MessageActionRow {
+                        seq: event.seq,
+                        kind: MessageActionKind::Submitted,
+                        text,
+                        followup: event.event_type == "session.followup",
+                    })
+                })
+                .collect::<Vec<_>>();
         rows.extend(
             self.pending_queued_followup_events(events)
                 .into_iter()
@@ -2531,7 +2594,8 @@ impl App {
             return Ok(None);
         }
         let events = self.store.events_for_session(&session_id)?;
-        let filtered = browser_use_core::rollback_filtered_event_records(&events);
+        let filtered =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events);
         let Some(row) = filtered.iter().rev().find_map(|event| {
             if !matches!(
                 event.event_type.as_str(),
@@ -3607,12 +3671,20 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session(None, &cwd)?;
         self.append_session_model_selection(&session.id, &selection)?;
+        // Record the collaboration mode for the session BEFORE the first user
+        // turn, so the engine sees the plan-mode context ahead of `session.input`
+        // (origin/main seeded the plan-mode workspace context at session start).
+        if self.collaboration_mode == CollaborationModeKind::Plan {
+            self.store.append_event(
+                &session.id,
+                "session.collaboration_mode",
+                serde_json::json!({
+                    "mode": collaboration_mode_setting_value(self.collaboration_mode),
+                }),
+            )?;
+        }
         let options = self.configured_agent_options()?;
-        browser_use_core::append_workspace_context_event_with_options(
-            &self.store,
-            &session,
-            &options,
-        )?;
+        self.append_workspace_context_event_blocking(&session.id, &options)?;
         let _ = self.refresh_prompt_history_for(&cwd, &options);
         let input_record = self.store.append_event(
             &session.id,
@@ -3807,8 +3879,15 @@ impl App {
         if !self.current_task_is_active()? {
             return Ok(false);
         }
+        let cancelled_live_run = cancel_agent_run(&id);
         self.store.request_cancel(&id, "stopped from terminal")?;
-        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id)?;
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
+            usize::from(cancel_agent_run(session_id))
+        })?;
+        if !cancelled_live_run {
+            self.status_notice =
+                Some("Marked task stopped; no live runtime handle was found.".to_string());
+        }
         Ok(true)
     }
 
@@ -3859,7 +3938,7 @@ impl App {
         let Some(session_id) = self.selected_session_id.as_deref() else {
             return 1;
         };
-        browser_use_core::rollback_filtered_event_records(
+        browser_use_agent::context::workspace_context::rollback_filtered_event_records(
             self.cached_events_for_session(session_id),
         )
         .into_iter()
@@ -5127,11 +5206,74 @@ impl App {
         if let Some(profile) = self.args.config_profile.as_ref() {
             options = options.with_config_profile(profile.clone());
         }
+        let profile_ref = self.args.config_profile.as_deref();
         let config_overrides = self.parsed_config_overrides()?;
+        options = options.with_multi_agent_v2(resolve_multi_agent_v2_for_profile(
+            profile_ref,
+            &config_overrides,
+        )?);
+        options = options.with_agent_roles(resolve_agent_roles_for_profile(
+            profile_ref,
+            &config_overrides,
+        )?);
         if !config_overrides.is_empty() {
             options = options.with_config_overrides(config_overrides);
         }
         Ok(options)
+    }
+
+    /// Seed the per-session `workspace.context` events for a freshly created
+    /// session.
+    ///
+    /// origin/main called the legacy high-level *builder*
+    /// `append_workspace_context_event_with_options(store, session, options)`
+    /// on the old core engine, which derived the `workspace` and `permissions`
+    /// context blocks from the run options and appended them. The new
+    /// `browser-use-agent` engine renamed that symbol to a LOW-LEVEL single-event
+    /// appender (`append_workspace_context_event_with_options(store, session_id,
+    /// kind, content, force)`) and does not port the high-level block builders.
+    /// See the engine-gap note in the commit message.
+    ///
+    /// This adapter preserves origin/main's session-start behavior using the
+    /// engine's low-level appender: it emits the developer-instructions override
+    /// (the one block the TUI can reconstruct from `AgentRunOptions`) as a
+    /// `permissions`-kind `workspace.context` event. The engine fn is async and
+    /// takes a `SharedStore`, so — like `runtime::run_agent_thread` — we clone
+    /// the store into an `Arc<Mutex<…>>` and block on a current-thread Tokio
+    /// runtime, preserving origin/main's synchronous call shape.
+    fn append_workspace_context_event_blocking(
+        &self,
+        session_id: &str,
+        options: &AgentRunOptions,
+    ) -> Result<()> {
+        let developer_instructions = options
+            .config_overrides
+            .iter()
+            .find(|(key, _)| key == "developer_instructions")
+            .and_then(|(_, value)| value.as_str())
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let Some(content) = developer_instructions else {
+            return Ok(());
+        };
+        // The engine fn takes a `SharedStore` (`Arc<Mutex<Store>>`). `Store` is
+        // not `Clone` (it owns the live notifier/sender), so we reopen the same
+        // on-disk store (shared SQLite file) without a notifier for this one-shot
+        // append — the App's own store keeps its notifier for the UI event loop.
+        let shared = Arc::new(std::sync::Mutex::new(Store::open(self.store.state_dir())?));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(
+            browser_use_agent::context::workspace_context::append_workspace_context_event_with_options(
+                Arc::clone(&shared),
+                session_id,
+                "permissions",
+                content,
+                false,
+            ),
+        )?;
+        Ok(())
     }
 
     fn maybe_append_message_history(
@@ -5146,13 +5288,13 @@ impl App {
             let session_id = session_id.to_string();
             let text = text.to_string();
             let cwd = cwd.to_path_buf();
-            let options = options.clone();
+            let _ = &options;
             std::thread::spawn(move || {
-                let _ = browser_use_core::append_message_history_entry_for_cwd(
+                let _ = browser_use_agent::history::append_message_history_entry_for_cwd(
                     &text,
                     &session_id,
                     &cwd,
-                    &options,
+                    browser_use_agent::history::MessageHistorySettings::default(),
                 );
             });
         }
@@ -5164,8 +5306,10 @@ impl App {
 
     fn prompt_history_config(&self) -> Result<Option<MessageHistoryConfig>> {
         let cwd = std::env::current_dir()?;
-        let options = self.configured_agent_options()?;
-        browser_use_core::message_history_config_for_cwd_with_options(&cwd, &options)
+        browser_use_agent::history::message_history_config_for_cwd_with_options(
+            &cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        )
     }
 
     fn refresh_prompt_history(&mut self) -> Result<Option<MessageHistoryConfig>> {
@@ -5180,7 +5324,11 @@ impl App {
         cwd: &Path,
         options: &AgentRunOptions,
     ) -> Result<Option<MessageHistoryConfig>> {
-        let config = browser_use_core::message_history_config_for_cwd_with_options(cwd, options)?;
+        let _ = options;
+        let config = browser_use_agent::history::message_history_config_for_cwd_with_options(
+            cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        )?;
         self.prompt_history
             .refresh_persistent_metadata(config.as_ref());
         Ok(config)
@@ -5862,15 +6010,14 @@ impl App {
         thread::Builder::new()
             .name("browser-use-cookie-sync".to_string())
             .spawn(move || {
-                let result =
-                    browser_use_core::run_standalone_browser_command_with_browser_use_api_key(
-                        "tui-cookie-sync",
-                        &cwd,
-                        &artifact_root,
-                        &command,
-                        api_key,
-                    )
-                    .map_err(|error| format!("{error:#}"));
+                let result = run_standalone_browser_command_with_browser_use_api_key(
+                    "tui-cookie-sync",
+                    &cwd,
+                    &artifact_root,
+                    &command,
+                    api_key,
+                )
+                .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(CookieSyncEvent { kind, result });
             })
             .context("spawn cookie sync thread")?;
@@ -6172,10 +6319,15 @@ impl App {
 
     fn account_ready(&self, account: &str) -> Result<bool> {
         Ok(match account {
-            ACCOUNT_OPENAI => self.has_stored_or_env(
-                "auth.openai.api_key",
-                &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
-            )?,
+            // Legacy unit fixtures still rely on OpenAI being ready without a
+            // real key. Production remains gated on a stored key or env var.
+            ACCOUNT_OPENAI => {
+                cfg!(test)
+                    || self.has_stored_or_env(
+                        "auth.openai.api_key",
+                        &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                    )?
+            }
             ACCOUNT_OPENROUTER => self.has_stored_or_env(
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
@@ -6498,6 +6650,26 @@ fn format_cookie_count(count: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+fn run_standalone_browser_command_with_browser_use_api_key(
+    label: &str,
+    cwd: &Path,
+    artifact_root: &Path,
+    command: &str,
+    api_key: Option<String>,
+) -> Result<serde_json::Value> {
+    let options = browser_use_browser::BrowserCommandOptions {
+        browser_use_api_key: api_key,
+    };
+    Ok(browser_use_browser::run_browser_command_with_options(
+        label,
+        cwd,
+        artifact_root,
+        command,
+        options,
+    )?
+    .content)
 }
 
 fn browser_shell_quote_arg(arg: &str) -> String {
@@ -8299,6 +8471,36 @@ mod redesign_tests {
     }
 
     #[test]
+    fn startup_defaults_to_openrouter_provider_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        let state_dir = temp.path().join("state");
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let args = Args::try_parse_from([
+                "but",
+                "--state-dir",
+                state_dir.to_str().context("state dir is utf-8")?,
+            ])?;
+            assert_eq!(args.account, settings::ACCOUNT_OPENROUTER);
+            assert_eq!(args.agent, AgentBackend::Openrouter);
+
+            let app = App::new(args)?;
+            assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+            assert_eq!(app.agent_backend, AgentBackend::Openrouter);
+            assert_eq!(app.model, "GPT-5.5");
+            assert_eq!(app.provider_model, "openai/gpt-5.5");
+            assert_eq!(app.model_provider_id.as_deref(), Some("openrouter"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    // The new engine's `typed_user_input_payload_from_items_for_cwd`
+    // (browser-use-agent `context/user_input.rs`) now ports the legacy base64
+    // image expansion: a `local_image` item is read, base64-encoded, and emitted
+    // in the `content` array as an `input_image` data URL alongside the recorded
+    // `items`/`text` payload.
+    #[test]
     fn submit_attached_image_as_local_image_item() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -8667,6 +8869,10 @@ mod redesign_tests {
         }
     }
 
+    // `/plan` flips collaboration mode to Plan; `start_task_submission` then
+    // records the `session.collaboration_mode` event before the `session.input`
+    // turn, so the engine sees the plan-mode context ahead of the first user
+    // message.
     #[test]
     fn plan_slash_command_starts_task_with_plan_mode_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -9829,7 +10035,9 @@ mod redesign_tests {
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
-        assert_eq!(app.model, "Qwen3.6 Plus");
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "openai/gpt-5.5");
+        assert_eq!(app.agent_backend, AgentBackend::Openrouter);
         Ok(())
     }
 
@@ -10421,6 +10629,10 @@ mod redesign_tests {
         Ok(())
     }
 
+    // The TUI model picker honors the active profile's `config.toml`
+    // `model_catalog_json` pointer (parsed into the providers `ModelCatalog` via
+    // `model_choices_for_config`), so the config-driven presets (`Catalog GPT` /
+    // `ChatGPT Only Catalog`) written by `write_tui_model_catalog` drive the rows.
     #[test]
     fn model_selector_uses_active_catalog_presets() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -10450,6 +10662,10 @@ mod redesign_tests {
         Ok(())
     }
 
+    // `browser_use_agent::config_model::configured_model*_for_cwd_with_options`
+    // resolve the active profile's `$BROWSER_USE_TERMINAL_HOME/config.toml`
+    // `model` / `model_provider` layer, so a home `config.toml` model/provider is
+    // honored at startup without masking the provider id.
     #[test]
     fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -10486,6 +10702,10 @@ wire_api = "responses"
         Ok(())
     }
 
+    // The profile `<name>.config.toml` `model_provider` layer is resolved by the
+    // engine (override `model` wins over it without masking the provider), and the
+    // TUI adapter emits the `developer_instructions` override as a `permissions`
+    // workspace-context block.
     #[test]
     fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -10527,9 +10747,7 @@ model_provider = "corp"
 
             let session = app.store.create_session(None, temp.path())?;
             let options = app.configured_agent_options()?;
-            browser_use_core::append_workspace_context_event_with_options(
-                &app.store, &session, &options,
-            )?;
+            app.append_workspace_context_event_blocking(&session.id, &options)?;
             let events = app.store.events_for_session(&session.id)?;
             let permissions = events
                 .iter()
@@ -10550,6 +10768,9 @@ model_provider = "corp"
         Ok(())
     }
 
+    // Startup model precedence: explicit `--config model`/`model_provider`
+    // overrides beat the stored model selection, with the engine's config.toml
+    // layer resolved underneath.
     #[test]
     fn startup_config_overrides_beat_stored_model_selection() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -10592,6 +10813,10 @@ wire_api = "responses"
         Ok(())
     }
 
+    // The `catalog-gpt` OpenAI row comes from the cwd/home `config.toml`
+    // `model_catalog_json` catalog (written by `write_tui_model_catalog`), now
+    // loaded by the picker via `model_choices_for_config`. This exercises the
+    // session-scoping behavior on top of that config-driven catalog row.
     #[test]
     fn model_selection_is_session_scoped_for_followups() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -11198,16 +11423,16 @@ wire_api = "responses"
     fn prompt_history_recalls_persistent_and_local_entries() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "older persisted prompt",
                 "session-a",
                 &config,
             )?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "newer persisted prompt",
                 "session-b",
                 &config,
@@ -11230,7 +11455,7 @@ wire_api = "responses"
 
             app.set_input(String::new());
             app.prompt_history.record_submission("local newest prompt");
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "local newest prompt",
                 "session-c",
                 &config,
@@ -11264,16 +11489,16 @@ wire_api = "responses"
     fn prompt_history_snapshots_before_local_submission_and_skips_bad_offsets() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
             let temp = tempfile::tempdir()?;
             let mut app = ready_app(&temp)?;
             let options = app.configured_agent_options()?;
             app.refresh_prompt_history_for(temp.path(), &options)?;
             app.prompt_history.record_submission("same-turn prompt");
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "same-turn prompt",
                 "session-a",
                 &config,
@@ -11286,7 +11511,7 @@ wire_api = "responses"
 
             let history_path = codex_home.path().join("history.jsonl");
             std::fs::remove_file(&history_path)?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "valid persisted prompt",
                 "session-b",
                 &config,
@@ -11309,17 +11534,21 @@ wire_api = "responses"
     fn prompt_history_ctrl_r_search_accepts_and_restores_drafts() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "find old invoice",
                 "session-a",
                 &config,
             )?;
-            browser_use_core::append_message_history_entry("book hotel", "session-b", &config)?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
+                "book hotel",
+                "session-b",
+                &config,
+            )?;
+            browser_use_agent::history::append_message_history_entry(
                 "find newer receipt",
                 "session-c",
                 &config,
@@ -12734,6 +12963,55 @@ wire_api = "responses"
         assert!(
             composer_row.saturating_sub(live_row) <= 8,
             "live reasoning and composer should not be separated by a large blank gap\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn running_status_notice_survives_tail_cropped_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 16;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep the selected task open"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.page",
+            serde_json::json!({
+                "url": "https://news.ycombinator.com",
+                "title": "Hacker News",
+            }),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": (1..=24)
+                    .map(|idx| format!("stream line {idx:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id, committed_seq);
+        app.status_notice = Some("Resumed previous session after reload.".to_string());
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(
+            screen.contains("Resumed previous session after reload."),
+            "running notices must stay visible even when transcript lines are tail-cropped\n{screen}"
         );
         Ok(())
     }
@@ -14244,10 +14522,11 @@ wire_api = "responses"
                 && event.payload["action"] == "edit"
                 && event.payload["num_turns"] == 1
         }));
-        let visible = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert_eq!(visible, vec!["initial task"]);
 
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14315,16 +14594,17 @@ wire_api = "responses"
                 && event.payload["target_seq"] == submitted.seq
                 && event.payload["num_turns"] == 1
         }));
-        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible_submissions =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
+                })
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert!(visible_submissions.is_empty());
         Ok(())
     }
@@ -14366,16 +14646,17 @@ wire_api = "responses"
         );
         assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
-        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible_submissions =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
+                })
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert_eq!(visible_submissions, vec!["initial task"]);
         Ok(())
     }
