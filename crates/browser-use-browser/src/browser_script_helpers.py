@@ -375,6 +375,102 @@ def page_info():
     return info
 
 
+def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
+    """Find repeated visible record/card groups and suggest an extraction selector.
+
+    This is for pages where the answer is in repeated cards, listings, rows, or
+    product tiles. It returns compact candidates; call extract_repeated_items()
+    with the recommended selector to get the records.
+    """
+    expression = f"""
+(() => {{
+  const minCount = {int(min_count)};
+  const limit = {int(limit)};
+  const includePrices = {json.dumps(bool(include_prices))};
+  const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/i;
+  const visible = (el) => {{
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width >= 40 && r.height >= 20 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }};
+  const clean = (text, max = 240) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const cssPath = (el) => {{
+    if (!el || !el.tagName) return '';
+    if (el.id) return `${{el.tagName.toLowerCase()}}#${{CSS.escape(el.id)}}`;
+    const classes = [...el.classList].filter(c => c && !/^ng-|^css-|^sc-|^_[a-z0-9]/i.test(c)).slice(0, 2);
+    if (classes.length) return `${{el.tagName.toLowerCase()}}.${{classes.map(c => CSS.escape(c)).join('.')}}`;
+    return el.tagName.toLowerCase();
+  }};
+  const scoreGroup = (items, selector) => {{
+    const samples = items.slice(0, 5).map(el => clean(el.innerText || el.textContent || ''));
+    const nonempty = samples.filter(Boolean);
+    const priceSignals = samples.filter(text => priceRe.test(text)).length;
+    const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
+    const links = new Set();
+    for (const el of items.slice(0, 10)) {{
+      for (const a of el.querySelectorAll('a[href]')) links.add(a.href);
+    }}
+    let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8);
+    if (priceSignals) score += priceSignals * 6;
+    if (/^(li|div|article|section|tr)($|[.#])/.test(selector)) score += 1;
+    return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, score, samples }};
+  }};
+  const groups = new Map();
+  for (const el of document.querySelectorAll('article, section, li, tr, [class]')) {{
+    if (!visible(el)) continue;
+    const text = clean(el.innerText || el.textContent || '', 500);
+    if (text.length < 12) continue;
+    const selector = cssPath(el);
+    if (!selector) continue;
+    if (!groups.has(selector)) groups.set(selector, []);
+    groups.get(selector).push(el);
+  }}
+  const candidates = [];
+  for (const [selector, items] of groups) {{
+    if (items.length < minCount) continue;
+    const scored = scoreGroup(items, selector);
+    if (includePrices && scored.price_signal_count === 0 && scored.link_count === 0 && scored.score < 14) continue;
+    candidates.push(scored);
+  }}
+  candidates.sort((a, b) => b.score - a.score || b.price_signal_count - a.price_signal_count || b.count - a.count);
+  const recommended = candidates[0] || null;
+  return {{
+    recommended_action: recommended ? 'extract_repeated_items' : null,
+    recommended_selector: recommended ? recommended.selector : null,
+    next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
+    candidates: candidates.slice(0, limit),
+  }};
+}})()
+"""
+    return js(expression)
+
+
+def extract_repeated_items(selector, limit=50, include_html=False):
+    """Extract compact records from repeated page elements matching selector."""
+    expression = f"""
+(() => {{
+  const selector = {json.dumps(selector)};
+  const limit = {int(limit)};
+  const includeHtml = {json.dumps(bool(include_html))};
+  const clean = (text, max = 2000) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/ig;
+  return Array.from(document.querySelectorAll(selector)).slice(0, limit).map((el, index) => {{
+    const text = clean(el.innerText || el.textContent || '');
+    const headings = Array.from(el.querySelectorAll('h1,h2,h3,h4,[role="heading"]')).map(h => clean(h.textContent, 200)).filter(Boolean);
+    const links = Array.from(el.querySelectorAll('a[href]')).slice(0, 8).map(a => ({{ text: clean(a.textContent, 160), href: a.href }}));
+    const buttons = Array.from(el.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')).slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
+    const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
+    const record = {{ index, text, headings, prices, links, buttons }};
+    if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
+    return record;
+  }});
+}})()
+"""
+    records = js(expression)
+    return {"selector": selector, "count": len(records or []), "records": records or []}
+
+
 def current_tab():
     page = _send_meta("current_tab")
     target_id = page.get("targetId") or page.get("target_id")

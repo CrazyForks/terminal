@@ -5267,6 +5267,61 @@ print("return detection ok")
     }
 
     #[test]
+    fn browser_script_repeated_item_helpers_surface_actionable_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-repeated-item-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    if "querySelectorAll(selector)" in expression:
+        return [
+            {
+                "index": 0,
+                "text": "DNA Netti 300M 19,90 €/kk",
+                "headings": ["DNA Netti 300M"],
+                "prices": ["19,90 €/kk"],
+                "links": [],
+                "buttons": ["Valitse"],
+            }
+        ]
+    return {
+        "recommended_action": "extract_repeated_items",
+        "recommended_selector": "div.subscriptioncard",
+        "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
+        "candidates": [
+            {
+                "selector": "div.subscriptioncard",
+                "count": 3,
+                "price_signal_count": 3,
+                "link_count": 0,
+                "samples": ["DNA Netti 300M 19,90 €/kk"],
+            }
+        ],
+    }
+
+snapshot = repeated_items_snapshot()
+assert snapshot["recommended_action"] == "extract_repeated_items"
+assert snapshot["recommended_selector"] == "div.subscriptioncard"
+records = extract_repeated_items(snapshot["recommended_selector"])
+assert records["count"] == 1
+assert records["records"][0]["prices"] == ["19,90 €/kk"]
+assert any("querySelectorAll(selector)" in call for call in calls)
+print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("extract_repeated_items"));
+        assert!(output.text.contains("19,90"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");

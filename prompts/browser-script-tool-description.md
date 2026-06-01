@@ -28,6 +28,8 @@ js(expression, returnByValue=True)
 new_tab(url="about:blank")
 goto_url(url)
 page_info()
+repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
+extract_repeated_items(selector, limit=50, include_html=False)
 
 capture_screenshot(...)
 screenshot(label="screenshot", full=False)
@@ -73,6 +75,7 @@ Usage guidance:
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
+- When repeated product/listing/package/ticket cards are visible, call `repeated_items_snapshot()` first. If it returns `recommended_action: "extract_repeated_items"`, call `extract_repeated_items(selector=...)` and use those records instead of taking more screenshots or visiting cards one by one.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
