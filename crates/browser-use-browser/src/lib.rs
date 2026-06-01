@@ -5281,17 +5281,23 @@ def js(expression, returnByValue=True):
         assert "el.matches('a[href]')" in expression
         assert "seenLinks" in expression
         assert "buttonNodes" in expression
+        assert "aria-label" in expression
+        assert "img[alt]" in expression
+        assert "labels" in expression
         return [
             {
                 "index": 0,
                 "text": "DNA Netti 300M 19,90 €/kk",
                 "headings": ["DNA Netti 300M"],
+                "labels": ["DNA Netti 300M product card"],
                 "prices": ["19,90 €/kk"],
                 "links": [{"text": "DNA Netti 300M", "href": "https://example.test/dna-300"}],
                 "buttons": ["Valitse"],
             }
         ]
     assert "el.matches('a[href]')" in expression
+    assert "aria-label" in expression
+    assert "img[alt]" in expression
     assert expression.index("if (classes.length)") < expression.index("if (el.id)")
     return {
         "recommended_action": "extract_repeated_items",
@@ -5314,6 +5320,7 @@ assert snapshot["recommended_selector"] == "div.subscriptioncard"
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
+assert records["records"][0]["labels"] == ["DNA Netti 300M product card"]
 assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))

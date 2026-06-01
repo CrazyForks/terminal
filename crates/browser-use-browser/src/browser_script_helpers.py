@@ -395,6 +395,11 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     return r.width >= 40 && r.height >= 20 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
   }};
   const clean = (text, max = 240) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const recordText = (el, max = 500) => {{
+    const parts = [el.innerText || el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
+    for (const img of el.querySelectorAll('img[alt]')) parts.push(img.getAttribute('alt') || '');
+    return clean(parts.filter(Boolean).join(' '), max);
+  }};
   const cssPath = (el) => {{
     if (!el || !el.tagName) return '';
     const classes = [...el.classList].filter(c => c && !/^ng-|^css-|^sc-|^_[a-z0-9]/i.test(c)).slice(0, 2);
@@ -403,7 +408,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     return el.tagName.toLowerCase();
   }};
   const scoreGroup = (items, selector) => {{
-    const samples = items.slice(0, 5).map(el => clean(el.innerText || el.textContent || ''));
+    const samples = items.slice(0, 5).map(el => recordText(el));
     const nonempty = samples.filter(Boolean);
     const priceSignals = samples.filter(text => priceRe.test(text)).length;
     const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
@@ -420,7 +425,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
   const groups = new Map();
   for (const el of document.querySelectorAll('article, section, li, tr, [class]')) {{
     if (!visible(el)) continue;
-    const text = clean(el.innerText || el.textContent || '', 500);
+    const text = recordText(el, 500);
     if (text.length < 12) continue;
     const selector = cssPath(el);
     if (!selector) continue;
@@ -455,10 +460,18 @@ def extract_repeated_items(selector, limit=50, include_html=False):
   const limit = {int(limit)};
   const includeHtml = {json.dumps(bool(include_html))};
   const clean = (text, max = 2000) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const imageAlts = (el) => Array.from(el.querySelectorAll('img[alt]')).map(img => clean(img.getAttribute('alt'), 200)).filter(Boolean).slice(0, 8);
+  const recordText = (el) => clean([
+    el.innerText || el.textContent || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    ...imageAlts(el),
+  ].filter(Boolean).join(' '));
   const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/ig;
   return Array.from(document.querySelectorAll(selector)).slice(0, limit).map((el, index) => {{
-    const text = clean(el.innerText || el.textContent || '');
+    const text = recordText(el);
     const headings = Array.from(el.querySelectorAll('h1,h2,h3,h4,[role="heading"]')).map(h => clean(h.textContent, 200)).filter(Boolean);
+    const labels = Array.from(new Set([clean(el.getAttribute('aria-label'), 200), clean(el.getAttribute('title'), 200), ...imageAlts(el)].filter(Boolean))).slice(0, 12);
     const linkNodes = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
     const buttonNodes = (el.matches('button,[role="button"],input[type="button"],input[type="submit"]') ? [el] : []).concat(Array.from(el.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')));
     const seenLinks = new Set();
@@ -469,7 +482,7 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     }}).slice(0, 8).map(a => ({{ text: clean(a.textContent || a.value, 160), href: a.href }}));
     const buttons = buttonNodes.slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
-    const record = {{ index, text, headings, prices, links, buttons }};
+    const record = {{ index, text, headings, labels, prices, links, buttons }};
     if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
     return record;
   }});
