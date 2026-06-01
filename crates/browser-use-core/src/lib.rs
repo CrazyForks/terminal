@@ -25253,6 +25253,7 @@ fn dispatch_wait_agent_tool(
             serde_json::json!({
                 "message": if timed_out { "Wait timed out." } else { "Wait completed." },
                 "timed_out": timed_out,
+                "agents": agent_status_summaries(store, session, None, false)?,
             }),
         )?],
     })
@@ -25457,14 +25458,41 @@ fn dispatch_list_agents_tool(
                 .map(|current| canonical_agent_reference(prefix, &current))
         })
         .transpose()?;
+    let agents = agent_status_summaries(store, session, path_prefix.as_deref(), true)?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "list_agents",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "list_agents",
+            serde_json::json!({ "agents": agents }),
+        )?],
+    })
+}
+
+fn agent_status_summaries(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    path_prefix: Option<&str>,
+    include_root: bool,
+) -> Result<Vec<Value>> {
     let root_id = root_session_id(store, &session.id)?;
     let root_session = store
         .load_session(&root_id)?
         .with_context(|| format!("unknown root session id: {root_id}"))?;
     let mut agents = Vec::new();
-    if path_prefix
-        .as_deref()
-        .is_none_or(|prefix| prefix == "/root" || "/root".starts_with(&format!("{prefix}/")))
+    if include_root
+        && path_prefix
+            .is_none_or(|prefix| prefix == "/root" || "/root".starts_with(&format!("{prefix}/")))
     {
         agents.push(serde_json::json!({
             "agent_name": "/root",
@@ -25489,6 +25517,7 @@ fn dispatch_list_agents_tool(
             .load_session(&agent.child_session_id)?
             .with_context(|| format!("unknown child session id: {}", agent.child_session_id))?;
         agents.push(serde_json::json!({
+            "agent_id": agent.child_session_id,
             "agent_name": agent_name,
             "agent_status": local_agent_status_value(store, &child, Some(&agent))?,
             "last_task_message": last_task_message_for_agent(store, &agent.child_session_id)?,
@@ -25499,24 +25528,7 @@ fn dispatch_list_agents_tool(
             .and_then(Value::as_str)
             .cmp(&right.get("agent_name").and_then(Value::as_str))
     });
-    store.append_event(
-        &session.id,
-        "tool.finished",
-        serde_json::json!({
-            "name": "list_agents",
-            "tool_call_id": call.id,
-        }),
-    )?;
-    Ok(ToolDispatchOutcome {
-        finished: false,
-        messages: vec![tool_json_message(
-            store,
-            session,
-            call,
-            "list_agents",
-            serde_json::json!({ "agents": agents }),
-        )?],
-    })
+    Ok(agents)
 }
 
 pub fn local_agent_status_value(
@@ -45694,7 +45706,7 @@ command = "explicit-mcp"
     }
 
     #[test]
-    fn wait_agent_v2_returns_summary_without_child_content() -> Result<()> {
+    fn wait_agent_v2_returns_compact_child_statuses() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
@@ -45741,8 +45753,17 @@ command = "explicit-mcp"
         let data: Value = serde_json::from_str(content)?;
         assert_eq!(data["message"], "Wait completed.");
         assert_eq!(data["timed_out"], false);
-        assert!(!content.contains("done child result"));
-        assert!(data.get("agents").is_none());
+        assert!(content.contains("done child result"));
+        let agents = data["agents"].as_array().context("agents")?;
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().any(|agent| {
+            agent["agent_name"] == "/root/done_child"
+                && agent["agent_status"] == serde_json::json!({"completed": "done child result"})
+        }));
+        assert!(agents.iter().any(|agent| {
+            agent["agent_name"] == "/root/running_child"
+                && agent["agent_status"] == serde_json::json!("running")
+        }));
         Ok(())
     }
 
@@ -45809,7 +45830,7 @@ command = "explicit-mcp"
         let data: Value = serde_json::from_str(content)?;
         assert_eq!(data["timed_out"], false);
         assert_eq!(data["message"], "Wait completed.");
-        assert!(!content.contains("second finished"));
+        assert!(content.contains("second finished"));
         Ok(())
     }
 
