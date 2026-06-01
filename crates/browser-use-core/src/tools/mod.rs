@@ -2120,6 +2120,10 @@ The user does NOT need to explicitly ask for sub-agents — the right pattern is
 - Citation or bibliography cascade: if the task asks for authors/titles/abstracts/citations for many papers/books/repos, spawn helpers for each citation or source after discovering the list.\n\
 - Multi-site comparison: if comparing 3+ stores, countries, vendors, or official sources, spawn helpers per site/source and have each return the same compact schema.\n\
 - Parent responsibility: keep the item manifest, collect helper results with `wait_agent`, audit count/schema/dedupe, and assemble the final answer.\n\n\
+### Exact fan-out call pattern\n\
+- In V1/Anthropic-style schemas where `spawn_agent` has no `task_name` field, call `spawn_agent` once per helper with only `message` (or `items`) plus optional `fork_context`; do not invent `task_name`. Example message: `For the parent task, handle only item 3/9: <item name>. Use the browser/data tools as needed and return JSON with fields ... via done(result=...)`.\n\
+- In V2 schemas where `task_name` is required, call `spawn_agent(task_name=\"item_3\", message=\"Handle only item 3/9: <item name>; return JSON with fields ... via done(result=...)\")`.\n\
+- Issue all obvious independent helper spawns back-to-back before opening item detail pages locally. After the spawn calls return, keep a manifest of helper id/name to item, call `wait_agent`, integrate completed results, and repeat only for unfinished helpers.\n\n\
 ### When to delegate vs. do the subtask yourself\n\
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. For browser/data fan-out patterns listed above, the immediate local step is spawning the focused helpers, not opening the first item yourself. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.\n\
 - Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.\n\
@@ -2595,6 +2599,21 @@ mod tests {
         assert!(spec
             .description
             .contains("audit count/schema/dedupe"));
+        assert!(spec
+            .description
+            .contains("Exact fan-out call pattern"));
+        assert!(spec
+            .description
+            .contains("V1/Anthropic-style schemas where `spawn_agent` has no `task_name` field"));
+        assert!(spec
+            .description
+            .contains("do not invent `task_name`"));
+        assert!(spec
+            .description
+            .contains("spawn_agent(task_name=\"item_3\""));
+        assert!(spec
+            .description
+            .contains("Issue all obvious independent helper spawns back-to-back"));
         assert!(spec.description.contains(
             "each independent item/document/site helper is not urgent blocking work"
         ));
