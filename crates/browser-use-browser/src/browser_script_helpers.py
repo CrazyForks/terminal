@@ -404,7 +404,8 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     if (!el || !el.tagName) return [];
     const tag = el.tagName.toLowerCase();
     const out = [];
-    const classes = [...el.classList].filter(c => c && !/^ng-|^css-|^sc-|^_[a-z0-9]/i.test(c)).slice(0, 2);
+    const utilityClassRe = /^(?:ng-|css-|sc-|_[a-z0-9]|flex|grid|block|inline|hidden|relative|absolute|fixed|sticky|static|container|row|col|clearfix|sr-only|w-|h-|min-w-|min-h-|max-w-|max-h-|p[trblxy]?[-_]|m[trblxy]?[-_]|gap[-_]|space-[xy]-|text[-_]|font[-_]|leading[-_]|tracking[-_]|bg[-_]|border(?:[-_]|$)|rounded(?:[-_]|$)|shadow(?:[-_]|$)|opacity[-_]|overflow[-_]|z[-_]|items[-_]|justify[-_]|content[-_]|self[-_]|place[-_])/i;
+    const classes = [...el.classList].filter(c => c && !utilityClassRe.test(c)).slice(0, 2);
     if (classes.length) {{
       out.push(`${{tag}}.${{classes.map(c => CSS.escape(c)).join('.')}}`);
       for (const cls of classes) out.push(`${{tag}}.${{CSS.escape(cls)}}`);

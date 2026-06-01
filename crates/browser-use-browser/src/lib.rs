@@ -5300,6 +5300,8 @@ def js(expression, returnByValue=True):
     assert "img[alt]" in expression
     assert "a[href], button, [role=\"button\"]" in expression
     assert "selectorCandidates" in expression
+    assert "utilityClassRe" in expression
+    assert "flex|grid|block" in expression
     assert "for (const cls of classes)" in expression
     assert "for (const selector of selectorCandidates(el))" in expression
     return {
