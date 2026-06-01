@@ -5721,6 +5721,74 @@ print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False)
     }
 
     #[test]
+    fn browser_script_navigation_snapshot_surfaces_menu_and_route_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-navigation-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    assert "navigation links and menu-like controls" in navigation_snapshot.__doc__
+    assert "aria-expanded" in expression
+    assert "aria-controls" in expression
+    assert "role=\"navigation\"" in expression or "[role=\"navigation\"]" in expression
+    assert "properties" in expression
+    assert "rentals" in expression
+    assert "menu" in expression
+    assert "recommended" in expression
+    assert "keyword_matches" in expression
+    assert "relevance_score" in expression
+    assert "CSS.escape" in expression
+    return {
+        "url": "https://www.hostgenius.ca/",
+        "title": "HostGenius",
+        "keywords": ["properties", "rentals", "menu"],
+        "recommended": [
+            {
+                "text": "Properties",
+                "href": "https://www.hostgenius.ca/properties",
+                "tag": "a",
+                "area": "nav navigation Main menu",
+                "selector": "a[aria-label=\"Properties\"]",
+                "attributes": {"aria-label": "Properties"},
+                "relevance_score": 7,
+                "keyword_matches": ["properties"],
+            },
+            {
+                "text": "Menu",
+                "href": "",
+                "tag": "button",
+                "area": "header",
+                "selector": "button[aria-controls=\"mobile-menu\"]",
+                "attributes": {"aria-expanded": "false", "aria-controls": "mobile-menu"},
+                "relevance_score": 2,
+                "keyword_matches": ["menu"],
+            },
+        ],
+        "links": [],
+    }
+
+snapshot = navigation_snapshot(keywords=["properties", "rentals", "menu"])
+assert snapshot["recommended"][0]["href"] == "https://www.hostgenius.ca/properties"
+assert snapshot["recommended"][0]["keyword_matches"] == ["properties"]
+assert snapshot["recommended"][1]["attributes"]["aria-expanded"] == "false"
+assert snapshot["recommended"][1]["selector"] == "button[aria-controls=\"mobile-menu\"]"
+assert any("querySelectorAll" in call for call in calls)
+print("navigation_snapshot ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("navigation_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");

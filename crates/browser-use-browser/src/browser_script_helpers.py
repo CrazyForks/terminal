@@ -497,6 +497,137 @@ def page_info():
     return info
 
 
+def navigation_snapshot(keywords=None, limit=80):
+    """Return visible navigation links and menu-like controls with relevance scores.
+
+    Use this before deciding a site lacks a listing/document section. It surfaces
+    anchors, nav/menu links, and collapsed-menu buttons so the next action can be
+    based on the live DOM rather than screenshots or guesswork.
+    """
+    if keywords is None:
+        keywords = [
+            "properties",
+            "property",
+            "rentals",
+            "vacation rentals",
+            "listings",
+            "browse",
+            "available",
+            "investors",
+            "investor",
+            "reports",
+            "financial",
+            "documents",
+            "filings",
+            "search",
+            "results",
+        ]
+    expression = f"""
+(() => {{
+  const keywords = {json.dumps([str(k).lower() for k in (keywords or [])])};
+  const limit = {int(limit)};
+  const clean = (text, max = 260) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const visible = (el) => {{
+    if (!el || !(el instanceof Element)) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+      && rect.width >= 4 && rect.height >= 4;
+  }};
+  const nearestArea = (el) => {{
+    const area = el.closest('nav,header,footer,main,aside,[role="navigation"],[role="menu"],[role="menubar"],[aria-label]');
+    if (!area) return '';
+    const tag = (area.tagName || '').toLowerCase();
+    const role = area.getAttribute('role') || '';
+    const label = area.getAttribute('aria-label') || area.id || '';
+    return clean([tag, role, label].filter(Boolean).join(' '), 120);
+  }};
+  const textFor = (el) => clean([
+    el.innerText || el.textContent || el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('alt') || '',
+    ...Array.from(el.querySelectorAll('img[alt]')).map(img => img.getAttribute('alt') || ''),
+  ].filter(Boolean).join(' '), 260);
+  const hrefFor = (el) => {{
+    if (el.matches('a[href],area[href]')) return el.href;
+    const nested = el.querySelector('a[href],area[href]');
+    return nested ? nested.href : '';
+  }};
+  const stableAttrs = (el) => {{
+    const attrs = {{}};
+    for (const name of ['id', 'role', 'aria-label', 'aria-expanded', 'aria-controls', 'data-testid', 'data-test', 'data-cy', 'data-component', 'title']) {{
+      const value = clean(el.getAttribute(name), 180);
+      if (value) attrs[name] = value;
+    }}
+    return attrs;
+  }};
+  const selectorFor = (el) => {{
+    const tag = (el.tagName || '').toLowerCase();
+    if (!tag) return '';
+    for (const attr of ['data-testid', 'data-test', 'data-cy', 'aria-controls', 'aria-label']) {{
+      const value = el.getAttribute(attr);
+      if (value && value.length <= 80) return `${{tag}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    if (el.id) return `${{tag}}#${{CSS.escape(el.id)}}`;
+    const cls = Array.from(el.classList || []).find(c => c && c.length <= 80);
+    return cls ? `${{tag}}.${{CSS.escape(cls)}}` : tag;
+  }};
+  const keywordScore = (text, href, area, attrs) => {{
+    const haystack = [text, href, area, Object.values(attrs).join(' ')].join(' ').toLowerCase();
+    let score = 0;
+    const matches = [];
+    for (const keyword of keywords) {{
+      if (keyword && haystack.includes(keyword)) {{
+        matches.push(keyword);
+        score += keyword.includes(' ') ? 5 : 3;
+      }}
+    }}
+    if (/\\b(menu|hamburger|toggle|open|more)\\b/i.test(haystack) && !href) score += 2;
+    if (/\\b(pdf|docx?|xlsx?|download|filing|report|annual|quarterly)\\b/i.test(haystack)) score += 2;
+    if (/\\b(properties|property|rentals|listings|investors?|reports?)\\b/i.test(haystack)) score += 4;
+    return {{score, matches: Array.from(new Set(matches)).slice(0, 8)}};
+  }};
+  const nodes = Array.from(document.querySelectorAll(
+    'a[href],area[href],nav a[href],header a[href],footer a[href],[role="navigation"] a[href],button,[role="button"],[aria-expanded],[aria-controls],[role="menuitem"],[role="link"]'
+  ));
+  const seen = new Set();
+  const records = [];
+  for (const el of nodes) {{
+    if (!visible(el)) continue;
+    const text = textFor(el);
+    const href = hrefFor(el);
+    const attrs = stableAttrs(el);
+    if (!text && !href && !Object.keys(attrs).length) continue;
+    const key = `${{href}}|${{text}}|${{attrs.id || ''}}|${{attrs['aria-controls'] || ''}}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const area = nearestArea(el);
+    const relevance = keywordScore(text, href, area, attrs);
+    records.push({{
+      text,
+      href,
+      tag: (el.tagName || '').toLowerCase(),
+      area,
+      selector: selectorFor(el),
+      attributes: attrs,
+      relevance_score: relevance.score,
+      keyword_matches: relevance.matches,
+    }});
+  }}
+  records.sort((a, b) => b.relevance_score - a.relevance_score || Number(Boolean(b.href)) - Number(Boolean(a.href)) || a.text.localeCompare(b.text));
+  return {{
+    url: location.href,
+    title: document.title || '',
+    keywords,
+    recommended: records.filter(r => r.relevance_score > 0).slice(0, Math.min(12, limit)),
+    links: records.slice(0, limit),
+  }};
+}})()
+"""
+    return js(expression)
+
+
 def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     """Find repeated visible record/card groups and suggest an extraction selector.
 

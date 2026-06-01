@@ -2460,6 +2460,8 @@ mod tests {
             "new_tab(url)",
             "First navigation should usually be `new_tab(url)`",
             "domain_skills_for_url",
+            "navigation_snapshot",
+            "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",
             "browser cookies/session",
