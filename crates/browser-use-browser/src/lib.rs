@@ -5638,7 +5638,14 @@ def js(expression, returnByValue=True):
     assert "aria-label" in expression
     assert "img[alt]" in expression
     assert "a[href], button, [role=\"button\"]" in expression
+    assert "[data-testid]" in expression
+    assert "data-component" in expression
+    assert "[role=\"listitem\"]" in expression
+    assert "[itemtype]" in expression
     assert "selectorCandidates" in expression
+    assert "data-testid', 'data-test', 'data-cy', 'data-component" in expression
+    assert "itemtype" in expression
+    assert "listitem|article|row|gridcell|option" in expression
     assert "utilityClassRe" in expression
     assert "flex|grid|block" in expression
     assert "for (const cls of classes)" in expression

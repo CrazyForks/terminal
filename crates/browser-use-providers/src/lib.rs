@@ -11994,6 +11994,7 @@ mod tests {
         assert!(none.contains("browser_fetch"));
         assert!(none.contains("browser_fetch_many"));
         assert!(none.contains("lazy image/source fields"));
+        assert!(none.contains("data-attribute, role, and schema selectors"));
         assert!(none.contains("required_fields"));
         assert!(none.contains("audit_artifact(path=\"result.json\""));
         assert!(none.contains("records_path=\"payload.results\""));

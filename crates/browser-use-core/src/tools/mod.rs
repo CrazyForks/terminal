@@ -2449,6 +2449,7 @@ mod tests {
             "browser_fetch_many",
             "browser cookies/session",
             "lazy `data-src`",
+            "data-attribute, role, and schema selectors",
             "coordinate clicks",
             "click_at_xy",
             "screenshot(label)",

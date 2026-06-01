@@ -528,6 +528,16 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     const out = [];
     const utilityClassRe = /^(?:ng-|css-|sc-|_[a-z0-9]|flex|grid|block|inline|hidden|relative|absolute|fixed|sticky|static|container|row|col|clearfix|sr-only|w-|h-|min-w-|min-h-|max-w-|max-h-|p[trblxy]?[-_]|m[trblxy]?[-_]|gap[-_]|space-[xy]-|text[-_]|font[-_]|leading[-_]|tracking[-_]|bg[-_]|border(?:[-_]|$)|rounded(?:[-_]|$)|shadow(?:[-_]|$)|opacity[-_]|overflow[-_]|z[-_]|items[-_]|justify[-_]|content[-_]|self[-_]|place[-_])/i;
     const classes = [...el.classList].filter(c => c && !utilityClassRe.test(c)).slice(0, 2);
+    for (const attr of ['data-testid', 'data-test', 'data-cy', 'data-component']) {{
+      const value = el.getAttribute(attr);
+      if (value && value.length <= 80) out.push(`${{tag}}[${{attr}}="${{CSS.escape(value)}}"]`);
+    }}
+    const role = el.getAttribute('role');
+    if (role && /^(?:listitem|article|row|gridcell|option|menuitem|button|link)$/i.test(role)) {{
+      out.push(`${{tag}}[role="${{CSS.escape(role)}}"]`);
+    }}
+    const itemtype = el.getAttribute('itemtype');
+    if (itemtype && itemtype.length <= 160) out.push(`${{tag}}[itemtype="${{CSS.escape(itemtype)}}"]`);
     if (classes.length) {{
       out.push(`${{tag}}.${{classes.map(c => CSS.escape(c)).join('.')}}`);
       for (const cls of classes) out.push(`${{tag}}.${{CSS.escape(cls)}}`);
@@ -554,7 +564,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, image_count: imageCount, score, samples }};
   }};
   const groups = new Map();
-  for (const el of document.querySelectorAll('article, section, li, tr, a[href], button, [role="button"], [class]')) {{
+  for (const el of document.querySelectorAll('article, section, li, tr, [role="listitem"], [role="article"], [role="row"], [role="gridcell"], [role="option"], [itemscope], [itemtype], [data-testid], [data-test], [data-cy], [data-component], a[href], button, [role="button"], [class]')) {{
     if (!visible(el)) continue;
     const text = recordText(el, 500);
     if (text.length < 12) continue;
