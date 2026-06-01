@@ -478,6 +478,7 @@ impl ToolRegistry {
             ShellToolSpecConfig::default(),
             can_request_original_image_detail,
             model_overrides_description,
+            true,
         )
     }
 
@@ -487,6 +488,7 @@ impl ToolRegistry {
         shell_config: ShellToolSpecConfig,
         can_request_original_image_detail: bool,
         model_overrides_description: String,
+        workspace_tools_enabled: bool,
     ) -> Self {
         let mut registry = Self::default();
         registry.allow_login_shell = shell_config.allow_login_shell;
@@ -511,23 +513,25 @@ impl ToolRegistry {
                 );
             }
         }
-        registry.register(apply_patch_tool_spec(), ToolHandlerKind::ApplyPatch);
-        registry.register(
-            view_image_tool_spec(can_request_original_image_detail),
-            ToolHandlerKind::ViewImage,
-        );
-        if multi_agent_config.goals_enabled {
-            registry.register(get_goal_tool_spec(), ToolHandlerKind::GetGoal);
-            registry.register(create_goal_tool_spec(), ToolHandlerKind::CreateGoal);
-            registry.register(update_goal_tool_spec(), ToolHandlerKind::UpdateGoal);
+        if workspace_tools_enabled {
+            registry.register(apply_patch_tool_spec(), ToolHandlerKind::ApplyPatch);
+            registry.register(
+                view_image_tool_spec(can_request_original_image_detail),
+                ToolHandlerKind::ViewImage,
+            );
+            if multi_agent_config.goals_enabled {
+                registry.register(get_goal_tool_spec(), ToolHandlerKind::GetGoal);
+                registry.register(create_goal_tool_spec(), ToolHandlerKind::CreateGoal);
+                registry.register(update_goal_tool_spec(), ToolHandlerKind::UpdateGoal);
+            }
+            registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
+            registry.register(
+                request_user_input_tool_spec(
+                    multi_agent_config.request_user_input_default_mode_enabled,
+                ),
+                ToolHandlerKind::RequestUserInput,
+            );
         }
-        registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
-        registry.register(
-            request_user_input_tool_spec(
-                multi_agent_config.request_user_input_default_mode_enabled,
-            ),
-            ToolHandlerKind::RequestUserInput,
-        );
         registry.register(browser_tool_spec(), ToolHandlerKind::Browser);
         registry.register(browser_script_tool_spec(), ToolHandlerKind::BrowserScript);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
@@ -2681,6 +2685,7 @@ mod tests {
                 ShellToolSpecConfig::default(),
                 false,
                 browser_use_providers::spawn_agent_model_overrides_description(),
+                true,
         );
 
         let router = ToolRouter::new(registry.clone(), true, true);

@@ -12229,6 +12229,7 @@ fn browser_tool_registry_for_session(
         },
         model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
         model_overrides_description,
+        config.workspace_tools_enabled,
     );
     registry.register_mcp_resource_tools(config.mcp_servers.clone());
     registry.register_mcp_tools(mcp::discover_tool_definitions_for_session(
@@ -15966,6 +15967,7 @@ struct AgentsMdConfig {
     shell_tool_enabled: bool,
     unified_exec_enabled: bool,
     allow_login_shell: bool,
+    workspace_tools_enabled: bool,
     image_generation_enabled: bool,
     memories_enabled: bool,
     skills_include_instructions: bool,
@@ -16020,6 +16022,7 @@ impl Default for AgentsMdConfig {
             shell_tool_enabled: true,
             unified_exec_enabled: !cfg!(windows),
             allow_login_shell: true,
+            workspace_tools_enabled: true,
             image_generation_enabled: true,
             memories_enabled: false,
             skills_include_instructions: true,
@@ -17172,6 +17175,11 @@ fn apply_codex_features_config_layer(
         config.unified_exec_enabled = enabled;
     }
     if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "workspace_tools"], path)?
+    {
+        config.workspace_tools_enabled = enabled;
+    }
+    if let Some(enabled) =
         toml_optional_nested_enabled_bool(value, &["features", "image_generation"], path)?
     {
         config.image_generation_enabled = enabled;
@@ -17212,6 +17220,7 @@ fn apply_codex_features_config_layer(
                 | "goals"
                 | "shell_tool"
                 | "unified_exec"
+                | "workspace_tools"
                 | "image_generation"
                 | "plugins"
                 | "default_mode_request_user_input"
@@ -34284,6 +34293,54 @@ request_max_retries = 7
             tool_call_streaming_predispatch_kind(&legacy_router, &shell_call),
             Some(StreamingPredispatchKind::ParallelSafe)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_tools_feature_gates_code_and_planning_tools_for_browser_tasks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.workspace_tools".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+
+        let (specs, registry) = with_browser_use_terminal_home(&app_home, || {
+            Ok::<_, anyhow::Error>((
+                browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?,
+                browser_tool_registry_for_session(&session, &options, "gpt-5.5", true)?,
+            ))
+        })?;
+        for hidden in [
+            "apply_patch",
+            "view_image",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+            "update_plan",
+            "request_user_input",
+        ] {
+            assert!(
+                !specs.iter().any(|spec| spec.name == hidden),
+                "{hidden} should be hidden when workspace tools are disabled"
+            );
+        }
+        for visible in ["browser", "browser_script", "done"] {
+            assert!(
+                specs.iter().any(|spec| spec.name == visible),
+                "{visible} should remain visible for browser-agent work"
+            );
+        }
+        for multi_agent_tool in ["spawn_agent", "wait_agent"] {
+            assert!(
+                registry
+                    .handler_for_namespaced(Some("multi_agent_v1"), multi_agent_tool)
+                    .is_some(),
+                "{multi_agent_tool} should remain callable for browser-agent fan-out"
+            );
+        }
         Ok(())
     }
 
