@@ -2061,6 +2061,10 @@ fn spawn_agent_v1_tool_spec(
                 "description": "Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one."
             }
         },
+        "oneOf": [
+            { "required": ["message"] },
+            { "required": ["items"] }
+        ],
         "additionalProperties": false
     });
     if multi_agent_config.hide_spawn_agent_metadata {
@@ -2703,6 +2707,14 @@ mod tests {
         assert!(flat_specs
             .iter()
             .any(|spec| spec.namespace.is_none() && spec.name == "spawn_agent"));
+        let flat_spawn = flat_specs
+            .iter()
+            .find(|spec| spec.namespace.is_none() && spec.name == "spawn_agent")
+            .expect("flat V1 spawn_agent spec");
+        assert_eq!(
+            flat_spawn.input_schema["oneOf"],
+            serde_json::json!([{ "required": ["message"] }, { "required": ["items"] }])
+        );
         for (tool_name, handler) in [
             ("spawn_agent", ToolHandlerKind::SpawnAgentV1),
             ("send_input", ToolHandlerKind::SendInputV1),
