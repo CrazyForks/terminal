@@ -1732,7 +1732,7 @@ fn done_tool_spec() -> ToolSpec {
                 },
                 "result_file": {
                     "type": "string",
-                    "description": "Optional attachment path. The runtime AUTO-INLINES file contents (up to ~200KB) into `result` if `result` is empty/short — so passing only `result_file` for reasonable-size artifacts is acceptable. For very large outputs (>200KB) include a brief summary in `result` and the file as the attachment."
+                    "description": "Optional attachment path. Prefer also passing the exact user-visible answer in `result`. If `result` is omitted, the runtime auto-inlines readable file contents up to ~200KB; for larger files, include a concise but complete summary in `result` and attach the file here."
                 },
                 "finish_and_close_children": {
                     "type": "boolean",
@@ -2633,6 +2633,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("collecting enough fan-out results"));
+        assert!(spec.input_schema["properties"]["result_file"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Prefer also passing the exact user-visible answer"));
     }
 
     #[test]

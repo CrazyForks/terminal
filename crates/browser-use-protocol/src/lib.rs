@@ -1520,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn result_projection_uses_pointer_for_done_result_file() {
+    fn result_projection_prefers_inlined_done_result_file_contents() {
         let events = vec![EventRecord {
             seq: 1,
             id: "e1".to_string(),
@@ -1533,7 +1533,29 @@ mod tests {
                 "result_file_url": "file:///tmp/but/answer.json",
                 "result_file_directory_url": "file:///tmp/but",
                 "result_file_bytes": 123,
-                "result": "SHOULD_NOT_RENDER ".repeat(100),
+                "result": r#"{"items":[{"id":1},{"id":2}]}"#,
+            }),
+        }];
+        let result = result_from_events(&events).expect("result");
+
+        assert_eq!(result, r#"{"items":[{"id":1},{"id":2}]}"#);
+        assert!(!result.contains("Saved result file."));
+    }
+
+    #[test]
+    fn result_projection_uses_pointer_when_done_result_file_is_not_inlined() {
+        let events = vec![EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "s1".to_string(),
+            ts_ms: 1,
+            event_type: "session.done".to_string(),
+            payload: json!({
+                "source": "done.result_file",
+                "result_file": "answer.json",
+                "result_file_url": "file:///tmp/but/answer.json",
+                "result_file_directory_url": "file:///tmp/but",
+                "result_file_bytes": 250_000,
             }),
         }];
         let result = result_from_events(&events).expect("result");
@@ -1541,8 +1563,7 @@ mod tests {
         assert!(result.contains("Saved result file."));
         assert!(result.contains("file:///tmp/but/answer.json"));
         assert!(result.contains("file:///tmp/but"));
-        assert!(result.contains("123 bytes"));
-        assert!(!result.contains("SHOULD_NOT_RENDER"));
+        assert!(result.contains("250000 bytes"));
     }
 
     #[test]
