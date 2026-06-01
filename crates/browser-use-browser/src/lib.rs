@@ -5617,6 +5617,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/slow":
+            body = b"slow ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -5634,6 +5642,13 @@ try:
     assert blob == bytes([0, 159, 255])
     assert blob.status_code == 200
     assert blob.content == bytes([0, 159, 255])
+    many = http_get_many([base + "/gzip", base + "/missing", base + "/slow"], headers={"X-Parity": "yes"}, timeout=2, max_workers=3)
+    assert [row["index"] for row in many] == [0, 1, 2], many
+    assert many[0]["ok"] is True and many[0]["text"] == "hello gzip", many
+    assert many[1]["ok"] is False and "HTTP 404" in many[1]["error"], many
+    assert many[2]["ok"] is True and many[2]["text"] == "slow ok", many
+    many_binary = http_get_many([base + "/binary"], binary=True)
+    assert many_binary[0]["content_base64"] == base64.b64encode(bytes([0, 159, 255])).decode("ascii")
 finally:
     server.shutdown()
     server.server_close()
@@ -5663,6 +5678,10 @@ proxied_binary = http_get("https://example.test/binary", headers={"X": "1"}, tim
 assert proxied_binary == bytes([0, 159, 255])
 assert proxied_binary.status_code == 202
 assert proxied_binary.content == bytes([0, 159, 255])
+proxied_many = http_get_many(["https://example.test/data"], headers={"X": "1"}, timeout=1.234)
+assert proxied_many[0]["ok"] is True
+assert proxied_many[0]["text"] == "proxied"
+assert proxied_many[0]["status_code"] == 202
 print("http_get parity ok")
 "#,
             10,

@@ -6,6 +6,7 @@ browser-harness semantics so the model sees one coherent browser API.
 """
 
 import base64
+import concurrent.futures
 import gzip
 import json
 import math
@@ -1020,3 +1021,37 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         raise RuntimeError(
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
         ) from exc
+
+
+def http_get_many(urls, headers=None, timeout=20.0, binary=False, max_workers=8):
+    """Fetch many static pages/APIs concurrently and return compact records.
+
+    Results preserve input order. Each record is serializable and has either
+    ok=True with text/content_base64 plus response metadata, or ok=False with an
+    error string so one blocked URL does not discard the whole batch.
+    """
+    urls = list(urls or [])
+    worker_count = max(1, min(int(max_workers or 1), max(1, len(urls)), 16))
+
+    def fetch_one(index_url):
+        index, url = index_url
+        try:
+            body = http_get(url, headers=headers, timeout=timeout, binary=binary)
+            record = {
+                "index": index,
+                "url": url,
+                "final_url": getattr(body, "url", url),
+                "status_code": getattr(body, "status_code", None),
+                "headers": dict(getattr(body, "headers", {}) or {}),
+                "ok": True,
+            }
+            if isinstance(body, (bytes, bytearray)):
+                record["content_base64"] = base64.b64encode(bytes(body)).decode("ascii")
+            else:
+                record["text"] = str(body)
+            return record
+        except Exception as exc:
+            return {"index": index, "url": url, "ok": False, "error": str(exc)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(fetch_one, enumerate(urls)))
