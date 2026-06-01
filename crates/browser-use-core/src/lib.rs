@@ -22831,24 +22831,10 @@ fn dispatch_spawn_agent_tool_with_hooks<P: ModelProvider>(
     } else {
         let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
         match spawn_agent_task_name(call, &parent_agent_path) {
-            Ok(agent_path) => Some(agent_path),
+            Ok(agent_path) => Some(unique_live_agent_path(store, &session.id, &agent_path)?),
             Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
         }
     };
-    if let Some(agent_path) = agent_path.as_deref() {
-        match live_agent_path_exists_in_tree(store, &session.id, agent_path) {
-            Ok(true) => {
-                return dispatch_tool_validation_error(
-                    store,
-                    session,
-                    call,
-                    &format!("agent path `{agent_path}` already exists"),
-                )
-            }
-            Ok(false) => {}
-            Err(error) => return Err(error),
-        }
-    }
     let nickname = reserve_spawn_agent_nickname(
         store,
         &session.id,
@@ -24876,6 +24862,27 @@ fn live_agent_path_exists_in_tree(
     Ok(collect_agent_tree(store, &root_id)?
         .into_iter()
         .any(|agent| agent.status != "closed" && agent.agent_path.as_deref() == Some(agent_path)))
+}
+
+fn unique_live_agent_path(store: &Store, session_id: &str, agent_path: &str) -> Result<String> {
+    if !live_agent_path_exists_in_tree(store, session_id, agent_path)? {
+        return Ok(agent_path.to_string());
+    }
+    let (parent_path, base_name) = agent_path
+        .rsplit_once('/')
+        .map(|(parent, base)| (parent, base))
+        .unwrap_or(("", agent_path));
+    for suffix in 2..=999 {
+        let candidate = if parent_path.is_empty() {
+            format!("{base_name}_{suffix}")
+        } else {
+            format!("{parent_path}/{base_name}_{suffix}")
+        };
+        if !live_agent_path_exists_in_tree(store, session_id, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a unique agent path for `{agent_path}`")
 }
 
 fn enforce_multi_agent_v2_thread_cap(
@@ -43615,7 +43622,7 @@ usage_hint_enabled = false
     }
 
     #[test]
-    fn spawn_agent_rejects_duplicate_v2_task_name_before_store_error() -> Result<()> {
+    fn spawn_agent_suffixes_duplicate_v2_task_name() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
@@ -43659,10 +43666,18 @@ usage_hint_enabled = false
 
         let content = duplicate.messages[0]["content"]
             .as_str()
-            .unwrap_or_default();
-        assert!(content.contains("agent path `/root/repo_helper` already exists"));
-        assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
-        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            .context("duplicate spawn content")?;
+        let payload: Value = serde_json::from_str(content)?;
+        assert_eq!(payload["task_name"], "/root/repo_helper_2");
+        let children = store.list_child_agents(&session.id)?;
+        assert_eq!(children.len(), 2);
+        assert!(children
+            .iter()
+            .any(|child| child.agent_path.as_deref() == Some("/root/repo_helper")));
+        assert!(children
+            .iter()
+            .any(|child| child.agent_path.as_deref() == Some("/root/repo_helper_2")));
+        assert!(!store.events_for_session(&session.id)?.iter().any(|event| {
             event.event_type == "tool.failed" && event.payload["tool_call_id"] == "spawn_duplicate"
         }));
         Ok(())
