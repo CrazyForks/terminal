@@ -16,17 +16,15 @@ use opentelemetry_sdk::Resource;
 use serde_json::Value;
 
 const DEFAULT_LAMINAR_HTTP_ENDPOINT: &str = "https://api.lmnr.ai/v1/traces";
-// Bumped from 16K → 200K so the full system prompt + tool descriptions +
-// recent conversation history are visible in the Laminar UI. The previous
-// limit truncated the message array mid-stream, which made the Laminar UI
-// show "[truncated]" on the input field for any turn past step 5 or so —
-// you could no longer audit what the agent actually saw. 200K covers a full
-// 80-turn Claude Sonnet session with full system + tools + ~10 recent turns.
-const DEFAULT_MAX_ATTR_CHARS: usize = 200_000;
-// Bumped from 24 → 200 so per-message gen_ai.prompt.{idx}.{role,content}
-// attributes are written for every message in a long conversation, not just
-// the first 24.
-const DEFAULT_MAX_PROMPT_ATTRS: usize = 200;
+// Effectively no truncation — Laminar's UI is the only thing we lose by
+// trimming. The agent's actual message history is built independently by
+// the provider; this cap only governs the OTel attribute payload size.
+// Laminar handles multi-MB payloads fine per their docs; the only downside
+// is upload bandwidth. Set very high (50MB / 5000 prompt attrs) so the
+// reviewer sees exactly what the agent saw at every step. Override via
+// LLM_BROWSER_LAMINAR_MAX_ATTR_CHARS / _MAX_PROMPT_ATTRS env if needed.
+const DEFAULT_MAX_ATTR_CHARS: usize = 50_000_000;
+const DEFAULT_MAX_PROMPT_ATTRS: usize = 5_000;
 const DEFAULT_BATCH_DELAY_MS: u64 = 1_000;
 const DEFAULT_BATCH_QUEUE_SIZE: usize = 2_048;
 const DEFAULT_BATCH_EXPORT_SIZE: usize = 128;
