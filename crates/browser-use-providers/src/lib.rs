@@ -5310,10 +5310,29 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
             json!({
                 "name": anthropic_request_tool_name(&tool.name, is_oauth),
                 "description": anthropic_tool_description(tool),
-                "input_schema": tool.input_schema,
+                "input_schema": anthropic_input_schema(tool),
             })
         })
         .collect()
+}
+
+fn anthropic_input_schema(tool: &ToolSpec) -> Value {
+    let mut schema = tool.input_schema.clone();
+    if tool.name == "spawn_agent"
+        && schema.get("oneOf").is_some()
+        && schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| {
+                properties.contains_key("message") && properties.contains_key("items")
+            })
+    {
+        if let Some(object) = schema.as_object_mut() {
+            object.remove("oneOf");
+            object.insert("required".to_string(), json!(["message"]));
+        }
+    }
+    schema
 }
 
 fn anthropic_tool_description(tool: &ToolSpec) -> String {
@@ -7904,6 +7923,39 @@ mod tests {
         assert_eq!(namespace_tools[1]["name"], "wait_agent");
         assert_eq!(tools[1]["type"], "function");
         assert_eq!(tools[1]["name"], "done");
+    }
+
+    #[test]
+    fn anthropic_spawn_agent_schema_avoids_top_level_one_of_for_v1_shape() {
+        let tools = tool_specs_to_anthropic_tools(
+            &[ToolSpec {
+                name: "spawn_agent".to_string(),
+                namespace: None,
+                namespace_description: None,
+                description: "Create a sub-agent.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "items": {"type": "array", "items": {"type": "object"}},
+                        "fork_context": {"type": "boolean"}
+                    },
+                    "oneOf": [
+                        {"required": ["message"]},
+                        {"required": ["items"]}
+                    ],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                freeform: None,
+            }],
+            false,
+        );
+
+        assert_eq!(tools[0]["name"], "spawn_agent");
+        assert!(tools[0]["input_schema"].get("oneOf").is_none());
+        assert_eq!(tools[0]["input_schema"]["required"], json!(["message"]));
+        assert!(tools[0]["input_schema"]["properties"].get("items").is_some());
     }
 
     #[test]
