@@ -5619,6 +5619,14 @@ def js(expression, returnByValue=True):
         assert "currentSrc" in expression
         assert "data-src" in expression
         assert "picture source[srcset]" in expression
+        assert "directCellNodes" in expression
+        assert "tableHeadersForRow" in expression
+        assert "ariaHeadersForRow" in expression
+        assert "cellRecords" in expression
+        assert "columnheader" in expression
+        assert "gridcell" in expression
+        assert "data-label" in expression
+        assert "record.cells" in expression
         assert "actionText" in expression
         assert "labels" in expression
         assert "images" in expression
@@ -5632,6 +5640,10 @@ def js(expression, returnByValue=True):
                 "links": [{"text": "DNA Netti 300M product page", "aria_label": "DNA Netti 300M product page", "title": "", "href": "https://example.test/dna-300"}],
                 "buttons": ["Valitse"],
                 "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": "https://example.test/lazy-dna.png", "data_srcset": "", "width": 200, "height": 120}],
+                "cells": [
+                    {"index": 0, "header": "Plan", "text": "DNA Netti 300M", "links": []},
+                    {"index": 1, "header": "Price", "text": "19,90 €/kk", "links": []},
+                ],
             }
         ]
     assert "el.matches('a[href]')" in expression
@@ -5679,6 +5691,8 @@ assert records["records"][0]["images"][0]["src"] == "https://example.test/dna.pn
 assert records["records"][0]["images"][0]["data_src"] == "https://example.test/lazy-dna.png"
 assert records["records"][0]["links"][0]["aria_label"] == "DNA Netti 300M product page"
 assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
+assert records["records"][0]["cells"][1]["header"] == "Price"
+assert records["records"][0]["cells"][1]["text"] == "19,90 €/kk"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))
 "#,

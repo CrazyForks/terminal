@@ -640,6 +640,52 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     el.getAttribute('title') || '',
     ...imageAlts(el),
   ].filter(Boolean).join(' '));
+  const directCellNodes = (el) => {{
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag === 'TR') {{
+      return Array.from(el.children).filter(child => ['TH', 'TD'].includes((child.tagName || '').toUpperCase()));
+    }}
+    if (el.getAttribute('role') === 'row') {{
+      return Array.from(el.children).filter(child => ['cell', 'gridcell', 'columnheader', 'rowheader'].includes(child.getAttribute('role') || ''));
+    }}
+    return [];
+  }};
+  const tableHeadersForRow = (row) => {{
+    if ((row.tagName || '').toUpperCase() !== 'TR') return [];
+    const table = row.closest('table');
+    if (!table) return [];
+    const headerRow = table.querySelector('thead tr') || Array.from(table.querySelectorAll('tr')).find(tr => tr.querySelector('th'));
+    if (!headerRow || headerRow === row) return [];
+    return Array.from(headerRow.children)
+      .filter(cell => ['TH', 'TD'].includes((cell.tagName || '').toUpperCase()))
+      .map(cell => clean(cell.textContent, 200));
+  }};
+  const ariaHeadersForRow = (row) => {{
+    const container = row.closest('[role="table"],[role="grid"],[role="treegrid"]');
+    if (!container) return [];
+    return Array.from(container.querySelectorAll('[role="columnheader"]')).map(cell => clean(cell.textContent, 200));
+  }};
+  const cellRecords = (el) => {{
+    const cells = directCellNodes(el);
+    if (!cells.length) return [];
+    const headers = tableHeadersForRow(el);
+    const ariaHeaders = headers.length ? [] : ariaHeadersForRow(el);
+    return cells.map((cell, cellIndex) => {{
+      const header = headers[cellIndex] || ariaHeaders[cellIndex] || clean(cell.getAttribute('data-label'), 200) || clean(cell.getAttribute('aria-label'), 200);
+      const cellLinks = Array.from(cell.querySelectorAll('a[href]')).slice(0, 4).map(a => ({{
+        text: actionText(a),
+        aria_label: clean(a.getAttribute('aria-label'), 160),
+        title: clean(a.getAttribute('title'), 160),
+        href: a.href,
+      }}));
+      return {{
+        index: cellIndex,
+        header,
+        text: recordText(cell),
+        links: cellLinks,
+      }};
+    }}).filter(cell => cell.text || cell.header || cell.links.length).slice(0, 20);
+  }};
   const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/ig;
   return Array.from(document.querySelectorAll(selector)).slice(0, limit).map((el, index) => {{
     const text = recordText(el);
@@ -656,7 +702,9 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     const buttons = buttonNodes.slice(0, 8).map(b => actionText(b)).filter(Boolean);
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
     const images = imageRecords(el);
+    const cells = cellRecords(el);
     const record = {{ index, text, headings, labels, prices, links, buttons, images }};
+    if (cells.length) record.cells = cells;
     if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
     return record;
   }});
