@@ -4739,29 +4739,6 @@ impl App {
         true
     }
 
-    fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
-        if self.is_slash_palette_active() {
-            return false;
-        }
-        let Some(rect) = self.composer_input_rect.get() else {
-            return false;
-        };
-        if column < rect.x
-            || column >= rect.x.saturating_add(rect.width)
-            || row < rect.y
-            || row >= rect.y.saturating_add(rect.height)
-        {
-            return false;
-        }
-        self.composer.set_cursor_from_wrapped_position(
-            rect.height.max(1) as usize,
-            rect.width.max(1) as usize,
-            column.saturating_sub(rect.x) as usize,
-            row.saturating_sub(rect.y) as usize,
-        );
-        true
-    }
-
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -7781,9 +7758,6 @@ fn handle_terminal_event(
             let before_cursor = app.composer.cursor_index();
             let logo_handled = matches!(kind, MouseEventKind::Down(_))
                 && app.handle_welcome_logo_click(column, row);
-            if !logo_handled && matches!(kind, MouseEventKind::Down(_)) {
-                app.handle_composer_click(column, row);
-            }
             app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }
@@ -12976,6 +12950,55 @@ wire_api = "responses"
         assert!(
             composer_row.saturating_sub(live_row) <= 8,
             "live reasoning and composer should not be separated by a large blank gap\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn running_status_notice_survives_tail_cropped_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 16;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep the selected task open"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.page",
+            serde_json::json!({
+                "url": "https://news.ycombinator.com",
+                "title": "Hacker News",
+            }),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": (1..=24)
+                    .map(|idx| format!("stream line {idx:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id, committed_seq);
+        app.status_notice = Some("Resumed previous session after reload.".to_string());
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(
+            screen.contains("Resumed previous session after reload."),
+            "running notices must stay visible even when transcript lines are tail-cropped\n{screen}"
         );
         Ok(())
     }
