@@ -2462,6 +2462,7 @@ mod tests {
             "audit_artifact(path=\"result.json\", ...)",
             "records_path=\"payload.results\"",
             "\"source.url\"",
+            "missing or blank dedupe keys",
             "required_fields",
             "unique_by",
         ] {

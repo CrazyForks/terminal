@@ -4590,6 +4590,9 @@ def _audit_field_value(row, field):
             return None
     return current
 
+def _audit_value_missing(value):
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
 def _audit_select_records(data, requirements, details):
     if isinstance(data, list):
         return data
@@ -4683,7 +4686,7 @@ def audit_artifact(data=None, **requirements):
                 for index, row in enumerate(records):
                     for field in fields:
                         value = _audit_field_value(row, field)
-                        if value is None or value == "":
+                        if _audit_value_missing(value):
                             missing.append({{"index": index, "field": field}})
                 checks["required_fields"] = not missing
                 details["required_fields"] = fields
@@ -4694,15 +4697,21 @@ def audit_artifact(data=None, **requirements):
                 fields = _audit_normalize_fields(unique_by)
                 seen = set()
                 duplicates = []
+                missing_keys = []
                 for index, row in enumerate(records):
                     if not isinstance(row, dict):
                         continue
                     key = tuple(_audit_field_value(row, field) for field in fields)
+                    if any(_audit_value_missing(value) for value in key):
+                        missing_keys.append({{"index": index, "key": list(key)}})
+                        continue
                     if key in seen:
                         duplicates.append({{"index": index, "key": list(key)}})
                     seen.add(key)
-                checks["unique_by"] = not duplicates
+                checks["unique_by"] = not duplicates and not missing_keys
                 details["unique_by"] = fields
+                if missing_keys:
+                    details["missing_unique_keys"] = missing_keys[:20]
                 if duplicates:
                     details["duplicates"] = duplicates[:20]
     checks.update({{f"requirement_{{k}}": bool(v) for k, v in requirements.items()}})
@@ -5330,6 +5339,14 @@ assert bad["checks"]["required_fields"] is False, bad
 assert bad["checks"]["unique_by"] is False, bad
 assert bad["details"]["missing_fields"][0]["field"] == "name", bad
 assert bad["details"]["duplicates"][0]["key"] == ["https://example.test/a"], bad
+
+missing_unique_rows = [{"name": "Ada", "url": "https://example.test/a"}, {"name": "Grace", "url": "   "}]
+missing_unique = audit_artifact(missing_unique_rows, required_fields=["name", "url"], unique_by="url")
+assert missing_unique["ready_for_done"] is False, missing_unique
+assert missing_unique["checks"]["required_fields"] is False, missing_unique
+assert missing_unique["checks"]["unique_by"] is False, missing_unique
+assert missing_unique["details"]["missing_fields"][0]["index"] == 1, missing_unique
+assert missing_unique["details"]["missing_unique_keys"][0]["index"] == 1, missing_unique
 
 path = pathlib.Path(outputs_dir()) / "result.json"
 path.write_text(json.dumps([{"name": "Ada", "url": "https://example.test/a"}, {"name": "Grace", "url": "https://example.test/b"}]), encoding="utf-8")

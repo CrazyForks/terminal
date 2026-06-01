@@ -11997,6 +11997,7 @@ mod tests {
         assert!(none.contains("audit_artifact(path=\"result.json\""));
         assert!(none.contains("records_path=\"payload.results\""));
         assert!(none.contains("\"source.url\""));
+        assert!(none.contains("missing or blank dedupe keys"));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
             "custom-model",
