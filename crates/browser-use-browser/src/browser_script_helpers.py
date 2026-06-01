@@ -400,12 +400,18 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     for (const img of el.querySelectorAll('img[alt]')) parts.push(img.getAttribute('alt') || '');
     return clean(parts.filter(Boolean).join(' '), max);
   }};
-  const cssPath = (el) => {{
-    if (!el || !el.tagName) return '';
+  const selectorCandidates = (el) => {{
+    if (!el || !el.tagName) return [];
+    const tag = el.tagName.toLowerCase();
+    const out = [];
     const classes = [...el.classList].filter(c => c && !/^ng-|^css-|^sc-|^_[a-z0-9]/i.test(c)).slice(0, 2);
-    if (classes.length) return `${{el.tagName.toLowerCase()}}.${{classes.map(c => CSS.escape(c)).join('.')}}`;
-    if (el.id) return `${{el.tagName.toLowerCase()}}#${{CSS.escape(el.id)}}`;
-    return el.tagName.toLowerCase();
+    if (classes.length) {{
+      out.push(`${{tag}}.${{classes.map(c => CSS.escape(c)).join('.')}}`);
+      for (const cls of classes) out.push(`${{tag}}.${{CSS.escape(cls)}}`);
+    }}
+    if (el.id) out.push(`${{tag}}#${{CSS.escape(el.id)}}`);
+    if (!out.length) out.push(tag);
+    return [...new Set(out)];
   }};
   const scoreGroup = (items, selector) => {{
     const samples = items.slice(0, 5).map(el => recordText(el));
@@ -427,10 +433,10 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     if (!visible(el)) continue;
     const text = recordText(el, 500);
     if (text.length < 12) continue;
-    const selector = cssPath(el);
-    if (!selector) continue;
-    if (!groups.has(selector)) groups.set(selector, []);
-    groups.get(selector).push(el);
+    for (const selector of selectorCandidates(el)) {{
+      if (!groups.has(selector)) groups.set(selector, []);
+      groups.get(selector).push(el);
+    }}
   }}
   const candidates = [];
   for (const [selector, items] of groups) {{

@@ -5299,7 +5299,9 @@ def js(expression, returnByValue=True):
     assert "aria-label" in expression
     assert "img[alt]" in expression
     assert "a[href], button, [role=\"button\"]" in expression
-    assert expression.index("if (classes.length)") < expression.index("if (el.id)")
+    assert "selectorCandidates" in expression
+    assert "for (const cls of classes)" in expression
+    assert "for (const selector of selectorCandidates(el))" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
