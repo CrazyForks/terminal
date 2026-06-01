@@ -790,7 +790,19 @@ impl AgentRunOptions {
     }
 }
 
-fn browser_mode_instruction(mode: &str) -> String {
+fn browser_mode_instruction(mode: &str, remote_cdp_url: Option<&str>) -> String {
+    if let Some(remote_cdp_url) = remote_cdp_url.filter(|url| !url.trim().is_empty()) {
+        let remote_cdp_url = remote_cdp_url.trim();
+        let flag = if remote_cdp_url.starts_with("ws") {
+            "--ws"
+        } else {
+            "--url"
+        };
+        return format!(
+            "Selected browser mode: External remote CDP. Use `browser connect remote-cdp {flag} {remote_cdp_url}` before page work. \
+Do not call `browser connect managed`, `browser connect local`, or `browser remote start`; a browser with the required proxy/session is already running at the remote CDP endpoint."
+        );
+    }
     let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
         "local" | "local-chrome" => concat!(
@@ -818,6 +830,19 @@ fn browser_mode_instruction(mode: &str) -> String {
             "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
         ),
     }
+}
+
+fn remote_cdp_url_for_browser_instruction(options: &AgentRunOptions) -> Option<String> {
+    options
+        .python_env
+        .iter()
+        .find(|(key, value)| key == "LLM_BROWSER_REMOTE_CDP_URL" && !value.trim().is_empty())
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            std::env::var("LLM_BROWSER_REMOTE_CDP_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn collaboration_mode_instructions(mode: CollaborationModeKind) -> String {
@@ -3271,11 +3296,12 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     };
     let task_text = task_text_from_provider_messages(&messages);
     if let Some(browser_mode) = options.browser_mode.as_deref() {
+        let remote_cdp_url = remote_cdp_url_for_browser_instruction(&options);
         messages.insert(
             0,
             serde_json::json!({
                 "role": "system",
-                "content": browser_mode_instruction(browser_mode),
+                "content": browser_mode_instruction(browser_mode, remote_cdp_url.as_deref()),
             }),
         );
     }
@@ -27442,6 +27468,39 @@ x-env = "CORP_HEADER"
         .to_string();
         assert!(preference_change.contains("locked to Local Chrome"));
         Ok(())
+    }
+
+    #[test]
+    fn browser_mode_instruction_prefers_remote_cdp_url_over_managed_mode() {
+        let instruction = browser_mode_instruction(
+            "managed-headless",
+            Some("wss://unikraft.example/devtools/browser/eval"),
+        );
+
+        assert!(instruction.contains("Selected browser mode: External remote CDP"));
+        assert!(instruction.contains(
+            "browser connect remote-cdp --ws wss://unikraft.example/devtools/browser/eval"
+        ));
+        assert!(instruction.contains("Do not call `browser connect managed`"));
+    }
+
+    #[test]
+    fn browser_mode_instruction_uses_remote_cdp_url_from_child_python_env() {
+        let _guard = EnvVarGuard::remove("LLM_BROWSER_REMOTE_CDP_URL");
+        let options = AgentRunOptions::default().with_python_env(vec![(
+            "LLM_BROWSER_REMOTE_CDP_URL".to_string(),
+            "http://127.0.0.1:9222".to_string(),
+        )]);
+
+        assert_eq!(
+            remote_cdp_url_for_browser_instruction(&options).as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
+        let instruction = browser_mode_instruction(
+            "managed-headless",
+            remote_cdp_url_for_browser_instruction(&options).as_deref(),
+        );
+        assert!(instruction.contains("browser connect remote-cdp --url http://127.0.0.1:9222"));
     }
 
     #[test]
