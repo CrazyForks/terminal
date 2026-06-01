@@ -1287,14 +1287,45 @@ fn wait_agent_output_schema() -> Value {
         "properties": {
             "message": {
                 "type": "string",
-                "description": "Brief wait summary without the agent's final content."
+                "description": "Brief wait summary."
             },
             "timed_out": {
                 "type": "boolean",
                 "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+            },
+            "agents": {
+                "type": "array",
+                "description": "Compact live-agent status summaries after the wait. Completed statuses include each agent's final result when available.",
+                "items": agent_status_summary_output_schema()
             }
         },
-        "required": ["message", "timed_out"],
+        "required": ["message", "timed_out", "agents"],
+        "additionalProperties": false
+    })
+}
+
+fn agent_status_summary_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "agent_id": {
+                "type": "string",
+                "description": "Local session id for the child agent when this summary refers to a child agent."
+            },
+            "agent_name": {
+                "type": "string",
+                "description": "Canonical task name for the agent when available, otherwise the agent id."
+            },
+            "agent_status": {
+                "description": "Last known status of the agent.",
+                "allOf": [agent_status_output_schema()]
+            },
+            "last_task_message": {
+                "type": ["string", "null"],
+                "description": "Most recent user or inter-agent instruction received by the agent, when available."
+            }
+        },
+        "required": ["agent_name", "agent_status", "last_task_message"],
         "additionalProperties": false
     })
 }
@@ -1305,25 +1336,7 @@ fn list_agents_output_schema() -> Value {
         "properties": {
             "agents": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "agent_name": {
-                            "type": "string",
-                            "description": "Canonical task name for the agent when available, otherwise the agent id."
-                        },
-                        "agent_status": {
-                            "description": "Last known status of the agent.",
-                            "allOf": [agent_status_output_schema()]
-                        },
-                        "last_task_message": {
-                            "type": ["string", "null"],
-                            "description": "Most recent user or inter-agent instruction received by the agent, when available."
-                        }
-                    },
-                    "required": ["agent_name", "agent_status", "last_task_message"],
-                    "additionalProperties": false
-                },
+                "items": agent_status_summary_output_schema(),
                 "description": "Live agents visible in the current root thread tree."
             }
         },
@@ -2116,7 +2129,7 @@ The user does NOT need to explicitly ask for sub-agents — the right pattern is
 - When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.\n\
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.\n\n\
 ### After you delegate\n\
-- For browser/data fan-out tasks, collecting helper outputs is part of the critical path: after spawning the item/document/site helpers, call `wait_agent` with the helper ids, integrate any completed statuses, then repeat for remaining helpers until you have enough results for the final answer.\n\
+- For browser/data fan-out tasks, collecting helper outputs is part of the critical path: after spawning the item/document/site helpers, call `wait_agent` and integrate completed statuses. In V1, pass the helper ids and repeat with unfinished ids. In V2, call `wait_agent` without targets, read the returned `agents` array, and use each `agent_status.completed` value as the helper's result.\n\
 - Outside fan-out collection, call wait_agent sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.\n\
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.\n\
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.\n\
@@ -2288,7 +2301,7 @@ fn wait_agent_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> ToolSp
             .tool_namespace
             .as_ref()
             .map(|_| MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string()),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
+        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. For browser/data fan-out, call this after spawning helpers and read the returned `agents` array: completed helpers appear as `agent_status: {\"completed\": ...}` and that completed value is the helper's final result. If some helpers are still running, integrate the completed results and call wait_agent again until you have enough data or the task budget requires a partial answer. Returns a timeout summary if no mailbox update arrives before the deadline."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -2543,9 +2556,10 @@ mod tests {
         assert!(spec
             .description
             .contains("For browser/data fan-out tasks, collecting helper outputs"));
-        assert!(!spec
+        assert!(spec
             .description
-            .contains("Call wait_agent very sparingly"));
+            .contains("In V2, call `wait_agent` without targets"));
+        assert!(!spec.description.contains("Call wait_agent very sparingly"));
         assert!(!spec
             .description
             .contains("spawn a read-only helper with role \"explorer\" before answering"));
@@ -2617,7 +2631,12 @@ mod tests {
             .iter()
             .find(|spec| spec.name == "wait_agent")
             .expect("wait_agent spec");
-        assert!(wait.description.contains("Does not return the content"));
+        assert!(wait
+            .description
+            .contains("read the returned `agents` array"));
+        assert!(wait
+            .description
+            .contains("`agent_status: {\"completed\": ...}`"));
         let wait_properties = wait.input_schema["properties"].as_object().unwrap();
         assert!(wait_properties.contains_key("timeout_ms"));
         assert!(!wait_properties.contains_key("target"));
@@ -2626,6 +2645,15 @@ mod tests {
         assert_eq!(
             wait_properties["timeout_ms"]["description"],
             "Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+        );
+        assert_eq!(
+            wait.output_schema.as_ref().unwrap()["required"],
+            serde_json::json!(["message", "timed_out", "agents"])
+        );
+        assert_eq!(
+            wait.output_schema.as_ref().unwrap()["properties"]["agents"]["items"]["properties"]
+                ["agent_status"]["description"],
+            "Last known status of the agent."
         );
 
         let send = specs
@@ -2746,10 +2774,12 @@ mod tests {
         assert!(flat_wait
             .description
             .contains("call wait_agent again with the remaining ids"));
-        assert!(flat_wait.input_schema["properties"]["targets"]["description"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("repeat with unfinished ids"));
+        assert!(
+            flat_wait.input_schema["properties"]["targets"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("repeat with unfinished ids")
+        );
 
         let loaded = registry.search_deferred_tools("spawn subagent", 8);
         assert_eq!(loaded.len(), 1);
