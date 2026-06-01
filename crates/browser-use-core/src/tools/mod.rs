@@ -2208,7 +2208,7 @@ fn send_input_v1_tool_spec() -> ToolSpec {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Agent id to message (from spawn_agent)."
+                    "description": "Agent id, nickname, or path to message (from spawn_agent)."
                 },
                 "message": {
                     "type": "string",
@@ -2256,14 +2256,14 @@ fn wait_agent_v1_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> Too
         name: "wait_agent".to_string(),
         namespace: Some(MULTI_AGENT_V1_NAMESPACE.to_string()),
         namespace_description: Some(MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string()),
-        description: "Wait for one or more agents to reach a final status. Completed statuses may include each agent's final message. When waiting on multiple fan-out helpers, pass multiple ids in targets; if targets is omitted, wait for any direct child agent. The response may include only the helpers that finished before the timeout; integrate those results, then call wait_agent again with the remaining ids until the final answer has enough data. Returns empty status when timed out. Once an agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait for one or more agents to reach a final status. Completed statuses may include each agent's final message. When waiting on multiple fan-out helpers, pass multiple ids, nicknames, or paths in targets; if targets is omitted, wait for any direct child agent. The response may include only the helpers that finished before the timeout; integrate those results, then call wait_agent again with the remaining ids until the final answer has enough data. Returns empty status when timed out. Once an agent reaches a final status, a notification message will be received containing the same completed status."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "targets": {
                     "type": "array",
-                    "description": "Optional agent ids to wait on. Pass multiple ids during fan-out collection; the tool returns statuses for whichever target(s) finish first, so repeat with unfinished ids. If omitted, waits for any direct child agent.",
+                    "description": "Optional agent ids, nicknames, or paths to wait on. Pass multiple targets during fan-out collection; the tool returns statuses for whichever target(s) finish first, so repeat with unfinished targets. If omitted, waits for any direct child agent.",
                     "items": {
                         "type": "string"
                     }
@@ -2298,7 +2298,7 @@ fn close_agent_v1_tool_spec() -> ToolSpec {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Agent id to close (from spawn_agent)."
+                    "description": "Agent id, nickname, or path to close (from spawn_agent)."
                 }
             },
             "required": ["target"],
@@ -2863,7 +2863,7 @@ mod tests {
             .expect("flat V1 wait_agent spec");
         assert!(flat_wait
             .description
-            .contains("call wait_agent again with the remaining ids"));
+            .contains("pass multiple ids, nicknames, or paths in targets"));
         assert!(flat_wait
             .description
             .contains("if targets is omitted, wait for any direct child agent"));
@@ -2879,6 +2879,12 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("V2-style fan-out collection"));
+        assert!(
+            flat_wait.input_schema["properties"]["targets"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent ids, nicknames, or paths")
+        );
         assert!(
             flat_wait.input_schema["properties"]["targets"]["description"]
                 .as_str()

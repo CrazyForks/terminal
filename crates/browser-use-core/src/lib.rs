@@ -25125,16 +25125,33 @@ fn dispatch_wait_agent_v1_tool(
             .map(|agent| agent.child_session_id)
             .collect::<Vec<_>>()
     } else {
-        targets
+        let mut resolved = Vec::with_capacity(targets.len());
+        for target in targets {
+            if is_local_agent_id(&target) {
+                resolved.push(target);
+                continue;
+            }
+            let Some(target_agent) = resolve_agent_reference_in_tree(store, &session.id, &target)?
+            else {
+                return dispatch_tool_validation_error(
+                    store,
+                    session,
+                    call,
+                    &format!("live agent `{target}` not found"),
+                );
+            };
+            if target_agent.is_root {
+                return dispatch_tool_validation_error(
+                    store,
+                    session,
+                    call,
+                    "root is not a spawned agent",
+                );
+            }
+            resolved.push(target_agent.session_id);
+        }
+        resolved
     };
-    if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            &format!("invalid agent id `{invalid}`"),
-        );
-    }
     let config = match load_provider_config_for_session(session, options) {
         Ok(config) => config.multi_agent_v2,
         Err(error) => {
@@ -45865,6 +45882,66 @@ command = "explicit-mcp"
         assert!(agents.iter().any(|agent| {
             agent["agent_id"] == first.id && agent["agent_status"] == serde_json::json!("running")
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v1_targets_accept_nickname_and_path_refs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let nickname_child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/nickname_child"),
+            Some("Atlas"),
+            None,
+        )?;
+        store.append_event(
+            &nickname_child.id,
+            "session.done",
+            serde_json::json!({"result": "nickname result"}),
+        )?;
+        store.set_child_agent_status(&nickname_child.id, "done")?;
+        let path_child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/path_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &path_child.id,
+            "session.done",
+            serde_json::json!({"result": "path result"}),
+        )?;
+        store.set_child_agent_status(&path_child.id, "done")?;
+
+        let outcome = dispatch_wait_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_v1_refs".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "targets": ["Atlas", "path_child"],
+                    "timeout_ms": 10_000,
+                }),
+            },
+            &AgentRunOptions::default(),
+        )?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["timed_out"], false);
+        assert_eq!(
+            payload["status"][&nickname_child.id],
+            serde_json::json!({"completed": "nickname result"})
+        );
+        assert_eq!(
+            payload["status"][&path_child.id],
+            serde_json::json!({"completed": "path result"})
+        );
         Ok(())
     }
 
