@@ -1974,17 +1974,43 @@ fn retarget_managed_child_python_env(options: &mut AgentRunOptions, child_sessio
         .python_env
         .iter()
         .any(|(key, _)| key == "BU_NAME" || key == "BH_RUNTIME_DIR" || key == "BH_TMP_DIR");
-    if !has_managed_browser_env {
-        return;
-    }
-    let daemon_name = format!("but-tui-{}", safe_agent_env_segment(child_session_id));
-    let runtime_dir = format!("/tmp/{daemon_name}");
-    for (key, value) in &mut options.python_env {
-        match key.as_str() {
-            "BU_NAME" => *value = daemon_name.clone(),
-            "BH_RUNTIME_DIR" | "BH_TMP_DIR" => *value = runtime_dir.clone(),
-            _ => {}
+    if has_managed_browser_env {
+        let daemon_name = format!("but-tui-{}", safe_agent_env_segment(child_session_id));
+        let runtime_dir = format!("/tmp/{daemon_name}");
+        for (key, value) in &mut options.python_env {
+            match key.as_str() {
+                "BU_NAME" => *value = daemon_name.clone(),
+                "BH_RUNTIME_DIR" | "BH_TMP_DIR" => *value = runtime_dir.clone(),
+                _ => {}
+            }
         }
+    }
+    if child_inherits_remote_cdp(&options.python_env) {
+        upsert_python_env(
+            &mut options.python_env,
+            "LLM_BROWSER_REMOTE_CDP_FRESH_TARGET",
+            "1",
+        );
+    }
+}
+
+fn child_inherits_remote_cdp(python_env: &[(String, String)]) -> bool {
+    std::env::var_os("LLM_BROWSER_REMOTE_CDP_URL")
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || python_env
+            .iter()
+            .any(|(key, value)| key == "LLM_BROWSER_REMOTE_CDP_URL" && !value.trim().is_empty())
+}
+
+fn upsert_python_env(python_env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = python_env
+        .iter_mut()
+        .find(|(candidate, _)| candidate == key)
+    {
+        *existing = value.to_string();
+    } else {
+        python_env.push((key.to_string(), value.to_string()));
     }
 }
 
@@ -45602,6 +45628,10 @@ command = "explicit-mcp"
                 "/tmp/but-tui-parent".to_string(),
             ),
             ("BH_TMP_DIR".to_string(), "/tmp/but-tui-parent".to_string()),
+            (
+                "LLM_BROWSER_REMOTE_CDP_URL".to_string(),
+                "ws://example.invalid/devtools/browser/1".to_string(),
+            ),
             ("UNCHANGED".to_string(), "1".to_string()),
         ]);
         retarget_managed_child_python_env(&mut options, "child/123");
@@ -45615,6 +45645,7 @@ command = "explicit-mcp"
         assert_eq!(value("BU_NAME"), Some("but-tui-child-123"));
         assert_eq!(value("BH_RUNTIME_DIR"), Some("/tmp/but-tui-child-123"));
         assert_eq!(value("BH_TMP_DIR"), Some("/tmp/but-tui-child-123"));
+        assert_eq!(value("LLM_BROWSER_REMOTE_CDP_FRESH_TARGET"), Some("1"));
         assert_eq!(value("UNCHANGED"), Some("1"));
     }
 

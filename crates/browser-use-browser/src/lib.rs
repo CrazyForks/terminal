@@ -31,6 +31,7 @@ const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
+const LLM_BROWSER_REMOTE_CDP_FRESH_TARGET: &str = "LLM_BROWSER_REMOTE_CDP_FRESH_TARGET";
 
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
@@ -889,6 +890,15 @@ fn browser_script_python_command() -> Command {
 
 fn nonempty_os_var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn remote_cdp_fresh_target_requested() -> bool {
+    std::env::var(LLM_BROWSER_REMOTE_CDP_FRESH_TARGET).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn venv_python_path(venv: &Path) -> PathBuf {
@@ -1946,6 +1956,8 @@ impl BrowserSession {
         mode: BrowserMode,
         owner: BrowserOwner,
     ) -> Result<()> {
+        let fresh_remote_target =
+            mode == BrowserMode::RemoteCdp && remote_cdp_fresh_target_requested();
         let ws_url = endpoint.ws_url.clone();
         let connection = CdpConnection::connect(&ws_url)?;
         self.endpoint = Some(endpoint);
@@ -1957,7 +1969,11 @@ impl BrowserSession {
         self.last_error_kind = None;
         self.last_target_id = None;
         self.last_session_id = None;
-        self.attach_first_page()?;
+        if fresh_remote_target {
+            self.attach_new_blank_page()?;
+        } else {
+            self.attach_first_page()?;
+        }
         Ok(())
     }
 
@@ -2282,6 +2298,21 @@ impl BrowserSession {
                 .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
                 .to_string(),
         };
+        let session_id = self.attach_target(&target_id)?;
+        self.current_target_id = Some(target_id);
+        self.current_session_id = Some(session_id);
+        let _ = self.cdp_current("Runtime.enable", json!({}));
+        let _ = self.cdp_current("Page.enable", json!({}));
+        Ok(())
+    }
+
+    fn attach_new_blank_page(&mut self) -> Result<()> {
+        let target_id = self
+            .cdp("Target.createTarget", None, json!({ "url": "about:blank" }))?
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Target.createTarget response missing targetId"))?
+            .to_string();
         let session_id = self.attach_target(&target_id)?;
         self.current_target_id = Some(target_id);
         self.current_session_id = Some(session_id);
@@ -4792,6 +4823,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_cdp_fresh_target_flag_accepts_truthy_values() {
+        let _env = EnvRestore::set(&[(LLM_BROWSER_REMOTE_CDP_FRESH_TARGET, "true")]);
+        assert!(remote_cdp_fresh_target_requested());
+    }
+
+    #[test]
+    fn remote_cdp_fresh_target_flag_rejects_falsey_values() {
+        let _env = EnvRestore::set(&[(LLM_BROWSER_REMOTE_CDP_FRESH_TARGET, "0")]);
+        assert!(!remote_cdp_fresh_target_requested());
+    }
+
+    #[test]
     fn status_shape_contains_llm_recovery_fields() {
         let session = BrowserSession::default();
         let status = session.status_json();
@@ -6304,6 +6347,77 @@ info = page_info()
         );
 
         cleanup_session(remote_session);
+        cleanup_session(source_session);
+    }
+
+    #[test]
+    #[ignore = "launches a dedicated local Chromium-family browser and attaches through remote CDP"]
+    fn remote_cdp_fresh_target_flag_attaches_new_target() {
+        if chromium_candidate_paths(true).is_empty() {
+            eprintln!("skipping remote CDP fresh-target smoke: no Chromium-family browser found");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let source_session = "remote-cdp-fresh-source";
+        let shared_client = "remote-cdp-shared-client";
+        let fresh_client = "remote-cdp-fresh-client";
+
+        let connect = run_browser_command(
+            source_session,
+            temp.path(),
+            &artifacts,
+            "browser connect managed --headless",
+        )
+        .unwrap();
+        let http_url = connect.content["browser"]["endpoint"]["http_url"]
+            .as_str()
+            .expect("managed browser http url")
+            .to_string();
+
+        let script = run_browser_script(
+            source_session,
+            temp.path(),
+            &artifacts,
+            r##"
+goto_url("data:text/html,<title>Parent Target</title><h1 id='parent'>Parent Target</h1>")
+wait_for_element("#parent")
+"##,
+            30,
+        )
+        .unwrap();
+        assert!(script.ok, "{:?}\n{}", script.error, script.text);
+
+        let shared = run_browser_command(
+            shared_client,
+            temp.path(),
+            &artifacts,
+            &format!("browser connect remote-cdp --url {http_url}"),
+        )
+        .unwrap();
+        let parent_target = shared.content["browser"]["page"]["target_id"]
+            .as_str()
+            .expect("shared target id")
+            .to_string();
+
+        let _env = EnvRestore::set(&[(LLM_BROWSER_REMOTE_CDP_FRESH_TARGET, "1")]);
+        let fresh = run_browser_command(
+            fresh_client,
+            temp.path(),
+            &artifacts,
+            &format!("browser connect remote-cdp --url {http_url}"),
+        )
+        .unwrap();
+        let fresh_target = fresh.content["browser"]["page"]["target_id"]
+            .as_str()
+            .expect("fresh target id")
+            .to_string();
+
+        assert_ne!(fresh_target, parent_target);
+
+        cleanup_session(fresh_client);
+        cleanup_session(shared_client);
         cleanup_session(source_session);
     }
 }
