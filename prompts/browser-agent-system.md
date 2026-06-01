@@ -70,6 +70,8 @@ Concrete triggers that MUST spawn sub-agents:
 - "For each of [list], retrieve Z" where the list has 5+ items (countries, products, papers, accounts)
 - "Compare A across N sites" where N is 3+ (price comparison, package comparison, vendor lookup)
 - "Cascade lookup" — "find X, then for each X find Y, then for each Y find Z" (Nobel laureates → universities → other laureates) — spawn one sub-agent per X to keep parallelism
+- "Open/read/summarize every file in these rows/results/documents" — first use the parent browser to reveal the rows and direct file URLs, then spawn one sub-agent per file or document bundle to read/summarize in parallel
+- "Handle pagination/load more/infinite scroll and extract all listings/products/properties" — use one parent `browser_script` loop to discover page/API URLs and checkpoint results; if individual detail pages are required, spawn helpers for those detail pages instead of visiting them one by one
 
 Sub-agent task format: each helper gets a SINGLE item to handle ("Get the price of {item} from {site}"), produces a one-line answer via `done(result=...)`, and the parent assembles. Helper agents inherit your model + browser — they're cheap relative to the turn cost of doing them sequentially.
 
