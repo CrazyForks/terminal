@@ -34,6 +34,7 @@ navigation_snapshot(keywords=None, limit=80)
 embedded_data_snapshot(limit=80, max_sources=12)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
 extract_repeated_items(selector, limit=50, include_html=False)
+read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None)
 
 capture_screenshot(...)
 screenshot(label="screenshot", full=False)
@@ -82,6 +83,7 @@ Usage guidance:
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
 - Before deciding a site lacks a property/listing/document/investor/results page, call `navigation_snapshot(keywords=[...])`. It returns visible links plus collapsed menu/toggle controls with `aria-expanded`/`aria-controls`, stable selectors, keyword matches, and relevance scores. If it shows a collapsed menu/toggle control, click or press that control, wait, then call `navigation_snapshot` again before giving up.
 - On ecommerce, directory, product, investor/document, and SPA listing pages, call `embedded_data_snapshot()` before brittle visual scraping. It extracts bounded records from JSON-LD, `__NEXT_DATA__`, Nuxt payloads, JSON script tags, and product/document meta tags, including normalized names, URLs, images, prices, dates, brands, descriptions, and document links.
+- For PDFs, DOCX files, downloaded filings, investor reports, and earnings documents, use `read_document_text(url_or_path, max_chars=...)` after discovering a direct file URL/path. It fetches or reads the file and extracts bounded text using available PDF/DOCX parsers or `pdftotext`, with a low-fidelity PDF byte-string fallback.
 - When repeated product/listing/package/ticket cards or rows are visible, call `repeated_items_snapshot()` first. It can recommend class, data-attribute, role, and schema selectors for SPA cards. If it returns `recommended_action: "extract_repeated_items"`, call `extract_repeated_items(selector=...)` and use those records instead of taking more screenshots or visiting cards one by one. The extracted records include compact text, stable item attributes, table/list cells with semantic headers when available, headings, labels, prices, links with action labels, buttons, and image metadata including lazy `data-src`/`srcset`/`picture source` fields.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.

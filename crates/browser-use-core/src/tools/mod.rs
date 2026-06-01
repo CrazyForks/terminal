@@ -2464,6 +2464,8 @@ mod tests {
             "embedded_data_snapshot",
             "JSON-LD",
             "__NEXT_DATA__",
+            "read_document_text",
+            "pdftotext",
             "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",
