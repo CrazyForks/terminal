@@ -26,5 +26,6 @@ serde_json.workspace = true
 signal-hook = "0.3.18"
 syntect.workspace = true
 tempfile.workspace = true
+terminal-colorsaurus.workspace = true
 two-face.workspace = true
 unicode-width.workspace = true
