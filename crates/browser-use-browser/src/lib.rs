@@ -4557,6 +4557,52 @@ def _audit_load_path_data(file_path):
         return list(csv.DictReader(io.StringIO(text)))
     return [line for line in text.splitlines() if line.strip()]
 
+def _audit_path_get(data, records_path):
+    current = data
+    for part in str(records_path).split("."):
+        if not part:
+            continue
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            current = current[index] if index < len(current) else None
+        else:
+            return None
+        if current is None:
+            return None
+    return current
+
+def _audit_select_records(data, requirements, details):
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return None
+    records_path = requirements.pop("records_path", None)
+    if records_path:
+        records = _audit_path_get(data, records_path)
+        details["records_path"] = str(records_path)
+        return records if isinstance(records, list) else None
+    records_key = requirements.pop("records_key", None) or requirements.pop("items_key", None)
+    if records_key:
+        records = data.get(records_key)
+        details["records_key"] = str(records_key)
+        return records if isinstance(records, list) else None
+    for key in ("items", "results", "records", "rows", "data"):
+        records = data.get(key)
+        if isinstance(records, list):
+            details["records_key"] = key
+            return records
+    for parent_key in ("data", "result", "payload"):
+        parent = data.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("items", "results", "records", "rows"):
+                records = parent.get(key)
+                if isinstance(records, list):
+                    details["records_path"] = f"{{parent_key}}.{{key}}"
+                    return records
+    return None
+
 def audit_artifact(data=None, **requirements):
     checks = {{}}
     details = {{}}
@@ -4578,8 +4624,32 @@ def audit_artifact(data=None, **requirements):
                 details["load_error"] = str(exc)
     if data is not None:
         checks["has_data"] = data is not None and data != [] and data != {{}}
-        if isinstance(data, list):
-            count = len(data)
+        records = _audit_select_records(data, requirements, details)
+        expects_records = any(
+            key in requirements
+            for key in ("min_count", "exact_count", "required_fields", "required_keys", "unique_by", "dedupe_field")
+        )
+        if records is None and expects_records:
+            checks["records_found"] = False
+            details["data_type"] = type(data).__name__
+            min_count = requirements.pop("min_count", None)
+            if min_count is not None:
+                checks["min_count"] = False
+                details["min_count"] = int(min_count)
+            exact_count = requirements.pop("exact_count", None)
+            if exact_count is not None:
+                checks["exact_count"] = False
+                details["exact_count"] = int(exact_count)
+            required_fields = requirements.pop("required_fields", None) or requirements.pop("required_keys", None)
+            if required_fields:
+                checks["required_fields"] = False
+                details["required_fields"] = list(required_fields)
+            unique_by = requirements.pop("unique_by", None) or requirements.pop("dedupe_field", None)
+            if unique_by:
+                checks["unique_by"] = False
+                details["unique_by"] = [unique_by] if isinstance(unique_by, str) else list(unique_by)
+        if isinstance(records, list):
+            count = len(records)
             details["record_count"] = count
             min_count = requirements.pop("min_count", None)
             if min_count is not None:
@@ -4593,7 +4663,7 @@ def audit_artifact(data=None, **requirements):
             if required_fields:
                 fields = list(required_fields)
                 missing = []
-                for index, row in enumerate(data):
+                for index, row in enumerate(records):
                     for field in fields:
                         value = row.get(field) if isinstance(row, dict) else None
                         if value is None or value == "":
@@ -4607,7 +4677,7 @@ def audit_artifact(data=None, **requirements):
                 fields = [unique_by] if isinstance(unique_by, str) else list(unique_by)
                 seen = set()
                 duplicates = []
-                for index, row in enumerate(data):
+                for index, row in enumerate(records):
                     if not isinstance(row, dict):
                         continue
                     key = tuple(row.get(field) for field in fields)
@@ -5258,6 +5328,28 @@ assert from_json_path["ready_for_done"] is True, from_json_path
 assert from_json_path["details"]["loaded_from_path"] == str(path), from_json_path
 assert from_json_path["details"]["loaded_kind"] == "json", from_json_path
 assert from_json_path["details"]["record_count"] == 2, from_json_path
+
+wrapped_path = pathlib.Path(outputs_dir()) / "wrapped.json"
+wrapped_path.write_text(json.dumps({"items": [{"name": "Ada", "url": "https://example.test/a"}, {"name": "Grace", "url": "https://example.test/b"}]}), encoding="utf-8")
+wrapped = audit_artifact(path=str(wrapped_path), min_count=2, required_fields=["name", "url"], unique_by="url", nonempty_file=True)
+assert wrapped["ready_for_done"] is True, wrapped
+assert wrapped["details"]["records_key"] == "items", wrapped
+assert wrapped["details"]["record_count"] == 2, wrapped
+
+nested_path = pathlib.Path(outputs_dir()) / "nested.json"
+nested_path.write_text(json.dumps({"payload": {"results": [{"name": "Ada", "url": "https://example.test/a"}, {"name": "Grace", "url": "https://example.test/b"}]}}), encoding="utf-8")
+nested = audit_artifact(path=str(nested_path), records_path="payload.results", exact_count=2, required_fields=["name", "url"], unique_by="url", nonempty_file=True)
+assert nested["ready_for_done"] is True, nested
+assert nested["details"]["records_path"] == "payload.results", nested
+assert nested["details"]["record_count"] == 2, nested
+
+wrong_shape_path = pathlib.Path(outputs_dir()) / "wrong-shape.json"
+wrong_shape_path.write_text(json.dumps({"summary": {"count": 2}}), encoding="utf-8")
+wrong_shape = audit_artifact(path=str(wrong_shape_path), min_count=2, required_fields=["name"], nonempty_file=True)
+assert wrong_shape["ready_for_done"] is False, wrong_shape
+assert wrong_shape["checks"]["records_found"] is False, wrong_shape
+assert wrong_shape["checks"]["min_count"] is False, wrong_shape
+assert wrong_shape["checks"]["required_fields"] is False, wrong_shape
 
 jsonl_path = pathlib.Path(outputs_dir()) / "result.jsonl"
 jsonl_path.write_text(

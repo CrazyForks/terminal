@@ -63,7 +63,7 @@ emit_image(path, label=None)
 artifact_root()
 outputs_dir()
 session_metadata()
-audit_artifact(data=None, min_count=None, exact_count=None, required_fields=None, unique_by=None, path=None, nonempty_file=False, **requirements)  # path can point to JSON, JSONL, CSV, or text
+audit_artifact(data=None, min_count=None, exact_count=None, required_fields=None, unique_by=None, path=None, records_key=None, records_path=None, nonempty_file=False, **requirements)  # path can point to JSON, JSONL, CSV, or text
 load_agent_helpers()
 agent_workspace()
 domain_skills_for_url(url_or_domain, include_content=False)
@@ -116,7 +116,7 @@ emit_output(rows, label="employee_rows")
 - Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. For URL batches, use `http_get_many(...)`; it preserves input order and returns compact per-URL records with `ok`, `status_code`, `text` or `content_base64`, and `error` fields. If direct HTTP hits bot or login protection but the page is loaded, retry with `browser_fetch_many(...)` or `browser_fetch(...)` so requests run in the page context with browser cookies/session; otherwise use site-specific headers/cookies or the configured Browser Use fetch proxy.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
-- Before finalizing explicit structured/file requirements, call `audit_artifact(...)` with concrete checks such as `min_count`, `exact_count`, `required_fields`, `unique_by`, `path`, and `nonempty_file=True`. You can pass `audit_artifact(path="result.json", ...)`, `audit_artifact(path="result.jsonl", ...)`, or `audit_artifact(path="result.csv", ...)` directly; it loads the file and applies count/field/dedupe checks. If `ready_for_done` is false, fix the result or clearly finalize as partial.
+- Before finalizing explicit structured/file requirements, call `audit_artifact(...)` with concrete checks such as `min_count`, `exact_count`, `required_fields`, `unique_by`, `path`, and `nonempty_file=True`. You can pass `audit_artifact(path="result.json", ...)`, `audit_artifact(path="result.jsonl", ...)`, or `audit_artifact(path="result.csv", ...)` directly; it loads the file and applies count/field/dedupe checks. For object-wrapped JSON like `{"items": [...]}` or `{"payload": {"results": [...]}}`, use `records_key="items"` or `records_path="payload.results"` when needed. If `ready_for_done` is false, fix the result or clearly finalize as partial.
 - For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.

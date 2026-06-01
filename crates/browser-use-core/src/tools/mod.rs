@@ -2460,6 +2460,7 @@ mod tests {
             "Python variables do not persist across calls.",
             "audit_artifact",
             "audit_artifact(path=\"result.json\", ...)",
+            "records_path=\"payload.results\"",
             "required_fields",
             "unique_by",
         ] {
