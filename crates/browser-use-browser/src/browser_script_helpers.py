@@ -656,22 +656,51 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     if (!table) return [];
     const headerRow = table.querySelector('thead tr') || Array.from(table.querySelectorAll('tr')).find(tr => tr.querySelector('th'));
     if (!headerRow || headerRow === row) return [];
-    return Array.from(headerRow.children)
-      .filter(cell => ['TH', 'TD'].includes((cell.tagName || '').toUpperCase()))
-      .map(cell => clean(cell.textContent, 200));
+    const out = [];
+    for (const cell of Array.from(headerRow.children).filter(cell => ['TH', 'TD'].includes((cell.tagName || '').toUpperCase()))) {{
+      const span = Math.max(1, parseInt(cell.getAttribute('colspan') || '1', 10) || 1);
+      for (let i = 0; i < span; i++) out.push(clean(cell.textContent, 200));
+    }}
+    return out;
   }};
   const ariaHeadersForRow = (row) => {{
     const container = row.closest('[role="table"],[role="grid"],[role="treegrid"]');
     if (!container) return [];
     return Array.from(container.querySelectorAll('[role="columnheader"]')).map(cell => clean(cell.textContent, 200));
   }};
+  const idRefTexts = (value) => (value || '').split(/\\s+/).map(id => {{
+    const node = id ? document.getElementById(id) : null;
+    return node ? clean(node.textContent, 200) : '';
+  }}).filter(Boolean);
+  const rowHeaderTexts = (cell, row) => {{
+    if (row.getAttribute('role') === 'row') {{
+      return Array.from(row.children)
+        .filter(other => other !== cell && other.getAttribute('role') === 'rowheader')
+        .map(other => clean(other.textContent, 200))
+        .filter(Boolean);
+    }}
+    return Array.from(row.children)
+      .filter(other => other !== cell && (other.tagName || '').toUpperCase() === 'TH')
+      .filter(other => ['row', 'rowgroup'].includes(other.getAttribute('scope') || '') || !other.getAttribute('scope'))
+      .map(other => clean(other.textContent, 200))
+      .filter(Boolean);
+  }};
+  const headerLabelsForCell = (cell, row, cellIndex, headers, ariaHeaders) => Array.from(new Set([
+    ...rowHeaderTexts(cell, row),
+    ...idRefTexts(cell.getAttribute('headers')),
+    ...idRefTexts(cell.getAttribute('aria-labelledby')),
+    headers[cellIndex] || '',
+    ariaHeaders[cellIndex] || '',
+    clean(cell.getAttribute('data-label'), 200),
+    clean(cell.getAttribute('aria-label'), 200),
+  ].filter(Boolean))).slice(0, 6);
   const cellRecords = (el) => {{
     const cells = directCellNodes(el);
     if (!cells.length) return [];
     const headers = tableHeadersForRow(el);
     const ariaHeaders = headers.length ? [] : ariaHeadersForRow(el);
     return cells.map((cell, cellIndex) => {{
-      const header = headers[cellIndex] || ariaHeaders[cellIndex] || clean(cell.getAttribute('data-label'), 200) || clean(cell.getAttribute('aria-label'), 200);
+      const headerLabels = headerLabelsForCell(cell, el, cellIndex, headers, ariaHeaders);
       const cellLinks = Array.from(cell.querySelectorAll('a[href]')).slice(0, 4).map(a => ({{
         text: actionText(a),
         aria_label: clean(a.getAttribute('aria-label'), 160),
@@ -680,7 +709,8 @@ def extract_repeated_items(selector, limit=50, include_html=False):
       }}));
       return {{
         index: cellIndex,
-        header,
+        header: headerLabels.join(' / '),
+        headers: headerLabels,
         text: recordText(cell),
         links: cellLinks,
       }};

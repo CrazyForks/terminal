@@ -5622,6 +5622,13 @@ def js(expression, returnByValue=True):
         assert "directCellNodes" in expression
         assert "tableHeadersForRow" in expression
         assert "ariaHeadersForRow" in expression
+        assert "idRefTexts" in expression
+        assert "rowHeaderTexts" in expression
+        assert "headerLabelsForCell" in expression
+        assert "getAttribute('headers')" in expression
+        assert "aria-labelledby" in expression
+        assert "colspan" in expression
+        assert "rowgroup" in expression
         assert "cellRecords" in expression
         assert "columnheader" in expression
         assert "gridcell" in expression
@@ -5641,8 +5648,8 @@ def js(expression, returnByValue=True):
                 "buttons": ["Valitse"],
                 "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": "https://example.test/lazy-dna.png", "data_srcset": "", "width": 200, "height": 120}],
                 "cells": [
-                    {"index": 0, "header": "Plan", "text": "DNA Netti 300M", "links": []},
-                    {"index": 1, "header": "Price", "text": "19,90 €/kk", "links": []},
+                    {"index": 0, "header": "Provider / Plan", "headers": ["Provider", "Plan"], "text": "DNA Netti 300M", "links": []},
+                    {"index": 1, "header": "Provider / Price", "headers": ["Provider", "Price"], "text": "19,90 €/kk", "links": []},
                 ],
             }
         ]
@@ -5691,7 +5698,8 @@ assert records["records"][0]["images"][0]["src"] == "https://example.test/dna.pn
 assert records["records"][0]["images"][0]["data_src"] == "https://example.test/lazy-dna.png"
 assert records["records"][0]["links"][0]["aria_label"] == "DNA Netti 300M product page"
 assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
-assert records["records"][0]["cells"][1]["header"] == "Price"
+assert records["records"][0]["cells"][1]["header"] == "Provider / Price"
+assert records["records"][0]["cells"][1]["headers"] == ["Provider", "Price"]
 assert records["records"][0]["cells"][1]["text"] == "19,90 €/kk"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))
