@@ -146,6 +146,7 @@ impl AgentTelemetry {
             KeyValue::new("gen_ai.request.model", input.model_name.to_string()),
             KeyValue::new("gen_ai.response.model", input.model_name.to_string()),
             KeyValue::new("browser_use.turn_index", input.turn_idx as i64),
+            KeyValue::new("browser_use.llm.provider", input.provider_name.to_string()),
         ];
         if inner.capture_payloads {
             // Convert messages into Laminar's canonical OTel GenAI format:
@@ -371,7 +372,15 @@ impl AgentTelemetry {
             }
         }
         if let Some(usage) = usage {
+            span.set_attribute(KeyValue::new("browser_use.llm.usage_present", true));
+            span.set_attribute(KeyValue::new("browser_use.llm.usage_missing_reason", ""));
             set_usage_attrs(span, usage);
+        } else {
+            span.set_attribute(KeyValue::new("browser_use.llm.usage_present", false));
+            span.set_attribute(KeyValue::new(
+                "browser_use.llm.usage_missing_reason",
+                "no_model_usage_event",
+            ));
         }
         if inner.capture_payloads {
             let output_payload =
@@ -1321,6 +1330,11 @@ mod tests {
             attr_string(llm, "gen_ai.request.model").as_deref(),
             Some("gpt-test")
         );
+        assert_eq!(attr_bool(llm, "browser_use.llm.usage_present"), Some(true));
+        assert_eq!(
+            attr_string(llm, "browser_use.llm.provider").as_deref(),
+            Some("openai-compatible")
+        );
         assert_eq!(attr_i64(llm, "gen_ai.usage.input_tokens"), Some(10));
         assert_eq!(attr_i64(llm, "llm.usage.prompt_tokens"), Some(10));
         assert_eq!(attr_i64(llm, "gen_ai.usage.output_tokens"), Some(2));
@@ -1353,6 +1367,14 @@ mod tests {
         assert_eq!(
             attr_string(responses, "gen_ai.response.id").as_deref(),
             Some("browser_use_turn_1")
+        );
+        assert_eq!(
+            attr_bool(responses, "browser_use.llm.usage_present"),
+            Some(false)
+        );
+        assert_eq!(
+            attr_string(responses, "browser_use.llm.usage_missing_reason").as_deref(),
+            Some("no_model_usage_event")
         );
         let output: Value = serde_json::from_str(
             &attr_string(responses, "gen_ai.output.messages").expect("responses output"),
@@ -1413,6 +1435,16 @@ mod tests {
             .find(|attr| attr.key.as_str() == key)
             .and_then(|attr| match &attr.value {
                 OtelValue::I64(value) => Some(*value),
+                _ => None,
+            })
+    }
+
+    fn attr_bool(span: &SpanData, key: &str) -> Option<bool> {
+        span.attributes
+            .iter()
+            .find(|attr| attr.key.as_str() == key)
+            .and_then(|attr| match &attr.value {
+                OtelValue::Bool(value) => Some(*value),
                 _ => None,
             })
     }
