@@ -2251,14 +2251,14 @@ fn wait_agent_v1_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> Too
         name: "wait_agent".to_string(),
         namespace: Some(MULTI_AGENT_V1_NAMESPACE.to_string()),
         namespace_description: Some(MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string()),
-        description: "Wait for one or more agents to reach a final status. Completed statuses may include each agent's final message. When waiting on multiple fan-out helpers, the response may include only the helpers that finished before the timeout; integrate those results, then call wait_agent again with the remaining ids until the final answer has enough data. Returns empty status when timed out. Once an agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait for one or more agents to reach a final status. Completed statuses may include each agent's final message. When waiting on multiple fan-out helpers, pass multiple ids in targets; if targets is omitted, wait for any direct child agent. The response may include only the helpers that finished before the timeout; integrate those results, then call wait_agent again with the remaining ids until the final answer has enough data. Returns empty status when timed out. Once an agent reaches a final status, a notification message will be received containing the same completed status."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "targets": {
                     "type": "array",
-                    "description": "Agent ids to wait on. Pass multiple ids during fan-out collection; the tool returns statuses for whichever target(s) finish first, so repeat with unfinished ids.",
+                    "description": "Optional agent ids to wait on. Pass multiple ids during fan-out collection; the tool returns statuses for whichever target(s) finish first, so repeat with unfinished ids. If omitted, waits for any direct child agent.",
                     "items": {
                         "type": "string"
                     }
@@ -2273,7 +2273,7 @@ fn wait_agent_v1_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> Too
                     )
                 }
             },
-            "required": ["targets"],
+            "required": [],
             "additionalProperties": false
         }),
         output_schema: Some(wait_agent_v1_output_schema()),
@@ -2859,11 +2859,18 @@ mod tests {
         assert!(flat_wait
             .description
             .contains("call wait_agent again with the remaining ids"));
+        assert!(flat_wait
+            .description
+            .contains("if targets is omitted, wait for any direct child agent"));
+        assert_eq!(
+            flat_wait.input_schema["required"],
+            serde_json::json!([])
+        );
         assert!(
             flat_wait.input_schema["properties"]["targets"]["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("repeat with unfinished ids")
+                .contains("If omitted, waits for any direct child agent")
         );
 
         let loaded = registry.search_deferred_tools("spawn subagent", 8);

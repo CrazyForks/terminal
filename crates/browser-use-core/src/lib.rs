@@ -25103,11 +25103,24 @@ fn dispatch_wait_agent_v1_tool(
         .arguments
         .get("targets")
         .and_then(Value::as_array)
-        .map(|targets| targets.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    if targets.is_empty() {
-        return dispatch_tool_validation_error(store, session, call, "wait_agent requires targets");
-    }
+    let targets = if targets.is_empty() {
+        store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .filter(|agent| agent.status != "closed")
+            .map(|agent| agent.child_session_id)
+            .collect::<Vec<_>>()
+    } else {
+        targets
+    };
     if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
         return dispatch_tool_validation_error(
             store,
@@ -25148,7 +25161,8 @@ fn dispatch_wait_agent_v1_tool(
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms as u64);
     let statuses = loop {
-        let statuses = final_statuses_for_v1_wait(store, &targets)?;
+        let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
+        let statuses = final_statuses_for_v1_wait(store, &target_refs)?;
         if !statuses.is_empty() {
             break statuses;
         }
@@ -45806,6 +45820,47 @@ command = "explicit-mcp"
         let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
         assert_eq!(payload["timed_out"], true);
         assert_eq!(payload["status"], serde_json::json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v1_without_targets_collects_any_direct_child() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let first = store.create_child_session(&parent.id, temp.path(), None, None, None)?;
+        let second = store.create_child_session(&parent.id, temp.path(), None, None, None)?;
+        store.append_event(
+            &first.id,
+            "session.input",
+            serde_json::json!({"text": "still running"}),
+        )?;
+        store.append_event(
+            &second.id,
+            "session.done",
+            serde_json::json!({"result": "second child result"}),
+        )?;
+        store.set_child_agent_status(&second.id, "done")?;
+
+        let outcome = dispatch_wait_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_v1_any_child".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
+            },
+            &AgentRunOptions::default(),
+        )?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["timed_out"], false);
+        assert_eq!(
+            payload["status"][&second.id],
+            serde_json::json!({"completed": "second child result"})
+        );
+        assert!(payload["status"].get(&first.id).is_none());
         Ok(())
     }
 
