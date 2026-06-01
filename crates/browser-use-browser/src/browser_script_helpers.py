@@ -640,6 +640,15 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     el.getAttribute('title') || '',
     ...imageAlts(el),
   ].filter(Boolean).join(' '));
+  const stableAttributes = (el) => {{
+    const attrs = {{}};
+    for (const name of ['id', 'role', 'data-testid', 'data-test', 'data-cy', 'data-component', 'itemtype', 'itemprop', 'aria-label', 'title']) {{
+      const value = clean(el.getAttribute(name), 240);
+      if (value) attrs[name] = value;
+    }}
+    if (el.matches('a[href]')) attrs.href = el.href;
+    return attrs;
+  }};
   const directCellNodes = (el) => {{
     const tag = (el.tagName || '').toUpperCase();
     if (tag === 'TR') {{
@@ -733,7 +742,8 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
     const images = imageRecords(el);
     const cells = cellRecords(el);
-    const record = {{ index, text, headings, labels, prices, links, buttons, images }};
+    const attributes = stableAttributes(el);
+    const record = {{ index, text, attributes, headings, labels, prices, links, buttons, images }};
     if (cells.length) record.cells = cells;
     if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
     return record;

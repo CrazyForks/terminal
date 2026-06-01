@@ -5619,6 +5619,10 @@ def js(expression, returnByValue=True):
         assert "currentSrc" in expression
         assert "data-src" in expression
         assert "picture source[srcset]" in expression
+        assert "stableAttributes" in expression
+        assert "data-testid" in expression
+        assert "itemprop" in expression
+        assert "attrs.href" in expression
         assert "directCellNodes" in expression
         assert "tableHeadersForRow" in expression
         assert "ariaHeadersForRow" in expression
@@ -5641,6 +5645,7 @@ def js(expression, returnByValue=True):
             {
                 "index": 0,
                 "text": "DNA Netti 300M 19,90 €/kk",
+                "attributes": {"id": "plan-dna-300", "role": "row", "data-testid": "plan-row", "itemtype": "https://schema.org/Product"},
                 "headings": ["DNA Netti 300M"],
                 "labels": ["DNA Netti 300M product card"],
                 "prices": ["19,90 €/kk"],
@@ -5693,6 +5698,8 @@ assert snapshot["recommended_selector"] == "div.subscriptioncard"
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
+assert records["records"][0]["attributes"]["data-testid"] == "plan-row"
+assert records["records"][0]["attributes"]["itemtype"] == "https://schema.org/Product"
 assert records["records"][0]["labels"] == ["DNA Netti 300M product card"]
 assert records["records"][0]["images"][0]["src"] == "https://example.test/dna.png"
 assert records["records"][0]["images"][0]["data_src"] == "https://example.test/lazy-dna.png"
