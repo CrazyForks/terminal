@@ -24582,14 +24582,55 @@ pub fn canonical_agent_path_from_task_name(
     task_name: &str,
     parent_agent_path: &str,
 ) -> Result<String, String> {
-    let task_name = task_name.trim();
-    validate_agent_task_name(task_name)?;
+    let task_name = normalize_agent_task_name(task_name)?;
+    validate_agent_task_name(&task_name)?;
     let parent_agent_path = canonical_agent_path(parent_agent_path);
     if parent_agent_path == "/root" {
         Ok(format!("/root/{task_name}"))
     } else {
         Ok(format!("{parent_agent_path}/{task_name}"))
     }
+}
+
+fn normalize_agent_task_name(task_name: &str) -> Result<String, String> {
+    let raw = task_name.trim();
+    if raw.is_empty() {
+        return Err("task_name must not be empty".to_string());
+    }
+    let mut normalized = String::new();
+    let mut previous_underscore = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '_'
+        };
+        if mapped == '_' {
+            if !normalized.is_empty() && !previous_underscore {
+                normalized.push('_');
+                previous_underscore = true;
+            }
+        } else {
+            normalized.push(mapped);
+            previous_underscore = false;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    let normalized = if normalized.is_empty() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        format!("task_{:08x}", hasher.finish() as u32)
+    } else {
+        normalized.chars().take(64).collect::<String>()
+    };
+    let normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        return Err("task_name must not be empty".to_string());
+    }
+    if matches!(normalized.as_str(), "root" | "." | "..") {
+        return Err(format!("task_name `{normalized}` is reserved"));
+    }
+    Ok(normalized)
 }
 
 fn validate_agent_task_name(task_name: &str) -> Result<(), String> {
@@ -46510,8 +46551,18 @@ command = "explicit-mcp"
         );
         assert_eq!(
             canonical_agent_path_from_task_name("BadName", "/root")
-                .expect_err("uppercase task names should be rejected"),
-            "task_name must use only lowercase letters, digits, and underscores"
+                .expect("uppercase task names should be normalized"),
+            "/root/badname"
+        );
+        assert_eq!(
+            canonical_agent_path_from_task_name("UniFi Dream Machine-Pro", "/root")
+                .expect("product labels should be normalized"),
+            "/root/unifi_dream_machine_pro"
+        );
+        assert_eq!(
+            canonical_agent_path_from_task_name("https://example.com/a/b", "/root")
+                .expect("url-like labels should be normalized"),
+            "/root/https_example_com_a_b"
         );
     }
 

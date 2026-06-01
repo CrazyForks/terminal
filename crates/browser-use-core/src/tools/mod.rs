@@ -1971,7 +1971,7 @@ fn spawn_agent_tool_spec(
             },
             "task_name": {
                 "type": "string",
-                "description": "Task name for the new agent. Use lowercase letters, digits, and underscores."
+                "description": "Task name for the new agent. Prefer a short snake_case label; spaces, punctuation, and uppercase letters are normalized to a lowercase task-path segment."
             },
             "agent_type": {
                 "type": "string",
