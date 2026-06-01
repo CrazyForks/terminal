@@ -258,8 +258,18 @@ impl ToolRouter {
             if !namespace_tools_supported {
                 if let Some(mcp_tool) = &tool.mcp_tool {
                     model_visible_specs.push(mcp_tool.flat_tool_spec());
-                } else if tool.spec.namespace.is_none() {
-                    model_visible_specs.push(tool.spec.clone());
+                } else {
+                    // Strip the namespace for providers like Anthropic that
+                    // don't support namespaced tools. Without this strip, V1
+                    // multi-agent tools (spawn_agent, wait_agent, ...) were
+                    // hardcoded with namespace="multi_agent_v1" and would be
+                    // entirely DROPPED from Anthropic's tool list — the agent
+                    // had no way to fan out, no matter how strongly the
+                    // system prompt mandated it. Now they're visible flat.
+                    let mut flat = tool.spec.clone();
+                    flat.namespace = None;
+                    flat.namespace_description = None;
+                    model_visible_specs.push(flat);
                 }
                 continue;
             }
