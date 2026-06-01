@@ -2448,6 +2448,7 @@ mod tests {
             "browser_fetch",
             "browser_fetch_many",
             "browser cookies/session",
+            "lazy `data-src`",
             "coordinate clicks",
             "click_at_xy",
             "screenshot(label)",

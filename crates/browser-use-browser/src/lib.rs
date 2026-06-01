@@ -5617,6 +5617,9 @@ def js(expression, returnByValue=True):
         assert "img[alt]" in expression
         assert "imageRecords" in expression
         assert "currentSrc" in expression
+        assert "data-src" in expression
+        assert "picture source[srcset]" in expression
+        assert "actionText" in expression
         assert "labels" in expression
         assert "images" in expression
         return [
@@ -5626,9 +5629,9 @@ def js(expression, returnByValue=True):
                 "headings": ["DNA Netti 300M"],
                 "labels": ["DNA Netti 300M product card"],
                 "prices": ["19,90 €/kk"],
-                "links": [{"text": "DNA Netti 300M", "href": "https://example.test/dna-300"}],
+                "links": [{"text": "DNA Netti 300M product page", "aria_label": "DNA Netti 300M product page", "title": "", "href": "https://example.test/dna-300"}],
                 "buttons": ["Valitse"],
-                "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "width": 200, "height": 120}],
+                "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": "https://example.test/lazy-dna.png", "data_srcset": "", "width": 200, "height": 120}],
             }
         ]
     assert "el.matches('a[href]')" in expression
@@ -5666,6 +5669,8 @@ assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
 assert records["records"][0]["labels"] == ["DNA Netti 300M product card"]
 assert records["records"][0]["images"][0]["src"] == "https://example.test/dna.png"
+assert records["records"][0]["images"][0]["data_src"] == "https://example.test/lazy-dna.png"
+assert records["records"][0]["links"][0]["aria_label"] == "DNA Netti 300M product page"
 assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))

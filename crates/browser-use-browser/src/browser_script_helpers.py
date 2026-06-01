@@ -592,15 +592,38 @@ def extract_repeated_items(selector, limit=50, include_html=False):
   const includeHtml = {json.dumps(bool(include_html))};
   const clean = (text, max = 2000) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
   const imageAlts = (el) => Array.from(el.querySelectorAll('img[alt]')).map(img => clean(img.getAttribute('alt'), 200)).filter(Boolean).slice(0, 8);
-  const imageRecords = (el) => Array.from(el.querySelectorAll('img[src],img[srcset]')).map(img => {{
+  const imageRecords = (el) => {{
+    const imgRecords = Array.from(el.querySelectorAll('img[src],img[srcset],img[data-src],img[data-srcset]')).map(img => {{
     const rect = img.getBoundingClientRect();
     return {{
       alt: clean(img.getAttribute('alt'), 200),
       src: img.currentSrc || img.src || img.getAttribute('src') || '',
+      srcset: img.getAttribute('srcset') || '',
+      data_src: img.getAttribute('data-src') || '',
+      data_srcset: img.getAttribute('data-srcset') || '',
       width: Math.round(rect.width || img.naturalWidth || 0),
       height: Math.round(rect.height || img.naturalHeight || 0),
     }};
-  }}).filter(img => img.src || img.alt).slice(0, 8);
+    }});
+    const sourceRecords = Array.from(el.querySelectorAll('picture source[srcset],source[srcset]')).map(source => ({{
+      alt: '',
+      src: '',
+      srcset: source.getAttribute('srcset') || '',
+      data_src: '',
+      data_srcset: source.getAttribute('data-srcset') || '',
+      media: source.getAttribute('media') || '',
+      type: source.getAttribute('type') || '',
+      width: 0,
+      height: 0,
+    }}));
+    return imgRecords.concat(sourceRecords).filter(img => img.src || img.srcset || img.data_src || img.data_srcset || img.alt).slice(0, 8);
+  }};
+  const actionText = (el) => clean([
+    el.innerText || el.textContent || el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    ...imageAlts(el),
+  ].filter(Boolean).join(' '), 200);
   const recordText = (el) => clean([
     el.innerText || el.textContent || '',
     el.getAttribute('aria-label') || '',
@@ -619,8 +642,8 @@ def extract_repeated_items(selector, limit=50, include_html=False):
       if (seenLinks.has(a.href)) return false;
       seenLinks.add(a.href);
       return true;
-    }}).slice(0, 8).map(a => ({{ text: clean(a.textContent || a.value, 160), href: a.href }}));
-    const buttons = buttonNodes.slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
+    }}).slice(0, 8).map(a => ({{ text: actionText(a), aria_label: clean(a.getAttribute('aria-label'), 160), title: clean(a.getAttribute('title'), 160), href: a.href }}));
+    const buttons = buttonNodes.slice(0, 8).map(b => actionText(b)).filter(Boolean);
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
     const images = imageRecords(el);
     const record = {{ index, text, headings, labels, prices, links, buttons, images }};
