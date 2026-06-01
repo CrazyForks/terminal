@@ -13326,6 +13326,7 @@ fn dispatch_tool_call<P: ModelProvider>(
             options,
             base_instructions,
             runtime_hooks,
+            false,
         ),
         ToolHandlerKind::SpawnAgentV1 => dispatch_spawn_agent_tool_with_hooks(
             store,
@@ -13335,6 +13336,7 @@ fn dispatch_tool_call<P: ModelProvider>(
             options,
             base_instructions,
             runtime_hooks,
+            true,
         ),
         ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call, options),
         ToolHandlerKind::WaitAgentV1 => dispatch_wait_agent_v1_tool(store, session, call),
@@ -22530,6 +22532,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         options,
         base_instructions,
         &RuntimeHookConfig::default(),
+        false,
     )
 }
 
@@ -22541,8 +22544,9 @@ fn dispatch_spawn_agent_tool_with_hooks<P: ModelProvider>(
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
     runtime_hooks: &RuntimeHookConfig,
+    legacy_v1_handler: bool,
 ) -> Result<ToolDispatchOutcome> {
-    let legacy_v1 = call.namespace.as_deref() == Some("multi_agent_v1");
+    let legacy_v1 = legacy_v1_handler || call.namespace.as_deref() == Some("multi_agent_v1");
     if let Err(error) = validate_spawn_agent_arguments(&call.arguments, legacy_v1) {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
@@ -45191,6 +45195,61 @@ command = "explicit-mcp"
                 && event.payload["fork_mode"] == "last_n"
                 && event.payload["model"] == "gpt-5.4"
                 && event.payload["reasoning_effort"] == "low"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn flat_v1_spawn_agent_dispatch_keeps_legacy_semantics_after_namespace_strip() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "flat_v1_spawn".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "fork_context": true,
+            }),
+        };
+
+        let outcome = with_browser_use_terminal_home(&app_home, || {
+            dispatch_spawn_agent_tool_with_hooks(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+                &RuntimeHookConfig::default(),
+                true,
+            )
+        })?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert!(payload["agent_id"].as_str().is_some());
+        assert!(payload.get("task_name").is_none());
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context" && event.payload["fork_mode"] == "all"
         }));
         Ok(())
     }

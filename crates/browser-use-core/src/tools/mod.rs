@@ -215,6 +215,7 @@ pub(crate) struct ToolRouter {
     search_entries: Vec<ToolSearchEntry>,
     search_engine: Option<Arc<SearchEngine<usize>>>,
     tool_search_enabled: bool,
+    namespace_tools_supported: bool,
 }
 
 impl ToolRouter {
@@ -284,6 +285,7 @@ impl ToolRouter {
             search_entries,
             search_engine,
             tool_search_enabled,
+            namespace_tools_supported,
         }
     }
 
@@ -300,7 +302,9 @@ impl ToolRouter {
         namespace: Option<&str>,
         name: &str,
     ) -> Option<ToolHandlerKind> {
-        self.registry.handler_for_namespaced(namespace, name)
+        self.registry
+            .handler_for_namespaced(namespace, name)
+            .or_else(|| self.flattened_handler_for_unsupported_namespace(namespace, name))
     }
 
     pub(crate) fn visible_handler_for_call(
@@ -310,6 +314,7 @@ impl ToolRouter {
     ) -> Option<ToolHandlerKind> {
         self.registry
             .direct_handler_for_namespaced(namespace, name)
+            .or_else(|| self.flattened_handler_for_unsupported_namespace(namespace, name))
             .or_else(|| {
                 (namespace.is_none() && name == TOOL_SEARCH_TOOL_NAME && self.tool_search_enabled)
                     .then(|| {
@@ -318,6 +323,26 @@ impl ToolRouter {
                     })
                     .flatten()
             })
+    }
+
+    fn flattened_handler_for_unsupported_namespace(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        if self.namespace_tools_supported || namespace.is_some() {
+            return None;
+        }
+        self.registry
+            .tools
+            .iter()
+            .find(|tool| {
+                tool.exposure != ToolExposure::Hidden
+                    && tool.mcp_tool.is_none()
+                    && tool.spec.name == name
+                    && tool.spec.namespace.is_some()
+            })
+            .map(|tool| tool.handler)
     }
 
     pub(crate) fn mcp_tool_for_call(
@@ -2476,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_tool_description_matches_codex_delegation_gate() {
+    fn spawn_agent_tool_description_matches_eval_fanout_gate() {
         let description = default_spawn_agent_type_description();
         let model_description = browser_use_providers::spawn_agent_model_overrides_description();
         let spec = spawn_agent_tool_spec(
@@ -2496,16 +2521,16 @@ mod tests {
         assert!(!spec.description.contains("`codex-auto-review`"));
         assert!(spec
             .description
-            .contains("Only use `spawn_agent` if and only if the user explicitly asks"));
+            .contains("Spawn `spawn_agent` whenever the task naturally decomposes"));
         assert!(spec
             .description
-            .contains("detailed codebase analysis do not count as permission to spawn"));
+            .contains("The user does NOT need to explicitly ask for sub-agents"));
         assert!(spec
             .description
             .contains("Do not delegate urgent blocking work"));
         assert!(spec
             .description
-            .contains("max_concurrent_threads_per_session = 4"));
+            .contains("Run multiple independent information-seeking subtasks in parallel"));
         assert!(!spec
             .description
             .contains("spawn a read-only helper with role \"explorer\" before answering"));
@@ -2665,6 +2690,31 @@ mod tests {
         assert!(fallback_specs.iter().any(|spec| {
             spec.namespace.as_deref() == Some("multi_agent_v1") && spec.name == "spawn_agent"
         }));
+
+        let flat_router = ToolRouter::new(registry.clone(), false, false);
+        let flat_specs = flat_router.model_visible_specs();
+        assert!(flat_specs
+            .iter()
+            .any(|spec| spec.namespace.is_none() && spec.name == "spawn_agent"));
+        for (tool_name, handler) in [
+            ("spawn_agent", ToolHandlerKind::SpawnAgentV1),
+            ("send_input", ToolHandlerKind::SendInputV1),
+            ("resume_agent", ToolHandlerKind::ResumeAgentV1),
+            ("wait_agent", ToolHandlerKind::WaitAgentV1),
+            ("close_agent", ToolHandlerKind::CloseAgentV1),
+        ] {
+            assert!(
+                flat_specs
+                    .iter()
+                    .any(|spec| spec.namespace.is_none() && spec.name == tool_name),
+                "expected flat visible spec for {tool_name}"
+            );
+            assert_eq!(
+                flat_router.handler_for_dispatch(None, tool_name),
+                Some(handler),
+                "expected flat dispatch handler for {tool_name}"
+            );
+        }
 
         let loaded = registry.search_deferred_tools("spawn subagent", 8);
         assert_eq!(loaded.len(), 1);
