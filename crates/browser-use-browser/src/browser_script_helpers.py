@@ -423,7 +423,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, score, samples }};
   }};
   const groups = new Map();
-  for (const el of document.querySelectorAll('article, section, li, tr, [class]')) {{
+  for (const el of document.querySelectorAll('article, section, li, tr, a[href], button, [role="button"], [class]')) {{
     if (!visible(el)) continue;
     const text = recordText(el, 500);
     if (text.length < 12) continue;
