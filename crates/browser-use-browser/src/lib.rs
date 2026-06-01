@@ -4274,7 +4274,7 @@ fn browser_script_prelude(
     )?;
     Ok(format!(
         r#"
-import base64, contextlib, io, json, os, pathlib, shutil, socket, sys, time, traceback, urllib.request
+import base64, contextlib, csv, io, json, os, pathlib, shutil, socket, sys, time, traceback, urllib.request
 
 BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
@@ -4546,9 +4546,36 @@ def emit_image(path, label=None):
     _stream_event({{"type": "image", "image": meta}})
     return meta
 
+def _audit_load_path_data(file_path):
+    suffix = file_path.suffix.lower()
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+    if suffix == ".json":
+        return json.loads(text)
+    if suffix == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    if suffix == ".csv":
+        return list(csv.DictReader(io.StringIO(text)))
+    return [line for line in text.splitlines() if line.strip()]
+
 def audit_artifact(data=None, **requirements):
     checks = {{}}
     details = {{}}
+    path = requirements.pop("path", None) or requirements.pop("file_path", None)
+    file_path = pathlib.Path(path).expanduser() if path else None
+    if file_path:
+        checks["file_exists"] = file_path.exists()
+        details["file_path"] = str(file_path)
+        if requirements.pop("nonempty_file", False):
+            checks["nonempty_file"] = file_path.exists() and file_path.stat().st_size > 0
+            details["file_size"] = file_path.stat().st_size if file_path.exists() else 0
+        if data is None and file_path.exists():
+            try:
+                data = _audit_load_path_data(file_path)
+                details["loaded_from_path"] = str(file_path)
+                details["loaded_kind"] = file_path.suffix.lower().lstrip(".") or "text"
+            except Exception as exc:
+                checks["load_path_data"] = False
+                details["load_error"] = str(exc)
     if data is not None:
         checks["has_data"] = data is not None and data != [] and data != {{}}
         if isinstance(data, list):
@@ -4591,14 +4618,6 @@ def audit_artifact(data=None, **requirements):
                 details["unique_by"] = fields
                 if duplicates:
                     details["duplicates"] = duplicates[:20]
-    path = requirements.pop("path", None) or requirements.pop("file_path", None)
-    if path:
-        file_path = pathlib.Path(path).expanduser()
-        checks["file_exists"] = file_path.exists()
-        details["file_path"] = str(file_path)
-        if requirements.pop("nonempty_file", False):
-            checks["nonempty_file"] = file_path.exists() and file_path.stat().st_size > 0
-            details["file_size"] = file_path.stat().st_size if file_path.exists() else 0
     checks.update({{f"requirement_{{k}}": bool(v) for k, v in requirements.items()}})
     return {{"generated_by": "audit_artifact", "checks": checks, "details": details, "ready_for_done": all(checks.values()) if checks else True}}
 
@@ -5233,6 +5252,37 @@ assert good["ready_for_done"] is True, good
 assert good["checks"]["file_exists"] is True, good
 assert good["checks"]["nonempty_file"] is True, good
 assert good["details"]["record_count"] == 2, good
+
+from_json_path = audit_artifact(path=str(path), min_count=2, exact_count=2, required_fields=["name", "url"], unique_by="url", nonempty_file=True)
+assert from_json_path["ready_for_done"] is True, from_json_path
+assert from_json_path["details"]["loaded_from_path"] == str(path), from_json_path
+assert from_json_path["details"]["loaded_kind"] == "json", from_json_path
+assert from_json_path["details"]["record_count"] == 2, from_json_path
+
+jsonl_path = pathlib.Path(outputs_dir()) / "result.jsonl"
+jsonl_path.write_text(
+    "\n".join([
+        json.dumps({"name": "Ada", "url": "https://example.test/a"}),
+        json.dumps({"name": "Grace", "url": "https://example.test/b"}),
+    ]),
+    encoding="utf-8",
+)
+from_jsonl_path = audit_artifact(path=str(jsonl_path), min_count=2, required_fields=["name", "url"], unique_by="url", nonempty_file=True)
+assert from_jsonl_path["ready_for_done"] is True, from_jsonl_path
+assert from_jsonl_path["details"]["loaded_kind"] == "jsonl", from_jsonl_path
+assert from_jsonl_path["details"]["record_count"] == 2, from_jsonl_path
+
+csv_path = pathlib.Path(outputs_dir()) / "result.csv"
+csv_path.write_text("name,url\nAda,https://example.test/a\nGrace,https://example.test/b\n", encoding="utf-8")
+from_csv_path = audit_artifact(path=str(csv_path), min_count=2, required_fields=["name", "url"], unique_by="url", nonempty_file=True)
+assert from_csv_path["ready_for_done"] is True, from_csv_path
+assert from_csv_path["details"]["loaded_kind"] == "csv", from_csv_path
+assert from_csv_path["details"]["record_count"] == 2, from_csv_path
+
+missing = audit_artifact(path=str(pathlib.Path(outputs_dir()) / "missing.json"), min_count=1, nonempty_file=True)
+assert missing["ready_for_done"] is False, missing
+assert missing["checks"]["file_exists"] is False, missing
+assert missing["checks"]["nonempty_file"] is False, missing
 print("audit_artifact ok")
 "#,
             10,

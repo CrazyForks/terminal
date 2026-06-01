@@ -2459,6 +2459,7 @@ mod tests {
             "Each `browser_script` call starts a fresh Python process.",
             "Python variables do not persist across calls.",
             "audit_artifact",
+            "audit_artifact(path=\"result.json\", ...)",
             "required_fields",
             "unique_by",
         ] {
