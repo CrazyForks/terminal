@@ -15842,21 +15842,16 @@ impl Default for MultiAgentV2Config {
             subagent_usage_hint_text: None,
             tool_namespace: None,
             hide_spawn_agent_metadata: false,
-            // CRITICAL: with `enabled: false` the agent falls back to the V1
-            // multi-agent family, whose spawn_agent tool spec hardcodes
-            // namespace="multi_agent_v1". On Anthropic (which doesn't support
-            // namespaced tools) the visibility loop drops every namespaced
-            // tool — so spawn_agent / wait_agent / send_message NEVER appear
-            // in the tool list sent to the model. The agent then has no way
-            // to fan out, regardless of how strongly the system prompt
-            // mandates it. Symptom: real_v8 task 4 (9 UniFi products) hit
-            // step-limit on every single run because the agent walked the
-            // list sequentially in one rollout.
-            //
-            // Defaulting to V2 (Direct exposure, no namespace required for
-            // the tool to appear) fixes this — spawn_agent is in every
-            // model's tool list including Anthropic.
-            enabled: true,
+            // Tried setting enabled=true to expose spawn_agent (V1's
+            // hardcoded namespace was dropping it from Anthropic's tool
+            // list) but V2 sub-agents fail badly in the brust runtime —
+            // 10-task score dropped from 60% (no spawn) to 17-30% (V2
+            // spawning but sub-agents not returning useful results /
+            // wait_agent timing out even at 5min). Revert to V1 default
+            // and address namespace stripping separately so spawn_agent
+            // becomes visible without breaking the sub-agent execution
+            // path. TODO: trace why V2 sub-agents fail in the eval env.
+            enabled: false,
             non_code_mode_only: false,
         }
     }
