@@ -25215,11 +25215,17 @@ fn dispatch_wait_agent_tool(
     )?;
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms as u64);
+    let previously_observed_final_child_ids =
+        previously_observed_wait_final_child_ids(store, &session.id)?;
     let timed_out = loop {
         if !store.messages_for_agent(&session.id)?.is_empty() {
             break false;
         }
-        if has_final_child_agent_status_for_wait(store, session)? {
+        if has_new_final_child_agent_status_for_wait(
+            store,
+            session,
+            &previously_observed_final_child_ids,
+        )? {
             break false;
         }
         if started.elapsed() >= timeout {
@@ -25228,6 +25234,7 @@ fn dispatch_wait_agent_tool(
         thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
     };
     let waited_ms = started.elapsed().as_millis() as u64;
+    let final_child_ids = final_child_agent_ids_for_wait(store, session)?;
     store.append_event(
         &session.id,
         "agent.wait.finished",
@@ -25236,6 +25243,7 @@ fn dispatch_wait_agent_tool(
             "timed_out": timed_out,
             "waited_ms": waited_ms,
             "active_count": count_active_watched_agents(store, &live_agents_in_root_tree(store, &session.id)?)?,
+            "final_child_ids": final_child_ids,
         }),
     )?;
     store.append_event(
@@ -25262,11 +25270,22 @@ fn dispatch_wait_agent_tool(
     })
 }
 
-fn has_final_child_agent_status_for_wait(
+fn has_new_final_child_agent_status_for_wait(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
+    previously_observed_final_child_ids: &HashSet<String>,
 ) -> Result<bool> {
+    Ok(final_child_agent_ids_for_wait(store, session)?
+        .into_iter()
+        .any(|child_id| !previously_observed_final_child_ids.contains(&child_id)))
+}
+
+fn final_child_agent_ids_for_wait(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+) -> Result<Vec<String>> {
     let root_id = root_session_id(store, &session.id)?;
+    let mut final_child_ids = Vec::new();
     for agent in collect_agent_tree(store, &root_id)? {
         if agent.status == "closed" {
             continue;
@@ -25275,14 +25294,43 @@ fn has_final_child_agent_status_for_wait(
             continue;
         };
         if !child.status.is_active() && child.status != SessionStatus::Created {
-            return Ok(true);
+            final_child_ids.push(agent.child_session_id);
+            continue;
         }
         let status = local_agent_status_value(store, &child, Some(&agent))?;
         if agent_status_is_final_for_wait(&status) {
-            return Ok(true);
+            final_child_ids.push(agent.child_session_id);
         }
     }
-    Ok(false)
+    final_child_ids.sort();
+    final_child_ids.dedup();
+    Ok(final_child_ids)
+}
+
+fn previously_observed_wait_final_child_ids(
+    store: &Store,
+    session_id: &str,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for event in store.events_for_session(session_id)? {
+        if event.event_type != "agent.wait.finished" {
+            continue;
+        }
+        let Some(final_child_ids) = event
+            .payload
+            .get("final_child_ids")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        ids.extend(
+            final_child_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    Ok(ids)
 }
 
 fn agent_status_is_final_for_wait(status: &Value) -> bool {
@@ -45919,6 +45967,108 @@ command = "explicit-mcp"
         assert_eq!(data["timed_out"], false);
         assert_eq!(data["message"], "Wait completed.");
         assert!(content.contains("finished without mailbox"));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v2_does_not_rewake_on_same_final_child_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let first = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/first_done_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &first.id,
+            "session.done",
+            serde_json::json!({"result": "first finished"}),
+        )?;
+        store.set_child_agent_status(&first.id, "done")?;
+        let second = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/second_done_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &second.id,
+            "session.input",
+            serde_json::json!({"text": "finish later"}),
+        )?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![
+            (
+                "features.multi_agent_v2.min_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10),
+            ),
+            (
+                "features.multi_agent_v2.max_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10_000),
+            ),
+            (
+                "features.multi_agent_v2.default_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10),
+            ),
+        ]);
+
+        let first_wait = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_first_done".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
+            },
+            &options,
+        )?;
+        let first_content = first_wait.messages[0]["content"]
+            .as_str()
+            .context("first wait content")?;
+        assert!(first_content.contains("first finished"));
+
+        let state_dir = store.state_dir().to_path_buf();
+        let second_id = second.id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let store = Store::open(&state_dir).expect("open store");
+            store
+                .append_event(
+                    &second_id,
+                    "session.done",
+                    serde_json::json!({"result": "second finished"}),
+                )
+                .expect("finish second child");
+            store
+                .set_child_agent_status(&second_id, "done")
+                .expect("set second child status");
+        });
+
+        let started = Instant::now();
+        let second_wait = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_second_done".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
+            },
+            &options,
+        )?;
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        let second_content = second_wait.messages[0]["content"]
+            .as_str()
+            .context("second wait content")?;
+        let data: Value = serde_json::from_str(second_content)?;
+        assert_eq!(data["timed_out"], false);
+        assert!(second_content.contains("first finished"));
+        assert!(second_content.contains("second finished"));
         assert!(store.messages_for_agent(&parent.id)?.is_empty());
         Ok(())
     }
