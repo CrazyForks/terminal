@@ -22685,12 +22685,14 @@ fn dispatch_spawn_agent_tool_with_hooks<P: ModelProvider>(
         Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
     };
     let multi_agent_v2_config = spawn_config.multi_agent_v2.clone();
-    if let Err(error) = enforce_multi_agent_v2_thread_cap(
-        store,
-        &session.id,
-        multi_agent_v2_config.max_concurrent_threads_per_session,
-    ) {
-        return dispatch_tool_validation_error(store, session, call, &error);
+    if !legacy_v1 {
+        if let Err(error) = enforce_multi_agent_v2_thread_cap(
+            store,
+            &session.id,
+            multi_agent_v2_config.max_concurrent_threads_per_session,
+        ) {
+            return dispatch_tool_validation_error(store, session, call, &error);
+        }
     }
     let hide_spawn_agent_metadata = multi_agent_v2_config.hide_spawn_agent_metadata;
     let mut child_options = options.clone();
@@ -45251,6 +45253,58 @@ command = "explicit-mcp"
         assert!(child_events.iter().any(|event| {
             event.event_type == "agent.context" && event.payload["fork_mode"] == "all"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn flat_v1_spawn_agent_ignores_v2_thread_cap_for_eval_fanout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 1\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let options = AgentRunOptions::default().with_child_agent_runner(runner);
+
+        let outcome = with_browser_use_terminal_home(&app_home, || {
+            dispatch_spawn_agent_tool_with_hooks(
+                &store,
+                &provider,
+                &session,
+                &ToolCall {
+                    id: "flat_v1_spawn_under_v2_cap".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "message": "inspect one item",
+                        "fork_context": false,
+                    }),
+                },
+                &options,
+                &None,
+                &RuntimeHookConfig::default(),
+                true,
+            )
+        })?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert!(payload["agent_id"].as_str().is_some());
+        assert!(!message_content_text(&outcome.messages[0])
+            .contains("max_concurrent_threads_per_session"));
+        assert_eq!(store.list_child_agents(&session.id)?.len(), 1);
         Ok(())
     }
 
