@@ -11991,6 +11991,7 @@ mod tests {
         assert!(none.contains("Browser Agent Contract"));
         assert!(none.contains("Python variables do not persist across calls"));
         assert!(!none.contains("Python namespace persists"));
+        assert!(none.contains("browser_fetch"));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
             "custom-model",

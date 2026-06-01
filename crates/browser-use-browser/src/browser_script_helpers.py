@@ -227,6 +227,55 @@ def js(expression, target_id=None, returnByValue=True):
     )
 
 
+def browser_fetch(url, headers=None, method="GET", body=None, timeout=20.0, binary=False):
+    """Fetch from the current page context, preserving browser credentials.
+
+    Use this after direct http_get/http_get_many is blocked but the browser has
+    loaded the site and may have useful cookies or same-origin API access.
+    """
+    expression = f"""
+(async () => {{
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), {int(float(timeout) * 1000)});
+  try {{
+    const response = await fetch({json.dumps(url)}, {{
+      method: {json.dumps(method)},
+      headers: {json.dumps(headers or {})},
+      body: {json.dumps(body) if body is not None else "undefined"},
+      credentials: 'include',
+      signal: controller.signal,
+    }});
+    const responseHeaders = Object.fromEntries(Array.from(response.headers.entries()));
+    const out = {{
+      ok: response.ok,
+      status_code: response.status,
+      status: response.status,
+      status_text: response.statusText,
+      url: response.url,
+      headers: responseHeaders,
+    }};
+    if ({json.dumps(bool(binary))}) {{
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let raw = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {{
+        raw += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      }}
+      out.content_base64 = btoa(raw);
+    }} else {{
+      out.text = await response.text();
+      if ((responseHeaders['content-type'] || '').toLowerCase().includes('json')) {{
+        try {{ out.json = JSON.parse(out.text); }} catch (err) {{}}
+      }}
+    }}
+    return out;
+  }} finally {{
+    clearTimeout(timeoutId);
+  }}
+}})()
+"""
+    return js(expression)
+
+
 def _truthy_env(name, default=False):
     value = os.environ.get(name)
     if value is None:
@@ -1013,13 +1062,13 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
     except urllib.error.HTTPError as exc:
         guidance = (
             "http_get received HTTP "
-            f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with js(fetch(...)), "
+            f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with browser_fetch(...), "
             "pass site-specific headers/cookies, or configure the Browser Use fetch proxy with BROWSER_USE_API_KEY."
         )
         raise RuntimeError(guidance) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(
-            f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
+            f"http_get failed for {url}: {exc}. Try a shorter timeout, browser_fetch(...), or a configured proxy if the site blocks direct HTTP."
         ) from exc
 
 

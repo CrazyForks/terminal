@@ -24,6 +24,7 @@ Preimported helpers:
 cdp(method, session_id=None, **params)
 cdp_batch(calls)
 js(expression, returnByValue=True)
+browser_fetch(url, headers=None, method="GET", body=None, timeout=20.0, binary=False)
 
 new_tab(url="about:blank")
 goto_url(url)
@@ -111,7 +112,7 @@ emit_output(rows, label="employee_rows")
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
-- Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. For URL batches, use `http_get_many(...)`; it preserves input order and returns compact per-URL records with `ok`, `status_code`, `text` or `content_base64`, and `error` fields. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
+- Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. For URL batches, use `http_get_many(...)`; it preserves input order and returns compact per-URL records with `ok`, `status_code`, `text` or `content_base64`, and `error` fields. If direct HTTP hits bot or login protection but the page is loaded, retry with `browser_fetch(...)` so the request runs in the page context with browser cookies/session; otherwise use site-specific headers/cookies or the configured Browser Use fetch proxy.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.
 - For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.

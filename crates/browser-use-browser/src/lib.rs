@@ -5267,6 +5267,48 @@ print("return detection ok")
     }
 
     #[test]
+    fn browser_script_browser_fetch_uses_page_context_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-browser-fetch-helper",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+def js(expression, target_id=None, returnByValue=True):
+    calls.append(expression)
+    assert "fetch(" in expression
+    assert "credentials: 'include'" in expression
+    assert "AbortController" in expression
+    assert "content_base64" in expression
+    assert "JSON.parse" in expression
+    assert '"X-Test": "yes"' in expression
+    return {
+        "ok": True,
+        "status_code": 200,
+        "status": 200,
+        "status_text": "OK",
+        "url": "https://example.test/api",
+        "headers": {"content-type": "application/json"},
+        "text": "{\"answer\": 42}",
+        "json": {"answer": 42},
+    }
+
+result = browser_fetch("https://example.test/api", headers={"X-Test": "yes"}, timeout=1.5)
+assert result["ok"] is True
+assert result["json"]["answer"] == 42
+assert calls and "1500" in calls[0]
+print("browser_fetch ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("browser_fetch ok"));
+    }
+
+    #[test]
     fn browser_script_repeated_item_helpers_surface_actionable_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
