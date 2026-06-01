@@ -25190,6 +25190,7 @@ fn dispatch_wait_agent_v1_tool(
             serde_json::json!({
                 "status": statuses,
                 "timed_out": timed_out,
+                "agents": agent_status_summaries(store, session, None, false)?,
             }),
         )?],
     })
@@ -45861,6 +45862,14 @@ command = "explicit-mcp"
             serde_json::json!({"completed": "second child result"})
         );
         assert!(payload["status"].get(&first.id).is_none());
+        let agents = payload["agents"].as_array().context("agents")?;
+        assert!(agents.iter().any(|agent| {
+            agent["agent_id"] == second.id
+                && agent["agent_status"] == serde_json::json!({"completed": "second child result"})
+        }));
+        assert!(agents.iter().any(|agent| {
+            agent["agent_id"] == first.id && agent["agent_status"] == serde_json::json!("running")
+        }));
         Ok(())
     }
 

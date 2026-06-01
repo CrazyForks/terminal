@@ -1271,12 +1271,17 @@ fn wait_agent_v1_output_schema() -> Value {
                 "description": "Final statuses keyed by agent id.",
                 "additionalProperties": agent_status_output_schema()
             },
+            "agents": {
+                "type": "array",
+                "description": "Compact child-agent summaries, included for compatibility with V2-style fan-out collection.",
+                "items": agent_status_summary_output_schema()
+            },
             "timed_out": {
                 "type": "boolean",
                 "description": "Whether the wait call returned due to timeout before any agent reached a final status."
             }
         },
-        "required": ["status", "timed_out"],
+        "required": ["status", "timed_out", "agents"],
         "additionalProperties": false
     })
 }
@@ -2866,6 +2871,14 @@ mod tests {
             flat_wait.input_schema["required"],
             serde_json::json!([])
         );
+        assert_eq!(
+            flat_wait.output_schema.as_ref().unwrap()["required"],
+            serde_json::json!(["status", "timed_out", "agents"])
+        );
+        assert!(flat_wait.output_schema.as_ref().unwrap()["properties"]["agents"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("V2-style fan-out collection"));
         assert!(
             flat_wait.input_schema["properties"]["targets"]["description"]
                 .as_str()
