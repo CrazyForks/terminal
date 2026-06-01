@@ -2114,6 +2114,12 @@ fn default_spawn_agent_usage_hint() -> &'static str {
 Spawn `spawn_agent` whenever the task naturally decomposes into N independent units: iterating over a list of items, cascading lookups (find X, then for each X find Y), comparing K sources, or any pattern where sequential execution would burn the per-session turn budget on item 6-10. Each helper gets its own browser session and its own turn budget — that's the only way to fit N>4 items in one run.\n\
 Triggers that should make you spawn before doing anything else: a numbered list of >=5 items in the user task; the phrase 'for each' over a list of 5+; explicit comparison across 3+ sites; cascade lookups (A->B->C). Do not iterate sequentially in one rollout for any of these — you will run out of turns.\n\
 The user does NOT need to explicitly ask for sub-agents — the right pattern is the one that completes the task within budget. Defaulting to sequential is the wrong default for multi-item / parallelisable work.\n\n\
+### Concrete browser/data fan-out examples\n\
+- Product or listing list: if there are 5+ products/properties/packages/vendors, spawn one helper per item with the item name, visible card text, stable attributes/links, and the exact field to return. Do not open product pages one by one in the parent.\n\
+- Document bundle: if a filing/docket/page has 5+ PDFs, exhibits, attachments, or linked documents, spawn one helper per document to read/extract/summarize the required fields while the parent tracks the manifest.\n\
+- Citation or bibliography cascade: if the task asks for authors/titles/abstracts/citations for many papers/books/repos, spawn helpers for each citation or source after discovering the list.\n\
+- Multi-site comparison: if comparing 3+ stores, countries, vendors, or official sources, spawn helpers per site/source and have each return the same compact schema.\n\
+- Parent responsibility: keep the item manifest, collect helper results with `wait_agent`, audit count/schema/dedupe, and assemble the final answer.\n\n\
 ### When to delegate vs. do the subtask yourself\n\
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. For browser/data fan-out patterns listed above, the immediate local step is spawning the focused helpers, not opening the first item yourself. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.\n\
 - Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.\n\
@@ -2571,6 +2577,24 @@ mod tests {
         assert!(spec.description.contains(
             "For browser/data fan-out patterns listed above, the immediate local step is spawning the focused helpers"
         ));
+        assert!(spec
+            .description
+            .contains("Concrete browser/data fan-out examples"));
+        assert!(spec
+            .description
+            .contains("Product or listing list: if there are 5+"));
+        assert!(spec
+            .description
+            .contains("Document bundle: if a filing/docket/page has 5+"));
+        assert!(spec
+            .description
+            .contains("Citation or bibliography cascade"));
+        assert!(spec
+            .description
+            .contains("Multi-site comparison: if comparing 3+"));
+        assert!(spec
+            .description
+            .contains("audit count/schema/dedupe"));
         assert!(spec.description.contains(
             "each independent item/document/site helper is not urgent blocking work"
         ));
