@@ -409,6 +409,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
     const links = new Set();
     for (const el of items.slice(0, 10)) {{
+      if (el.matches('a[href]')) links.add(el.href);
       for (const a of el.querySelectorAll('a[href]')) links.add(a.href);
     }}
     let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8);
@@ -458,8 +459,15 @@ def extract_repeated_items(selector, limit=50, include_html=False):
   return Array.from(document.querySelectorAll(selector)).slice(0, limit).map((el, index) => {{
     const text = clean(el.innerText || el.textContent || '');
     const headings = Array.from(el.querySelectorAll('h1,h2,h3,h4,[role="heading"]')).map(h => clean(h.textContent, 200)).filter(Boolean);
-    const links = Array.from(el.querySelectorAll('a[href]')).slice(0, 8).map(a => ({{ text: clean(a.textContent, 160), href: a.href }}));
-    const buttons = Array.from(el.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')).slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
+    const linkNodes = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
+    const buttonNodes = (el.matches('button,[role="button"],input[type="button"],input[type="submit"]') ? [el] : []).concat(Array.from(el.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')));
+    const seenLinks = new Set();
+    const links = linkNodes.filter(a => {{
+      if (seenLinks.has(a.href)) return false;
+      seenLinks.add(a.href);
+      return true;
+    }}).slice(0, 8).map(a => ({{ text: clean(a.textContent || a.value, 160), href: a.href }}));
+    const buttons = buttonNodes.slice(0, 8).map(b => clean(b.innerText || b.value || b.textContent, 160)).filter(Boolean);
     const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
     const record = {{ index, text, headings, prices, links, buttons }};
     if (includeHtml) record.html = clean(el.outerHTML || '', 4000);

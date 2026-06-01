@@ -5278,16 +5278,20 @@ calls = []
 def js(expression, returnByValue=True):
     calls.append(expression)
     if "querySelectorAll(selector)" in expression:
+        assert "el.matches('a[href]')" in expression
+        assert "seenLinks" in expression
+        assert "buttonNodes" in expression
         return [
             {
                 "index": 0,
                 "text": "DNA Netti 300M 19,90 €/kk",
                 "headings": ["DNA Netti 300M"],
                 "prices": ["19,90 €/kk"],
-                "links": [],
+                "links": [{"text": "DNA Netti 300M", "href": "https://example.test/dna-300"}],
                 "buttons": ["Valitse"],
             }
         ]
+    assert "el.matches('a[href]')" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
@@ -5309,6 +5313,7 @@ assert snapshot["recommended_selector"] == "div.subscriptioncard"
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
+assert records["records"][0]["links"][0]["href"] == "https://example.test/dna-300"
 assert any("querySelectorAll(selector)" in call for call in calls)
 print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False))
 "#,
