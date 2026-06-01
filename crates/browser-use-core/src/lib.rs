@@ -15836,7 +15836,21 @@ impl Default for MultiAgentV2Config {
             subagent_usage_hint_text: None,
             tool_namespace: None,
             hide_spawn_agent_metadata: false,
-            enabled: false,
+            // CRITICAL: with `enabled: false` the agent falls back to the V1
+            // multi-agent family, whose spawn_agent tool spec hardcodes
+            // namespace="multi_agent_v1". On Anthropic (which doesn't support
+            // namespaced tools) the visibility loop drops every namespaced
+            // tool — so spawn_agent / wait_agent / send_message NEVER appear
+            // in the tool list sent to the model. The agent then has no way
+            // to fan out, regardless of how strongly the system prompt
+            // mandates it. Symptom: real_v8 task 4 (9 UniFi products) hit
+            // step-limit on every single run because the agent walked the
+            // list sequentially in one rollout.
+            //
+            // Defaulting to V2 (Direct exposure, no namespace required for
+            // the tool to appear) fixes this — spawn_agent is in every
+            // model's tool list including Anthropic.
+            enabled: true,
             non_code_mode_only: false,
         }
     }
