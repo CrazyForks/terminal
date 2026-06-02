@@ -5722,12 +5722,13 @@ def js(expression, returnByValue=True):
     assert "fanout_recommended" in expression
     assert "next_fanout_hint" in expression
     assert "Use candidates[0].fanout_tasks" in expression
+    assert "task.spawn_message" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
         "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
         "fanout_recommended": True,
-        "next_fanout_hint": "Use candidates[0].fanout_tasks as the child manifest: spawn one child agent per task_name/url, then wait_agent and assemble the final answer.",
+        "next_fanout_hint": "Use candidates[0].fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent, then wait_agent and assemble the final answer.",
         "candidates": [
             {
                 "selector": "div.subscriptioncard",
@@ -5749,10 +5750,12 @@ snapshot = repeated_items_snapshot()
 assert snapshot["recommended_action"] == "extract_repeated_items"
 assert snapshot["recommended_selector"] == "div.subscriptioncard"
 assert snapshot["fanout_recommended"] is True
-assert "child agent" in snapshot["next_fanout_hint"]
+assert "spawn_agent" in snapshot["next_fanout_hint"]
 assert snapshot["candidates"][0]["detail_link_count"] == 6
 assert snapshot["candidates"][0]["fanout_tasks"][0]["task_name"] == "item_1"
 assert snapshot["fanout_tasks"][0]["url"] == "https://example.test/dna-300"
+assert "Handle only manifest item 1" in snapshot["fanout_tasks"][0]["spawn_message"]
+assert "Do not process sibling manifest items" in snapshot["candidates"][0]["fanout_tasks"][0]["spawn_message"]
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]

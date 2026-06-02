@@ -2041,31 +2041,56 @@ def _fanout_tasks_from_actions(prefix, actions, kind="item"):
             continue
         text = action.get("text") or action.get("item_text") or action.get("row_text") or ""
         task_name = f"{prefix}_{index + 1}"
-        instruction = (
-            f"Open this {kind} URL from the parent manifest, extract only the fields "
-            "requested by the parent task for this one target, and return a concise "
-            f"done(result=...) with the target name, URL, and extracted fields: {href}"
-        )
-        spawn_message = (
-            f"Handle only manifest item {index + 1}: {text[:220] or href}. "
-            f"{instruction} Do not process sibling manifest items. If the page is blocked "
-            "or incomplete, return a concise partial result with the blocker and source URL."
-        )
+        instruction = _fanout_instruction(kind, href)
         tasks.append(
             {
                 "task_name": task_name,
                 "url": href,
                 "item_text": text[:260],
                 "instruction": instruction,
-                "spawn_message": spawn_message,
+                "spawn_message": _fanout_spawn_message(index, href, text, instruction),
             }
         )
+    return tasks
+
+
+def _fanout_instruction(kind, href):
+    return (
+        f"Open this {kind} URL from the parent manifest, extract only the fields "
+        "requested by the parent task for this one target, and return a concise "
+        f"done(result=...) with the target name, URL, and extracted fields: {href}"
+    )
+
+
+def _fanout_spawn_message(index, href, text, instruction):
+    return (
+        f"Handle only manifest item {index + 1}: {(text or '')[:220] or href}. "
+        f"{instruction} Do not process sibling manifest items. If the page is blocked "
+        "or incomplete, return a concise partial result with the blocker and source URL."
+    )
+
+
+def _ensure_fanout_spawn_messages(tasks, *, kind):
+    if not isinstance(tasks, list):
+        return tasks
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        href = task.get("url") or task.get("href")
+        if not href:
+            continue
+        text = task.get("item_text") or task.get("text") or task.get("row_text") or task.get("task_name") or ""
+        if not task.get("instruction"):
+            task["instruction"] = _fanout_instruction(kind, href)
+        if not task.get("spawn_message"):
+            task["spawn_message"] = _fanout_spawn_message(index, href, text, task["instruction"])
     return tasks
 
 
 def _attach_fanout_tasks(data, *, prefix, kind):
     if not isinstance(data, dict):
         return data
+    _ensure_fanout_spawn_messages(data.get("fanout_tasks"), kind=kind)
     candidates = data.get("candidates")
     if not isinstance(candidates, list):
         return data
@@ -2075,8 +2100,11 @@ def _attach_fanout_tasks(data, *, prefix, kind):
         if not candidate.get("fanout_tasks"):
             actions = candidate.get("detail_actions") or candidate.get("detail_links") or []
             candidate["fanout_tasks"] = _fanout_tasks_from_actions(prefix, actions, kind=kind)
+        else:
+            _ensure_fanout_spawn_messages(candidate.get("fanout_tasks"), kind=kind)
         if data.get("fanout_recommended") and not data.get("fanout_tasks"):
             data["fanout_tasks"] = candidate.get("fanout_tasks") or []
+        _ensure_fanout_spawn_messages(data.get("fanout_tasks"), kind=kind)
     return data
 
 
@@ -2199,7 +2227,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     recommended_selector: recommended ? recommended.selector : null,
     next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
     fanout_recommended: fanoutRecommended,
-    next_fanout_hint: fanoutRecommended ? 'Use candidates[0].fanout_tasks as the child manifest: spawn one child agent per task_name/url, then wait_agent and assemble the final answer.' : null,
+    next_fanout_hint: fanoutRecommended ? 'Use candidates[0].fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent, then wait_agent and assemble the final answer.' : null,
     candidates: candidates.slice(0, limit),
   }};
 }})()
