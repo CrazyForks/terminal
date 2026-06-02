@@ -6370,6 +6370,49 @@ print("pagination helpers ok")
     }
 
     #[test]
+    fn browser_script_result_count_snapshot_parses_visible_count_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-result-count-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "__RESULT_COUNT_SNAPSHOT__" in expression
+    assert "matches" in expression
+    assert "records" in expression
+    assert "page" in expression
+    assert "exhibitors" in expression
+    return {
+        "best": {"kind": "range_total", "evidence": "Matches 1 - 25 of 58", "score": 140, "start": 1, "end": 25, "total": 58},
+        "candidates": [
+            {"kind": "range_total", "evidence": "Matches 1 - 25 of 58", "score": 140, "start": 1, "end": 25, "total": 58},
+            {"kind": "page_total", "evidence": "Page 1 of 3", "score": 105, "current_page": 1, "total_pages": 3},
+            {"kind": "labeled_total", "evidence": "710 exhibitors", "score": 80, "total": 710, "label": "exhibitors"},
+        ],
+    }
+
+snapshot = result_count_snapshot()
+assert snapshot["count"] == 3
+assert snapshot["best"]["total"] == 58
+assert snapshot["best"]["evidence"] == "Matches 1 - 25 of 58"
+assert snapshot["candidates"][1]["total_pages"] == 3
+assert snapshot["candidates"][2]["total"] == 710
+assert len(calls) == 1
+print("result count helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("result count helpers ok"));
+    }
+
+    #[test]
     fn browser_script_form_control_helpers_toggle_labeled_controls() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

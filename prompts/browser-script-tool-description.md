@@ -55,6 +55,7 @@ overlay_actions_snapshot(limit=20)
 dismiss_overlay(prefer="accept", timeout=1.0)
 pagination_controls_snapshot(limit=20)
 click_pagination(label_or_text="next", timeout=2.0)
+result_count_snapshot(limit=12)
 form_controls_snapshot(limit=30)
 toggle_form_control(label_or_text, checked=True, timeout=1.0)
 select_controls_snapshot(limit=20, option_limit=30)
@@ -111,6 +112,7 @@ Usage guidance:
 - For arXiv recent-list or paper-search tasks, use `arxiv_query(search_query=..., start=..., max_results=...)` instead of browsing arXiv list/abstract pages one by one. It returns normalized title, authors, abstract, abs/pdf URLs, categories, DOI/journal/comment metadata, and first-version submission time when exposed by arXiv.
 - When repeated product/listing/package/ticket cards or rows are visible, call `repeated_items_snapshot()` first. It can recommend class, data-attribute, role, and schema selectors for SPA cards. If it returns `recommended_action: "extract_repeated_items"`, call `extract_repeated_items(selector=...)` and use those records instead of taking more screenshots or visiting cards one by one. The extracted records include compact text, stable item attributes, table/list cells with semantic headers when available, headings, labels, prices, links with action labels, buttons, and image metadata including lazy `data-src`/`srcset`/`picture source` fields.
 - For paginated listings, result pages, and "Load more" flows, call `pagination_controls_snapshot()` before guessing. Use `click_pagination("next")` or `click_pagination("load more")`, then wait and re-run the relevant extraction helper.
+- For result-count or page-count evidence such as "Matches 1 - 25 of 58", "Records 1 through 10 of N", "Page 1 of 3", or "710 exhibitors", call `result_count_snapshot()` and keep its `evidence` text with the parsed count.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.

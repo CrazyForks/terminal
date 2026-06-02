@@ -1722,6 +1722,38 @@ def click_pagination(label_or_text="next", timeout=2.0):
     return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "href": match.get("href", ""), "rel": match.get("rel", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def result_count_snapshot(limit=12):
+    """Return parsed visible result/page-count snippets with evidence text."""
+    expression = f"""
+(() => {{
+ // __RESULT_COUNT_SNAPSHOT__
+ const clean=(t,m=500)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),num=s=>{{const n=parseInt(String(s||'').replace(/,/g,''),10);return Number.isFinite(n)?n:null}},out=[],seen=new Set();
+ const add=(kind,evidence,score,fields={{}})=>{{evidence=clean(evidence);const key=kind+'|'+evidence;if(!evidence||seen.has(key))return;seen.add(key);out.push(Object.assign({{kind,evidence,score}},fields));}};
+ const texts=[clean(document.body&&document.body.innerText||'',8000)];
+ for(const e of document.querySelectorAll('main,section,header,footer,nav,table,tbody,thead,tfoot,[role=status],[aria-live],[class*=result],[id*=result],[class*=pagination],[id*=pagination],[class*=pager],[id*=pager]')){{const r=e.getBoundingClientRect(),s=getComputedStyle(e);if(r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden')texts.push(clean(e.innerText||e.textContent||'',1200));}}
+ for(const text of texts){{if(!text)continue;let m;
+  const range=/\\b(?:matches|records|results?|entries|items?)\\s+(\\d[\\d,]*)\\s*(?:-|–|to|through)\\s*(\\d[\\d,]*)\\s+(?:of|from)\\s+(\\d[\\d,]*)\\b/ig;
+  while((m=range.exec(text)))add('range_total',m[0],140,{{start:num(m[1]),end:num(m[2]),total:num(m[3])}});
+  const showing=/\\b(?:showing|displaying|viewing)\\s+(\\d[\\d,]*)\\s*(?:-|–|to|through)\\s*(\\d[\\d,]*)\\s+(?:of|from)\\s+(\\d[\\d,]*)\\b/ig;
+  while((m=showing.exec(text)))add('showing_total',m[0],130,{{start:num(m[1]),end:num(m[2]),total:num(m[3])}});
+  const page=/\\bpage\\s+(\\d[\\d,]*)\\s*(?:of|\\/|from)\\s*(\\d[\\d,]*)\\b/ig;
+  while((m=page.exec(text)))add('page_total',m[0],105,{{current_page:num(m[1]),total_pages:num(m[2])}});
+  const compact=/\\b(\\d[\\d,]*)\\s+(?:of|\\/)\\s+(\\d[\\d,]*)\\b/ig;
+  if(/\\b(page|pagination|pager|next|previous|results?|records?|entries)\\b/i.test(text))while((m=compact.exec(text)))add('compact_page_total',m[0],70,{{current_page:num(m[1]),total_pages:num(m[2])}});
+  const total=/\\b(\\d[\\d,]*)\\s+(exhibitors?|results?|records?|entries|items?|companies|matches)\\b/ig;
+  while((m=total.exec(text)))add('labeled_total',m[0],80,{{total:num(m[1]),label:m[2].toLowerCase()}});
+  const found=/\\b(?:found|total)\\s*:?\\s*(\\d[\\d,]*)\\s+(results?|records?|entries|items?|companies|matches)\\b/ig;
+  while((m=found.exec(text)))add('found_total',m[0],90,{{total:num(m[1]),label:m[2].toLowerCase()}});
+ }}
+ out.sort((a,b)=>b.score-a.score);
+ return {{best:out[0]||null,candidates:out.slice(0,{int(limit)})}};
+}})()
+"""
+    data = js(expression) or {}
+    candidates = data.get("candidates") if isinstance(data, dict) else []
+    return {"count": len(candidates or []), "best": (data or {}).get("best"), "candidates": candidates or []}
+
+
 def form_controls_snapshot(limit=30):
     """Return compact rendered checkboxes/radios/toggles with labels and state."""
     expression = f"""
