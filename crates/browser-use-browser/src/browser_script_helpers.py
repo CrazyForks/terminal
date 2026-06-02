@@ -4352,9 +4352,9 @@ def wikidata_education_award_cascade(person_names, award_keywords=None, limit_pe
 
     Use for public-knowledge cascades such as Nobel laureate -> PhD/education
     institution -> other Nobel graduates. The helper resolves each input name
-    through Wikidata search, queries P69 education relationships, and returns
-    other people educated at the same institutions whose award labels match the
-    supplied keywords.
+    through Wikidata search, queries P69 education statements and P512 degree
+    qualifiers when present, and returns other people educated at the same
+    institutions whose award labels match the supplied keywords.
     """
     names = [str(name).strip() for name in (person_names or []) if str(name).strip()]
     if not names:
@@ -4414,10 +4414,14 @@ def wikidata_education_award_cascade(person_names, award_keywords=None, limit_pe
             continue
         qid = matches[0]["id"]
         query = f"""
-SELECT ?target ?targetLabel ?institution ?institutionLabel ?other ?otherLabel ?award ?awardLabel WHERE {{
+SELECT ?target ?targetLabel ?institution ?institutionLabel ?targetDegree ?targetDegreeLabel ?other ?otherLabel ?otherDegree ?otherDegreeLabel ?award ?awardLabel WHERE {{
   VALUES ?target {{ wd:{qid} }}
-  ?target wdt:P69 ?institution .
-  ?other wdt:P69 ?institution .
+  ?target p:P69 ?targetEducationStatement .
+  ?targetEducationStatement ps:P69 ?institution .
+  OPTIONAL {{ ?targetEducationStatement pq:P512 ?targetDegree . }}
+  ?other p:P69 ?otherEducationStatement .
+  ?otherEducationStatement ps:P69 ?institution .
+  OPTIONAL {{ ?otherEducationStatement pq:P512 ?otherDegree . }}
   ?other wdt:P166 ?award .
   FILTER(?other != ?target)
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
@@ -4442,12 +4446,17 @@ LIMIT {int(limit_per_person)}
                 "source_name": name,
                 "source_qid": qid,
                 "source_label": matches[0].get("label", ""),
+                "relationship": "educated_at",
                 "institution": cell_text(row, "institution"),
                 "institution_qid": institution.get("id", ""),
                 "institution_url": institution.get("url", institution.get("value", "")),
+                "source_degree": cell_text(row, "targetDegree"),
+                "source_degree_qid": (row.get("targetDegree") or {}).get("id", "") if isinstance(row.get("targetDegree"), dict) else "",
                 "other_person": cell_text(row, "other"),
                 "other_person_qid": other.get("id", ""),
                 "other_person_url": other.get("url", other.get("value", "")),
+                "other_degree": cell_text(row, "otherDegree"),
+                "other_degree_qid": (row.get("otherDegree") or {}).get("id", "") if isinstance(row.get("otherDegree"), dict) else "",
                 "award": cell_text(row, "award"),
                 "award_qid": award.get("id", ""),
                 "award_url": award.get("url", award.get("value", "")),
