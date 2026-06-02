@@ -2477,6 +2477,8 @@ mod tests {
             "click_button",
             "form_controls_snapshot",
             "toggle_form_control",
+            "select_controls_snapshot",
+            "select_option",
             "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",

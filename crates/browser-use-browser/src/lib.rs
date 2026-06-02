@@ -6241,6 +6241,84 @@ print("form control helpers ok")
     }
 
     #[test]
+    fn browser_script_select_helpers_choose_native_select_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-select-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+focused = []
+keys = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "select,[role=combobox]" in expression
+    assert "label[for=" in expression
+    assert "CSS.escape" in expression
+    if "wanted=" in expression:
+        assert "option_index" in expression
+        return {
+            "selector": "select[name=\"state\"]",
+            "score": 130,
+            "matched_text": "state",
+            "tag": "select",
+            "option_index": 2,
+            "option_text": "California",
+            "option_value": "CA",
+            "x": 120,
+            "y": 80,
+        }
+    return [
+        {
+            "index": 0,
+            "selector": "select[name=\"state\"]",
+            "tag": "select",
+            "role": "",
+            "label": "State",
+            "name": "state",
+            "value": "",
+            "aria_expanded": None,
+            "options": [
+                {"text": "Choose", "value": "", "selected": True},
+                {"text": "Alaska", "value": "AK", "selected": False},
+                {"text": "California", "value": "CA", "selected": False},
+            ],
+            "rect": {"x": 40, "y": 64, "width": 160, "height": 32, "in_viewport": True},
+        }
+    ]
+
+def _focus_selector_like_user(selector, timeout=0.0):
+    focused.append({"selector": selector, "timeout": timeout})
+    return True
+
+def press_key(key, modifiers=0):
+    keys.append(key)
+    return True
+
+snapshot = select_controls_snapshot()
+assert snapshot["count"] == 1
+assert snapshot["controls"][0]["options"][2]["value"] == "CA"
+result = select_option("state", "California", timeout=2.5)
+assert result["selected"] is True
+assert result["selector"] == "select[name=\"state\"]"
+assert result["option_text"] == "California"
+assert result["option_value"] == "CA"
+assert focused == [{"selector": "select[name=\"state\"]", "timeout": 2.5}]
+assert keys == ["Home", "ArrowDown", "ArrowDown", "Enter"]
+assert len(calls) == 2
+print("select helpers ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("select helpers ok"));
+    }
+
+    #[test]
     fn browser_script_press_key_accepts_common_chord_strings() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

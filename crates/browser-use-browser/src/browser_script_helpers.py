@@ -1638,6 +1638,62 @@ def toggle_form_control(label_or_text, checked=True, timeout=1.0):
     return {"changed": bool(match.get("needs_click")), "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "checked": bool(checked), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def select_controls_snapshot(limit=20, option_limit=30):
+    """Return rendered selects/comboboxes with labels, current values, and options."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=180)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','placeholder','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const label=e=>{{const bits=[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.getAttribute('name'),e.id];if(e.id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(e.id)}}"]`))bits.push(l.innerText);const p=e.closest('label,[aria-label],[data-label],.field,.form-group,li,div');if(p)bits.push(p.innerText,p.getAttribute('aria-label'),p.getAttribute('data-label'));return clean(bits.filter(Boolean).join(' '))}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ return [...document.querySelectorAll('select,[role=combobox],[aria-haspopup=listbox],[aria-controls][aria-expanded]')].filter(e=>!e.disabled&&visible(e)).slice(0,{int(limit)}).map((e,i)=>{{const r=e.getBoundingClientRect(),opts=e.tagName.toLowerCase()==='select'?[...e.options].slice(0,{int(option_limit)}).map(o=>({{text:clean(o.textContent),value:o.value,selected:o.selected}})):[];return {{index:i,selector:sel(e),tag:e.tagName.toLowerCase(),role:e.getAttribute('role')||'',label:label(e),name:clean(e.getAttribute('name')),value:clean(e.value||e.textContent,240),aria_expanded:e.getAttribute('aria-expanded'),options:opts,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}}}}}});
+}})()
+"""
+    controls = js(expression) or []
+    return {"count": len(controls), "controls": controls}
+
+
+def select_option(label_or_placeholder, option_text_or_value, timeout=1.0):
+    """Select a native select/combobox option by field label and option text/value."""
+    needle = str(label_or_placeholder or "").strip().lower()
+    option = str(option_text_or_value or "").strip()
+    if not needle or not option:
+        raise RuntimeError("select_option requires both a field label and option text/value")
+    expression = f"""
+(() => {{
+ const needle={json.dumps(needle)},wanted={json.dumps(option.lower())},clean=t=>(t||'').replace(/\\s+/g,' ').trim(),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','placeholder','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const text=e=>{{const bits=[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.getAttribute('name'),e.id];if(e.id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(e.id)}}"]`))bits.push(l.innerText);const p=e.closest('label,[aria-label],[data-label],.field,.form-group,li,div');if(p)bits.push(p.innerText,p.getAttribute('aria-label'),p.getAttribute('data-label'));return clean(bits.filter(Boolean).join(' ')).toLowerCase()}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ let best=null,bestScore=-1,bestText='';for(const e of document.querySelectorAll('select,[role=combobox],[aria-haspopup=listbox],[aria-controls][aria-expanded]')){{if(e.disabled||!visible(e))continue;const s=sel(e),hay=text(e);let score=hay===needle?130:hay.includes(needle)?80:needle.includes(hay)&&hay.length>2?35:0;if(s&&s.toLowerCase()===needle)score=150;if(score>bestScore){{best=e;bestScore=score;bestText=hay}}}}
+ if(!best||bestScore<=0)return null;
+ const r=best.getBoundingClientRect(),tag=best.tagName.toLowerCase();let optionIndex=-1,optionText='',optionValue='';
+ if(tag==='select'){{const opts=[...best.options];optionIndex=opts.findIndex(o=>o.value.toLowerCase()===wanted||clean(o.textContent).toLowerCase()===wanted||clean(o.textContent).toLowerCase().includes(wanted));if(optionIndex>=0){{optionText=clean(opts[optionIndex].textContent);optionValue=opts[optionIndex].value}}}}
+ return {{selector:sel(best),score:bestScore,matched_text:bestText,tag,option_index:optionIndex,option_text:optionText,option_value:optionValue,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = select_controls_snapshot(limit=20)
+        raise RuntimeError(f"select_option: no rendered select/combobox matched {label_or_placeholder!r}; controls={controls}")
+    selector = match.get("selector")
+    if match.get("tag") == "select":
+        if match.get("option_index", -1) < 0:
+            controls = select_controls_snapshot(limit=20)
+            raise RuntimeError(f"select_option: no option matched {option_text_or_value!r}; controls={controls}")
+        if not _focus_selector_like_user(selector, timeout=timeout):
+            raise RuntimeError(f"select_option: element not found: {selector!r}")
+        press_key("Home")
+        for _ in range(int(match["option_index"])):
+            press_key("ArrowDown")
+        press_key("Enter")
+    else:
+        click_at_xy(match["x"], match["y"])
+        if timeout:
+            _time.sleep(min(float(timeout), 1.0))
+        type_text(option)
+        press_key("Enter")
+    return {"selected": True, "selector": selector, "matched_text": match.get("matched_text", ""), "option_text": match.get("option_text", option), "option_value": match.get("option_value", ""), "score": match.get("score")}
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
