@@ -2471,6 +2471,8 @@ mod tests {
             "rows_snapshot",
             "extract_grid_rows",
             "file_actions",
+            "form_fields_snapshot",
+            "fill_form_field",
             "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",

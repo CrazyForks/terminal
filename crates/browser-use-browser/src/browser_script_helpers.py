@@ -1523,6 +1523,40 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
     return True
 
 
+def form_fields_snapshot(limit=30):
+    """Return compact rendered form fields with labels/placeholders/selectors."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=220)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','placeholder','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const label=e=>{{const id=e.id,ls=[];if(id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(id)}}"]`))ls.push(l.innerText);const p=e.closest('label');if(p)ls.push(p.innerText);const wrap=e.closest('[aria-label],[data-label],.field,.form-group,li,div');if(wrap)ls.push(wrap.getAttribute('aria-label')||wrap.getAttribute('data-label')||'');return clean([e.getAttribute('aria-label'),...ls].filter(Boolean).join(' '))}};
+ return [...document.querySelectorAll('input:not([type=hidden]),textarea,select,[contenteditable="true"],[role="combobox"],[role="textbox"]')].filter(e=>!e.disabled).slice(0,{int(limit)}).map((e,i)=>{{const r=e.getBoundingClientRect(),type=(e.getAttribute('type')||e.tagName).toLowerCase();return {{index:i,selector:sel(e),tag:e.tagName.toLowerCase(),type,label:label(e),placeholder:clean(e.getAttribute('placeholder')),name:clean(e.getAttribute('name')),value:clean(e.value||e.textContent,300),required:!!e.required,autocomplete:clean(e.getAttribute('autocomplete')),aria_expanded:e.getAttribute('aria-expanded'),rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight}}}}}});
+}})()
+"""
+    fields = js(expression) or []
+    return {"count": len(fields), "fields": fields}
+
+
+def fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0):
+    """Fill a rendered form field by label, placeholder, name, selector, or nearby text."""
+    needle = str(label_or_placeholder or "").strip().lower()
+    if not needle:
+        raise RuntimeError("fill_form_field requires a label_or_placeholder")
+    expression = f"""
+(() => {{
+ const needle={json.dumps(needle)},clean=t=>(t||'').replace(/\\s+/g,' ').trim(),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','placeholder','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const text=e=>{{const bits=[e.getAttribute('aria-label'),e.getAttribute('placeholder'),e.getAttribute('name'),e.id];if(e.id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(e.id)}}"]`))bits.push(l.innerText);const p=e.closest('label,[aria-label],[data-label],.field,.form-group,li,div');if(p)bits.push(p.innerText,p.getAttribute('aria-label'),p.getAttribute('data-label'));return clean(bits.filter(Boolean).join(' ')).toLowerCase()}};
+ let best=null,bestScore=-1;for(const e of document.querySelectorAll('input:not([type=hidden]),textarea,select,[contenteditable="true"],[role="combobox"],[role="textbox"]')){{if(e.disabled)continue;const s=sel(e),hay=text(e);let score=hay===needle?100:hay.includes(needle)?50:needle.includes(hay)&&hay.length>2?20:0;if(s&&s.toLowerCase()===needle)score=120;if(score>bestScore){{best=e;bestScore=score}}}}
+ return best&&bestScore>0?{{selector:sel(best),score:bestScore,matched_text:text(best),tag:best.tagName.toLowerCase(),type:(best.getAttribute('type')||best.tagName).toLowerCase()}}:null;
+}})()
+"""
+    match = js(expression)
+    if not match or not match.get("selector"):
+        fields = form_fields_snapshot(limit=20)
+        raise RuntimeError(f"fill_form_field: no rendered field matched {label_or_placeholder!r}; fields={fields}")
+    fill_input(match["selector"], value, clear=clear, timeout=timeout)
+    return {"filled": True, "selector": match["selector"], "matched_text": match.get("matched_text", ""), "score": match.get("score")}
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
