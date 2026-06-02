@@ -6476,6 +6476,66 @@ print("json_api_records ok")
     }
 
     #[test]
+    fn browser_script_tabular_data_records_normalizes_exports() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-tabular-data-records",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+class FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+def http_get(url, timeout=20.0, headers=None):
+    calls.append(("http_get", url, timeout))
+    return FakeResponse("name,url\nAda,https://example.test/a\nGrace,https://example.test/g\n")
+
+def browser_fetch(url, timeout=20.0):
+    calls.append(("browser_fetch", url, timeout))
+    return {"text": "id\tcity\n1\tParis\n2\tBerlin\n"}
+
+csv_records = tabular_data_records("https://example.test/export/results.csv", limit=10)
+assert csv_records["kind"] == "csv", csv_records
+assert csv_records["source_kind"] == "http_get", csv_records
+assert csv_records["count"] == 2, csv_records
+assert csv_records["fields"] == ["name", "url"], csv_records
+assert csv_records["records"][1]["name"] == "Grace", csv_records
+
+tsv_records = tabular_data_records("https://example.test/private.tsv", use_browser_fetch=True)
+assert tsv_records["used_browser_fetch"] is True, tsv_records
+assert tsv_records["kind"] == "tsv", tsv_records
+assert tsv_records["records"][0]["city"] == "Paris", tsv_records
+
+html_records = tabular_data_records("""
+<table>
+  <tr><th>Company</th><th>Price</th></tr>
+  <tr><td>Alpha</td><td>$10</td></tr>
+  <tr><td>Beta</td><td>$20</td></tr>
+</table>
+""")
+assert html_records["kind"] == "html_table", html_records
+assert html_records["parsed_as"] == "html_table_0", html_records
+assert html_records["count"] == 2, html_records
+assert html_records["records"][0]["Company"] == "Alpha", html_records
+assert html_records["records"][1]["Price"] == "$20", html_records
+assert calls == [
+    ("http_get", "https://example.test/export/results.csv", 20.0),
+    ("browser_fetch", "https://example.test/private.tsv", 20.0),
+], calls
+print("tabular_data_records ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("tabular_data_records ok"));
+    }
+
+    #[test]
     fn browser_script_shopify_products_api_normalizes_catalog_pages() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

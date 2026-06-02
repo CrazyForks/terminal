@@ -2473,6 +2473,7 @@ mod tests {
             "__NEXT_DATA__",
             "network_resources_snapshot",
             "json_api_records",
+            "tabular_data_records",
             "pricing_cards_snapshot",
             "read_document_text",
             "pdftotext",
