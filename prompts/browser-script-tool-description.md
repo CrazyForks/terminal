@@ -47,6 +47,8 @@ click_at_xy(x, y)
 fill_input(selector, text, clear=True)
 form_fields_snapshot(limit=30)
 fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0)
+autocomplete_suggestions_snapshot(query=None, limit=20)
+select_autocomplete(label_or_placeholder, query, match_text=None, timeout=3.0)
 action_controls_snapshot(limit=30)
 click_button(label_or_text, timeout=3.0)
 overlay_actions_snapshot(limit=20)
@@ -94,7 +96,8 @@ Usage guidance:
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - On first page load, if a cookie/privacy/modal overlay blocks content or intercepts clicks, call `overlay_actions_snapshot()` when uncertain and `dismiss_overlay(prefer="accept")` or `dismiss_overlay(prefer="reject")` to click the rendered consent/dismissal control.
-- For forms with labeled fields, split address fields, or autocomplete-like controls, call `form_fields_snapshot()` before coordinate guessing. Use `fill_form_field(label_or_placeholder, value)` to target visible/rendered fields by label, placeholder, name, selector, or nearby text while preserving real browser input events.
+- For forms with labeled fields or split address fields, call `form_fields_snapshot()` before coordinate guessing. Use `fill_form_field(label_or_placeholder, value)` to target visible/rendered fields by label, placeholder, name, selector, or nearby text while preserving real browser input events.
+- For autocomplete/typeahead fields where a valid suggestion must be selected before Search/Submit is enabled, use `select_autocomplete(label_or_placeholder, query, match_text=...)`; it fills the rendered field, inspects visible listbox/menu suggestions with `autocomplete_suggestions_snapshot(...)`, and clicks the rendered suggestion center.
 - For named actions after filling/search/filter forms, call `action_controls_snapshot()` when uncertain and use `click_button(label_or_text)` for visible buttons/links such as Search, Submit, Apply, Next, Download, or Save. It clicks the rendered control center through browser input events instead of synthesizing DOM clicks.
 - For labeled checkboxes, radios, and switches, call `form_controls_snapshot()` when uncertain and use `toggle_form_control(label_or_text, checked=True/False)` to click only when the current state differs.
 - For native selects and combobox-like dropdowns, call `select_controls_snapshot()` when uncertain and use `select_option(label_or_placeholder, option_text_or_value)` to choose by visible label and option text/value.

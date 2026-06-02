@@ -2475,6 +2475,8 @@ mod tests {
             "file_actions",
             "form_fields_snapshot",
             "fill_form_field",
+            "autocomplete_suggestions_snapshot",
+            "select_autocomplete",
             "action_controls_snapshot",
             "click_button",
             "overlay_actions_snapshot",

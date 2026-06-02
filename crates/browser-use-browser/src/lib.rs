@@ -6107,6 +6107,75 @@ print("form field helpers ok")
     }
 
     #[test]
+    fn browser_script_autocomplete_helpers_select_visible_suggestions() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-autocomplete-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+filled = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "CSS.escape" in expression
+    if "__AUTOCOMPLETE_SUGGESTIONS__" in expression:
+        assert "[role=option]" in expression
+        assert "aria-controls" in expression
+        assert "getBoundingClientRect" in expression
+        return [
+            {
+                "selector": "#addr-option",
+                "tag": "li",
+                "role": "option",
+                "text": "225 Garcia Ave, San Leandro, CA 94577",
+                "score": 235,
+                "rect": {"x": 120, "y": 180, "width": 420, "height": 36, "in_viewport": True},
+                "center": {"x": 330, "y": 198},
+            }
+        ]
+    if "needle=" in expression:
+        return {
+            "selector": "input[aria-label=\"Address\"]",
+            "score": 100,
+            "matched_text": "address search address",
+            "tag": "input",
+            "type": "text",
+        }
+    raise AssertionError(f"unexpected js expression: {expression[:200]}")
+
+def fill_input(selector, text, clear=True, timeout=0.0):
+    filled.append({"selector": selector, "text": text, "clear": clear, "timeout": timeout})
+    return True
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = autocomplete_suggestions_snapshot("225 Garcia")
+assert snapshot["count"] == 1
+assert snapshot["suggestions"][0]["text"].startswith("225 Garcia")
+result = select_autocomplete("Address", "225 Garcia Ave", match_text="225 Garcia", timeout=1.0)
+assert result["selected"] is True
+assert result["field_selector"] == "input[aria-label=\"Address\"]"
+assert result["selector"] == "#addr-option"
+assert result["matched_text"] == "225 Garcia Ave, San Leandro, CA 94577"
+assert filled == [{"selector": "input[aria-label=\"Address\"]", "text": "225 Garcia Ave", "clear": True, "timeout": 1.0}]
+assert clicked_points == [{"x": 330, "y": 198, "button": "left", "clicks": 1}]
+assert len(calls) == 3
+print("autocomplete helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("autocomplete helpers ok"));
+    }
+
+    #[test]
     fn browser_script_action_helpers_click_named_controls() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

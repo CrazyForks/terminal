@@ -1557,6 +1557,52 @@ def fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0):
     return {"filled": True, "selector": match["selector"], "matched_text": match.get("matched_text", ""), "score": match.get("score")}
 
 
+def autocomplete_suggestions_snapshot(query=None, limit=20):
+    """Return likely visible autocomplete/typeahead suggestions with text and rects."""
+    needle = str(query or "").strip().lower()
+    expression = f"""
+(() => {{
+ // __AUTOCOMPLETE_SUGGESTIONS__
+ const needle={json.dumps(needle)},clean=(t,m=220)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','data-testid','data-test','data-value','value']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}};
+ const active=document.activeElement,controlled=new Set(((active&&active.getAttribute('aria-controls'))||'').split(/\\s+/).filter(Boolean));
+ const out=[],seen=new Set(),nodes=[...document.querySelectorAll('[role=option],[role=menuitem],[role=treeitem],[role=listitem],li,option,[data-value],[data-testid],[data-test],.suggestion,.suggestions,.autocomplete,.typeahead,.pac-item')];
+ for(const e of nodes){{if(!visible(e))continue;const t=clean([e.innerText,e.textContent,e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('data-value'),e.value].filter(Boolean).join(' '));if(!t)continue;const hay=`${{t}} ${{e.id||''}} ${{e.className||''}} ${{e.getAttribute('role')||''}} ${{e.getAttribute('data-testid')||''}} ${{e.getAttribute('data-test')||''}}`.toLowerCase();let score=0;if(needle&&hay.includes(needle))score+=120;if(needle&&needle.includes(t.toLowerCase())&&t.length>2)score+=35;if(/option|menuitem|treeitem|listitem/.test(e.getAttribute('role')||''))score+=45;if(/suggest|autocomplete|typeahead|pac-item|result|dropdown|menu|listbox/.test(hay))score+=40;for(let n=e;n&&n!==document.body;n=n.parentElement){{if(controlled.has(n.id))score+=70;const nh=`${{n.id||''}} ${{n.className||''}} ${{n.getAttribute('role')||''}}`.toLowerCase();if(/suggest|autocomplete|typeahead|pac-container|results?|dropdown|listbox|menu/.test(nh))score+=25;if(n.getAttribute('role')==='listbox'||n.getAttribute('role')==='menu')score+=25;}}if(!needle&&score<40)continue;if(needle&&score<80)continue;const r=e.getBoundingClientRect(),key=`${{Math.round(r.left)}}:${{Math.round(r.top)}}:${{t}}`;if(seen.has(key))continue;seen.add(key);out.push({{selector:sel(e),tag:e.tagName.toLowerCase(),role:e.getAttribute('role')||'',text:t,score,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:true}},center:{{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}}}})}}
+ return out.sort((a,b)=>b.score-a.score).slice(0,{int(limit)});
+}})()
+"""
+    suggestions = js(expression) or []
+    return {"count": len(suggestions), "query": query or "", "suggestions": suggestions}
+
+
+def select_autocomplete(label_or_placeholder, query, match_text=None, timeout=3.0):
+    """Fill an autocomplete field and click the best visible suggestion."""
+    filled = fill_form_field(label_or_placeholder, query, clear=True, timeout=timeout)
+    needle = str(match_text or query or "").strip().lower()
+    deadline = _time.monotonic() + _timeout_seconds(timeout)
+    snapshot = {"suggestions": []}
+    while True:
+        snapshot = autocomplete_suggestions_snapshot(needle, limit=20)
+        if snapshot["suggestions"]:
+            break
+        if _time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"select_autocomplete: no visible suggestion matched {needle!r}; suggestions={autocomplete_suggestions_snapshot(limit=20)}"
+            )
+        _time.sleep(0.2)
+    best = snapshot["suggestions"][0]
+    click_at_xy(best["center"]["x"], best["center"]["y"])
+    return {
+        "selected": True,
+        "field_selector": filled.get("selector", ""),
+        "selector": best.get("selector", ""),
+        "matched_text": best.get("text", ""),
+        "score": best.get("score"),
+        "x": best["center"]["x"],
+        "y": best["center"]["y"],
+    }
+
+
 def action_controls_snapshot(limit=30):
     """Return compact rendered buttons/links/actions with text/selectors/rects."""
     expression = f"""
