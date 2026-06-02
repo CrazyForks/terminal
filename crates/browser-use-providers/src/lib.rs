@@ -5099,6 +5099,10 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
             include_str!("../../../prompts/interaction-skills/cookies.md"),
         ),
         (
+            "interaction-skills/cascade-lookups.md",
+            include_str!("../../../prompts/interaction-skills/cascade-lookups.md"),
+        ),
+        (
             "interaction-skills/cross-origin-iframes.md",
             include_str!("../../../prompts/interaction-skills/cross-origin-iframes.md"),
         ),
@@ -11951,12 +11955,14 @@ mod tests {
             "agent_helpers.py",
             "Browser interaction tool",
             "Loaded Browser-Harness Interaction Skills",
-            "Use helper agents only when the user explicitly asks",
-            "detailed codebase analysis do not by themselves authorize spawning",
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
             "interaction-skills/forms.md",
+            "interaction-skills/cascade-lookups.md",
+            "find X, then for each X find Y",
+            "Spawn one helper per independent item before visiting detail pages locally",
+            "Return exactly one JSON object via done(result=...)",
             "JS may inspect forms; browser input actions mutate forms",
             "Do not build manager layers",
             "Do not import or install Playwright",
@@ -11972,6 +11978,7 @@ mod tests {
         assert!(permissions.contains("Approval policy is currently never"));
         assert!(permissions.contains("Do not provide the `sandbox_permissions` for any reason"));
         assert!(!instructions.contains("spawn a read-only helper with role `explorer` unless"));
+        assert!(!instructions.contains("Use helper agents only when the user explicitly asks"));
     }
 
     #[test]
