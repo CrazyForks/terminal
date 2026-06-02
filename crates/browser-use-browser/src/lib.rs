@@ -7898,6 +7898,84 @@ print("navigation_snapshot ok")
     }
 
     #[test]
+    fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-embedded-data-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    assert "page-embedded structured/hydration data" in embedded_data_snapshot.__doc__
+    assert "application/ld+json" in expression
+    assert "__NEXT_DATA__" in expression
+    assert "__NUXT_DATA__" in expression
+    assert "application/json" in expression
+    assert "product:price:amount" in expression
+    assert "recordFrom" in expression
+    assert "priceFrom" in expression
+    assert "imageFrom" in expression
+    assert "WeakSet" in expression
+    assert "source_count" in expression
+    return {
+        "url": "https://shop.example.test/products",
+        "title": "Shop",
+        "source_count": 2,
+        "sources": [
+            {"label": "json-ld", "path": "", "size": 320, "record_count": 1},
+            {"label": "__NEXT_DATA__", "path": "#__NEXT_DATA__", "size": 2048, "record_count": 1},
+        ],
+        "record_count": 2,
+        "records": [
+            {
+                "source": "json-ld",
+                "path": "@graph[0]",
+                "type": "Product",
+                "name": "Canvas Tote",
+                "url": "https://shop.example.test/products/canvas-tote",
+                "image": "https://shop.example.test/tote.jpg",
+                "price": "29.00",
+                "brand": "Example",
+                "description": "Heavy canvas tote",
+                "raw_keys": ["@type", "name", "offers"],
+                "fields": {"sku": "TOTE-1"},
+            },
+            {
+                "source": "__NEXT_DATA__",
+                "path": "props.pageProps.products[0]",
+                "name": "Desk Lamp",
+                "url": "https://shop.example.test/products/desk-lamp",
+                "price": "$42",
+                "image": "https://shop.example.test/lamp.jpg",
+                "raw_keys": ["name", "price", "image"],
+                "fields": {"handle": "desk-lamp"},
+            },
+        ],
+    }
+
+snapshot = embedded_data_snapshot(limit=25, max_sources=4)
+assert snapshot["source_count"] == 2
+assert snapshot["record_count"] == 2
+assert snapshot["records"][0]["name"] == "Canvas Tote"
+assert snapshot["records"][0]["price"] == "29.00"
+assert snapshot["records"][0]["image"].endswith("tote.jpg")
+assert snapshot["records"][1]["source"] == "__NEXT_DATA__"
+assert snapshot["records"][1]["url"].endswith("/desk-lamp")
+assert any("__NEXT_DATA__" in call for call in calls)
+print("embedded_data_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("embedded_data_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
