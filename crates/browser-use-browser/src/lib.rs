@@ -22,10 +22,12 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
 const BU_API: &str = "https://api.browser-use.com/api/v3";
+const BU_CDP_HEADERS_ENV: &str = "BU_CDP_HEADERS";
 const BU_BROWSER_ACCEPT_DOWNLOADS_ENV: &str = "BU_BROWSER_ACCEPT_DOWNLOADS";
 const BU_BROWSER_DOWNLOADS_PATH_ENV: &str = "BU_BROWSER_DOWNLOADS_PATH";
 const BU_BROWSER_NO_VIEWPORT_ENV: &str = "BU_BROWSER_NO_VIEWPORT";
@@ -2729,8 +2731,9 @@ impl BrowserSession {
 
 impl CdpConnection {
     fn connect(ws_url: &str) -> Result<Self> {
+        let request = cdp_websocket_request(ws_url)?;
         let (mut socket, _) =
-            connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
+            connect(request).with_context(|| format!("connect CDP websocket {ws_url}"))?;
         set_cdp_socket_timeouts(&mut socket);
         Ok(Self { socket, next_id: 1 })
     }
@@ -2858,8 +2861,9 @@ struct CdpDispatcher {
 
 impl CdpDispatcher {
     fn connect(ws_url: &str) -> Result<Arc<Self>> {
+        let request = cdp_websocket_request(ws_url)?;
         let (mut socket, _) =
-            connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
+            connect(request).with_context(|| format!("connect CDP websocket {ws_url}"))?;
         set_cdp_dispatcher_socket_timeouts(&mut socket);
         let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
         let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
@@ -3288,10 +3292,23 @@ fn probe_endpoint(endpoint: &Endpoint) -> EndpointProbe {
         };
     };
     let url = format!("{}/json/version", http_url.trim_end_matches('/'));
-    let response = Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(2))
-        .send();
+    let mut request = Client::new().get(&url).timeout(Duration::from_secs(2));
+    match cdp_header_pairs_from_env() {
+        Ok(headers) => {
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+        }
+        Err(error) => {
+            return EndpointProbe {
+                ok: false,
+                state: "endpoint-error",
+                detail: format!("failed to parse {BU_CDP_HEADERS_ENV}: {error:#}"),
+                next_step: "browser recover reconnect-websocket",
+            };
+        }
+    }
+    let response = request.send();
     match response {
         Ok(response) if response.status().is_success() => EndpointProbe {
             ok: true,
@@ -3646,9 +3663,11 @@ fn known_profile_roots() -> Vec<(&'static str, PathBuf)> {
 
 fn resolve_ws_from_http(http_url: &str) -> Result<String> {
     let url = format!("{}/json/version", http_url.trim_end_matches('/'));
-    let value: Value = Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(15))
+    let mut request = Client::new().get(&url).timeout(Duration::from_secs(15));
+    for (name, value) in cdp_header_pairs_from_env()? {
+        request = request.header(name, value);
+    }
+    let value: Value = request
         .send()
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
@@ -3660,6 +3679,46 @@ fn resolve_ws_from_http(http_url: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("{url} missing webSocketDebuggerUrl"))
+}
+
+fn cdp_websocket_request(ws_url: &str) -> Result<tungstenite::http::Request<()>> {
+    let mut request = ws_url
+        .into_client_request()
+        .with_context(|| format!("build CDP websocket request {ws_url}"))?;
+    for (name, value) in cdp_header_pairs_from_env()? {
+        let name = tungstenite::http::header::HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("{BU_CDP_HEADERS_ENV} contains invalid header name"))?;
+        let value = tungstenite::http::HeaderValue::from_str(&value)
+            .with_context(|| format!("{BU_CDP_HEADERS_ENV} contains invalid header value"))?;
+        request.headers_mut().insert(name, value);
+    }
+    Ok(request)
+}
+
+fn cdp_header_pairs_from_env() -> Result<Vec<(String, String)>> {
+    let Ok(raw) = std::env::var(BU_CDP_HEADERS_ENV) else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value = serde_json::from_str::<Value>(raw)
+        .with_context(|| format!("{BU_CDP_HEADERS_ENV} must be a JSON object"))?;
+    let Some(headers) = value.as_object() else {
+        bail!("{BU_CDP_HEADERS_ENV} must be a JSON object");
+    };
+    let mut pairs = Vec::new();
+    for (name, value) in headers {
+        if name.trim().is_empty() {
+            continue;
+        }
+        let Some(value) = value.as_str() else {
+            bail!("{BU_CDP_HEADERS_ENV}.{name} must be a string");
+        };
+        pairs.push((name.to_string(), value.to_string()));
+    }
+    Ok(pairs)
 }
 
 fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, String)> {
@@ -7300,6 +7359,32 @@ mod tests {
         assert!(storage_state.init_scripts[0].contains("theme"));
         assert!(storage_state.init_scripts[1].contains("sessionStorage"));
         assert!(storage_state.init_scripts[1].contains("step"));
+    }
+
+    #[test]
+    fn cdp_headers_env_builds_websocket_request_headers() {
+        let _env = EnvRestore::set(&[(
+            BU_CDP_HEADERS_ENV,
+            r#"{"Authorization":"Bearer test-token","X-Browser-Use":"rust"}"#,
+        )]);
+
+        let request = cdp_websocket_request("ws://127.0.0.1:9222/devtools/browser/test")
+            .expect("websocket request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-Browser-Use")
+                .and_then(|value| value.to_str().ok()),
+            Some("rust")
+        );
     }
 
     #[test]
