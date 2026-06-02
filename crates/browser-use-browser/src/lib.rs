@@ -5761,6 +5761,66 @@ print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False)
     }
 
     #[test]
+    fn browser_script_pricing_cards_snapshot_surfaces_commercial_signals() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pricing-cards-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    assert "__PRICING_CARDS_SNAPSHOT__" in expression
+    assert "priceRe" in expression
+    assert "speedRe" in expression
+    assert "contractRe" in expression
+    assert "offerRe" in expression
+    assert "img[src]" in expression
+    assert "a[href]" in expression
+    assert "CSS.escape" in expression
+    return {
+        "count": 1,
+        "cards": [
+            {
+                "selector": "article.plan-card",
+                "tag": "article",
+                "score": 72,
+                "text": "New customers DNA Netti 300M 19,90 €/kk 300 Mbps No binding",
+                "headings": ["DNA Netti 300M"],
+                "prices": ["19,90 €/kk"],
+                "speeds": ["300 Mbps"],
+                "contracts": ["No binding"],
+                "offer_types": ["New customers"],
+                "links": [{"text": "See offer", "href": "https://example.test/dna-300"}],
+                "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": ""}],
+                "rect": {"x": 30, "y": 90, "width": 360, "height": 220, "in_viewport": True},
+            }
+        ],
+    }
+
+snapshot = pricing_cards_snapshot()
+assert snapshot["count"] == 1
+card = snapshot["cards"][0]
+assert card["prices"] == ["19,90 €/kk"]
+assert card["speeds"] == ["300 Mbps"]
+assert card["contracts"] == ["No binding"]
+assert card["offer_types"] == ["New customers"]
+assert card["links"][0]["href"].endswith("/dna-300")
+assert card["images"][0]["src"].endswith("/dna.png")
+assert len(calls) == 1
+print("pricing cards helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pricing cards helpers ok"));
+    }
+
+    #[test]
     fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

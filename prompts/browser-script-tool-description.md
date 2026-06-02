@@ -34,6 +34,7 @@ navigation_snapshot(keywords=None, limit=80)
 embedded_data_snapshot(limit=80, max_sources=12)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
 extract_repeated_items(selector, limit=50, include_html=False)
+pricing_cards_snapshot(limit=50)
 rows_snapshot(limit=8)
 extract_grid_rows(selector=None, limit=50, include_html=False)
 read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None)
@@ -111,6 +112,7 @@ Usage guidance:
 - For PDFs, DOCX files, downloaded filings, investor reports, and earnings documents, use `read_document_text(url_or_path, max_chars=...)` after discovering a direct file URL/path. It fetches or reads the file and extracts bounded text using available PDF/DOCX parsers or `pdftotext`, with a low-fidelity PDF byte-string fallback.
 - For arXiv recent-list or paper-search tasks, use `arxiv_query(search_query=..., start=..., max_results=...)` instead of browsing arXiv list/abstract pages one by one. It returns normalized title, authors, abstract, abs/pdf URLs, categories, DOI/journal/comment metadata, and first-version submission time when exposed by arXiv.
 - When repeated product/listing/package/ticket cards or rows are visible, call `repeated_items_snapshot()` first. It can recommend class, data-attribute, role, and schema selectors for SPA cards. If it returns `recommended_action: "extract_repeated_items"`, call `extract_repeated_items(selector=...)` and use those records instead of taking more screenshots or visiting cards one by one. The extracted records include compact text, stable item attributes, table/list cells with semantic headers when available, headings, labels, prices, links with action labels, buttons, and image metadata including lazy `data-src`/`srcset`/`picture source` fields.
+- For pricing/product/package/ticket cards, call `pricing_cards_snapshot()` to get visible commercial records with price tokens, speed/data tokens, contract hints, offer-type hints, links, and images before writing custom extraction JavaScript.
 - For paginated listings, result pages, and "Load more" flows, call `pagination_controls_snapshot()` before guessing. Use `click_pagination("next")` or `click_pagination("load more")`, then wait and re-run the relevant extraction helper.
 - For result-count or page-count evidence such as "Matches 1 - 25 of 58", "Records 1 through 10 of N", "Page 1 of 3", or "710 exhibitors", call `result_count_snapshot()` and keep its `evidence` text with the parsed count.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.

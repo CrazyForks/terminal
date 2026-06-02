@@ -2464,6 +2464,7 @@ mod tests {
             "embedded_data_snapshot",
             "JSON-LD",
             "__NEXT_DATA__",
+            "pricing_cards_snapshot",
             "read_document_text",
             "pdftotext",
             "arxiv_query",
