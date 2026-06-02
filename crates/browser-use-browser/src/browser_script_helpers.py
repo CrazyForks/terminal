@@ -1557,6 +1557,45 @@ def fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0):
     return {"filled": True, "selector": match["selector"], "matched_text": match.get("matched_text", ""), "score": match.get("score")}
 
 
+def action_controls_snapshot(limit=30):
+    """Return compact rendered buttons/links/actions with text/selectors/rects."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=180)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','value','title','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const text=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('name'),e.id].filter(Boolean).join(' '));
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ return [...document.querySelectorAll('button,input[type=button],input[type=submit],input[type=reset],a[href],[role=button],[role=link],[onclick]')].filter(e=>!e.disabled&&visible(e)).slice(0,{int(limit)}).map((e,i)=>{{const r=e.getBoundingClientRect();return {{index:i,selector:sel(e),tag:e.tagName.toLowerCase(),type:(e.getAttribute('type')||''),text:text(e),href:e.href||'',name:clean(e.getAttribute('name')),aria_label:clean(e.getAttribute('aria-label')),rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}}}}}});
+}})()
+"""
+    actions = js(expression) or []
+    return {"count": len(actions), "actions": actions}
+
+
+def click_button(label_or_text, timeout=3.0):
+    """Click a rendered button/link/action by visible text, aria-label, name, or selector."""
+    needle = str(label_or_text or "").strip().lower()
+    if not needle:
+        raise RuntimeError("click_button requires a label_or_text")
+    expression = f"""
+(() => {{
+ const needle={json.dumps(needle)},clean=t=>(t||'').replace(/\\s+/g,' ').trim(),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','value','title','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const txt=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('name'),e.id].filter(Boolean).join(' ')).toLowerCase();
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ let best=null,bestScore=-1,bestText='';for(const e of document.querySelectorAll('button,input[type=button],input[type=submit],input[type=reset],a[href],[role=button],[role=link],[onclick]')){{if(e.disabled||!visible(e))continue;const s=sel(e),hay=txt(e);let score=hay===needle?140:hay.startsWith(needle)?100:hay.includes(needle)?70:needle.includes(hay)&&hay.length>2?30:0;if(s&&s.toLowerCase()===needle)score=160;const r=e.getBoundingClientRect();if(score>0&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth)score+=5;if(score>bestScore){{best=e;bestScore=score;bestText=hay}}}}
+ if(!best||bestScore<=0)return null;
+ const r=best.getBoundingClientRect();return {{selector:sel(best),score:bestScore,matched_text:bestText,tag:best.tagName.toLowerCase(),type:(best.getAttribute('type')||''),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}}}};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        actions = action_controls_snapshot(limit=20)
+        raise RuntimeError(f"click_button: no rendered action matched {label_or_text!r}; actions={actions}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(float(timeout), 3.0))
+    return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]

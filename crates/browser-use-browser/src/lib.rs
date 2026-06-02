@@ -6107,6 +6107,72 @@ print("form field helpers ok")
     }
 
     #[test]
+    fn browser_script_action_helpers_click_named_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-action-control-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "button,input[type=button]" in expression
+    assert "[role=button]" in expression
+    assert "CSS.escape" in expression
+    if "needle=" in expression:
+        assert "matched_text" in expression
+        return {
+            "selector": "button[name=\"apply\"]",
+            "score": 145,
+            "matched_text": "apply filters",
+            "tag": "button",
+            "type": "submit",
+            "x": 88,
+            "y": 144,
+            "rect": {"x": 40, "y": 128, "width": 96, "height": 32},
+        }
+    return [
+        {
+            "index": 0,
+            "selector": "button[name=\"apply\"]",
+            "tag": "button",
+            "type": "submit",
+            "text": "Apply filters",
+            "href": "",
+            "name": "apply",
+            "aria_label": "",
+            "rect": {"x": 40, "y": 128, "width": 96, "height": 32, "in_viewport": True},
+        }
+    ]
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicks_record = {"x": x, "y": y, "button": button, "clicks": clicks}
+    clicked_points.append(clicks_record)
+    return True
+
+snapshot = action_controls_snapshot()
+assert snapshot["count"] == 1
+assert snapshot["actions"][0]["text"] == "Apply filters"
+result = click_button("apply filters", timeout=0)
+assert result["clicked"] is True
+assert result["selector"] == "button[name=\"apply\"]"
+assert result["matched_text"] == "apply filters"
+assert clicked_points == [{"x": 88, "y": 144, "button": "left", "clicks": 1}]
+assert len(calls) == 2
+print("action helpers ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("action helpers ok"));
+    }
+
+    #[test]
     fn browser_script_press_key_accepts_common_chord_strings() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

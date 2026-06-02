@@ -2473,6 +2473,8 @@ mod tests {
             "file_actions",
             "form_fields_snapshot",
             "fill_form_field",
+            "action_controls_snapshot",
+            "click_button",
             "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",
