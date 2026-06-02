@@ -7705,6 +7705,112 @@ print("arxiv_query ok")
     }
 
     #[test]
+    fn browser_script_semantic_scholar_citations_normalizes_year_filtered_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-semantic-scholar-citations",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+seen = []
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    seen.append(url)
+    assert headers["Accept"] == "application/json"
+    if "/paper/search?" in url:
+        assert "query=Parameter-efficient" in url, url
+        assert "limit=3" in url, url
+        return json.dumps({
+            "data": [
+                {
+                    "paperId": "paper123",
+                    "title": "Parameter-efficient fine-tuning of large-scale pre-trained language models",
+                    "year": 2023,
+                    "venue": "Nature Machine Intelligence",
+                    "citationCount": 42,
+                    "url": "https://www.semanticscholar.org/paper/paper123",
+                    "externalIds": {"DOI": "10.1038/example"},
+                    "authors": [{"authorId": "174", "name": "Ning Ding"}],
+                }
+            ]
+        })
+    if "/paper/paper123/citations?" in url:
+        if "offset=2" in url:
+            return json.dumps({
+                "data": [
+                    {
+                        "citingPaper": {
+                            "paperId": "cite2024b",
+                            "title": "Adapters for Browser Agents",
+                            "authors": [{"authorId": "4", "name": "Browser Example"}],
+                            "venue": "ACL",
+                            "year": 2024,
+                            "citationCount": 9,
+                        }
+                    }
+                ]
+            })
+        return json.dumps({
+            "next": 2,
+            "data": [
+                {
+                    "citingPaper": {
+                        "paperId": "cite2024",
+                        "title": "Efficient Adapters for Agents",
+                        "authors": [{"authorId": "1", "name": "Ada Example"}, {"authorId": "2", "name": "Grace Example"}],
+                        "venue": "ICLR",
+                        "year": 2024,
+                        "citationCount": 7,
+                        "url": "https://www.semanticscholar.org/paper/cite2024",
+                        "openAccessPdf": {"url": "https://example.test/cite2024.pdf"},
+                        "publicationTypes": ["Conference"],
+                    }
+                },
+                {
+                    "citingPaper": {
+                        "paperId": "cite2023",
+                        "title": "Older Adapter Work",
+                        "authors": [{"authorId": "3", "name": "Old Example"}],
+                        "venue": "NeurIPS",
+                        "year": 2023,
+                        "citationCount": 3,
+                    }
+                }
+            ]
+        })
+    raise AssertionError(url)
+
+result = semantic_scholar_citations(
+    "Parameter-efficient fine-tuning of large-scale pre-trained language models",
+    year=2024,
+    limit=5,
+    search_limit=3,
+)
+assert result["selected_paper"]["paper_id"] == "paper123", result
+assert result["selected_paper"]["author_names"] == ["Ning Ding"], result
+assert result["year_filter"] == 2024, result
+assert result["count"] == 2, result
+assert result["citations"][0]["paper_id"] == "cite2024", result
+assert result["citations"][0]["author_names"] == ["Ada Example", "Grace Example"], result
+assert result["citations"][0]["venue"] == "ICLR", result
+assert result["citations"][0]["pdf_url"] == "https://example.test/cite2024.pdf", result
+assert result["citations"][1]["paper_id"] == "cite2024b", result
+assert len(seen) == 3, seen
+print("semantic_scholar_citations ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("semantic_scholar_citations ok"));
+    }
+
+    #[test]
     fn browser_script_openreview_notes_normalizes_content_values() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

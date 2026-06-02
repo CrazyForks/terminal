@@ -23,7 +23,7 @@ import tempfile
 import time as _time
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -3245,6 +3245,144 @@ def arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="subm
         "max_results": int(max_results),
         "count": len(entries),
         "entries": entries,
+    }
+
+
+def semantic_scholar_citations(query_or_paper_id, year=None, limit=200, search_limit=5, timeout=20.0):
+    """Search/fetch a Semantic Scholar paper and return normalized citing papers.
+
+    Useful for Semantic Scholar citation-tab tasks: first verify the site in the
+    browser, then use this API path for complete citation pages, year filters,
+    titles, authors, venue, citation counts, URLs, and external ids.
+    """
+    target = str(query_or_paper_id or "").strip()
+    if not target:
+        raise ValueError("semantic_scholar_citations requires a title, DOI:, CorpusID:, URL, or paperId")
+    limit_int = max(1, min(int(limit or 200), 1000))
+    search_limit_int = max(1, min(int(search_limit or 5), 20))
+    api_base = "https://api.semanticscholar.org/graph/v1"
+    paper_fields = "paperId,title,authors,venue,year,citationCount,externalIds,url,publicationVenue,publicationTypes,openAccessPdf"
+
+    def clean(value, max_chars=2000):
+        return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()[:max_chars]
+
+    def normalize_paper(paper):
+        if not isinstance(paper, dict):
+            paper = {}
+        authors = []
+        for author in paper.get("authors") or []:
+            if not isinstance(author, dict):
+                continue
+            name = clean(author.get("name"), 240)
+            if not name:
+                continue
+            authors.append({"author_id": str(author.get("authorId") or ""), "name": name})
+        open_access_pdf = paper.get("openAccessPdf") if isinstance(paper.get("openAccessPdf"), dict) else {}
+        publication_venue = paper.get("publicationVenue") if isinstance(paper.get("publicationVenue"), dict) else {}
+        return {
+            "paper_id": str(paper.get("paperId") or ""),
+            "title": clean(paper.get("title"), 500),
+            "authors": authors,
+            "author_names": [author["name"] for author in authors],
+            "venue": clean(paper.get("venue") or publication_venue.get("name"), 240),
+            "publication_venue": clean(publication_venue.get("name"), 240),
+            "year": paper.get("year"),
+            "citation_count": paper.get("citationCount"),
+            "url": str(paper.get("url") or ""),
+            "pdf_url": str(open_access_pdf.get("url") or ""),
+            "external_ids": paper.get("externalIds") if isinstance(paper.get("externalIds"), dict) else {},
+            "publication_types": paper.get("publicationTypes") if isinstance(paper.get("publicationTypes"), list) else [],
+        }
+
+    def looks_like_paper_id(value):
+        return (
+            re.match(r"^[0-9a-f]{40}$", value, re.I)
+            or re.match(r"^(?:CorpusID|DOI|ARXIV|PMID|PMCID|MAG|ACL|URL):", value, re.I)
+            or value.startswith("https://")
+            or value.startswith("http://")
+        )
+
+    def api_json(url):
+        return json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+
+    search_results = []
+    if looks_like_paper_id(target):
+        paper_lookup_url = f"{api_base}/paper/{quote(target, safe=':/.')}?" + urlencode({"fields": paper_fields})
+        selected_paper = normalize_paper(api_json(paper_lookup_url))
+    else:
+        search_url = f"{api_base}/paper/search?" + urlencode({"query": target, "limit": search_limit_int, "fields": paper_fields})
+        search_payload = api_json(search_url)
+        search_results = [normalize_paper(item) for item in search_payload.get("data", []) if isinstance(item, dict)]
+        if not search_results:
+            return {
+                "query": target,
+                "selected_paper": {},
+                "search_results": [],
+                "count": 0,
+                "year_filter": year,
+                "citations": [],
+                "diagnosis": "no_search_results",
+            }
+        lower_target = clean(target).lower()
+        selected_paper = max(
+            search_results,
+            key=lambda paper: (
+                100 if paper.get("title", "").lower() == lower_target else 0,
+                60 if lower_target and lower_target in paper.get("title", "").lower() else 0,
+                int(paper.get("citation_count") or 0),
+            ),
+        )
+
+    paper_id = selected_paper.get("paper_id")
+    if not paper_id:
+        return {
+            "query": target,
+            "selected_paper": selected_paper,
+            "search_results": search_results,
+            "count": 0,
+            "year_filter": year,
+            "citations": [],
+            "diagnosis": "missing_paper_id",
+        }
+
+    citations = []
+    seen_citation_keys = set()
+    offset = 0
+    page_size = min(100, limit_int)
+    citation_fields = "citingPaper." + paper_fields.replace(",", ",citingPaper.")
+    while len(citations) < limit_int:
+        page_limit = min(page_size, limit_int - len(citations))
+        url = f"{api_base}/paper/{quote(paper_id, safe='')}/citations?" + urlencode(
+            {"offset": offset, "limit": page_limit, "fields": citation_fields}
+        )
+        payload = api_json(url)
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            paper = normalize_paper(row.get("citingPaper") if isinstance(row, dict) else {})
+            if year is not None and str(paper.get("year") or "") != str(year):
+                continue
+            if paper.get("paper_id") or paper.get("title"):
+                key = paper.get("paper_id") or paper.get("title")
+                if key in seen_citation_keys:
+                    continue
+                seen_citation_keys.add(key)
+                citations.append(paper)
+                if len(citations) >= limit_int:
+                    break
+        next_offset = payload.get("next") if isinstance(payload, dict) else None
+        if next_offset is None:
+            break
+        offset = int(next_offset)
+
+    return {
+        "query": target,
+        "selected_paper": selected_paper,
+        "search_results": search_results,
+        "count": len(citations),
+        "year_filter": year,
+        "citations": citations,
     }
 
 

@@ -2478,6 +2478,7 @@ mod tests {
             "read_document_text",
             "pdftotext",
             "arxiv_query",
+            "semantic_scholar_citations",
             "arXiv",
             "wikidata_sparql",
             "rows_snapshot",
