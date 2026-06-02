@@ -5717,15 +5717,17 @@ def js(expression, returnByValue=True):
     assert "image_count" in expression
     assert "picture source[srcset]" in expression
     assert "detail_links" in expression
+    assert "fanout_tasks" in expression
+    assert "fanoutTaskName" in expression
     assert "fanout_recommended" in expression
     assert "next_fanout_hint" in expression
-    assert "Spawn one child agent per detail link/item" in expression
+    assert "Use candidates[0].fanout_tasks" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
         "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
         "fanout_recommended": True,
-        "next_fanout_hint": "Spawn one child agent per detail link/item, then wait_agent and assemble the final answer.",
+        "next_fanout_hint": "Use candidates[0].fanout_tasks as the child manifest: spawn one child agent per task_name/url, then wait_agent and assemble the final answer.",
         "candidates": [
             {
                 "selector": "div.subscriptioncard",
@@ -5734,6 +5736,7 @@ def js(expression, returnByValue=True):
                 "link_count": 6,
                 "detail_link_count": 6,
                 "detail_links": [{"text": "DNA Netti 300M product page", "href": "https://example.test/dna-300"}],
+                "fanout_tasks": [{"task_name": "item_1", "url": "https://example.test/dna-300", "item_text": "DNA Netti 300M product page"}],
                 "fanout_recommended": True,
                 "fanout_reason": "Found 6 independent detail links; spawn one helper per item instead of sequential visits.",
                 "image_count": 3,
@@ -5748,6 +5751,8 @@ assert snapshot["recommended_selector"] == "div.subscriptioncard"
 assert snapshot["fanout_recommended"] is True
 assert "child agent" in snapshot["next_fanout_hint"]
 assert snapshot["candidates"][0]["detail_link_count"] == 6
+assert snapshot["candidates"][0]["fanout_tasks"][0]["task_name"] == "item_1"
+assert snapshot["fanout_tasks"][0]["url"] == "https://example.test/dna-300"
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
@@ -5891,11 +5896,14 @@ snapshot = rows_snapshot()
 assert snapshot["recommended_action"] == "extract_grid_rows"
 assert snapshot["fanout_recommended"] is True
 assert "row/file action" in snapshot["next_fanout_hint"]
+assert snapshot["candidates"][0]["fanout_tasks"][0]["task_name"] == "row_1"
+assert snapshot["fanout_tasks"][0]["url"] == "https://example.test/filing.pdf"
 rows = extract_grid_rows(snapshot["recommended_selector"])
 assert rows["selector"] == "tbody tr"
 assert rows["count"] == 1
 assert rows["fanout_recommended"] is False
 assert rows["detail_action_count"] == 1
+assert rows["fanout_tasks"] == []
 assert rows["detail_actions"][0]["row_index"] == 0
 row = rows["records"][0]
 assert row["description_fields"][0]["text"] == "Transmittal Letter"

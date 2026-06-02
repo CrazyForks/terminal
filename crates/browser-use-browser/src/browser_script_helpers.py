@@ -936,6 +936,48 @@ def network_resources_snapshot(limit=80, keywords=None):
     return js(expression)
 
 
+def _fanout_tasks_from_actions(prefix, actions, kind="item"):
+    tasks = []
+    for index, action in enumerate((actions or [])[:10]):
+        if not isinstance(action, dict):
+            continue
+        href = action.get("href") or action.get("url")
+        if not href:
+            continue
+        text = action.get("text") or action.get("item_text") or action.get("row_text") or ""
+        task_name = f"{prefix}_{index + 1}"
+        tasks.append(
+            {
+                "task_name": task_name,
+                "url": href,
+                "item_text": text[:260],
+                "instruction": (
+                    f"Open this {kind} URL from the parent manifest, extract only the fields "
+                    "requested by the parent task for this one target, and return a concise "
+                    f"done(result=...) with the target name, URL, and extracted fields: {href}"
+                ),
+            }
+        )
+    return tasks
+
+
+def _attach_fanout_tasks(data, *, prefix, kind):
+    if not isinstance(data, dict):
+        return data
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return data
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("fanout_recommended"):
+            continue
+        if not candidate.get("fanout_tasks"):
+            actions = candidate.get("detail_actions") or candidate.get("detail_links") or []
+            candidate["fanout_tasks"] = _fanout_tasks_from_actions(prefix, actions, kind=kind)
+        if data.get("fanout_recommended") and not data.get("fanout_tasks"):
+            data["fanout_tasks"] = candidate.get("fanout_tasks") or []
+    return data
+
+
 def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     """Find repeated visible record/card groups and suggest an extraction selector.
 
@@ -956,6 +998,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     return r.width >= 40 && r.height >= 20 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
   }};
   const clean = (text, max = 240) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const fanoutTaskName = (prefix, index) => `${{prefix}}_${{index + 1}}`;
   const recordText = (el, max = 500) => {{
     const parts = [el.innerText || el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
     for (const img of el.querySelectorAll('img[alt]')) parts.push(img.getAttribute('alt') || '');
@@ -1008,6 +1051,12 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     if (priceSignals) score += priceSignals * 6;
     if (/^(li|div|article|section|tr)($|[.#])/.test(selector)) score += 1;
     const fanoutRecommended = items.length >= 5 && links.size >= 5;
+    const fanoutTasks = fanoutRecommended ? detailLinks.slice(0, 10).map((link, index) => ({{
+      task_name: fanoutTaskName('item', index),
+      url: link.href,
+      item_text: clean(link.text || samples[index] || '', 260),
+      instruction: `Open this item/detail URL from the parent manifest, extract only the fields requested by the parent task for this one item, and return a concise done(result=...) with the item name, URL, and extracted fields: ${{link.href}}`,
+    }})) : [];
     return {{
       selector,
       count: items.length,
@@ -1015,6 +1064,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
       link_count: links.size,
       detail_link_count: links.size,
       detail_links: detailLinks.slice(0, 8),
+      fanout_tasks: fanoutTasks,
       fanout_recommended: fanoutRecommended,
       fanout_reason: fanoutRecommended ? `Found ${{Math.min(items.length, links.size)}} independent detail links; spawn one helper per item instead of sequential visits.` : '',
       image_count: imageCount,
@@ -1047,12 +1097,13 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     recommended_selector: recommended ? recommended.selector : null,
     next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
     fanout_recommended: fanoutRecommended,
-    next_fanout_hint: fanoutRecommended ? 'Spawn one child agent per detail link/item, then wait_agent and assemble the final answer.' : null,
+    next_fanout_hint: fanoutRecommended ? 'Use candidates[0].fanout_tasks as the child manifest: spawn one child agent per task_name/url, then wait_agent and assemble the final answer.' : null,
     candidates: candidates.slice(0, limit),
   }};
 }})()
 """
-    return js(expression)
+    data = js(expression) or {}
+    return _attach_fanout_tasks(data, prefix="item", kind="item/detail")
 
 
 def extract_repeated_items(selector, limit=50, include_html=False):
@@ -1259,7 +1310,8 @@ def rows_snapshot(limit=8):
  const r=candidates[0]||null,fanoutRecommended=!!(r&&r.fanout_recommended);return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,fanout_recommended:fanoutRecommended,next_fanout_hint:fanoutRecommended?'Spawn one child agent per row/file action, then wait_agent and assemble the final answer.':null,candidates:candidates.slice(0,{int(limit)})}};
 }})()
 """
-    return js(expression)
+    data = js(expression) or {}
+    return _attach_fanout_tasks(data, prefix="row", kind="row/file action")
 
 
 def extract_grid_rows(selector=None, limit=50, include_html=False):
@@ -1299,6 +1351,7 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
                 }
             )
     fanout_recommended = len(records) >= 5 and len(detail_actions) >= 5
+    fanout_tasks = _fanout_tasks_from_actions("row", detail_actions, kind="row/file action") if fanout_recommended else []
     return {
         "selector": selector,
         "count": len(records or []),
@@ -1308,6 +1361,7 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
         else None,
         "detail_action_count": len(detail_actions),
         "detail_actions": detail_actions[:12],
+        "fanout_tasks": fanout_tasks,
         "records": records or [],
     }
 
