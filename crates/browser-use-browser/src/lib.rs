@@ -5938,11 +5938,24 @@ def js(expression, returnByValue=True):
     assert "recommended" in expression
     assert "keyword_matches" in expression
     assert "relevance_score" in expression
+    assert "surface_signals" in expression
+    assert "has_public_listing_or_booking_signal" in expression
+    assert "consumer_evidence" in expression
+    assert "meta-description" in expression
     assert "CSS.escape" in expression
     return {
         "url": "https://www.hostgenius.ca/",
         "title": "HostGenius",
         "keywords": ["properties", "rentals", "menu"],
+        "surface_signals": {
+            "consumer_like_score": 5,
+            "business_like_score": 3,
+            "document_like_score": 0,
+            "has_public_listing_or_booking_signal": True,
+            "consumer_evidence": [{"label": "properties", "text": "Properties", "source": "link", "href": "https://www.hostgenius.ca/properties"}],
+            "business_evidence": [{"label": "company", "text": "About HostGenius", "source": "body", "href": ""}],
+            "document_evidence": [],
+        },
         "recommended": [
             {
                 "text": "Properties",
@@ -5970,6 +5983,8 @@ def js(expression, returnByValue=True):
 
 snapshot = navigation_snapshot(keywords=["properties", "rentals", "menu"])
 assert snapshot["recommended"][0]["href"] == "https://www.hostgenius.ca/properties"
+assert snapshot["surface_signals"]["has_public_listing_or_booking_signal"] is True
+assert snapshot["surface_signals"]["consumer_evidence"][0]["href"] == "https://www.hostgenius.ca/properties"
 assert snapshot["recommended"][0]["keyword_matches"] == ["properties"]
 assert snapshot["recommended"][1]["attributes"]["aria-expanded"] == "false"
 assert snapshot["recommended"][1]["selector"] == "button[aria-controls=\"mobile-menu\"]"

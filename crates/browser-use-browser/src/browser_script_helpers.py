@@ -596,6 +596,14 @@ def navigation_snapshot(keywords=None, limit=80):
     if (/\\b(properties|property|rentals|listings|investors?|reports?)\\b/i.test(haystack)) score += 4;
     return {{score, matches: Array.from(new Set(matches)).slice(0, 8)}};
   }};
+  const signalMatches = (patterns, evidence) => {{
+    const out = [];
+    for (const [label, re] of patterns) {{
+      const hit = evidence.find(item => re.test(item.text));
+      if (hit) out.push({{label, text: clean(hit.raw, 180), source: hit.source, href: hit.href || ''}});
+    }}
+    return out;
+  }};
   const nodes = Array.from(document.querySelectorAll(
     'a[href],area[href],nav a[href],header a[href],footer a[href],[role="navigation"] a[href],button,[role="button"],[aria-expanded],[aria-controls],[role="menuitem"],[role="link"]'
   ));
@@ -623,11 +631,43 @@ def navigation_snapshot(keywords=None, limit=80):
       keyword_matches: relevance.matches,
     }});
   }}
+  const metaDescription = document.querySelector('meta[name="description"],meta[property="og:description"]')?.content || '';
+  const bodyText = clean(document.body ? document.body.innerText || document.body.textContent || '' : '', 3000);
+  const evidence = [
+    {{source:'title', raw:document.title || '', text:(document.title || '').toLowerCase()}},
+    {{source:'meta-description', raw:metaDescription, text:metaDescription.toLowerCase()}},
+    {{source:'body', raw:bodyText, text:bodyText.toLowerCase()}},
+    ...records.slice(0, 80).map(r => ({{source:'link', raw:clean([r.text, r.href].filter(Boolean).join(' '), 260), text:clean([r.text, r.href].filter(Boolean).join(' '), 260).toLowerCase(), href:r.href}})),
+  ].filter(item => item.text);
+  const consumerPatterns = [
+    ['properties', /\\b(properties|property|rentals?|vacation rentals?|listings?|available homes?|stays?|book(?:ing)?|reserve|guests?|apartments?|homes?)\\b/i],
+    ['booking', /\\b(book now|reserve|availability|check-in|check in|nightly|monthly stay|short[- ]term|guest)\\b/i],
+    ['pricing', /\\b(price|rates?|from \\$|per night|per month|fees?)\\b/i],
+  ];
+  const businessPatterns = [
+    ['company', /\\b(company|about us|team|careers?|press|blog|contact)\\b/i],
+    ['partner', /\\b(partner|owner|host|management|services|platform|solutions|demo|sales)\\b/i],
+  ];
+  const documentPatterns = [
+    ['documents', /\\b(documents?|filings?|reports?|investors?|annual|quarterly|pdf|download)\\b/i],
+  ];
+  const consumerSignals = signalMatches(consumerPatterns, evidence);
+  const businessSignals = signalMatches(businessPatterns, evidence);
+  const documentSignals = signalMatches(documentPatterns, evidence);
   records.sort((a, b) => b.relevance_score - a.relevance_score || Number(Boolean(b.href)) - Number(Boolean(a.href)) || a.text.localeCompare(b.text));
   return {{
     url: location.href,
     title: document.title || '',
     keywords,
+    surface_signals: {{
+      consumer_like_score: consumerSignals.length * 5,
+      business_like_score: businessSignals.length * 3,
+      document_like_score: documentSignals.length * 4,
+      has_public_listing_or_booking_signal: consumerSignals.length > 0,
+      consumer_evidence: consumerSignals.slice(0, 6),
+      business_evidence: businessSignals.slice(0, 4),
+      document_evidence: documentSignals.slice(0, 4),
+    }},
     recommended: records.filter(r => r.relevance_score > 0).slice(0, Math.min(12, limit)),
     links: records.slice(0, limit),
   }};
