@@ -181,6 +181,11 @@ enum Command {
         #[arg(long, default_value = "gpt-5.1-codex")]
         model: String,
     },
+    RunCodexSession {
+        task_id: String,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
+    },
     RunOpenaiSession {
         task_id: String,
         #[arg(long)]
@@ -715,6 +720,15 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunCodexSession { task_id, model } => run_codex_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
             &task_id,
@@ -1030,6 +1044,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
+        Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
@@ -1978,6 +1993,28 @@ fn run_openai_session(
     let config = ProviderRunConfig::new(ProviderBackend::Openai, model)
         .with_model_source(model_source)
         .with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_codex_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
