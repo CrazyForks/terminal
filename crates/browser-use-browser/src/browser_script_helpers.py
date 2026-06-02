@@ -1717,6 +1717,177 @@ def shopify_products_api(url_or_domain=None, limit=250, page_limit=20, timeout=1
     }
 
 
+def product_records_snapshot(limit=80, keywords=None):
+    """Return normalized product/listing records from visible cards and product metadata.
+
+    Use this on non-Shopify product grids, vendor catalogs, and product-list pages
+    before manually opening each card. It combines JSON-LD/meta product signals with
+    visible product-like cards and returns fanout tasks for larger product bundles.
+    """
+    keyword_list = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
+    expression = f"""
+(() => {{
+  // __PRODUCT_RECORDS_SNAPSHOT__
+  const limit = {int(limit)};
+  const keywords = {json.dumps(keyword_list)};
+  const clean = (text, max = 1600) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const abs = value => {{ try {{ return value ? new URL(value, location.href).href : ''; }} catch (e) {{ return value || ''; }} }};
+  const visible = el => {{
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width >= 40 && r.height >= 24 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }};
+  const lower = value => clean(value, 2000).toLowerCase();
+  const scoreText = text => keywords.reduce((score, kw) => score + (kw && lower(text).includes(kw) ? 12 : 0), 0);
+  const priceRe = /(?:[$€£¥]\\s?\\d[\\d.,]*|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|aud|cad|dkk|sek|nok|kr))/ig;
+  const specRe = /\\b(?:wi-?fi\\s?\\d+|wifi|poe\\+?\\+?|gbe|gbps|mbps|ghz|mhz|ports?|switch|gateway|router|access point|camera|sensor|cloud|rack|wan|lan|tb|gb|4k|hd|mesh|vpn|firewall)\\b[^|\\n\\r;,.]*/ig;
+  const productUrlRe = /\\/(?:products?|product|store|shop|catalog|category|collections?|sku|item)\\//i;
+  const uniq = values => Array.from(new Set((values || []).map(v => clean(v, 300)).filter(Boolean)));
+  const imageFrom = el => {{
+    if (!el) return '';
+    const img = el.querySelector('img[src],img[srcset],img[data-src],picture source[srcset]');
+    if (!img) return '';
+    return abs(img.currentSrc || img.src || img.getAttribute('src') || img.getAttribute('data-src') || (img.getAttribute('srcset') || '').split(',')[0].trim().split(/\\s+/)[0]);
+  }};
+  const linkText = a => clean([a.innerText || a.textContent || '', a.getAttribute('aria-label') || '', a.getAttribute('title') || ''].join(' '), 260);
+  const add = (records, seen, raw) => {{
+    const title = clean(raw.title || raw.name || '', 300);
+    const url = abs(raw.url || raw.href || '');
+    const description = clean(raw.description || raw.text || '', 1200);
+    const key = url || lower(title) || lower(description).slice(0, 120);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const text = clean([title, description, (raw.specs || []).join(' '), (raw.price_texts || []).join(' ')].join(' '), 2200);
+    let score = 0;
+    if (title) score += 30;
+    if (url) score += 15;
+    if (productUrlRe.test(url)) score += 20;
+    if ((raw.price_texts || []).length) score += 8;
+    if ((raw.specs || []).length) score += 8;
+    if (raw.image_url) score += 4;
+    score += scoreText(text);
+    records.push({{
+      source: raw.source || 'visible_dom',
+      title,
+      url,
+      description,
+      price_texts: uniq(raw.price_texts || []),
+      specs: uniq(raw.specs || []),
+      image_url: abs(raw.image_url || ''),
+      labels: uniq(raw.labels || []),
+      text,
+      score,
+    }});
+  }};
+  const records = [], seen = new Set();
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {{
+    let parsed;
+    try {{ parsed = JSON.parse(script.textContent || 'null'); }} catch (e) {{ continue; }}
+    const queue = Array.isArray(parsed) ? [...parsed] : [parsed];
+    while (queue.length) {{
+      const item = queue.shift();
+      if (!item || typeof item !== 'object') continue;
+      if (Array.isArray(item)) {{ queue.push(...item); continue; }}
+      for (const key of ['@graph', 'itemListElement', 'hasVariant', 'offers']) {{
+        const value = item[key];
+        if (Array.isArray(value)) queue.push(...value);
+        else if (value && typeof value === 'object') queue.push(value);
+      }}
+      const type = Array.isArray(item['@type']) ? item['@type'].join(' ') : (item['@type'] || '');
+      const nested = item.item && typeof item.item === 'object' ? item.item : item;
+      if (!/Product|Offer|ListItem/i.test(type) && !nested.name) continue;
+      const offer = nested.offers && typeof nested.offers === 'object' ? nested.offers : item.offers || {{}};
+      add(records, seen, {{
+        source: 'json_ld',
+        title: nested.name || item.name,
+        url: nested.url || item.url,
+        description: nested.description || item.description,
+        image_url: Array.isArray(nested.image) ? nested.image[0] : nested.image,
+        price_texts: [offer.price ? `${{offer.price}} ${{offer.priceCurrency || ''}}` : '', offer.lowPrice ? `${{offer.lowPrice}} ${{offer.priceCurrency || ''}}` : ''],
+        specs: [nested.sku, nested.model, nested.category, nested.brand && (nested.brand.name || nested.brand)],
+        labels: [type],
+      }});
+    }}
+  }}
+  const metaTitle = document.querySelector('meta[property="og:title"],meta[name="twitter:title"]')?.content || '';
+  const metaDescription = document.querySelector('meta[property="og:description"],meta[name="description"],meta[name="twitter:description"]')?.content || '';
+  const metaImage = document.querySelector('meta[property="og:image"],meta[name="twitter:image"]')?.content || '';
+  if (metaTitle && /product|store|shop|catalog|ubiquiti|unifi|ui /i.test([metaTitle, location.href].join(' '))) {{
+    add(records, seen, {{source: 'meta', title: metaTitle, url: location.href, description: metaDescription, image_url: metaImage}});
+  }}
+  const cardSelector = [
+    'article', 'li', '[role="listitem"]', '[itemscope]', '[itemtype*="Product" i]',
+    '[class*="product" i]', '[class*="card" i]', '[class*="tile" i]', '[data-testid*="product" i]',
+    'a[href*="/product"]', 'a[href*="/products"]'
+  ].join(',');
+  for (const el of document.querySelectorAll(cardSelector)) {{
+    if (!visible(el)) continue;
+    const text = clean([el.innerText || el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' '), 1800);
+    const linkNodes = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
+    const links = linkNodes.map(a => ({{href: a.href, text: linkText(a)}})).filter(link => link.href);
+    const productLink = links.find(link => productUrlRe.test(link.href)) || links[0] || {{}};
+    const headings = Array.from(el.querySelectorAll('h1,h2,h3,h4,[role="heading"],[itemprop="name"]')).map(h => clean(h.textContent, 220)).filter(Boolean);
+    const labels = uniq([el.getAttribute('aria-label'), el.getAttribute('title'), ...Array.from(el.querySelectorAll('img[alt]')).map(img => img.getAttribute('alt'))]);
+    const title = headings[0] || productLink.text || labels[0] || text.split(/[\\n|•]/).map(part => clean(part, 220)).find(Boolean) || '';
+    const prices = uniq(text.match(priceRe) || []);
+    const specs = uniq(text.match(specRe) || []);
+    if (!title || (text.length < 8 && !productLink.href)) continue;
+    if (!productUrlRe.test(productLink.href || '') && !/product|unifi|ubiquiti|sku|model|gateway|switch|camera|access point/i.test(text + ' ' + labels.join(' '))) continue;
+    add(records, seen, {{
+      source: 'visible_dom',
+      title,
+      url: productLink.href || '',
+      description: text,
+      price_texts: prices,
+      specs,
+      image_url: imageFrom(el),
+      labels,
+    }});
+  }}
+  records.sort((a, b) => b.score - a.score || (b.url ? 1 : 0) - (a.url ? 1 : 0));
+  return {{url: location.href, title: document.title || '', keywords, count: records.length, products: records.slice(0, limit)}};
+}})()
+"""
+    data = js(expression) or {}
+    products = data.get("products") if isinstance(data, dict) else []
+    actions = []
+    seen_urls = set()
+    for product in products or []:
+        if not isinstance(product, dict):
+            continue
+        url = product.get("url")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        text = " | ".join(
+            part
+            for part in [
+                product.get("title") or "",
+                product.get("description") or "",
+                ", ".join(product.get("specs") or []),
+                ", ".join(product.get("price_texts") or []),
+            ]
+            if part
+        )
+        actions.append({"url": url, "text": text})
+    fanout_recommended = len(actions) >= 5
+    return {
+        "url": data.get("url") if isinstance(data, dict) else "",
+        "title": data.get("title") if isinstance(data, dict) else "",
+        "keywords": keyword_list,
+        "count": len(products or []),
+        "products": products or [],
+        "detail_action_count": len(actions),
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": "Spawn one child agent per product record, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+        "fanout_tasks": _fanout_tasks_from_actions("product", actions, kind="product record")
+        if fanout_recommended
+        else [],
+    }
+
+
 def _fanout_tasks_from_actions(prefix, actions, kind="item"):
     tasks = []
     for index, action in enumerate((actions or [])[:10]):

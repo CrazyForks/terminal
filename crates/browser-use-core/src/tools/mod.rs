@@ -2468,6 +2468,7 @@ mod tests {
             "navigation_snapshot",
             "sitemap_urls_snapshot",
             "route_candidates_snapshot",
+            "product_records_snapshot",
             "shopify_products_api",
             "embedded_data_snapshot",
             "JSON-LD",

@@ -6786,6 +6786,73 @@ print("shopify_products_api ok")
     }
 
     #[test]
+    fn browser_script_product_records_snapshot_fans_out_catalog_products() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-product-records-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    assert "__PRODUCT_RECORDS_SNAPSHOT__" in expression
+    assert "application/ld+json" in expression
+    assert "og:title" in expression
+    assert "productUrlRe" in expression
+    assert "specRe" in expression
+    assert "a[href*=\"/products\"]" in expression
+    assert '"unifi"' in expression
+    products = []
+    for index in range(6):
+        products.append({
+            "source": "visible_dom",
+            "title": f"UniFi Gateway {index + 1}",
+            "url": f"https://store.ui.example.test/products/gateway-{index + 1}",
+            "description": f"UniFi Gateway {index + 1} Cloud Gateway with 2.5 GbE WAN and PoE ports",
+            "price_texts": [f"${199 + index}.00"],
+            "specs": ["2.5 GbE WAN", "PoE ports"],
+            "image_url": f"https://store.ui.example.test/gateway-{index + 1}.png",
+            "labels": ["Product"],
+            "text": f"UniFi Gateway {index + 1} Cloud Gateway 2.5 GbE WAN PoE",
+            "score": 91 - index,
+        })
+    return {
+        "url": "https://store.ui.example.test/us/en/category/all-unifi-cloud-gateways",
+        "title": "UniFi Cloud Gateways",
+        "keywords": ["unifi", "gateway"],
+        "count": len(products),
+        "products": products,
+    }
+
+snapshot = product_records_snapshot(limit=20, keywords=["UniFi", "gateway"])
+assert snapshot["url"].endswith("/all-unifi-cloud-gateways"), snapshot
+assert snapshot["keywords"] == ["unifi", "gateway"], snapshot
+assert snapshot["count"] == 6, snapshot
+first = snapshot["products"][0]
+assert first["title"] == "UniFi Gateway 1", snapshot
+assert first["price_texts"] == ["$199.00"], snapshot
+assert first["specs"] == ["2.5 GbE WAN", "PoE ports"], snapshot
+assert first["image_url"].endswith("gateway-1.png"), snapshot
+assert snapshot["detail_action_count"] == 6, snapshot
+assert snapshot["fanout_recommended"] is True, snapshot
+assert "product record" in snapshot["next_fanout_hint"], snapshot
+assert len(snapshot["fanout_tasks"]) == 6, snapshot
+assert snapshot["fanout_tasks"][0]["task_name"] == "product_1", snapshot
+assert snapshot["fanout_tasks"][5]["url"] == "https://store.ui.example.test/products/gateway-6", snapshot
+assert "UniFi Gateway 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
+assert "product record" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+print("product_records_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("product_records_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");
