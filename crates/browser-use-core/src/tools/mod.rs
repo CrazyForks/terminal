@@ -2466,6 +2466,8 @@ mod tests {
             "__NEXT_DATA__",
             "read_document_text",
             "pdftotext",
+            "arxiv_query",
+            "arXiv",
             "collapsed menu/toggle control",
             "browser_fetch",
             "browser_fetch_many",
