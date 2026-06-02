@@ -6129,6 +6129,8 @@ def js(expression, returnByValue=True):
     assert "role=\"navigation\"" in expression or "[role=\"navigation\"]" in expression
     assert "properties" in expression
     assert "rentals" in expression
+    assert "accommodations" in expression
+    assert "book now" in expression
     assert "menu" in expression
     assert "recommended" in expression
     assert "keyword_matches" in expression
@@ -6176,7 +6178,7 @@ def js(expression, returnByValue=True):
         "links": [],
     }
 
-snapshot = navigation_snapshot(keywords=["properties", "rentals", "menu"])
+snapshot = navigation_snapshot(keywords=["properties", "rentals", "accommodations", "book now", "menu"])
 assert snapshot["recommended"][0]["href"] == "https://www.hostgenius.ca/properties"
 assert snapshot["surface_signals"]["has_public_listing_or_booking_signal"] is True
 assert snapshot["surface_signals"]["consumer_evidence"][0]["href"] == "https://www.hostgenius.ca/properties"
@@ -6228,6 +6230,7 @@ assert "https://www.hostgenius.ca/sitemap_index.xml" in snapshot["sitemaps_check
 assert snapshot["recommended"][0]["url"] == "https://www.hostgenius.ca/properties", snapshot
 assert snapshot["recommended"][0]["lastmod"] == "2026-01-01", snapshot
 assert snapshot["recommended"][1]["url"].endswith("/vacation-rentals/calgary-loft"), snapshot
+assert any("vacation-rentals" in item["url"] and item["score"] > 0 for item in snapshot["urls"]), snapshot
 assert not any(item["url"].endswith("app.js") and item["score"] > 0 for item in snapshot["urls"])
 print("sitemap_urls_snapshot ok")
 "##,
@@ -6265,14 +6268,14 @@ def js(expression, *args, **kwargs):
             {"tag": "a", "href": "https://www.hostgenius.ca/about", "rel": "", "type": "", "text": "About"},
         ],
         "inlineScripts": [
-            {"source": "inline-script-1", "text": 'self.__BUILD_MANIFEST={"/properties":["/static/properties.js"],"/vacation-rentals/calgary-loft":[]} booking availability'}
+            {"source": "inline-script-1", "text": 'self.__BUILD_MANIFEST={"/properties":["/static/properties.js"],"/vacation-rentals/calgary-loft":[],"/stays/downtown-suite":[],"/accommodations":[]} booking availability'}
         ],
     }
 
 def http_get(url, headers=None, timeout=20.0, binary=None):
     calls.append(("http_get", url))
     assert url == "https://www.hostgenius.ca/_next/static/app.js", url
-    return 'const routes=["/properties","/book-now","/availability/search","/static/app.js"];'
+    return 'const routes=["/properties","/book-now","/availability/search","/homes","/static/app.js"];'
 
 snapshot = route_candidates_snapshot("https://www.hostgenius.ca", keywords=["properties", "rentals", "booking"], limit=10)
 assert snapshot["origin"] == "https://www.hostgenius.ca", snapshot
@@ -6280,6 +6283,9 @@ assert snapshot["scripts_fetched"] == ["https://www.hostgenius.ca/_next/static/a
 urls = [item["url"] for item in snapshot["recommended"]]
 assert "https://www.hostgenius.ca/properties" in urls, snapshot
 assert "https://www.hostgenius.ca/vacation-rentals/calgary-loft" in urls, snapshot
+assert "https://www.hostgenius.ca/stays/downtown-suite" in urls, snapshot
+assert "https://www.hostgenius.ca/accommodations" in urls, snapshot
+assert "https://www.hostgenius.ca/homes" in urls, snapshot
 assert "https://www.hostgenius.ca/book-now" in urls, snapshot
 assert not any(url.endswith(".css") for url in urls), snapshot
 properties = next(item for item in snapshot["routes"] if item["url"].endswith("/properties"))

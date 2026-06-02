@@ -520,6 +520,13 @@ def navigation_snapshot(keywords=None, limit=80):
             "rentals",
             "vacation rentals",
             "listings",
+            "stays",
+            "homes",
+            "apartments",
+            "suites",
+            "accommodations",
+            "availability",
+            "book now",
             "browse",
             "available",
             "investors",
@@ -594,7 +601,7 @@ def navigation_snapshot(keywords=None, limit=80):
     }}
     if (/\\b(menu|hamburger|toggle|open|more)\\b/i.test(haystack) && !href) score += 2;
     if (/\\b(pdf|docx?|xlsx?|download|filing|report|annual|quarterly)\\b/i.test(haystack)) score += 2;
-    if (/\\b(properties|property|rentals|listings|investors?|reports?)\\b/i.test(haystack)) score += 4;
+    if (/\\b(properties|property|rentals|vacation rentals?|listings|stays?|homes?|apartments?|suites?|accommodations?|availability|book now|investors?|reports?)\\b/i.test(haystack)) score += 4;
     return {{score, matches: Array.from(new Set(matches)).slice(0, 8)}};
   }};
   const signalMatches = (patterns, evidence) => {{
@@ -641,8 +648,8 @@ def navigation_snapshot(keywords=None, limit=80):
     ...records.slice(0, 80).map(r => ({{source:'link', raw:clean([r.text, r.href].filter(Boolean).join(' '), 260), text:clean([r.text, r.href].filter(Boolean).join(' '), 260).toLowerCase(), href:r.href}})),
   ].filter(item => item.text);
   const consumerPatterns = [
-    ['properties', /\\b(properties|property|rentals?|vacation rentals?|listings?|available homes?|stays?|book(?:ing)?|reserve|guests?|apartments?|homes?)\\b/i],
-    ['booking', /\\b(book now|reserve|availability|check-in|check in|nightly|monthly stay|short[- ]term|guest)\\b/i],
+    ['properties', /\\b(properties|property|rentals?|vacation rentals?|listings?|available homes?|stays?|book(?:ing)?|reserve|guests?|apartments?|homes?|suites?|accommodations?)\\b/i],
+    ['booking', /\\b(book now|reserve|availability|check-in|check in|nightly|monthly stay|short[- ]term|guest|available dates?)\\b/i],
     ['pricing', /\\b(price|rates?|from \\$|per night|per month|fees?)\\b/i],
   ];
   const businessPatterns = [
@@ -1458,8 +1465,17 @@ def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitem
             "properties",
             "property",
             "rentals",
+            "vacation-rentals",
             "listing",
             "listings",
+            "stays",
+            "homes",
+            "apartments",
+            "suites",
+            "accommodations",
+            "availability",
+            "book",
+            "booking",
             "products",
             "catalog",
             "tickets",
@@ -1479,7 +1495,7 @@ def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitem
     def url_score(value):
         lower = str(value or "").lower()
         score = sum(10 for term in terms if term and term in lower)
-        if re.search(r"/(?:property|properties|rentals?|listings?|products?|catalog|tickets?|investors?|documents?|reports?|search|results?)(?:[/?#-]|$)", lower):
+        if re.search(r"/(?:property|properties|rentals?|vacation-rentals?|stays?|homes?|apartments?|suites?|accommodations?|availability|book(?:ing)?|listings?|products?|catalog|tickets?|investors?|documents?|reports?|search|results?)(?:[/?#-]|$)", lower):
             score += 12
         if re.search(r"\.(?:jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?)($|[?#])", lower):
             score -= 20
@@ -1575,7 +1591,13 @@ def route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_s
             "rentals",
             "vacation-rentals",
             "listings",
+            "stays",
+            "homes",
+            "apartments",
+            "suites",
+            "accommodations",
             "booking",
+            "book",
             "availability",
             "search",
             "results",
@@ -1597,7 +1619,7 @@ def route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_s
     def score_url(value, evidence=""):
         lower = f"{value} {evidence}".lower()
         score = sum(10 for term in terms if term and term in lower)
-        if re.search(r"/(?:propert(?:y|ies)|rentals?|vacation-rentals?|listings?|booking|availability|search|results?|products?|catalog|documents?|reports?|investors?)(?:[/?#._-]|$)", lower):
+        if re.search(r"/(?:propert(?:y|ies)|rentals?|vacation-rentals?|stays?|homes?|apartments?|suites?|accommodations?|listings?|book(?:ing)?|availability|search|results?|products?|catalog|documents?|reports?|investors?)(?:[/?#._-]|$)", lower):
             score += 14
         if re.search(r"\b(book now|reserve|check[- ]?in|guest|available homes?|short[- ]term|stays?)\b", lower):
             score += 8
@@ -1612,7 +1634,7 @@ def route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_s
         re.I,
     )
     interesting_re = re.compile(
-        r"(propert(?:y|ies)|rentals?|vacation[-_ ]?rentals?|listings?|booking|availability|search|results?|products?|catalog|documents?|reports?|investors?)",
+        r"(propert(?:y|ies)|rentals?|vacation[-_ ]?rentals?|stays?|homes?|apartments?|suites?|accommodations?|listings?|book(?:ing)?|availability|search|results?|products?|catalog|documents?|reports?|investors?)",
         re.I,
     )
     seen = {}
