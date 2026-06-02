@@ -8033,6 +8033,61 @@ print("read_document_text ok")
     }
 
     #[test]
+    fn browser_script_arxiv_query_normalizes_atom_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-arxiv-query",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    assert "export.arxiv.org/api/query" in url, url
+    assert "search_query=cat%3Acs.AI" in url, url
+    assert "max_results=2" in url, url
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.01234v1</id>
+    <updated>2024-01-03T10:00:00Z</updated>
+    <published>2024-01-02T09:00:00Z</published>
+    <title> Web Agents for Reliable Browsing </title>
+    <summary> We study browser agents. </summary>
+    <author><name>Ada Lovelace</name><arxiv:affiliation>Example University</arxiv:affiliation></author>
+    <author><name>Grace Hopper</name></author>
+    <arxiv:primary_category term="cs.AI"/>
+    <category term="cs.AI"/>
+    <category term="cs.CL"/>
+    <arxiv:comment>12 pages</arxiv:comment>
+    <arxiv:doi>10.1234/example</arxiv:doi>
+    <link href="http://arxiv.org/abs/2401.01234v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2401.01234v1" rel="related" type="application/pdf"/>
+  </entry>
+</feed>"""
+
+result = arxiv_query("cat:cs.AI", start=0, max_results=2)
+assert result["count"] == 1, result
+paper = result["entries"][0]
+assert paper["id"] == "2401.01234v1", paper
+assert paper["title"] == "Web Agents for Reliable Browsing", paper
+assert paper["summary"] == "We study browser agents.", paper
+assert paper["published"] == "2024-01-02T09:00:00Z", paper
+assert paper["pdf_url"] == "http://arxiv.org/pdf/2401.01234v1", paper
+assert paper["first_author"]["name"] == "Ada Lovelace", paper
+assert paper["first_author"]["affiliation"] == "Example University", paper
+assert paper["categories"] == ["cs.AI", "cs.CL"], paper
+assert paper["primary_category"] == "cs.AI", paper
+assert paper["doi"] == "10.1234/example", paper
+print("arxiv_query ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("arxiv_query ok"));
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

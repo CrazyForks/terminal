@@ -24,7 +24,8 @@ import time as _time
 import urllib.error
 import urllib.request
 import zipfile
-from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode, urlparse
 
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
@@ -1518,6 +1519,92 @@ def _extract_pdf_text(data):
     if text.strip():
         return text, "pdf-byte-strings"
     raise RuntimeError("could not extract PDF text; install pypdf/PyPDF2 or pdftotext. " + "; ".join(errors[:3]))
+
+
+def arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="submittedDate", sort_order="descending", timeout=20.0):
+    """Query arXiv's Atom API and return normalized paper metadata.
+
+    Useful for arXiv recent-list and paper-search tasks: title, authors,
+    abstract, abs/pdf URLs, first-version submission time when exposed by arXiv,
+    categories, DOI, journal ref, and any author affiliations present in the API.
+    """
+    params = {
+        "search_query": str(search_query),
+        "start": int(start),
+        "max_results": int(max_results),
+        "sortBy": str(sort_by),
+        "sortOrder": str(sort_order),
+    }
+    url = "https://export.arxiv.org/api/query?" + urlencode(params)
+    feed_text = str(http_get(url, timeout=timeout))
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+    root = ET.fromstring(feed_text.encode("utf-8"))
+
+    def child_text(node, path, default=""):
+        found = node.find(path, ns)
+        return default if found is None or found.text is None else re.sub(r"\s+", " ", found.text).strip()
+
+    def link_href(entry, rel=None, title=None, type_=None):
+        for link in entry.findall("atom:link", ns):
+            if rel and link.get("rel") != rel:
+                continue
+            if title and link.get("title") != title:
+                continue
+            if type_ and link.get("type") != type_:
+                continue
+            href = link.get("href")
+            if href:
+                return href
+        return ""
+
+    entries = []
+    for entry in root.findall("atom:entry", ns):
+        id_url = child_text(entry, "atom:id")
+        arxiv_id = id_url.rstrip("/").rsplit("/", 1)[-1] if id_url else ""
+        abs_url = link_href(entry, rel="alternate") or id_url
+        pdf_url = link_href(entry, title="pdf") or link_href(entry, type_="application/pdf")
+        if not pdf_url and abs_url:
+            pdf_url = abs_url.replace("/abs/", "/pdf/")
+        authors = []
+        for author in entry.findall("atom:author", ns):
+            name = child_text(author, "atom:name")
+            affiliation = child_text(author, "arxiv:affiliation")
+            item = {"name": name}
+            if affiliation:
+                item["affiliation"] = affiliation
+            if name:
+                authors.append(item)
+        categories = [cat.get("term") for cat in entry.findall("atom:category", ns) if cat.get("term")]
+        primary = entry.find("arxiv:primary_category", ns)
+        entries.append(
+            {
+                "id": arxiv_id,
+                "title": child_text(entry, "atom:title"),
+                "summary": child_text(entry, "atom:summary"),
+                "published": child_text(entry, "atom:published"),
+                "updated": child_text(entry, "atom:updated"),
+                "abs_url": abs_url,
+                "pdf_url": pdf_url,
+                "authors": authors,
+                "first_author": authors[0] if authors else {},
+                "categories": categories,
+                "primary_category": primary.get("term") if primary is not None else "",
+                "comment": child_text(entry, "arxiv:comment"),
+                "journal_ref": child_text(entry, "arxiv:journal_ref"),
+                "doi": child_text(entry, "arxiv:doi"),
+            }
+        )
+    return {
+        "query_url": url,
+        "search_query": str(search_query),
+        "start": int(start),
+        "max_results": int(max_results),
+        "count": len(entries),
+        "entries": entries,
+    }
 
 
 def read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None):
