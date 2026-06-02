@@ -5899,6 +5899,8 @@ assert len(snapshot["fanout_tasks"]) == 5, snapshot
 assert snapshot["fanout_tasks"][0]["task_name"] == "price_1", snapshot
 assert snapshot["fanout_tasks"][4]["url"] == "https://store.example.test/products/5", snapshot
 assert "UniFi product 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
+assert "Handle only manifest item 1" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
+assert "Do not process sibling manifest items" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
 print("pricing card fanout ok")
 "##,
             10,
@@ -6708,6 +6710,7 @@ assert snapshot["fanout_tasks"][0]["task_name"] == "doc_1", snapshot
 assert snapshot["fanout_tasks"][0]["url"] == "https://investor.example.test/fy2025-report-1.pdf", snapshot
 assert "FY2025 investor report part 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
 assert "investor/report document" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+assert "Handle only manifest item 1" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
 print("investor_documents_snapshot fanout ok")
 "##,
             10,
@@ -6773,6 +6776,7 @@ assert snapshot["fanout_tasks"][0]["task_name"] == "doc_1", snapshot
 assert snapshot["fanout_tasks"][5]["url"].endswith("file-6.pdf"), snapshot
 assert "CP23-29" in snapshot["fanout_tasks"][0]["item_text"], snapshot
 assert "filing/document link" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+assert "Do not process sibling manifest items" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
 print("document_links_snapshot ok")
 "##,
             10,
@@ -6909,6 +6913,7 @@ assert snapshot["fanout_tasks"][0]["task_name"] == "product_1", snapshot
 assert snapshot["fanout_tasks"][5]["url"] == "https://store.ui.example.test/products/gateway-6", snapshot
 assert "UniFi Gateway 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
 assert "product record" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+assert "Handle only manifest item 1" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
 print("product_records_snapshot ok")
 "##,
             10,
@@ -8263,6 +8268,7 @@ assert len(result["fanout_tasks"]) == 5, result
 assert result["fanout_tasks"][0]["task_name"] == "ref_1", result
 assert result["fanout_tasks"][0]["url"] == "https://www.semanticscholar.org/paper/ref1", result
 assert "Reference abstract 1" in result["fanout_tasks"][0]["item_text"], result
+assert "Do not process sibling manifest items" in result["fanout_tasks"][0]["spawn_message"], result
 assert len(seen) == 2, seen
 print("semantic_scholar_references ok")
 "##,

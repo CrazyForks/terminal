@@ -2477,6 +2477,7 @@ mod tests {
             "json_api_records",
             "tabular_data_records",
             "pricing_cards_snapshot",
+            "spawn_message",
             "document_links_snapshot",
             "investor_documents_snapshot",
             "read_document_text",

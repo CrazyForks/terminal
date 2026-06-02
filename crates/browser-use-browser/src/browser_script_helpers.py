@@ -2041,16 +2041,23 @@ def _fanout_tasks_from_actions(prefix, actions, kind="item"):
             continue
         text = action.get("text") or action.get("item_text") or action.get("row_text") or ""
         task_name = f"{prefix}_{index + 1}"
+        instruction = (
+            f"Open this {kind} URL from the parent manifest, extract only the fields "
+            "requested by the parent task for this one target, and return a concise "
+            f"done(result=...) with the target name, URL, and extracted fields: {href}"
+        )
+        spawn_message = (
+            f"Handle only manifest item {index + 1}: {text[:220] or href}. "
+            f"{instruction} Do not process sibling manifest items. If the page is blocked "
+            "or incomplete, return a concise partial result with the blocker and source URL."
+        )
         tasks.append(
             {
                 "task_name": task_name,
                 "url": href,
                 "item_text": text[:260],
-                "instruction": (
-                    f"Open this {kind} URL from the parent manifest, extract only the fields "
-                    "requested by the parent task for this one target, and return a concise "
-                    f"done(result=...) with the target name, URL, and extracted fields: {href}"
-                ),
+                "instruction": instruction,
+                "spawn_message": spawn_message,
             }
         )
     return tasks
