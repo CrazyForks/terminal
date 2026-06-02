@@ -1239,6 +1239,53 @@ def tabular_data_records(source, delimiter=None, limit=500, use_browser_fetch=Fa
     }
 
 
+def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
+    """Return classified investor/report/earnings document candidates from visible links."""
+    keyword_list = [str(k).lower() for k in (keywords or []) if str(k).strip()]
+    expression = f"""
+(() => {{
+ // __INVESTOR_DOCUMENTS_SNAPSHOT__
+ const limit={int(limit)}, keywords={json.dumps(keyword_list)}, latestOnly={json.dumps(bool(latest_only))};
+ const clean=(s,n=700)=>String(s||'').replace(/\\s+/g,' ').trim().slice(0,n);
+ const abs=u=>{{try{{return new URL(u,location.href).href}}catch(e){{return ''}}}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}};
+ const month={{jan:'01',january:'01',feb:'02',february:'02',mar:'03',march:'03',apr:'04',april:'04',may:'05',jun:'06',june:'06',jul:'07',july:'07',aug:'08',august:'08',sep:'09',sept:'09',september:'09',oct:'10',october:'10',nov:'11',november:'11',dec:'12',december:'12'}};
+ const classify=t=>{{const s=t.toLowerCase();if(/transcript|call transcript/.test(s))return 'earnings_call_transcript';if(/supplement|data book|statistical|trends report|financial data/.test(s))return 'financial_supplement';if(/presentation|slides|deck|roadshow|capital markets/.test(s))return /earnings|results|quarter|q[1-4]/.test(s)?'investor_presentation':'corporate_presentation';if(/earnings release|press release|financial results|quarterly results|annual results|full year results|results release/.test(s))return 'earnings_release';if(/annual report|quarterly report|interim report|integrated report|financial statements|10-k|10-q|20-f|md&a|investor report/.test(s))return 'investor_report';if(/\\.xlsx?|spreadsheet|data tables|questionnaire|coding frame|annex/.test(s))return 'data_table_or_annex';return 'other'}};
+ const parseDate=t=>{{let m=t.match(/\\b(20\\d{{2}}|19\\d{{2}})[-_ /.](\\d{{1,2}})[-_ /.](\\d{{1,2}})\\b/);if(m)return `${{m[1]}}-${{m[2].padStart(2,'0')}}-${{m[3].padStart(2,'0')}}`;m=t.match(/\\b(\\d{{1,2}})[-_ /.](\\d{{1,2}})[-_ /.](20\\d{{2}}|19\\d{{2}})\\b/);if(m)return `${{m[3]}}-${{m[1].padStart(2,'0')}}-${{m[2].padStart(2,'0')}}`;m=t.match(/\\b(january|february|march|april|may|june|july|august|september|sept|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\\s+(\\d{{1,2}}),?\\s+(20\\d{{2}}|19\\d{{2}})\\b/i);if(m)return `${{m[3]}}-${{month[m[1].toLowerCase()]}}-${{m[2].padStart(2,'0')}}`;m=t.match(/\\b(20\\d{{2}}|19\\d{{2}})\\b/);return m?m[1]+'-01-01':null}};
+ const periodTokens=t=>Array.from(new Set((t.match(/\\b(?:q[1-4]|fy\\d{{2,4}}|f\\dq\\d{{2}}|20\\d{{2}}|19\\d{{2}}|first quarter|second quarter|third quarter|fourth quarter|full year|annual)\\b/ig)||[]).map(x=>x.toLowerCase())));
+ const docs=[],seen=new Set(),docRe=/(\\.pdf($|[?#])|\\.docx?($|[?#])|\\.xlsx?($|[?#])|download|document|report|results?|earnings|presentation|supplement|transcript|filing|financial|investor|annual|quarter|data table|questionnaire|annex)/i;
+ for(const a of [...document.querySelectorAll('a[href]')].filter(visible).slice(0,limit*12)){{
+   const href=abs(a.href); if(!href)continue;
+   const row=a.closest('tr,li,article,section,div');
+   const text=clean([a.innerText||a.textContent||'',a.getAttribute('aria-label')||'',a.getAttribute('title')||'',a.getAttribute('download')||'',row?(row.innerText||row.textContent||''):''].filter(Boolean).join(' '),1200);
+   const hay=(href+' '+text).toLowerCase();
+   if(!docRe.test(hay) && !keywords.some(k=>hay.includes(k)))continue;
+   const key=href+'|'+text.slice(0,80); if(seen.has(key))continue; seen.add(key);
+   const type=classify(hay), date=parseDate(href+' '+text), tokens=periodTokens(href+' '+text);
+   const extension=(href.match(/\\.([a-z0-9]{{2,5}})(?:[?#]|$)/i)||[])[1]||'';
+   const keyword_matches=keywords.filter(k=>hay.includes(k));
+   let score=keyword_matches.length*25 + (/\\.pdf(?:[?#]|$)/i.test(href)?30:0) + (/\\.xlsx?(?:[?#]|$)/i.test(href)?25:0) + (type==='other'?0:35) + (date?10:0);
+   if(/investor|financial|earnings|results|reports?|presentation|supplement/.test(hay))score+=20;
+   docs.push({{title:clean(a.innerText||a.textContent||a.getAttribute('title')||a.getAttribute('aria-label')||'',300),url:href,type,published_on:date,extension,period_tokens:tokens,keyword_matches,context:text,score}});
+ }}
+ docs.sort((a,b)=>(b.published_on||'').localeCompare(a.published_on||'')||b.score-a.score);
+ const out=latestOnly&&docs.length?docs.filter(d=>d.published_on===docs[0].published_on):docs;
+ return {{url:location.href,title:document.title||'',count:out.length,documents:out.slice(0,limit),keywords,latest_only:latestOnly}};
+}})()
+"""
+    try:
+        data = js(expression) or {}
+    except Exception as exc:
+        return {"url": "", "title": "", "count": 0, "documents": [], "keywords": keyword_list, "latest_only": bool(latest_only), "error": str(exc)}
+    if not isinstance(data, dict):
+        return {"url": "", "title": "", "count": 0, "documents": [], "keywords": keyword_list, "latest_only": bool(latest_only), "raw": data}
+    data.setdefault("documents", [])
+    data["count"] = len(data.get("documents") or [])
+    data.setdefault("keywords", keyword_list)
+    data.setdefault("latest_only", bool(latest_only))
+    return data
+
+
 def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitemaps=8, timeout=10.0):
     """Discover public routes from robots.txt and XML sitemaps.
 
