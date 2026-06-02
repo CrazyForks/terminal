@@ -30,6 +30,7 @@ const BU_BROWSER_ACCEPT_DOWNLOADS_ENV: &str = "BU_BROWSER_ACCEPT_DOWNLOADS";
 const BU_BROWSER_DOWNLOADS_PATH_ENV: &str = "BU_BROWSER_DOWNLOADS_PATH";
 const BU_BROWSER_NO_VIEWPORT_ENV: &str = "BU_BROWSER_NO_VIEWPORT";
 const BU_BROWSER_PERMISSIONS_ENV: &str = "BU_BROWSER_PERMISSIONS";
+const BU_BROWSER_STORAGE_STATE_ENV: &str = "BU_BROWSER_STORAGE_STATE";
 const BU_BROWSER_VIEWPORT_ENV: &str = "BU_BROWSER_VIEWPORT";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
@@ -2208,6 +2209,7 @@ impl BrowserSession {
         self.last_session_id = None;
         self.attach_first_page()?;
         self.apply_configured_browser_viewport();
+        self.apply_configured_browser_storage_state();
         self.apply_configured_browser_permissions();
         self.apply_configured_browser_downloads();
         Ok(())
@@ -2267,6 +2269,51 @@ impl BrowserSession {
             Err(error) => self.log(format!(
                 "failed to apply {BU_BROWSER_VIEWPORT_ENV}: {error:#}"
             )),
+        }
+    }
+
+    fn apply_configured_browser_storage_state(&mut self) {
+        let Ok(raw) = std::env::var(BU_BROWSER_STORAGE_STATE_ENV) else {
+            return;
+        };
+        let storage_state = match parse_browser_storage_state_env(&raw) {
+            Ok(storage_state) => storage_state,
+            Err(error) => {
+                self.log(format!(
+                    "failed to parse {BU_BROWSER_STORAGE_STATE_ENV}: {error:#}"
+                ));
+                return;
+            }
+        };
+        let Some(session_id) = self.current_session_id.clone() else {
+            self.log(format!(
+                "failed to apply {BU_BROWSER_STORAGE_STATE_ENV}: no attached page session"
+            ));
+            return;
+        };
+        if !storage_state.cookies.is_empty() {
+            match self.cdp(
+                "Storage.setCookies",
+                Some(&session_id),
+                json!({ "cookies": storage_state.cookies }),
+            ) {
+                Ok(_) => self.log(format!("applied {BU_BROWSER_STORAGE_STATE_ENV} cookies")),
+                Err(error) => self.log(format!(
+                    "failed to apply {BU_BROWSER_STORAGE_STATE_ENV} cookies: {error:#}"
+                )),
+            }
+        }
+        for source in storage_state.init_scripts {
+            match self.cdp(
+                "Page.addScriptToEvaluateOnNewDocument",
+                Some(&session_id),
+                json!({ "source": source, "runImmediately": true }),
+            ) {
+                Ok(_) => {}
+                Err(error) => self.log(format!(
+                    "failed to apply {BU_BROWSER_STORAGE_STATE_ENV} init script: {error:#}"
+                )),
+            }
         }
     }
 
@@ -3827,6 +3874,66 @@ fn browser_viewport_optional_positive_i64(value: &Value, key: &str) -> Result<Op
         bail!("{BU_BROWSER_VIEWPORT_ENV}.{key} must be a positive integer");
     };
     Ok(Some(number))
+}
+
+#[derive(Debug, Default)]
+struct ConfiguredStorageState {
+    cookies: Vec<Value>,
+    init_scripts: Vec<String>,
+}
+
+fn parse_browser_storage_state_env(raw: &str) -> Result<ConfiguredStorageState> {
+    let value = serde_json::from_str::<Value>(raw)
+        .with_context(|| format!("{BU_BROWSER_STORAGE_STATE_ENV} must be a JSON object"))?;
+    let mut storage_state = ConfiguredStorageState::default();
+    if let Some(cookies) = value.get("cookies").and_then(Value::as_array) {
+        storage_state.cookies = cookies.iter().filter_map(cookie_to_cdp_param).collect();
+    }
+    if let Some(origins) = value.get("origins").and_then(Value::as_array) {
+        for origin in origins {
+            let Some(origin_url) = origin.get("origin").and_then(Value::as_str) else {
+                continue;
+            };
+            storage_state.init_scripts.extend(storage_init_scripts(
+                origin_url,
+                "localStorage",
+                origin.get("localStorage"),
+            )?);
+            storage_state.init_scripts.extend(storage_init_scripts(
+                origin_url,
+                "sessionStorage",
+                origin.get("sessionStorage"),
+            )?);
+        }
+    }
+    Ok(storage_state)
+}
+
+fn storage_init_scripts(
+    origin: &str,
+    storage_name: &str,
+    items: Option<&Value>,
+) -> Result<Vec<String>> {
+    let Some(items) = items.and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let origin_json = serde_json::to_string(origin)?;
+    let storage_name_json = serde_json::to_string(storage_name)?;
+    let mut scripts = Vec::new();
+    for item in items {
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = item.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        let name_json = serde_json::to_string(name)?;
+        let value_json = serde_json::to_string(value)?;
+        scripts.push(format!(
+            "try {{ if (location.origin === {origin_json}) {{ window[{storage_name_json}].setItem({name_json}, {value_json}); }} }} catch (error) {{}}"
+        ));
+    }
+    Ok(scripts)
 }
 
 fn parse_browser_env_bool(name: &str, raw: &str) -> Result<bool> {
@@ -7155,6 +7262,44 @@ mod tests {
         ]);
 
         assert!(browser_viewport_params_from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn browser_storage_state_env_parses_cookies_and_storage_scripts() {
+        let storage_state = parse_browser_storage_state_env(
+            r#"{
+                "cookies": [
+                    {
+                        "name": "sid",
+                        "value": "secret",
+                        "domain": ".example.com",
+                        "path": "/",
+                        "secure": true,
+                        "httpOnly": true,
+                        "sameSite": "Lax"
+                    },
+                    {"name": "missing-domain", "value": "ignored"}
+                ],
+                "origins": [
+                    {
+                        "origin": "https://example.com",
+                        "localStorage": [{"name": "theme", "value": "dark"}],
+                        "sessionStorage": [{"name": "step", "value": "2"}]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(storage_state.cookies.len(), 1);
+        assert_eq!(storage_state.cookies[0]["name"], "sid");
+        assert_eq!(storage_state.cookies[0]["domain"], ".example.com");
+        assert_eq!(storage_state.init_scripts.len(), 2);
+        assert!(storage_state.init_scripts[0].contains("https://example.com"));
+        assert!(storage_state.init_scripts[0].contains("localStorage"));
+        assert!(storage_state.init_scripts[0].contains("theme"));
+        assert!(storage_state.init_scripts[1].contains("sessionStorage"));
+        assert!(storage_state.init_scripts[1].contains("step"));
     }
 
     #[test]
