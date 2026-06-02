@@ -8049,6 +8049,98 @@ print("semantic_scholar_citations ok")
     }
 
     #[test]
+    fn browser_script_semantic_scholar_references_returns_bibliography_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-semantic-scholar-references",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+seen = []
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    seen.append(url)
+    assert headers["Accept"] == "application/json"
+    if "/paper/search?" in url:
+        assert "query=Browser+Agent+Survey" in url, url
+        assert "abstract" in url, url
+        return json.dumps({
+            "data": [
+                {
+                    "paperId": "paperabc",
+                    "title": "Browser Agent Survey",
+                    "abstract": "A survey of browser agents.",
+                    "year": 2025,
+                    "venue": "SurveyConf",
+                    "citationCount": 99,
+                    "url": "https://www.semanticscholar.org/paper/paperabc",
+                    "authors": [{"authorId": "10", "name": "Survey Author"}],
+                }
+            ]
+        })
+    if "/paper/paperabc/references?" in url:
+        return json.dumps({
+            "data": [
+                {
+                    "citedPaper": {
+                        "paperId": f"ref{i}",
+                        "title": f"Reference Paper {i}",
+                        "abstract": f"Reference abstract {i}",
+                        "authors": [{"authorId": str(i), "name": f"Author {i}"}],
+                        "venue": "ACL",
+                        "year": 2024,
+                        "citationCount": i,
+                        "url": f"https://www.semanticscholar.org/paper/ref{i}",
+                        "openAccessPdf": {"url": f"https://example.test/ref{i}.pdf"},
+                    }
+                }
+                for i in range(1, 6)
+            ] + [
+                {
+                    "citedPaper": {
+                        "paperId": "oldref",
+                        "title": "Old Reference",
+                        "authors": [{"authorId": "9", "name": "Old Author"}],
+                        "venue": "OldConf",
+                        "year": 2022,
+                        "citationCount": 1,
+                    }
+                }
+            ]
+        })
+    raise AssertionError(url)
+
+result = semantic_scholar_references("Browser Agent Survey", year=2024, limit=10, search_limit=4)
+assert result["selected_paper"]["paper_id"] == "paperabc", result
+assert result["selected_paper"]["abstract"] == "A survey of browser agents.", result
+assert result["year_filter"] == 2024, result
+assert result["count"] == 5, result
+assert result["references"][0]["paper_id"] == "ref1", result
+assert result["references"][0]["abstract"] == "Reference abstract 1", result
+assert result["references"][0]["pdf_url"] == "https://example.test/ref1.pdf", result
+assert result["references"][4]["author_names"] == ["Author 5"], result
+assert result["fanout_recommended"] is True, result
+assert "bibliography/reference paper" in result["next_fanout_hint"], result
+assert len(result["fanout_tasks"]) == 5, result
+assert result["fanout_tasks"][0]["task_name"] == "ref_1", result
+assert result["fanout_tasks"][0]["url"] == "https://www.semanticscholar.org/paper/ref1", result
+assert "Reference abstract 1" in result["fanout_tasks"][0]["item_text"], result
+assert len(seen) == 2, seen
+print("semantic_scholar_references ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("semantic_scholar_references ok"));
+    }
+
+    #[test]
     fn browser_script_openreview_notes_normalizes_content_values() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

@@ -3659,6 +3659,176 @@ def semantic_scholar_citations(query_or_paper_id, year=None, limit=200, search_l
     }
 
 
+def semantic_scholar_references(query_or_paper_id, year=None, limit=200, search_limit=5, timeout=20.0):
+    """Search/fetch a Semantic Scholar paper and return normalized references.
+
+    Use for bibliography/reference cascade tasks after verifying Semantic Scholar
+    or the source paper in-browser. It returns cited-paper metadata, abstracts
+    when exposed by the API, and a child-agent manifest for larger reference
+    lists that still need per-paper follow-up.
+    """
+    target = str(query_or_paper_id or "").strip()
+    if not target:
+        raise ValueError("semantic_scholar_references requires a title, DOI:, CorpusID:, URL, or paperId")
+    limit_int = max(1, min(int(limit or 200), 1000))
+    search_limit_int = max(1, min(int(search_limit or 5), 20))
+    api_base = "https://api.semanticscholar.org/graph/v1"
+    paper_fields = "paperId,title,abstract,authors,venue,year,citationCount,externalIds,url,publicationVenue,publicationTypes,openAccessPdf"
+
+    def clean(value, max_chars=4000):
+        return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()[:max_chars]
+
+    def normalize_paper(paper):
+        if not isinstance(paper, dict):
+            paper = {}
+        authors = []
+        for author in paper.get("authors") or []:
+            if not isinstance(author, dict):
+                continue
+            name = clean(author.get("name"), 240)
+            if not name:
+                continue
+            authors.append({"author_id": str(author.get("authorId") or ""), "name": name})
+        open_access_pdf = paper.get("openAccessPdf") if isinstance(paper.get("openAccessPdf"), dict) else {}
+        publication_venue = paper.get("publicationVenue") if isinstance(paper.get("publicationVenue"), dict) else {}
+        paper_id = str(paper.get("paperId") or "")
+        url = str(paper.get("url") or "")
+        if not url and paper_id:
+            url = f"https://www.semanticscholar.org/paper/{paper_id}"
+        return {
+            "paper_id": paper_id,
+            "title": clean(paper.get("title"), 500),
+            "abstract": clean(paper.get("abstract"), 2500),
+            "authors": authors,
+            "author_names": [author["name"] for author in authors],
+            "venue": clean(paper.get("venue") or publication_venue.get("name"), 240),
+            "publication_venue": clean(publication_venue.get("name"), 240),
+            "year": paper.get("year"),
+            "citation_count": paper.get("citationCount"),
+            "url": url,
+            "pdf_url": str(open_access_pdf.get("url") or ""),
+            "external_ids": paper.get("externalIds") if isinstance(paper.get("externalIds"), dict) else {},
+            "publication_types": paper.get("publicationTypes") if isinstance(paper.get("publicationTypes"), list) else [],
+        }
+
+    def looks_like_paper_id(value):
+        return (
+            re.match(r"^[0-9a-f]{40}$", value, re.I)
+            or re.match(r"^(?:CorpusID|DOI|ARXIV|PMID|PMCID|MAG|ACL|URL):", value, re.I)
+            or value.startswith("https://")
+            or value.startswith("http://")
+        )
+
+    def api_json(url):
+        return json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+
+    search_results = []
+    if looks_like_paper_id(target):
+        paper_lookup_url = f"{api_base}/paper/{quote(target, safe=':/.')}?" + urlencode({"fields": paper_fields})
+        selected_paper = normalize_paper(api_json(paper_lookup_url))
+    else:
+        search_url = f"{api_base}/paper/search?" + urlencode({"query": target, "limit": search_limit_int, "fields": paper_fields})
+        search_payload = api_json(search_url)
+        search_results = [normalize_paper(item) for item in search_payload.get("data", []) if isinstance(item, dict)]
+        if not search_results:
+            return {
+                "query": target,
+                "selected_paper": {},
+                "search_results": [],
+                "count": 0,
+                "year_filter": year,
+                "references": [],
+                "fanout_recommended": False,
+                "fanout_tasks": [],
+                "diagnosis": "no_search_results",
+            }
+        lower_target = clean(target).lower()
+        selected_paper = max(
+            search_results,
+            key=lambda paper: (
+                100 if paper.get("title", "").lower() == lower_target else 0,
+                60 if lower_target and lower_target in paper.get("title", "").lower() else 0,
+                int(paper.get("citation_count") or 0),
+            ),
+        )
+
+    paper_id = selected_paper.get("paper_id")
+    if not paper_id:
+        return {
+            "query": target,
+            "selected_paper": selected_paper,
+            "search_results": search_results,
+            "count": 0,
+            "year_filter": year,
+            "references": [],
+            "fanout_recommended": False,
+            "fanout_tasks": [],
+            "diagnosis": "missing_paper_id",
+        }
+
+    references = []
+    seen_reference_keys = set()
+    offset = 0
+    page_size = min(100, limit_int)
+    reference_fields = "citedPaper." + paper_fields.replace(",", ",citedPaper.")
+    while len(references) < limit_int:
+        page_limit = min(page_size, limit_int - len(references))
+        url = f"{api_base}/paper/{quote(paper_id, safe='')}/references?" + urlencode(
+            {"offset": offset, "limit": page_limit, "fields": reference_fields}
+        )
+        payload = api_json(url)
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            paper = normalize_paper(row.get("citedPaper") if isinstance(row, dict) else {})
+            if year is not None and str(paper.get("year") or "") != str(year):
+                continue
+            if paper.get("paper_id") or paper.get("title"):
+                key = paper.get("paper_id") or paper.get("title")
+                if key in seen_reference_keys:
+                    continue
+                seen_reference_keys.add(key)
+                references.append(paper)
+                if len(references) >= limit_int:
+                    break
+        next_offset = payload.get("next") if isinstance(payload, dict) else None
+        if next_offset is None:
+            break
+        offset = int(next_offset)
+
+    actions = []
+    for paper in references:
+        text = " | ".join(
+            part
+            for part in [
+                paper.get("title") or "",
+                ", ".join(paper.get("author_names") or []),
+                str(paper.get("year") or ""),
+                paper.get("venue") or "",
+                paper.get("abstract") or "",
+            ]
+            if part
+        )
+        actions.append({"url": paper.get("url"), "text": text})
+    fanout_recommended = len(actions) >= 5
+    return {
+        "query": target,
+        "selected_paper": selected_paper,
+        "search_results": search_results,
+        "count": len(references),
+        "year_filter": year,
+        "references": references,
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": "Spawn one child agent per bibliography/reference paper, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+        "fanout_tasks": _fanout_tasks_from_actions("ref", actions, kind="bibliography/reference paper")
+        if fanout_recommended
+        else [],
+    }
+
+
 def _openreview_content_value(value):
     if isinstance(value, dict) and set(value.keys()) & {"value", "values"}:
         if "value" in value:

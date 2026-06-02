@@ -2481,6 +2481,7 @@ mod tests {
             "pdftotext",
             "arxiv_query",
             "semantic_scholar_citations",
+            "semantic_scholar_references",
             "arXiv",
             "wikidata_sparql",
             "wikidata_education_award_cascade",
