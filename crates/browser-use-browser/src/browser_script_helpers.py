@@ -1407,7 +1407,42 @@ def pricing_cards_snapshot(limit=50):
 """
     data = js(expression) or {}
     cards = data.get("cards") if isinstance(data, dict) else []
-    return {"count": len(cards or []), "cards": cards or []}
+    detail_actions = []
+    seen_hrefs = set()
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        card_text = card.get("text") or " ".join(card.get("headings") or [])
+        for link in card.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            href = link.get("href")
+            if not href or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            detail_actions.append(
+                {
+                    "text": card_text or link.get("text"),
+                    "href": href,
+                }
+            )
+            break
+    fanout_recommended = len(detail_actions) >= 5
+    fanout_tasks = (
+        _fanout_tasks_from_actions("price", detail_actions, kind="pricing/product card")
+        if fanout_recommended
+        else []
+    )
+    return {
+        "count": len(cards or []),
+        "cards": cards or [],
+        "detail_action_count": len(detail_actions),
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": "Spawn one child agent per pricing/product card, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+        "fanout_tasks": fanout_tasks,
+    }
 
 
 def rows_snapshot(limit=8):

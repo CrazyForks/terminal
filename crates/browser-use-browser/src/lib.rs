@@ -5827,6 +5827,9 @@ assert card["contracts"] == ["No binding"]
 assert card["offer_types"] == ["New customers"]
 assert card["links"][0]["href"].endswith("/dna-300")
 assert card["images"][0]["src"].endswith("/dna.png")
+assert snapshot["detail_action_count"] == 1
+assert snapshot["fanout_recommended"] is False
+assert snapshot["fanout_tasks"] == []
 assert len(calls) == 1
 print("pricing cards helpers ok")
 "##,
@@ -5836,6 +5839,52 @@ print("pricing cards helpers ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("pricing cards helpers ok"));
+    }
+
+    #[test]
+    fn browser_script_pricing_cards_snapshot_fans_out_linked_cards() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pricing-card-fanout",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    cards = []
+    for index in range(5):
+        cards.append({
+            "selector": f"article.product-card-{index}",
+            "tag": "article",
+            "score": 70 - index,
+            "text": f"UniFi product {index + 1} AUD ${199 + index}.00 in stock",
+            "headings": [f"UniFi product {index + 1}"],
+            "prices": [f"${199 + index}.00"],
+            "speeds": [],
+            "contracts": [],
+            "offer_types": [],
+            "links": [{"text": "View product", "href": f"https://store.example.test/products/{index + 1}"}],
+            "images": [],
+            "rect": {"x": 0, "y": index * 80, "width": 320, "height": 72, "in_viewport": True},
+        })
+    return {"count": len(cards), "cards": cards}
+
+snapshot = pricing_cards_snapshot()
+assert snapshot["count"] == 5, snapshot
+assert snapshot["detail_action_count"] == 5, snapshot
+assert snapshot["fanout_recommended"] is True, snapshot
+assert "pricing/product card" in snapshot["next_fanout_hint"], snapshot
+assert len(snapshot["fanout_tasks"]) == 5, snapshot
+assert snapshot["fanout_tasks"][0]["task_name"] == "price_1", snapshot
+assert snapshot["fanout_tasks"][4]["url"] == "https://store.example.test/products/5", snapshot
+assert "UniFi product 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
+print("pricing card fanout ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pricing card fanout ok"));
     }
 
     #[test]
