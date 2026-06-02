@@ -5721,14 +5721,14 @@ def js(expression, returnByValue=True):
     assert "fanoutTaskName" in expression
     assert "fanout_recommended" in expression
     assert "next_fanout_hint" in expression
-    assert "Use candidates[0].fanout_tasks" in expression
+    assert "Use fanout_tasks as the child manifest" in expression
     assert "task.spawn_message" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
         "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
         "fanout_recommended": True,
-        "next_fanout_hint": "Use candidates[0].fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent, then wait_agent and assemble the final answer.",
+        "next_fanout_hint": "Use fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent for one item/detail, then wait_agent and assemble the final answer.",
         "candidates": [
             {
                 "selector": "div.subscriptioncard",
@@ -5948,13 +5948,13 @@ def js(expression, returnByValue=True):
     assert "detail_actions" in expression
     assert "fanout_recommended" in expression
     assert "next_fanout_hint" in expression
-    assert "Spawn one child agent per row/file action" in expression
+    assert "task.spawn_message" in expression
     return {
         "recommended_action": "extract_grid_rows",
         "recommended_selector": "tbody tr",
         "next_extract_hint": "extract_grid_rows(selector=\"tbody tr\")",
         "fanout_recommended": True,
-        "next_fanout_hint": "Spawn one child agent per row/file action, then wait_agent and assemble the final answer.",
+        "next_fanout_hint": "Use fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent for one row/file action, then wait_agent and assemble the final answer.",
         "candidates": [{
             "selector": "tbody tr",
             "count": 6,

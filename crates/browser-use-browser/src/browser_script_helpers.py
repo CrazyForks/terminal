@@ -1308,9 +1308,7 @@ def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     data.setdefault("fanout_recommended", fanout_recommended)
     data.setdefault(
         "next_fanout_hint",
-        "Spawn one child agent per investor/report document, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        _fanout_hint("investor/report document") if fanout_recommended else None,
     )
     data.setdefault(
         "fanout_tasks",
@@ -1433,9 +1431,7 @@ def document_links_snapshot(limit=100, keywords=None):
         "documents": documents or [],
         "document_action_count": len(actions),
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per filing/document link, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("filing/document link") if fanout_recommended else None,
         "fanout_tasks": _fanout_tasks_from_actions("doc", actions, kind="filing/document link")
         if fanout_recommended
         else [],
@@ -2022,9 +2018,7 @@ def product_records_snapshot(limit=80, keywords=None):
         "products": products or [],
         "detail_action_count": len(actions),
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per product record, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("product record") if fanout_recommended else None,
         "fanout_tasks": _fanout_tasks_from_actions("product", actions, kind="product record")
         if fanout_recommended
         else [],
@@ -2067,6 +2061,13 @@ def _fanout_spawn_message(index, href, text, instruction):
         f"Handle only manifest item {index + 1}: {(text or '')[:220] or href}. "
         f"{instruction} Do not process sibling manifest items. If the page is blocked "
         "or incomplete, return a concise partial result with the blocker and source URL."
+    )
+
+
+def _fanout_hint(kind):
+    return (
+        f"Use fanout_tasks as the child manifest: pass each task.spawn_message to "
+        f"spawn_agent for one {kind}, then wait_agent and assemble the final answer."
     )
 
 
@@ -2227,7 +2228,7 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     recommended_selector: recommended ? recommended.selector : null,
     next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
     fanout_recommended: fanoutRecommended,
-    next_fanout_hint: fanoutRecommended ? 'Use candidates[0].fanout_tasks as the child manifest: pass each task.spawn_message to spawn_agent, then wait_agent and assemble the final answer.' : null,
+    next_fanout_hint: fanoutRecommended ? {_fanout_hint("item/detail")!r} : null,
     candidates: candidates.slice(0, limit),
   }};
 }})()
@@ -2465,9 +2466,7 @@ def pricing_cards_snapshot(limit=50):
         "cards": cards or [],
         "detail_action_count": len(detail_actions),
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per pricing/product card, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("pricing/product card") if fanout_recommended else None,
         "fanout_tasks": fanout_tasks,
     }
 
@@ -2483,7 +2482,7 @@ def rows_snapshot(limit=8):
  const clean=(t,m=260)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>60&&r.height>12&&s.display!=='none'&&s.visibility!=='hidden'}},fileRe=/(pdf|docx?|xlsx?|zip|download|file|filing|attachment|exhibit|transmittal)/i;
  const choices=['tbody tr','tr','[role="row"]','[data-rowindex]','[aria-rowindex]','[class*="row"]','[class*="record"]','[class*="result"]','li'];
  const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[],detail_actions=[];for(const r of rows.slice(0,10)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;for(const a of links){{if(a.href&&!detail_actions.some(x=>x.href===a.href))detail_actions.push({{text:clean([a.innerText||a.textContent||'',a.getAttribute('aria-label')||'',a.getAttribute('title')||''].filter(Boolean).join(' '),180),href:a.href,file_like:fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)}})}}samples.push(clean(r.innerText||r.textContent))}}const fanout_recommended=detail_actions.length>=5;return {{selector,count:rows.length,action_count,file_action_count,detail_action_count:detail_actions.length,detail_actions:detail_actions.slice(0,8),fanout_recommended,fanout_reason:fanout_recommended?`Found ${{detail_actions.length}} independent row/file actions across ${{rows.length}} row(s); spawn one helper per row/file instead of sequential document visits.`:'',score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
- const r=candidates[0]||null,fanoutRecommended=!!(r&&r.fanout_recommended);return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,fanout_recommended:fanoutRecommended,next_fanout_hint:fanoutRecommended?'Spawn one child agent per row/file action, then wait_agent and assemble the final answer.':null,candidates:candidates.slice(0,{int(limit)})}};
+ const r=candidates[0]||null,fanoutRecommended=!!(r&&r.fanout_recommended);return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,fanout_recommended:fanoutRecommended,next_fanout_hint:fanoutRecommended?{_fanout_hint("row/file action")!r}:null,candidates:candidates.slice(0,{int(limit)})}};
 }})()
 """
     data = js(expression) or {}
@@ -2532,9 +2531,7 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
         "selector": selector,
         "count": len(records or []),
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per row/file action, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("row/file action") if fanout_recommended else None,
         "detail_action_count": len(detail_actions),
         "detail_actions": detail_actions[:12],
         "fanout_tasks": fanout_tasks,
@@ -2658,9 +2655,7 @@ def extract_paginated_grid_rows(
         "detail_action_count": len(detail_actions),
         "detail_actions": detail_actions[:20],
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per row/file action, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("paginated row/file action") if fanout_recommended else None,
         "fanout_tasks": _fanout_tasks_from_actions("row", detail_actions, kind="paginated row/file action")
         if fanout_recommended
         else [],
@@ -4169,9 +4164,7 @@ def semantic_scholar_references(query_or_paper_id, year=None, limit=200, search_
         "year_filter": year,
         "references": references,
         "fanout_recommended": fanout_recommended,
-        "next_fanout_hint": "Spawn one child agent per bibliography/reference paper, then wait_agent and assemble the final answer."
-        if fanout_recommended
-        else None,
+        "next_fanout_hint": _fanout_hint("bibliography/reference paper") if fanout_recommended else None,
         "fanout_tasks": _fanout_tasks_from_actions("ref", actions, kind="bibliography/reference paper")
         if fanout_recommended
         else [],
