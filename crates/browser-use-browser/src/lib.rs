@@ -17,7 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -484,6 +483,18 @@ fn spawn_browser_script(
     let stream_path = artifact_dir
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
+    let helper_source_path = artifact_dir
+        .as_ref()
+        .join(format!(".{run_id}.helpers.py"));
+    let user_code_path = artifact_dir.as_ref().join(format!(".{run_id}.user.py"));
+    fs::write(&helper_source_path, BROWSER_SCRIPT_HELPERS).with_context(|| {
+        format!(
+            "write browser_script helper source {}",
+            helper_source_path.display()
+        )
+    })?;
+    fs::write(&user_code_path, code)
+        .with_context(|| format!("write browser_script user code {}", user_code_path.display()))?;
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -491,7 +502,8 @@ fn spawn_browser_script(
         &agent_workspace_dir,
         &domain_skill_roots,
         &stream_path,
-        code,
+        &helper_source_path,
+        &user_code_path,
     )?;
     let mut command = browser_script_python_command();
     let mut child = command
@@ -4262,10 +4274,9 @@ fn browser_script_prelude(
     agent_workspace_dir: &Path,
     domain_skill_roots: &[PathBuf],
     stream_path: &Path,
-    user_code: &str,
+    helper_source_path: &Path,
+    user_code_path: &Path,
 ) -> Result<String> {
-    let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
-    let encoded_helpers = general_purpose::STANDARD.encode(BROWSER_SCRIPT_HELPERS.as_bytes());
     let domain_skill_roots_json = serde_json::to_string(
         &domain_skill_roots
             .iter()
@@ -4281,12 +4292,14 @@ CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 STREAM_PATH = pathlib.Path({stream_path:?}).expanduser().resolve()
 AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
+HELPER_SOURCE_PATH = pathlib.Path({helper_source_path:?}).expanduser().resolve()
+USER_CODE_PATH = pathlib.Path({user_code_path:?}).expanduser().resolve()
 DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-__USER_CODE = base64.b64decode({encoded_code:?}).decode()
+__USER_CODE = USER_CODE_PATH.read_text(encoding="utf-8")
 
 def _stream_event(event):
     try:
@@ -4495,7 +4508,7 @@ def _bridge(payload):
     return response.get("result")
 
 def _load_browser_script_helpers():
-    source = base64.b64decode({encoded_helpers:?}).decode()
+    source = HELPER_SOURCE_PATH.read_text(encoding="utf-8")
     exec(compile(source, "<browser_script_helpers>", "exec"), globals())
 
 def _artifact_meta(path, kind="file", mime_type=None):
@@ -5232,6 +5245,33 @@ print(session_metadata()["outputs_dir"])
             assert!(
                 Path::new(artifact["path"].as_str().unwrap()).is_absolute(),
                 "artifact path should be absolute: {artifact}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_script_launches_large_user_source_without_argv_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let code = format!(
+            "{}\nprint('long source ok')\n",
+            "# browser_script large source padding\n".repeat(8_000)
+        );
+        let output = run_browser_script(
+            "script-large-source",
+            temp.path(),
+            temp.path().join("artifacts"),
+            &code,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("long source ok"));
+        for artifact in &output.artifacts {
+            let path = artifact["path"].as_str().unwrap_or_default();
+            assert!(
+                !path.contains(".helpers.py") && !path.contains(".user.py"),
+                "internal browser_script source files should not be collected as artifacts: {path}"
             );
         }
     }
