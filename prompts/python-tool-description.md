@@ -10,7 +10,7 @@ Do not import Playwright, Selenium, or Pyppeteer. Browser-harness workflow: firs
 
 When `rows_snapshot()`, `extract_grid_rows(...)`, or `repeated_items_snapshot()` returns `fanout_recommended: true`, use the returned `fanout_tasks` list as the child-agent manifest instead of inventing task names or continuing a serial parent-browser walk.
 
-For Wikipedia/Wikidata/Nobel/public-knowledge cascades, verify the user-named source page in the browser first, then use `wikidata_sparql(...)` for entity relationship lookups such as laureate -> PhD institution -> other Nobel graduates.
+For Wikipedia/Wikidata/Nobel/public-knowledge cascades, verify the user-named source page in the browser first, then use `wikidata_sparql(...)` for entity relationship lookups such as laureate -> PhD institution -> other Nobel graduates. Before deciding a site lacks a property/listing/document/investor/results route, call both `navigation_snapshot(keywords=[...])` and `sitemap_urls_snapshot(keywords=[...])`.
 
 To pass pixels directly to the next model turn, call raw `cdp("Page.captureScreenshot", format="png")`, `screenshot(label)`, `screenshot_clip(label, x, y, width, height)`, or `capture_screenshot(..., attach=True)`; use `emit_image(path)` for existing image files. Raw `Page.captureScreenshot` results are attached automatically. The user does not see attached pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for a screenshot. Multiple labeled screenshots are good when they form a temporal trace, not when they repeat the same unchanged page.
 

@@ -6008,6 +6008,51 @@ print("navigation_snapshot ok")
     }
 
     #[test]
+    fn browser_script_sitemap_urls_snapshot_discovers_public_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-sitemap-urls-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    if url == "https://www.hostgenius.ca/robots.txt":
+        return "User-agent: *\nSitemap: https://www.hostgenius.ca/sitemap_index.xml\n"
+    if url == "https://www.hostgenius.ca/sitemap.xml":
+        raise RuntimeError("missing")
+    if url == "https://www.hostgenius.ca/sitemap_index.xml":
+        return """<?xml version="1.0"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://www.hostgenius.ca/routes.xml</loc></sitemap>
+</sitemapindex>"""
+    if url == "https://www.hostgenius.ca/routes.xml":
+        return """<?xml version="1.0"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://www.hostgenius.ca/properties</loc><lastmod>2026-01-01</lastmod></url>
+  <url><loc>https://www.hostgenius.ca/vacation-rentals/calgary-loft</loc></url>
+  <url><loc>https://www.hostgenius.ca/about</loc></url>
+  <url><loc>https://www.hostgenius.ca/static/app.js</loc></url>
+</urlset>"""
+    raise AssertionError(url)
+
+snapshot = sitemap_urls_snapshot("https://www.hostgenius.ca", keywords=["properties", "rentals"], limit=10)
+assert snapshot["origin"] == "https://www.hostgenius.ca", snapshot
+assert "https://www.hostgenius.ca/sitemap_index.xml" in snapshot["sitemaps_checked"], snapshot
+assert snapshot["recommended"][0]["url"] == "https://www.hostgenius.ca/properties", snapshot
+assert snapshot["recommended"][0]["lastmod"] == "2026-01-01", snapshot
+assert snapshot["recommended"][1]["url"].endswith("/vacation-rentals/calgary-loft"), snapshot
+assert not any(item["url"].endswith("app.js") and item["score"] > 0 for item in snapshot["urls"])
+print("sitemap_urls_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("sitemap_urls_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

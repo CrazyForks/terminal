@@ -31,6 +31,7 @@ new_tab(url="about:blank")
 goto_url(url)
 page_info()
 navigation_snapshot(keywords=None, limit=80)
+sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitemaps=8, timeout=10.0)
 embedded_data_snapshot(limit=80, max_sources=12)
 network_resources_snapshot(limit=80, keywords=None)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
@@ -108,7 +109,7 @@ Usage guidance:
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
-- Before deciding a site lacks a property/listing/document/investor/results page or is not consumer/public-facing, call `navigation_snapshot(keywords=[...])`. It returns visible links plus collapsed menu/toggle controls with `aria-expanded`/`aria-controls`, stable selectors, keyword matches, relevance scores, and `surface_signals` for public listing/booking/document evidence. If it shows a collapsed menu/toggle control or `surface_signals.has_public_listing_or_booking_signal`, follow that evidence before giving up.
+- Before deciding a site lacks a property/listing/document/investor/results page or is not consumer/public-facing, call `navigation_snapshot(keywords=[...])` and `sitemap_urls_snapshot(keywords=[...])`. Navigation returns visible links plus collapsed menu/toggle controls; sitemap discovery returns public routes from robots.txt and XML sitemaps. If either shows likely listing/document/result routes or `surface_signals.has_public_listing_or_booking_signal`, follow that evidence before giving up.
 - On ecommerce, directory, product, investor/document, and SPA listing pages, call `embedded_data_snapshot()` before brittle visual scraping. It extracts bounded records from JSON-LD, `__NEXT_DATA__`, Nuxt payloads, JSON script tags, and product/document meta tags, including normalized names, URLs, images, prices, dates, brands, descriptions, and document links.
 - After navigation, search/filter actions, SPA route changes, or downloads, call `network_resources_snapshot(keywords=[...])` to discover XHR/API, document/download, pagination, form, and export URLs before manual page walking. Use promising URLs with `http_get_many(...)`, `browser_fetch_many(...)`, or `read_document_text(...)`.
 - For search-result tables, docket grids, comparison tables, or SPA row lists where row-scoped links/buttons matter, call `rows_snapshot()` and then `extract_grid_rows(selector=...)`. It returns header-labeled cells, description-like fields, row-scoped links/buttons, coordinates, and `file_actions` so filenames/download buttons stay associated with the correct row. If either helper returns `fanout_recommended: true`, use `fanout_tasks` as the child manifest and spawn one child agent per row/file action before opening row detail pages or filings in the parent.

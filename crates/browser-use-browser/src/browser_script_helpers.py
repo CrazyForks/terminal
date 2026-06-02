@@ -22,7 +22,7 @@ import tempfile
 import time as _time
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -934,6 +934,120 @@ def network_resources_snapshot(limit=80, keywords=None):
 }})()
 """
     return js(expression)
+
+
+def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitemaps=8, timeout=10.0):
+    """Discover public routes from robots.txt and XML sitemaps.
+
+    Use this before deciding a site lacks listings, products, documents,
+    investor pages, search/results pages, or other public route families.
+    """
+    source = str(url_or_domain or "")
+    if not source:
+        try:
+            info = page_info()
+            source = info.get("url") or ""
+        except Exception:
+            source = ""
+    if not source:
+        return {"origin": "", "count": 0, "recommended": [], "urls": [], "diagnosis": "no current URL or domain"}
+    parsed = urlparse(source if "://" in source else f"https://{source}")
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc or parsed.path}".rstrip("/")
+    terms = [str(term).lower() for term in (keywords or []) if str(term).strip()]
+    if not terms:
+        terms = [
+            "properties",
+            "property",
+            "rentals",
+            "listing",
+            "listings",
+            "products",
+            "catalog",
+            "tickets",
+            "investor",
+            "documents",
+            "reports",
+            "search",
+            "results",
+        ]
+
+    def absolute_url(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return urljoin(origin + "/", text)
+
+    def url_score(value):
+        lower = str(value or "").lower()
+        score = sum(10 for term in terms if term and term in lower)
+        if re.search(r"/(?:property|properties|rentals?|listings?|products?|catalog|tickets?|investors?|documents?|reports?|search|results?)(?:[/?#-]|$)", lower):
+            score += 12
+        if re.search(r"\.(?:jpg|jpeg|png|gif|webp|svg|css|js|ico|woff2?)($|[?#])", lower):
+            score -= 20
+        return score
+
+    sitemap_candidates = [f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"]
+    robots_url = f"{origin}/robots.txt"
+    try:
+        robots = str(http_get(robots_url, timeout=timeout))
+        for line in robots.splitlines():
+            if line.lower().startswith("sitemap:"):
+                sitemap_candidates.append(absolute_url(line.split(":", 1)[1].strip()))
+    except Exception:
+        pass
+
+    seen_sitemaps = set()
+    seen_urls = {}
+
+    def parse_sitemap(sitemap_url, depth=0):
+        if not sitemap_url or sitemap_url in seen_sitemaps or len(seen_sitemaps) >= int(max_sitemaps):
+            return
+        seen_sitemaps.add(sitemap_url)
+        try:
+            text = str(http_get(sitemap_url, timeout=timeout))
+        except Exception:
+            return
+        try:
+            root = ET.fromstring(text.encode("utf-8"))
+        except Exception:
+            for match in re.findall(r"https?://[^\s<>\"]+", text):
+                score = url_score(match)
+                seen_urls.setdefault(match, {"url": match, "score": score, "source": sitemap_url})
+            return
+        for loc in root.findall(".//{*}sitemap/{*}loc"):
+            child = absolute_url(loc.text)
+            if depth < 1:
+                parse_sitemap(child, depth + 1)
+        for url_node in root.findall(".//{*}url"):
+            loc = url_node.find("{*}loc")
+            route = absolute_url(loc.text if loc is not None else "")
+            if not route:
+                continue
+            lastmod = url_node.find("{*}lastmod")
+            score = url_score(route)
+            seen_urls.setdefault(
+                route,
+                {
+                    "url": route,
+                    "score": score,
+                    "source": sitemap_url,
+                    "lastmod": "" if lastmod is None or lastmod.text is None else lastmod.text.strip(),
+                },
+            )
+
+    for sitemap_url in sitemap_candidates:
+        parse_sitemap(sitemap_url)
+
+    routes = sorted(seen_urls.values(), key=lambda item: (-item.get("score", 0), item.get("url", "")))[: int(limit)]
+    recommended = [item for item in routes if item.get("score", 0) > 0][: min(12, int(limit))]
+    return {
+        "origin": origin,
+        "keywords": terms,
+        "sitemaps_checked": sorted(seen_sitemaps),
+        "count": len(routes),
+        "recommended": recommended,
+        "urls": routes,
+    }
 
 
 def _fanout_tasks_from_actions(prefix, actions, kind="item"):
