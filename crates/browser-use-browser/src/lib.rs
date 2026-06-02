@@ -33,6 +33,7 @@ const BU_BROWSER_DOWNLOADS_PATH_ENV: &str = "BU_BROWSER_DOWNLOADS_PATH";
 const BU_BROWSER_NO_VIEWPORT_ENV: &str = "BU_BROWSER_NO_VIEWPORT";
 const BU_BROWSER_PERMISSIONS_ENV: &str = "BU_BROWSER_PERMISSIONS";
 const BU_BROWSER_STORAGE_STATE_ENV: &str = "BU_BROWSER_STORAGE_STATE";
+const BU_BROWSER_USER_AGENT_ENV: &str = "BU_BROWSER_USER_AGENT";
 const BU_BROWSER_VIEWPORT_ENV: &str = "BU_BROWSER_VIEWPORT";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
@@ -2211,6 +2212,7 @@ impl BrowserSession {
         self.last_session_id = None;
         self.attach_first_page()?;
         self.apply_configured_browser_viewport();
+        self.apply_configured_browser_user_agent();
         self.apply_configured_browser_storage_state();
         self.apply_configured_browser_permissions();
         self.apply_configured_browser_downloads();
@@ -2270,6 +2272,24 @@ impl BrowserSession {
             Ok(_) => self.log(format!("applied {BU_BROWSER_VIEWPORT_ENV}")),
             Err(error) => self.log(format!(
                 "failed to apply {BU_BROWSER_VIEWPORT_ENV}: {error:#}"
+            )),
+        }
+    }
+
+    fn apply_configured_browser_user_agent(&mut self) {
+        let Some(params) = browser_user_agent_params_from_env() else {
+            return;
+        };
+        let Some(session_id) = self.current_session_id.clone() else {
+            self.log(format!(
+                "failed to apply {BU_BROWSER_USER_AGENT_ENV}: no attached page session"
+            ));
+            return;
+        };
+        match self.cdp("Network.setUserAgentOverride", Some(&session_id), params) {
+            Ok(_) => self.log(format!("applied {BU_BROWSER_USER_AGENT_ENV}")),
+            Err(error) => self.log(format!(
+                "failed to apply {BU_BROWSER_USER_AGENT_ENV}: {error:#}"
             )),
         }
     }
@@ -3933,6 +3953,15 @@ fn browser_viewport_optional_positive_i64(value: &Value, key: &str) -> Result<Op
         bail!("{BU_BROWSER_VIEWPORT_ENV}.{key} must be a positive integer");
     };
     Ok(Some(number))
+}
+
+fn browser_user_agent_params_from_env() -> Option<Value> {
+    let user_agent = std::env::var(BU_BROWSER_USER_AGENT_ENV).ok()?;
+    let user_agent = user_agent.trim();
+    if user_agent.is_empty() {
+        return None;
+    }
+    Some(json!({ "userAgent": user_agent }))
 }
 
 #[derive(Debug, Default)]
@@ -7367,6 +7396,15 @@ mod tests {
         assert!(storage_state.init_scripts[0].contains("theme"));
         assert!(storage_state.init_scripts[1].contains("sessionStorage"));
         assert!(storage_state.init_scripts[1].contains("step"));
+    }
+
+    #[test]
+    fn browser_user_agent_env_builds_override_params() {
+        let _env = EnvRestore::set(&[(BU_BROWSER_USER_AGENT_ENV, "BrowserUseTest/2.0")]);
+
+        let params = browser_user_agent_params_from_env().expect("user agent params");
+
+        assert_eq!(params, json!({ "userAgent": "BrowserUseTest/2.0" }));
     }
 
     #[test]
