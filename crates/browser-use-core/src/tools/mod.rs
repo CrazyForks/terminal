@@ -2470,6 +2470,8 @@ mod tests {
             "arXiv",
             "rows_snapshot",
             "extract_grid_rows",
+            "pagination_controls_snapshot",
+            "click_pagination",
             "file_actions",
             "form_fields_snapshot",
             "fill_form_field",

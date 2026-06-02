@@ -6232,6 +6232,75 @@ print("overlay helpers ok")
     }
 
     #[test]
+    fn browser_script_pagination_helpers_click_next_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pagination-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "load more" in expression
+    assert "rel" in expression
+    assert "getBoundingClientRect" in expression
+    assert "CSS.escape" in expression
+    if "needle=" in expression:
+        return {
+            "selector": "a[rel=\"next\"]",
+            "matched_text": "Next",
+            "score": 210,
+            "x": 742,
+            "y": 710,
+            "href": "https://example.test/page/2",
+            "rel": "next",
+        }
+    return {
+        "page_hint": "Page 1 of 7",
+        "controls": [
+            {
+                "selector": "a[rel=\"next\"]",
+                "tag": "a",
+                "text": "Next",
+                "href": "https://example.test/page/2",
+                "rel": "next",
+                "aria_current": None,
+                "aria_disabled": None,
+                "score": 210,
+                "rect": {"x": 700, "y": 690, "width": 84, "height": 40, "in_viewport": True},
+                "center": {"x": 742, "y": 710},
+            }
+        ],
+    }
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = pagination_controls_snapshot()
+assert snapshot["count"] == 1
+assert snapshot["page_hint"] == "Page 1 of 7"
+assert snapshot["controls"][0]["rel"] == "next"
+result = click_pagination("next", timeout=0)
+assert result["clicked"] is True
+assert result["selector"] == "a[rel=\"next\"]"
+assert result["href"].endswith("/page/2")
+assert clicked_points == [{"x": 742, "y": 710, "button": "left", "clicks": 1}]
+assert len(calls) == 2
+print("pagination helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pagination helpers ok"));
+    }
+
+    #[test]
     fn browser_script_form_control_helpers_toggle_labeled_controls() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

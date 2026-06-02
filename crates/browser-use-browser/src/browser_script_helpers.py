@@ -1636,6 +1636,46 @@ def dismiss_overlay(prefer="accept", timeout=1.0):
     return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def pagination_controls_snapshot(limit=20):
+    """Return likely pagination/load-more controls with text, state, and rects."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=220)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','rel','data-testid','data-test','name']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const text=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('rel'),e.id].filter(Boolean).join(' '));
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}};
+ const nodes=[...document.querySelectorAll('a[href],button,input[type=button],input[type=submit],[role=button],[aria-label],[title]')].filter(e=>!e.disabled&&visible(e)),out=[];
+ for(const e of nodes){{const t=text(e),hay=`${{t}} ${{e.className||''}} ${{e.getAttribute('aria-current')||''}}`.toLowerCase();let score=0;if(/\\b(next|more|load more|show more|older|forward|continue)\\b|›|»|>/.test(hay))score+=90;if(/\\b(prev|previous|back|newer)\\b/.test(hay))score+=40;if(/\\b(page|pagination|pager|results?)\\b/.test(hay))score+=25;if(e.getAttribute('rel')==='next')score+=120;if(e.getAttribute('aria-disabled')==='true'||e.getAttribute('disabled')!==null)score-=120;if(score>0){{const r=e.getBoundingClientRect();out.push({{selector:sel(e),tag:e.tagName.toLowerCase(),text:t,href:e.href||'',rel:e.getAttribute('rel')||'',aria_current:e.getAttribute('aria-current'),aria_disabled:e.getAttribute('aria-disabled'),score,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:true}},center:{{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}}}})}}}}
+ const pageText=clean(document.body.innerText||'',1200).match(/(?:page\\s+\\d+\\s+(?:of|\\/|from)\\s+\\d+|\\d+\\s*[-–]\\s*\\d+\\s+of\\s+\\d+|showing\\s+\\d+)/i);
+ return {{page_hint:pageText?pageText[0]:'',controls:out.sort((a,b)=>b.score-a.score).slice(0,{int(limit)})}};
+}})()
+"""
+    data = js(expression) or {}
+    controls = data.get("controls") if isinstance(data, dict) else data
+    return {"count": len(controls or []), "page_hint": (data or {}).get("page_hint", ""), "controls": controls or []}
+
+
+def click_pagination(label_or_text="next", timeout=2.0):
+    """Click a likely pagination/load-more control by text/preference."""
+    needle = str(label_or_text or "next").strip().lower()
+    expression = f"""
+(() => {{
+ const needle={json.dumps(needle)},clean=t=>(t||'').replace(/\\s+/g,' ').trim(),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','rel','data-testid','data-test','name']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const text=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('rel'),e.id].filter(Boolean).join(' '));
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}};
+ let best=null,bestScore=-1,bestText='';for(const e of document.querySelectorAll('a[href],button,input[type=button],input[type=submit],[role=button],[aria-label],[title]')){{if(e.disabled||!visible(e)||e.getAttribute('aria-disabled')==='true')continue;const t=text(e),hay=`${{t}} ${{e.className||''}} ${{e.getAttribute('rel')||''}}`.toLowerCase();let score=0;if(hay===needle||t.toLowerCase()===needle)score+=150;if(hay.includes(needle))score+=90;if(needle==='next'&&(/\\bnext\\b|›|»|>/.test(hay)||e.getAttribute('rel')==='next'))score+=120;if(/load more|show more|more results|older|forward|continue/.test(hay))score+=needle==='next'||needle.includes('more')?100:40;if(/\\bprev|previous|back\\b/.test(hay))score-=60;if(score>bestScore){{best=e;bestScore=score;bestText=t}}}}
+ if(!best||bestScore<=0)return null;const r=best.getBoundingClientRect();return {{selector:sel(best),matched_text:bestText,score:bestScore,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),href:best.href||'',rel:best.getAttribute('rel')||''}};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = pagination_controls_snapshot(limit=20)
+        raise RuntimeError(f"click_pagination: no likely pagination control matched {label_or_text!r}; controls={controls}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(float(timeout), 3.0))
+    return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "href": match.get("href", ""), "rel": match.get("rel", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
+
+
 def form_controls_snapshot(limit=30):
     """Return compact rendered checkboxes/radios/toggles with labels and state."""
     expression = f"""
