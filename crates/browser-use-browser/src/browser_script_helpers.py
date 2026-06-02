@@ -7,6 +7,7 @@ browser-harness semantics so the model sees one coherent browser API.
 
 import base64
 import gzip
+import ipaddress
 import json
 import math
 import os
@@ -28,6 +29,8 @@ def _send_meta(meta, **params):
 
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
+    if method == "Page.navigate" and "url" in params:
+        _ensure_ip_navigation_allowed(params.get("url"))
     return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
@@ -63,6 +66,31 @@ def _browser_network_idle_ms():
 
 def _browser_wait_between_actions_seconds():
     return _env_ms("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS", 0) / 1000
+
+
+def _browser_block_ip_addresses_enabled():
+    return _env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") is True
+
+
+def _ip_literal_host(url):
+    try:
+        value = str(url or "").strip()
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        host = parsed.hostname
+        if not host:
+            return None
+        ipaddress.ip_address(host.split("%", 1)[0])
+        return host
+    except Exception:
+        return None
+
+
+def _ensure_ip_navigation_allowed(url):
+    if _browser_block_ip_addresses_enabled():
+        host = _ip_literal_host(url)
+        if host:
+            raise RuntimeError(f"BrowserProfile.block_ip_addresses blocked IP address host: {host}")
+    return url
 
 
 def _after_browser_action_wait():
@@ -415,6 +443,7 @@ def last_domain_skills(include_content=False):
 
 def goto_url(url):
     global __last_domain_skills
+    url = _ensure_ip_navigation_allowed(url)
     result = cdp("Page.navigate", url=url)
     __last_domain_skills = []
     if _domain_skills_enabled():
@@ -926,6 +955,7 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
     fetch-use like browser-harness. Otherwise fall back to local urllib with a
     browser-like UA and gzip handling. Pass binary=True for bytes.
     """
+    _ensure_ip_navigation_allowed(url)
     if os.environ.get("BROWSER_USE_API_KEY"):
         try:
             from fetch_use import fetch_sync

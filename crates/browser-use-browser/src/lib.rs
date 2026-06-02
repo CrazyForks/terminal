@@ -7733,6 +7733,44 @@ emit_output({
     }
 
     #[test]
+    fn browser_script_helpers_block_ip_address_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[("BU_BROWSER_BLOCK_IP_ADDRESSES", "true")]);
+        let output = run_browser_script(
+            "script-block-ip-addresses-env",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+emit_output({
+    "domain": _ip_literal_host("https://example.com/path"),
+    "ipv4": _ip_literal_host("http://127.0.0.1:8080/path"),
+    "ipv6": _ip_literal_host("http://[::1]/"),
+}, label="hosts")
+
+try:
+    _ensure_ip_navigation_allowed("http://127.0.0.1/admin")
+except RuntimeError as exc:
+    emit_output(str(exc), label="blocked")
+else:
+    raise AssertionError("expected IP literal navigation to be blocked")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert_eq!(output.outputs.len(), 2, "{:?}", output.outputs);
+        let hosts = &output.outputs[0]["value"];
+        assert!(hosts["domain"].is_null());
+        assert_eq!(hosts["ipv4"], "127.0.0.1");
+        assert_eq!(hosts["ipv6"], "::1");
+        assert!(output.outputs[1]["value"]
+            .as_str()
+            .unwrap()
+            .contains("blocked IP address host: 127.0.0.1"));
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
