@@ -26,6 +26,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
 const BU_API: &str = "https://api.browser-use.com/api/v3";
+const BU_BROWSER_PERMISSIONS_ENV: &str = "BU_BROWSER_PERMISSIONS";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
@@ -2202,7 +2203,36 @@ impl BrowserSession {
         self.last_target_id = None;
         self.last_session_id = None;
         self.attach_first_page()?;
+        self.apply_configured_browser_permissions();
         Ok(())
+    }
+
+    fn apply_configured_browser_permissions(&mut self) {
+        let Ok(raw) = std::env::var(BU_BROWSER_PERMISSIONS_ENV) else {
+            return;
+        };
+        let permissions = match parse_browser_permissions_env(&raw) {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                self.log(format!(
+                    "failed to parse {BU_BROWSER_PERMISSIONS_ENV}: {error:#}"
+                ));
+                return;
+            }
+        };
+        if permissions.is_empty() {
+            return;
+        }
+        match self.cdp(
+            "Browser.grantPermissions",
+            None,
+            json!({ "permissions": permissions }),
+        ) {
+            Ok(_) => self.log(format!("applied {BU_BROWSER_PERMISSIONS_ENV}")),
+            Err(error) => self.log(format!(
+                "failed to apply {BU_BROWSER_PERMISSIONS_ENV}: {error:#}"
+            )),
+        }
     }
 
     fn reconnect_websocket(&mut self) -> Result<Value> {
@@ -3653,6 +3683,18 @@ fn dedupe_strings(values: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+fn parse_browser_permissions_env(raw: &str) -> Result<Vec<String>> {
+    let permissions = serde_json::from_str::<Vec<String>>(raw)
+        .with_context(|| format!("{BU_BROWSER_PERMISSIONS_ENV} must be a JSON string array"))?;
+    Ok(dedupe_strings(
+        permissions
+            .into_iter()
+            .map(|permission| permission.trim().to_string())
+            .filter(|permission| !permission.is_empty())
+            .collect(),
+    ))
 }
 
 fn playwright_chromium_candidates() -> Vec<PathBuf> {
@@ -6903,6 +6945,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn browser_permissions_env_parses_json_array() {
+        let permissions = parse_browser_permissions_env(
+            r#"["clipboardReadWrite","notifications"," clipboardReadWrite ",""]"#,
+        )
+        .unwrap();
+
+        assert_eq!(permissions, vec!["clipboardReadWrite", "notifications"]);
     }
 
     #[test]
