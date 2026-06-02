@@ -7771,6 +7771,65 @@ else:
     }
 
     #[test]
+    fn browser_script_helpers_enforce_domain_constraints_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[
+            (
+                "BU_BROWSER_ALLOWED_DOMAINS",
+                r#"["example.com","*.browser-use.com","chrome-extension://*"]"#,
+            ),
+            ("BU_BROWSER_PROHIBITED_DOMAINS", r#"["ads.example.com"]"#),
+        ]);
+        let output = run_browser_script(
+            "script-domain-constraints-env",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+emit_output({
+    "root": _browser_domain_constraints_allow_url("https://example.com/page"),
+    "www": _browser_domain_constraints_allow_url("https://www.example.com/page"),
+    "wildcard_root": _browser_domain_constraints_allow_url("https://browser-use.com/"),
+    "wildcard_subdomain": _browser_domain_constraints_allow_url("https://docs.browser-use.com/"),
+    "scheme_glob": _browser_domain_constraints_allow_url("chrome-extension://abc/options.html"),
+    "other": _browser_domain_constraints_allow_url("https://other.test/"),
+}, label="allowed")
+
+try:
+    _ensure_navigation_allowed("https://other.test/")
+except RuntimeError as exc:
+    emit_output(str(exc), label="allowed_blocked")
+else:
+    raise AssertionError("expected non-allowed domain to be blocked")
+
+os.environ.pop("BU_BROWSER_ALLOWED_DOMAINS", None)
+emit_output({
+    "ads": _browser_domain_constraints_allow_url("https://ads.example.com/"),
+    "clean": _browser_domain_constraints_allow_url("https://example.com/"),
+}, label="prohibited")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert_eq!(output.outputs.len(), 3, "{:?}", output.outputs);
+        let allowed = &output.outputs[0]["value"];
+        assert_eq!(allowed["root"], true);
+        assert_eq!(allowed["www"], true);
+        assert_eq!(allowed["wildcard_root"], true);
+        assert_eq!(allowed["wildcard_subdomain"], true);
+        assert_eq!(allowed["scheme_glob"], true);
+        assert_eq!(allowed["other"], false);
+        assert!(output.outputs[1]["value"]
+            .as_str()
+            .unwrap()
+            .contains("domain constraints blocked URL"));
+        let prohibited = &output.outputs[2]["value"];
+        assert_eq!(prohibited["ads"], false);
+        assert_eq!(prohibited["clean"], true);
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

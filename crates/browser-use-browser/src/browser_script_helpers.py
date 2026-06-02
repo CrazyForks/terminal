@@ -6,6 +6,7 @@ browser-harness semantics so the model sees one coherent browser API.
 """
 
 import base64
+import fnmatch
 import gzip
 import ipaddress
 import json
@@ -30,7 +31,7 @@ def _send_meta(meta, **params):
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
     if method == "Page.navigate" and "url" in params:
-        _ensure_ip_navigation_allowed(params.get("url"))
+        _ensure_navigation_allowed(params.get("url"))
     return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
@@ -72,6 +73,19 @@ def _browser_block_ip_addresses_enabled():
     return _env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") is True
 
 
+def _env_string_list(name):
+    raw = os.environ.get(name)
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
 def _ip_literal_host(url):
     try:
         value = str(url or "").strip()
@@ -90,6 +104,62 @@ def _ensure_ip_navigation_allowed(url):
         host = _ip_literal_host(url)
         if host:
             raise RuntimeError(f"BrowserProfile.block_ip_addresses blocked IP address host: {host}")
+    return url
+
+
+def _is_root_domain(domain):
+    return "*" not in domain and "://" not in domain and domain.count(".") == 1
+
+
+def _domain_pattern_matches(url, host, scheme, pattern):
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        return False
+    full_url_pattern = f"{scheme}://{host}"
+    if "*" in pattern:
+        if pattern.startswith("*."):
+            domain_part = pattern[2:].lower()
+            host_lower = host.lower()
+            return scheme in ("http", "https") and (host_lower == domain_part or host_lower.endswith("." + domain_part))
+        if pattern.endswith("/*") and url.startswith(pattern[:-1]):
+            return True
+        target = full_url_pattern if "://" in pattern else host
+        return fnmatch.fnmatch(target, pattern)
+    if "://" in pattern:
+        return url.startswith(pattern)
+    host_lower = host.lower()
+    pattern_lower = pattern.lower()
+    if host_lower == pattern_lower:
+        return True
+    return _is_root_domain(pattern) and host_lower == f"www.{pattern_lower}"
+
+
+def _browser_domain_constraints_allow_url(url):
+    allowed = _env_string_list("BU_BROWSER_ALLOWED_DOMAINS")
+    prohibited = _env_string_list("BU_BROWSER_PROHIBITED_DOMAINS")
+    if not allowed and not prohibited:
+        return True
+    value = str(url or "").strip()
+    if value in ("about:blank", "chrome://new-tab-page/", "chrome://new-tab-page", "chrome://newtab/"):
+        return True
+    try:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+    except Exception:
+        return False
+    if parsed.scheme in ("data", "blob"):
+        return True
+    host = parsed.hostname
+    if not host:
+        return False
+    if allowed:
+        return any(_domain_pattern_matches(value, host, parsed.scheme, pattern) for pattern in allowed)
+    return not any(_domain_pattern_matches(value, host, parsed.scheme, pattern) for pattern in prohibited)
+
+
+def _ensure_navigation_allowed(url):
+    _ensure_ip_navigation_allowed(url)
+    if not _browser_domain_constraints_allow_url(url):
+        raise RuntimeError(f"BrowserProfile domain constraints blocked URL: {url}")
     return url
 
 
@@ -443,7 +513,7 @@ def last_domain_skills(include_content=False):
 
 def goto_url(url):
     global __last_domain_skills
-    url = _ensure_ip_navigation_allowed(url)
+    url = _ensure_navigation_allowed(url)
     result = cdp("Page.navigate", url=url)
     __last_domain_skills = []
     if _domain_skills_enabled():
@@ -955,7 +1025,7 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
     fetch-use like browser-harness. Otherwise fall back to local urllib with a
     browser-like UA and gzip handling. Pass binary=True for bytes.
     """
-    _ensure_ip_navigation_allowed(url)
+    _ensure_navigation_allowed(url)
     if os.environ.get("BROWSER_USE_API_KEY"):
         try:
             from fetch_use import fetch_sync
