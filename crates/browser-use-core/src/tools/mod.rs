@@ -2483,6 +2483,7 @@ mod tests {
             "click_pagination",
             "click_pagination_until_stable",
             "result_count_snapshot",
+            "contact_details_snapshot",
             "file_actions",
             "form_fields_snapshot",
             "fill_form_field",

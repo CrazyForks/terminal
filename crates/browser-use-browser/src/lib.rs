@@ -6837,6 +6837,55 @@ print("result count helpers ok")
     }
 
     #[test]
+    fn browser_script_contact_details_snapshot_normalizes_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-contact-details-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "__CONTACT_DETAILS_SNAPSHOT__" in expression
+    assert "mailto:" in expression
+    assert "tel:" in expression
+    assert "application/ld+json" in expression
+    assert "contact_links" in expression
+    assert "social_links" in expression
+    return {
+        "emails": [{"email": "support@example.test", "source": "mailto", "context": "Support"}],
+        "phones": [{"phone": "+1 415 555 0101", "source": "tel", "context": "Call us"}],
+        "contact_links": [{"text": "Contact support", "href": "https://example.test/contact", "source": "contact_candidate"}],
+        "social_links": [{"text": "LinkedIn", "href": "https://linkedin.com/company/example", "source": "social"}],
+        "addresses": [{"address": "123 Market St, San Francisco, CA 94103", "source": "json_ld", "context": "Example Inc"}],
+        "jsonld_contacts": [{"type": "Organization", "name": "Example Inc", "email": "support@example.test", "telephone": "+1 415 555 0101", "url": "https://example.test", "address": {"streetAddress": "123 Market St"}}],
+        "sections": [{"text": "Contact us at support@example.test or +1 415 555 0101", "selector": "footer"}],
+        "counts": {"emails": 1, "phones": 1, "contact_links": 1, "social_links": 1, "addresses": 1, "jsonld_contacts": 1, "sections": 1},
+    }
+
+snapshot = contact_details_snapshot(limit=12)
+assert snapshot["counts"]["emails"] == 1
+assert snapshot["emails"][0]["email"] == "support@example.test"
+assert snapshot["phones"][0]["phone"].endswith("0101")
+assert snapshot["contact_links"][0]["href"].endswith("/contact")
+assert "linkedin.com" in snapshot["social_links"][0]["href"]
+assert snapshot["addresses"][0]["address"].startswith("123 Market")
+assert snapshot["jsonld_contacts"][0]["name"] == "Example Inc"
+assert snapshot["sections"][0]["selector"] == "footer"
+assert len(calls) == 1
+print("contact details helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("contact details helpers ok"));
+    }
+
+    #[test]
     fn browser_script_form_control_helpers_toggle_labeled_controls() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

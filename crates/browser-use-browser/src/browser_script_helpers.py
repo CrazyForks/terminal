@@ -2269,6 +2269,86 @@ def result_count_snapshot(limit=12):
     return {"count": len(candidates or []), "best": (data or {}).get("best"), "candidates": candidates or []}
 
 
+def contact_details_snapshot(limit=50):
+    """Return visible and structured contact details: emails, phones, links, addresses."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 50
+    limit_int = max(1, min(limit_int, 200))
+    expression = r"""
+(() => {
+ // __CONTACT_DETAILS_SNAPSHOT__
+ const limit=__LIMIT__;
+ const clean=(t,m=500)=>(t||'').replace(/\s+/g,' ').trim().slice(0,m);
+ const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};
+ const normEmail=e=>clean(String(e||'').replace(/^mailto:/i,'').replace(/\?.*$/,'').replace(/\s*\[at\]\s*/ig,'@').replace(/\s*\(at\)\s*/ig,'@').replace(/\s+at\s+/ig,'@').replace(/\s*\[dot\]\s*/ig,'.').replace(/\s*\(dot\)\s*/ig,'.').replace(/\s+dot\s+/ig,'.')).toLowerCase();
+ const normPhone=p=>clean(String(p||'').replace(/^tel:/i,'').replace(/[^\d+().\-\s extx]/ig,' ').replace(/\s+/g,' '),80);
+ const sel=e=>{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','data-testid','data-test','href']){const v=e.getAttribute(a);if(v)return `${e.tagName.toLowerCase()}[${a}="${CSS.escape(v)}"]`}return e.tagName.toLowerCase()};
+ const emails=[],phones=[],contactLinks=[],socialLinks=[],addresses=[],sections=[],jsonldContacts=[];
+ const seen={emails:new Set(),phones:new Set(),links:new Set(),social:new Set(),addresses:new Set(),sections:new Set()};
+ const addEmail=(email,source,context='')=>{email=normEmail(email);if(!email||!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>.]+$/.test(email)||seen.emails.has(email))return;seen.emails.add(email);emails.push({email,source,context:clean(context,260)})};
+ const addPhone=(phone,source,context='')=>{phone=normPhone(phone);const digits=(phone.match(/\d/g)||[]).length;if(!phone||digits<7||seen.phones.has(phone))return;seen.phones.add(phone);phones.push({phone,source,context:clean(context,260)})};
+ const addAddress=(address,source,context='')=>{address=clean(address,260);if(!address||address.length<8||seen.addresses.has(address))return;seen.addresses.add(address);addresses.push({address,source,context:clean(context,220)})};
+ const addLink=(arr,seenSet,link,source)=>{const href=link.href||link.getAttribute('href')||'',text=clean(link.innerText||link.getAttribute('aria-label')||link.getAttribute('title')||href,220),key=href+'|'+text;if(!href||seenSet.has(key))return;seenSet.add(key);const r=link.getBoundingClientRect();arr.push({text,href,source,selector:sel(link),rect:{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}})};
+ const text=clean(document.body&&document.body.innerText||'',50000);
+ const emailRe=/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig;
+ let m; while((m=emailRe.exec(text))) addEmail(m[0],'visible_text');
+ const obfuscatedRe=/[A-Z0-9._%+-]+\s*(?:\[at\]|\(at\)|\sat\s)\s*[A-Z0-9.-]+\s*(?:\[dot\]|\(dot\)|\sdot\s)\s*[A-Z]{2,}/ig;
+ while((m=obfuscatedRe.exec(text))) addEmail(m[0],'visible_text_obfuscated');
+ const phoneRe=/(?:\+?\d[\d().\-\s]{6,}\d)(?:\s*(?:ext|x)\s*\d{1,6})?/ig;
+ while((m=phoneRe.exec(text))) addPhone(m[0],'visible_text');
+ for(const a of document.querySelectorAll('a[href]')){
+   const href=a.getAttribute('href')||'',lower=href.toLowerCase(),label=clean(a.innerText||a.getAttribute('aria-label')||a.getAttribute('title')||href,240);
+   if(lower.startsWith('mailto:')) addEmail(href,'mailto',label);
+   if(lower.startsWith('tel:')) addPhone(href,'tel',label);
+   if(/contact|support|help|customer|service|about|team|staff|location|store|directory|provider/i.test(label+' '+href)) addLink(contactLinks,seen.links,a,'contact_candidate');
+   if(/linkedin|facebook|twitter|x\.com|instagram|youtube|github|tiktok|pinterest/i.test(href)) addLink(socialLinks,seen.social,a,'social');
+ }
+ const flatten=o=>Array.isArray(o)?o.flatMap(flatten):(o&&typeof o==='object'?[o,...Object.values(o).flatMap(flatten)]:[]);
+ for(const s of document.querySelectorAll('script[type="application/ld+json"]')){
+   try{
+     for(const o of flatten(JSON.parse(s.textContent||'{}'))){
+       if(!o||typeof o!=='object')continue;
+       const name=clean(o.name||o.legalName||o.givenName&&o.familyName&&`${o.givenName} ${o.familyName}`||'',180);
+       if(o.email)addEmail(o.email,'json_ld',name);
+       if(o.telephone)addPhone(o.telephone,'json_ld',name);
+       const addr=o.address;
+       if(addr&&typeof addr==='object')addAddress([addr.streetAddress,addr.addressLocality,addr.addressRegion,addr.postalCode,addr.addressCountry].filter(Boolean).join(', '),'json_ld',name);
+       if(o.url||o.email||o.telephone||addr)jsonldContacts.push({type:o['@type']||'',name,email:o.email||'',telephone:o.telephone||'',url:o.url||'',address:addr||null});
+     }
+   }catch(e){}
+ }
+ for(const e of document.querySelectorAll('address,[itemtype*=PostalAddress],[class*=contact i],[id*=contact i],[class*=location i],[id*=location i],[class*=address i],[id*=address i],footer')){
+   if(!visible(e))continue;
+   const t=clean(e.innerText||e.textContent||'',900);
+   if(!t)continue;
+   if(/@|phone|tel|email|contact|support|address|location|hours|\d{3,}[\s\w,.-]+(?:st|street|ave|avenue|rd|road|blvd|drive|dr|lane|ln|way|suite|ste)\b/i.test(t)){
+     const key=t.slice(0,260); if(!seen.sections.has(key)){seen.sections.add(key);sections.push({text:t,selector:sel(e)});}
+     if(/(?:st|street|ave|avenue|rd|road|blvd|drive|dr|lane|ln|way|suite|ste)\b/i.test(t))addAddress(t,'visible_section');
+   }
+ }
+ return {
+   emails:emails.slice(0,limit),
+   phones:phones.slice(0,limit),
+   contact_links:contactLinks.slice(0,limit),
+   social_links:socialLinks.slice(0,limit),
+   addresses:addresses.slice(0,limit),
+   jsonld_contacts:jsonldContacts.slice(0,limit),
+   sections:sections.slice(0,Math.min(limit,20)),
+   counts:{emails:emails.length,phones:phones.length,contact_links:contactLinks.length,social_links:socialLinks.length,addresses:addresses.length,jsonld_contacts:jsonldContacts.length,sections:sections.length}
+ };
+})()
+""".replace("__LIMIT__", str(limit_int))
+    data = js(expression) or {}
+    if not isinstance(data, dict):
+        return {"emails": [], "phones": [], "contact_links": [], "social_links": [], "addresses": [], "jsonld_contacts": [], "sections": [], "counts": {}, "raw": data}
+    for key in ["emails", "phones", "contact_links", "social_links", "addresses", "jsonld_contacts", "sections"]:
+        data.setdefault(key, [])
+    data.setdefault("counts", {key: len(data.get(key) or []) for key in ["emails", "phones", "contact_links", "social_links", "addresses", "jsonld_contacts", "sections"]})
+    return data
+
+
 def form_controls_snapshot(limit=30):
     """Return compact rendered checkboxes/radios/toggles with labels and state."""
     expression = f"""
