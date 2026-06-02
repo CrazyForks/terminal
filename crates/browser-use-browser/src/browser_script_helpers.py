@@ -2915,6 +2915,41 @@ def contact_details_snapshot(limit=50):
     return data
 
 
+def location_records_snapshot(limit=200, keywords=None):
+    """Return normalized visible/structured store, hospital, office, and directory location records."""
+    keyword_list = [str(k).lower() for k in (keywords or []) if str(k).strip()]
+    expression = f"""
+(() => {{
+ // __LOCATION_RECORDS_SNAPSHOT__
+ const limit={int(limit)},keywords={json.dumps(keyword_list)};
+ const clean=(s,n=500)=>String(s||'').replace(/\\s+/g,' ').trim().slice(0,n);
+ const abs=u=>{{try{{return new URL(u,location.href).href}}catch(e){{return ''}}}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}};
+ const stateRe=/\\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY|DC)\\b/;
+ const phoneRe=/(?:\\+?1[\\s.-]?)?\\(?\\d{{3}}\\)?[\\s.-]?\\d{{3}}[\\s.-]?\\d{{4}}/,zipRe=/\\b\\d{{5}}(?:-\\d{{4}})?\\b/;
+ const records=[],seen=new Set(),scoreText=t=>keywords.reduce((s,k)=>s+(t.toLowerCase().includes(k)?25:0),0);
+ const normAddr=a=>!a?'':typeof a==='string'?clean(a,300):typeof a==='object'?clean([a.streetAddress,a.addressLocality,a.addressRegion,a.postalCode,a.addressCountry].filter(Boolean).join(', '),300):'';
+ const add=rec=>{{const name=clean(rec.name,240),address=clean(rec.address,300),url=abs(rec.url||'');if(!name&&!address)return;const key=(name+'|'+address+'|'+url).toLowerCase();if(seen.has(key))return;seen.add(key);const text=clean([name,address,rec.phone,rec.hours,rec.kind,rec.source].join(' '),900),m=address.match(stateRe)||text.match(stateRe);records.push({{source:clean(rec.source||'',80),kind:clean(rec.kind||'',80),name,address,city:clean(rec.city||'',120),state:clean(rec.state||rec.region||(m?m[1]:''),40),postal_code:clean(rec.postal_code||'',40),country:clean(rec.country||'',80),phone:clean(rec.phone||'',80),url,hours:clean(rec.hours||'',500),text,score:(name?30:0)+(address?50:0)+(url?10:0)+(rec.phone?10:0)+scoreText(text)}})}};
+ const visit=o=>{{if(!o)return;if(Array.isArray(o)){{for(const x of o)visit(x);return}}if(typeof o!=='object')return;const type=Array.isArray(o['@type'])?o['@type'].join(' '):String(o['@type']||'');if(/LocalBusiness|Store|Hospital|VeterinaryCare|MedicalBusiness|Organization|Place|LodgingBusiness|Restaurant|AutoDealer/i.test(type)||o.address){{const a=o.address||{{}};add({{source:'json_ld',kind:type,name:o.name||o.legalName||'',address:normAddr(a),city:a.addressLocality||'',state:a.addressRegion||'',postal_code:a.postalCode||'',country:a.addressCountry||'',phone:o.telephone||o.phone||'',url:o.url||''}})}}for(const v of Object.values(o))if(v&&typeof v==='object')visit(v)}};
+ for(const s of document.querySelectorAll('script[type="application/ld+json"]')){{try{{visit(JSON.parse(s.textContent||''))}}catch(e){{}}}}
+ const selectors='article,li,section,[itemtype*="LocalBusiness"],[itemtype*="PostalAddress"],[itemtype*="Place"],[class*="store" i],[class*="location" i],[class*="hospital" i],[class*="clinic" i],[class*="directory" i],[data-testid*="store" i],[data-testid*="location" i]';
+ for(const e of [...document.querySelectorAll(selectors)].filter(visible).slice(0,limit*6)){{const text=clean(e.innerText||e.textContent||'',900);if(text.length<8)continue;const hay=(text+' '+(e.className||'')+' '+(e.id||'')+' '+(e.getAttribute('data-testid')||'')).toLowerCase();if(!/@|address|hours?|phone|tel|store|location|hospital|clinic|practice|\\d{{5}}|\\b[A-Z]{{2}}\\b/.test(text)&&!/store|location|hospital|clinic|practice|directory/.test(hay))continue;const link=e.querySelector('a[href]'),phone=(text.match(phoneRe)||[''])[0],lines=text.split(/\\n+/).map(x=>clean(x,180)).filter(Boolean);let name=clean(e.querySelector('h1,h2,h3,h4,[itemprop=name],[class*=name i],[class*=title i]')?.innerText||lines[0]||'',180),address='',addrEl=e.querySelector('address,[itemprop=address],[class*=address i]');if(addrEl)address=clean(addrEl.innerText||addrEl.textContent,300);if(!address){{const i=lines.findIndex(line=>zipRe.test(line)||stateRe.test(line));if(i>=0)address=clean(lines.slice(Math.max(0,i-2),i+1).join(', '),300)}}if(!address&&text.length<300&&/\\d{{2,}}/.test(text)&&stateRe.test(text))address=text;const hours=clean(lines.filter(line=>/\\b(mon|tue|wed|thu|fri|sat|sun|hours?|open|closed)\\b/i.test(line)).slice(0,7).join('; '),500);add({{source:'visible_dom',kind:'location_card',name,address,phone,url:link?link.href:'',hours}})}}
+ records.sort((a,b)=>b.score-a.score);
+ return {{url:location.href,title:document.title||'',count:records.length,records:records.slice(0,limit),keywords}};
+}})()
+"""
+    try:
+        data = js(expression) or {}
+    except Exception as exc:
+        return {"url": "", "title": "", "count": 0, "records": [], "keywords": keyword_list, "error": str(exc)}
+    if not isinstance(data, dict):
+        return {"url": "", "title": "", "count": 0, "records": [], "keywords": keyword_list, "raw": data}
+    data.setdefault("records", [])
+    data["count"] = len(data.get("records") or [])
+    data.setdefault("keywords", keyword_list)
+    return data
+
+
 def form_controls_snapshot(limit=30):
     """Return compact rendered checkboxes/radios/toggles with labels and state."""
     expression = f"""
