@@ -1428,6 +1428,169 @@ def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitem
     }
 
 
+def route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_scripts=12, timeout=10.0):
+    """Discover likely public routes from visible links, scripts, and route manifests.
+
+    Use after navigation/sitemap checks when an SPA may hide listings, booking,
+    products, documents, or search pages in JavaScript route strings.
+    """
+    source = str(url_or_domain or "")
+    if not source:
+        try:
+            info = page_info()
+            source = info.get("url") or ""
+        except Exception:
+            source = ""
+    if not source:
+        return {"origin": "", "count": 0, "recommended": [], "routes": [], "diagnosis": "no current URL or domain"}
+    parsed = urlparse(source if "://" in source else f"https://{source}")
+    host = parsed.netloc or parsed.path
+    origin = f"{parsed.scheme or 'https'}://{host}".rstrip("/")
+    terms = [str(term).lower() for term in (keywords or []) if str(term).strip()]
+    if not terms:
+        terms = [
+            "properties",
+            "property",
+            "rentals",
+            "vacation-rentals",
+            "listings",
+            "booking",
+            "availability",
+            "search",
+            "results",
+            "products",
+            "catalog",
+            "documents",
+            "reports",
+            "investor",
+        ]
+    limit_int = max(1, min(int(limit or 80), 300))
+    max_scripts_int = max(0, min(int(max_scripts or 12), 40))
+
+    def absolute_url(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return urljoin(origin + "/", text)
+
+    def score_url(value, evidence=""):
+        lower = f"{value} {evidence}".lower()
+        score = sum(10 for term in terms if term and term in lower)
+        if re.search(r"/(?:propert(?:y|ies)|rentals?|vacation-rentals?|listings?|booking|availability|search|results?|products?|catalog|documents?|reports?|investors?)(?:[/?#._-]|$)", lower):
+            score += 14
+        if re.search(r"\b(book now|reserve|check[- ]?in|guest|available homes?|short[- ]term|stays?)\b", lower):
+            score += 8
+        if re.search(r"\.(?:jpg|jpeg|png|gif|webp|svg|css|ico|woff2?|map)($|[?#])", lower):
+            score -= 30
+        if re.search(r"\.(?:js)($|[?#])", lower):
+            score -= 8
+        return score
+
+    route_re = re.compile(
+        r"""(?P<route>(?:https?://[^\s"'<>\\)]+|/(?!/)[A-Za-z0-9][A-Za-z0-9_./%#?=&:-]{1,220}))""",
+        re.I,
+    )
+    interesting_re = re.compile(
+        r"(propert(?:y|ies)|rentals?|vacation[-_ ]?rentals?|listings?|booking|availability|search|results?|products?|catalog|documents?|reports?|investors?)",
+        re.I,
+    )
+    seen = {}
+
+    def add_candidate(value, source_label, context=""):
+        text = str(value or "").strip()
+        if not text or not interesting_re.search(f"{text} {context}"):
+            return
+        url = absolute_url(text)
+        parsed_url = urlparse(url)
+        if parsed_url.netloc and parsed_url.netloc != urlparse(origin).netloc:
+            return
+        score = score_url(url, context)
+        if score <= 0:
+            return
+        key = url.split("#", 1)[0]
+        current = seen.get(key)
+        item = {
+            "url": url,
+            "score": score,
+            "source": source_label,
+            "keyword_matches": [term for term in terms if term and term in f"{url} {context}".lower()][:10],
+            "context": re.sub(r"\s+", " ", str(context or "")).strip()[:260],
+        }
+        if current is None or score > current.get("score", 0):
+            seen[key] = item
+
+    def scan_text(text, source_label):
+        body = str(text or "")
+        for match in route_re.finditer(body[:1_500_000]):
+            route = match.group("route")
+            start = max(0, match.start() - 120)
+            end = min(len(body), match.end() + 120)
+            add_candidate(route, source_label, body[start:end])
+
+    try:
+        dom = js(
+            """
+(() => {
+  const clean = (s, n = 1200) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
+  const attrs = [];
+  for (const el of [...document.querySelectorAll('a[href],link[href],script[src],form[action]')]) {
+    attrs.push({
+      tag: (el.tagName || '').toLowerCase(),
+      href: el.href || el.src || el.action || '',
+      rel: el.getAttribute('rel') || '',
+      type: el.getAttribute('type') || '',
+      text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || ''),
+    });
+  }
+  const inlineScripts = [...document.querySelectorAll('script:not([src])')]
+    .map((el, index) => ({source: `inline-script-${index + 1}`, text: clean(el.textContent || '', 20000)}))
+    .filter(item => item.text);
+  return {url: location.href, title: document.title || '', attrs, inlineScripts};
+})()
+"""
+        ) or {}
+    except Exception as exc:
+        dom = {"error": str(exc), "attrs": [], "inlineScripts": []}
+
+    script_urls = []
+    for attr in dom.get("attrs", []) if isinstance(dom, dict) else []:
+        if not isinstance(attr, dict):
+            continue
+        href = attr.get("href") or ""
+        context = " ".join(str(attr.get(key) or "") for key in ["tag", "rel", "type", "text"])
+        add_candidate(href, "dom-attribute", context)
+        if attr.get("tag") == "script" and href:
+            script_urls.append(absolute_url(href))
+    for script in dom.get("inlineScripts", []) if isinstance(dom, dict) else []:
+        if isinstance(script, dict):
+            scan_text(script.get("text") or "", script.get("source") or "inline-script")
+
+    fetched = []
+    for script_url in script_urls[:max_scripts_int]:
+        parsed_script = urlparse(script_url)
+        if parsed_script.netloc and parsed_script.netloc != urlparse(origin).netloc:
+            continue
+        try:
+            text = str(http_get(script_url, timeout=timeout))
+        except Exception:
+            continue
+        fetched.append(script_url)
+        scan_text(text, script_url)
+
+    routes = sorted(seen.values(), key=lambda item: (-item.get("score", 0), item.get("url", "")))[:limit_int]
+    recommended = [item for item in routes if item.get("score", 0) >= 10][: min(12, limit_int)]
+    return {
+        "origin": origin,
+        "url": dom.get("url") if isinstance(dom, dict) else source,
+        "title": dom.get("title", "") if isinstance(dom, dict) else "",
+        "keywords": terms,
+        "scripts_fetched": fetched,
+        "count": len(routes),
+        "recommended": recommended,
+        "routes": routes,
+    }
+
+
 def shopify_products_api(url_or_domain=None, limit=250, page_limit=20, timeout=12.0):
     """Fetch public Shopify storefront products from /products.json and normalize catalog records."""
     source = str(url_or_domain or "").strip()
