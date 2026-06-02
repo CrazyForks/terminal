@@ -8,15 +8,22 @@ browser-harness semantics so the model sees one coherent browser API.
 import base64
 import fnmatch
 import gzip
+import html
+import io
 import ipaddress
 import json
 import math
 import os
 import pathlib
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time as _time
 import urllib.error
 import urllib.request
+import zipfile
 from urllib.parse import urlparse
 
 
@@ -1406,3 +1413,144 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         raise RuntimeError(
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
         ) from exc
+
+
+def _document_source_bytes(source, headers=None, timeout=30.0, binary=None):
+    source_text = str(source or "")
+    parsed = urlparse(source_text)
+    if parsed.scheme in ("http", "https"):
+        body = http_get(source_text, headers=headers, timeout=timeout, binary=True if binary is None else binary)
+        data = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8", errors="replace")
+        return bytes(data), getattr(body, "url", source_text), dict(getattr(body, "headers", {}) or {})
+    path = pathlib.Path(source_text).expanduser()
+    data = path.read_bytes()
+    return data, str(path), {}
+
+
+def _guess_document_kind(source, headers, data):
+    content_type = ""
+    for key, value in (headers or {}).items():
+        if key.lower() == "content-type":
+            content_type = str(value).lower()
+            break
+    lower = str(source or "").split("?", 1)[0].lower()
+    head = bytes(data[:256])
+    if "pdf" in content_type or lower.endswith(".pdf") or head.startswith(b"%PDF"):
+        return "pdf"
+    if "wordprocessingml" in content_type or lower.endswith(".docx") or head.startswith(b"PK"):
+        return "docx"
+    if "html" in content_type or lower.endswith((".html", ".htm")) or b"<html" in head.lower():
+        return "html"
+    return "text"
+
+
+def _decode_text_bytes(data):
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _strip_html_text(text):
+    text = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return html.unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def _extract_docx_text(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = [name for name in archive.namelist() if name.startswith("word/") and name.endswith(".xml")]
+        chunks = []
+        for name in sorted(names):
+            if not (name == "word/document.xml" or name.startswith("word/header") or name.startswith("word/footer")):
+                continue
+            xml = archive.read(name).decode("utf-8", errors="replace")
+            xml = re.sub(r"<w:tab\b[^>]*/>", "\t", xml)
+            xml = re.sub(r"</w:p>", "\n", xml)
+            texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml, flags=re.S)
+            if texts:
+                chunks.append("".join(html.unescape(part) for part in texts))
+        return "\n".join(chunks)
+
+
+def _extract_pdf_text(data):
+    errors = []
+    for module_name in ("pypdf", "PyPDF2"):
+        try:
+            module = __import__(module_name)
+            reader = module.PdfReader(io.BytesIO(data))
+            pages = []
+            for page in getattr(reader, "pages", [])[:80]:
+                pages.append(page.extract_text() or "")
+            text = "\n".join(pages).strip()
+            if text:
+                return text, module_name
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
+    if shutil.which("pdftotext"):
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+            proc = subprocess.run(
+                ["pdftotext", "-layout", "-enc", "UTF-8", tmp_path, "-"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.decode("utf-8", errors="replace"), "pdftotext"
+            errors.append(f"pdftotext: {proc.stderr.decode('utf-8', errors='replace')[:200]}")
+        except Exception as exc:
+            errors.append(f"pdftotext: {exc}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+    strings = re.findall(rb"[\x09\x0a\x0d\x20-\x7e]{8,}", data)
+    text = "\n".join(chunk.decode("latin-1", errors="replace") for chunk in strings)
+    if text.strip():
+        return text, "pdf-byte-strings"
+    raise RuntimeError("could not extract PDF text; install pypdf/PyPDF2 or pdftotext. " + "; ".join(errors[:3]))
+
+
+def read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None):
+    """Fetch/read a document URL or local path and return bounded extracted text.
+
+    Handles text/HTML, DOCX, and PDF. For PDFs it tries pypdf/PyPDF2, then the
+    `pdftotext` binary, then a low-fidelity byte-string fallback. Use this for
+    FERC filings, investor PDFs, earnings documents, and downloaded files before
+    spending browser turns opening each document visually.
+    """
+    data, final_source, response_headers = _document_source_bytes(source, headers=headers, timeout=timeout, binary=binary)
+    kind = _guess_document_kind(final_source, response_headers, data)
+    extractor = kind
+    if kind == "pdf":
+        text, extractor = _extract_pdf_text(data)
+    elif kind == "docx":
+        text = _extract_docx_text(data)
+    elif kind == "html":
+        text = _strip_html_text(_decode_text_bytes(data))
+    else:
+        text = _decode_text_bytes(data)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+    truncated = len(text) > int(max_chars)
+    if truncated:
+        text = text[: int(max_chars)]
+    return {
+        "source": str(source),
+        "final_source": final_source,
+        "kind": kind,
+        "extractor": extractor,
+        "bytes": len(data),
+        "chars": len(text),
+        "truncated": truncated,
+        "text": text,
+    }

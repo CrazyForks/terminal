@@ -7976,6 +7976,63 @@ print("embedded_data_snapshot ok")
     }
 
     #[test]
+    fn browser_script_read_document_text_extracts_common_document_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-read-document-text",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import types
+
+text_path = pathlib.Path(outputs_dir()) / "report.txt"
+text_path.write_text("Revenue grew 12% year over year.", encoding="utf-8")
+text_doc = read_document_text(str(text_path))
+assert text_doc["kind"] == "text", text_doc
+assert "Revenue grew" in text_doc["text"], text_doc
+
+html_path = pathlib.Path(outputs_dir()) / "report.html"
+html_path.write_text("<html><body><h1>Investor Report</h1><script>ignore()</script><p>Net income was strong.</p></body></html>", encoding="utf-8")
+html_doc = read_document_text(str(html_path))
+assert html_doc["kind"] == "html", html_doc
+assert "Investor Report" in html_doc["text"] and "ignore" not in html_doc["text"], html_doc
+
+docx_path = pathlib.Path(outputs_dir()) / "filing.docx"
+with zipfile.ZipFile(docx_path, "w") as z:
+    z.writestr("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>Pipeline filing summary</w:t></w:r></w:p></w:body></w:document>")
+docx_doc = read_document_text(str(docx_path))
+assert docx_doc["kind"] == "docx", docx_doc
+assert "Pipeline filing summary" in docx_doc["text"], docx_doc
+
+class FakePage:
+    def extract_text(self):
+        return "FERC PDF summary text"
+
+class FakePdfReader:
+    def __init__(self, stream):
+        self.pages = [FakePage()]
+
+sys.modules["pypdf"] = types.SimpleNamespace(PdfReader=FakePdfReader)
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    return _HttpGetBytes(b"%PDF-1.4 fake", 200, {"Content-Type": "application/pdf"}, url)
+
+pdf_doc = read_document_text("https://example.test/filing.pdf")
+assert pdf_doc["kind"] == "pdf", pdf_doc
+assert pdf_doc["extractor"] == "pypdf", pdf_doc
+assert "FERC PDF summary text" in pdf_doc["text"], pdf_doc
+
+print("read_document_text ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("read_document_text ok"));
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
