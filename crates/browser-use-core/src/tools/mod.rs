@@ -2467,6 +2467,7 @@ mod tests {
             "domain_skills_for_url",
             "navigation_snapshot",
             "sitemap_urls_snapshot",
+            "shopify_products_api",
             "embedded_data_snapshot",
             "JSON-LD",
             "__NEXT_DATA__",

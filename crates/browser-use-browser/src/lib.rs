@@ -6317,6 +6317,77 @@ print("network_resources_snapshot ok")
     }
 
     #[test]
+    fn browser_script_shopify_products_api_normalizes_catalog_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-shopify-products-api",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+    def json(self):
+        return self.payload
+
+def page_info():
+    return {"url": "https://shop.example.test/collections/all"}
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    calls.append({"url": url, "headers": headers, "timeout": timeout})
+    assert headers["Accept"] == "application/json"
+    if "page=1" in url:
+        return FakeResponse({"products": [
+            {
+                "id": 101,
+                "title": "Canvas Tote",
+                "handle": "canvas-tote",
+                "vendor": "Acme",
+                "product_type": "Bags",
+                "tags": "cotton, tote",
+                "body_html": "<p>Heavy duty tote&nbsp;bag.</p>",
+                "published_at": "2026-01-01T00:00:00Z",
+                "variants": [
+                    {"id": 201, "title": "Natural", "sku": "TOTE-NAT", "available": True, "price": "29.00", "compare_at_price": "39.00", "option1": "Natural"},
+                    {"id": 202, "title": "Black", "sku": "TOTE-BLK", "available": False, "price": "31.00", "option1": "Black"},
+                ],
+                "images": [
+                    {"src": "//cdn.example.test/tote.jpg", "alt": "Canvas tote"},
+                    {"src": "/files/detail.jpg"},
+                ],
+            }
+        ]})
+    return FakeResponse({"products": []})
+
+snapshot = shopify_products_api(limit=10, page_limit=3, timeout=2.5)
+assert snapshot["origin"] == "https://shop.example.test", snapshot
+assert snapshot["count"] == 1, snapshot
+assert len(snapshot["attempted_urls"]) == 1, snapshot
+product = snapshot["products"][0]
+assert product["title"] == "Canvas Tote", product
+assert product["url"] == "https://shop.example.test/products/canvas-tote", product
+assert product["vendor"] == "Acme", product
+assert product["product_type"] == "Bags", product
+assert product["tags"] == ["cotton", "tote"], product
+assert product["body"] == "Heavy duty tote bag.", product
+assert product["prices"] == ["29.00", "31.00"], product
+assert product["variants"][0]["sku"] == "TOTE-NAT", product
+assert product["images"][0]["src"] == "https://cdn.example.test/tote.jpg", product
+assert product["images"][1]["src"] == "https://shop.example.test/files/detail.jpg", product
+assert calls[0]["timeout"] == 2.5, calls
+print("shopify_products_api ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("shopify_products_api ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");

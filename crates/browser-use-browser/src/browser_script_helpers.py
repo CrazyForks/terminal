@@ -1050,6 +1050,132 @@ def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitem
     }
 
 
+def shopify_products_api(url_or_domain=None, limit=250, page_limit=20, timeout=12.0):
+    """Fetch public Shopify storefront products from /products.json and normalize catalog records."""
+    source = str(url_or_domain or "").strip()
+    if not source:
+        try:
+            source = (page_info() or {}).get("url") or ""
+        except Exception:
+            source = ""
+    if not source:
+        return {"origin": "", "count": 0, "products": [], "attempted_urls": [], "diagnosis": "no current URL or domain"}
+    parsed = urlparse(source if "://" in source else f"https://{source}")
+    host = parsed.netloc or parsed.path
+    origin = f"{parsed.scheme or 'https'}://{host}".rstrip("/")
+    try:
+        limit_int = max(1, min(int(limit or 250), 1000))
+    except Exception:
+        limit_int = 250
+    try:
+        page_limit_int = max(1, min(int(page_limit or 20), 100))
+    except Exception:
+        page_limit_int = 20
+
+    def clean_text(value, max_chars=4000):
+        text = html.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
+        return re.sub(r"\s+", " ", text).strip()[:max_chars]
+
+    def product_url(product):
+        handle = str(product.get("handle") or "").strip()
+        url = product.get("url") or product.get("product_url") or ""
+        if url:
+            return urljoin(origin + "/", str(url))
+        return f"{origin}/products/{handle}" if handle else origin
+
+    def normalize_product(product):
+        variants = product.get("variants") if isinstance(product.get("variants"), list) else []
+        images = product.get("images") if isinstance(product.get("images"), list) else []
+        normalized_variants = []
+        prices = []
+        for variant in variants[:50]:
+            if not isinstance(variant, dict):
+                continue
+            price = variant.get("price")
+            if price not in (None, ""):
+                prices.append(str(price))
+            normalized_variants.append(
+                {
+                    "id": variant.get("id"),
+                    "title": clean_text(variant.get("title"), 300),
+                    "sku": clean_text(variant.get("sku"), 200),
+                    "available": variant.get("available"),
+                    "price": price,
+                    "compare_at_price": variant.get("compare_at_price"),
+                    "option1": variant.get("option1"),
+                    "option2": variant.get("option2"),
+                    "option3": variant.get("option3"),
+                }
+            )
+        normalized_images = []
+        for image in images[:30]:
+            if isinstance(image, dict):
+                src = image.get("src") or image.get("url")
+                alt = image.get("alt")
+            else:
+                src = image
+                alt = ""
+            if src:
+                normalized_images.append({"src": urljoin(origin + "/", str(src)), "alt": clean_text(alt, 200)})
+        tags = product.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        return {
+            "id": product.get("id"),
+            "title": clean_text(product.get("title"), 500),
+            "handle": clean_text(product.get("handle"), 240),
+            "url": product_url(product),
+            "vendor": clean_text(product.get("vendor"), 300),
+            "product_type": clean_text(product.get("product_type"), 300),
+            "tags": tags[:50] if isinstance(tags, list) else [],
+            "published_at": product.get("published_at"),
+            "created_at": product.get("created_at"),
+            "updated_at": product.get("updated_at"),
+            "body": clean_text(product.get("body_html") or product.get("body") or product.get("description"), 4000),
+            "prices": sorted(set(prices)),
+            "variants": normalized_variants,
+            "images": normalized_images,
+        }
+
+    attempted = []
+    products = []
+    seen = set()
+    diagnosis = ""
+    for page in range(1, page_limit_int + 1):
+        if len(products) >= limit_int:
+            break
+        url = f"{origin}/products.json?limit=250&page={page}"
+        attempted.append(url)
+        try:
+            payload = http_get(url, headers={"Accept": "application/json"}, timeout=timeout)
+            data = payload.json() if hasattr(payload, "json") else json.loads(str(payload))
+        except Exception as exc:
+            diagnosis = f"stopped after {len(products)} products: {exc}"
+            break
+        page_products = data.get("products") if isinstance(data, dict) else None
+        if not page_products:
+            break
+        for product in page_products:
+            if not isinstance(product, dict):
+                continue
+            key = product.get("id") or product.get("handle") or product.get("title")
+            if key in seen:
+                continue
+            seen.add(key)
+            products.append(normalize_product(product))
+            if len(products) >= limit_int:
+                break
+        if len(page_products) < 250:
+            break
+    return {
+        "origin": origin,
+        "count": len(products),
+        "products": products,
+        "attempted_urls": attempted,
+        "diagnosis": diagnosis,
+    }
+
+
 def _fanout_tasks_from_actions(prefix, actions, kind="item"):
     tasks = []
     for index, action in enumerate((actions or [])[:10]):
