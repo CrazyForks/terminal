@@ -825,6 +825,21 @@ fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> Str
         ),
         "managed-headless" => "browser connect managed --headless".to_string(),
         "managed-headed" => "browser connect managed --headed".to_string(),
+        "remote-cdp" => std::env::var("BU_CDP_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| {
+                let flag = if url.starts_with("ws://") || url.starts_with("wss://") {
+                    "--ws"
+                } else {
+                    "--url"
+                };
+                format!(
+                    "browser connect remote-cdp {flag} {}",
+                    shell_quote_browser_arg(&url)
+                )
+            })
+            .unwrap_or_else(|| "browser connect remote-cdp".to_string()),
         _ => "browser connect local".to_string(),
     }
 }
@@ -879,10 +894,7 @@ fn enforce_browser_command_matches_selected_mode(
                     };
                 enforce_selected_browser_mode(Some(selected_mode), requested_mode)
             }
-            Some("remote-cdp") => bail!(
-                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
-                browser_display_name(selected_mode),
-            ),
+            Some("remote-cdp") => enforce_selected_browser_mode(Some(selected_mode), "remote-cdp"),
             Some(other) => bail!("unknown browser connect mode: {other}"),
         },
         "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
@@ -940,6 +952,7 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
             "cloud" => "browser remote start",
             "managed-headless" => "browser connect managed --headless",
             "managed-headed" => "browser connect managed --headed",
+            "remote-cdp" => "browser connect remote-cdp",
             _ => "browser connect local",
         },
     }))
@@ -1064,6 +1077,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
         "cloud" | "browser-use-cloud" => Ok("cloud"),
         "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
         "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
+        "remote-cdp" | "cdp" => Ok("remote-cdp"),
         other => bail!("unknown browser preference mode: {other}"),
     }
 }
@@ -1073,6 +1087,7 @@ fn browser_display_name(mode: &str) -> &'static str {
         "cloud" => "Browser Use cloud",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
+        "remote-cdp" => "Remote CDP",
         _ => "Local Chrome",
     }
 }
@@ -1082,6 +1097,7 @@ fn display_browser_to_mode(display: &str) -> Option<&'static str> {
         "Browser Use cloud" => Some("cloud"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
+        "Remote CDP" => Some("remote-cdp"),
         "Local Chrome" => Some("local"),
         _ => None,
     }

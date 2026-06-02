@@ -319,6 +319,27 @@ async fn bare_browser_connect_resolves_to_selected_cloud_mode() {
 }
 
 #[tokio::test]
+async fn selected_remote_cdp_mode_allows_remote_cdp_connect() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("remote-cdp".to_string()));
+
+    let req = BrowserRequest::command(
+        "sess-1",
+        "browser connect remote-cdp --ws wss://browser.example/devtools/browser/1",
+    );
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser connect remote-cdp --ws wss://browser.example/devtools/browser/1".to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn selected_browser_mode_rejects_wrong_connection_family() {
     let backend = Arc::new(FakeBackend::default());
     let tool =
