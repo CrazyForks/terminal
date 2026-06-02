@@ -26,6 +26,8 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
 const BU_API: &str = "https://api.browser-use.com/api/v3";
+const BU_BROWSER_ACCEPT_DOWNLOADS_ENV: &str = "BU_BROWSER_ACCEPT_DOWNLOADS";
+const BU_BROWSER_DOWNLOADS_PATH_ENV: &str = "BU_BROWSER_DOWNLOADS_PATH";
 const BU_BROWSER_PERMISSIONS_ENV: &str = "BU_BROWSER_PERMISSIONS";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
@@ -2204,6 +2206,7 @@ impl BrowserSession {
         self.last_session_id = None;
         self.attach_first_page()?;
         self.apply_configured_browser_permissions();
+        self.apply_configured_browser_downloads();
         Ok(())
     }
 
@@ -2231,6 +2234,25 @@ impl BrowserSession {
             Ok(_) => self.log(format!("applied {BU_BROWSER_PERMISSIONS_ENV}")),
             Err(error) => self.log(format!(
                 "failed to apply {BU_BROWSER_PERMISSIONS_ENV}: {error:#}"
+            )),
+        }
+    }
+
+    fn apply_configured_browser_downloads(&mut self) {
+        let params = match browser_download_behavior_params_from_env() {
+            Ok(Some(params)) => params,
+            Ok(None) => return,
+            Err(error) => {
+                self.log(format!("failed to parse browser download env: {error:#}"));
+                return;
+            }
+        };
+        match self.cdp("Browser.setDownloadBehavior", None, params) {
+            Ok(_) => self.log(format!(
+                "applied {BU_BROWSER_ACCEPT_DOWNLOADS_ENV}/{BU_BROWSER_DOWNLOADS_PATH_ENV}"
+            )),
+            Err(error) => self.log(format!(
+                "failed to apply {BU_BROWSER_ACCEPT_DOWNLOADS_ENV}/{BU_BROWSER_DOWNLOADS_PATH_ENV}: {error:#}"
             )),
         }
     }
@@ -3695,6 +3717,39 @@ fn parse_browser_permissions_env(raw: &str) -> Result<Vec<String>> {
             .filter(|permission| !permission.is_empty())
             .collect(),
     ))
+}
+
+fn browser_download_behavior_params_from_env() -> Result<Option<Value>> {
+    let accept_downloads = match std::env::var(BU_BROWSER_ACCEPT_DOWNLOADS_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => Some(parse_browser_env_bool(
+            BU_BROWSER_ACCEPT_DOWNLOADS_ENV,
+            &raw,
+        )?),
+        _ => None,
+    };
+    let downloads_path = std::env::var_os(BU_BROWSER_DOWNLOADS_PATH_ENV)
+        .map(|value| value.to_string_lossy().trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if accept_downloads == Some(false) {
+        return Ok(Some(json!({ "behavior": "deny" })));
+    }
+    if let Some(downloads_path) = downloads_path {
+        return Ok(Some(json!({
+            "behavior": "allow",
+            "downloadPath": downloads_path,
+            "eventsEnabled": true,
+        })));
+    }
+    Ok(None)
+}
+
+fn parse_browser_env_bool(name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        value => bail!("{name} must be a boolean value, got {value:?}"),
+    }
 }
 
 fn playwright_chromium_candidates() -> Vec<PathBuf> {
@@ -6955,6 +7010,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(permissions, vec!["clipboardReadWrite", "notifications"]);
+    }
+
+    #[test]
+    fn browser_download_behavior_env_allows_downloads_path() {
+        let _env = EnvRestore::set(&[
+            (BU_BROWSER_ACCEPT_DOWNLOADS_ENV, "true"),
+            (BU_BROWSER_DOWNLOADS_PATH_ENV, "/tmp/browser-use-downloads"),
+        ]);
+
+        let params = browser_download_behavior_params_from_env()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(params["behavior"], "allow");
+        assert_eq!(params["downloadPath"], "/tmp/browser-use-downloads");
+        assert_eq!(params["eventsEnabled"], true);
+    }
+
+    #[test]
+    fn browser_download_behavior_env_denies_disabled_downloads() {
+        let _env = EnvRestore::set(&[
+            (BU_BROWSER_ACCEPT_DOWNLOADS_ENV, "false"),
+            (BU_BROWSER_DOWNLOADS_PATH_ENV, "/tmp/browser-use-downloads"),
+        ]);
+
+        let params = browser_download_behavior_params_from_env()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(params, json!({ "behavior": "deny" }));
     }
 
     #[test]
