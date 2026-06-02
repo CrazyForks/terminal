@@ -2480,6 +2480,7 @@ mod tests {
             "wikidata_sparql",
             "rows_snapshot",
             "extract_grid_rows",
+            "extract_paginated_grid_rows",
             "pagination_controls_snapshot",
             "click_pagination",
             "click_pagination_until_stable",
