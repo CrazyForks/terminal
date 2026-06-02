@@ -28,6 +28,7 @@ js(expression, returnByValue=True)
 new_tab(url="about:blank")
 goto_url(url)
 page_info()
+navigation_snapshot(keywords=None, limit=80)
 
 capture_screenshot(...)
 screenshot(label="screenshot", full=False)
@@ -68,6 +69,7 @@ last_domain_skills(include_content=False)
 Usage guidance:
 
 - First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab.
+- Use `navigation_snapshot(...)` before giving up on hidden routes, menus, listings, investor/report links, search/result pages, or document sections; it returns visible links and menu controls with selectors and relevance scores.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
