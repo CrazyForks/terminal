@@ -246,6 +246,28 @@ fn shared_store() -> (tempfile::TempDir, SharedStore, String) {
     (dir, Arc::new(Mutex::new(store)), session)
 }
 
+struct EnvVarRestore {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// Run a request directly through the runtime with a `SandboxType::None`
 /// attempt (no orchestrator).
 async fn run_direct(tool: &BrowserTool, req: &BrowserRequest) -> Result<ExecOutput, ToolError> {
@@ -315,6 +337,29 @@ async fn bare_browser_connect_resolves_to_selected_cloud_mode() {
     assert_eq!(
         backend.last(),
         LastCall::Command("browser remote start".to_string())
+    );
+}
+
+#[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_managed_mode_with_launch_args() {
+    let _env = EnvVarRestore::set(
+        "BU_MANAGED_BROWSER_ARGS",
+        r#"["--proxy-server=http://proxy:8080","--window-size=1440,900"]"#,
+    );
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("managed-headless".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser connect managed --headless --arg '--proxy-server=http://proxy:8080' --arg '--window-size=1440,900'"
+                .to_string()
+        )
     );
 }
 

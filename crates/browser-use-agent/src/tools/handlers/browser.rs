@@ -77,6 +77,7 @@ pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_conte
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
+const BU_MANAGED_BROWSER_ARGS_ENV: &str = "BU_MANAGED_BROWSER_ARGS";
 
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +394,8 @@ impl RealBackend {
             .map(|mode| match mode {
                 "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
                 "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
+                "managed" | "managed-headed" | "headed" => "managed-headed",
+                "remote-cdp" | "cdp" => "remote-cdp",
                 other => other,
             })
     }
@@ -459,13 +462,19 @@ impl RealBackend {
                 if connected && current_mode == Some("remote-cloud") {
                     return Ok(events);
                 }
-                "browser remote start"
+                "browser remote start".to_string()
             }
             "managed-headless" => {
                 if connected && current_mode == Some("managed") {
                     return Ok(events);
                 }
-                "browser connect managed --headless"
+                managed_browser_connect_command("--headless")
+            }
+            "managed-headed" => {
+                if connected && current_mode == Some("managed") {
+                    return Ok(events);
+                }
+                managed_browser_connect_command("--headed")
             }
             _ => return Ok(events),
         };
@@ -473,7 +482,7 @@ impl RealBackend {
             session_id,
             cwd,
             artifact_dir,
-            desired_command,
+            &desired_command,
         )?;
         events.append(&mut started.events);
         Ok(events)
@@ -823,8 +832,8 @@ fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> Str
                 )
             },
         ),
-        "managed-headless" => "browser connect managed --headless".to_string(),
-        "managed-headed" => "browser connect managed --headed".to_string(),
+        "managed-headless" => managed_browser_connect_command("--headless"),
+        "managed-headed" => managed_browser_connect_command("--headed"),
         "remote-cdp" => std::env::var("BU_CDP_URL")
             .ok()
             .filter(|url| !url.trim().is_empty())
@@ -842,6 +851,27 @@ fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> Str
             .unwrap_or_else(|| "browser connect remote-cdp".to_string()),
         _ => "browser connect local".to_string(),
     }
+}
+
+fn managed_browser_connect_command(headed_flag: &str) -> String {
+    format!(
+        "browser connect managed {headed_flag}{}",
+        managed_browser_arg_flags()
+    )
+}
+
+fn managed_browser_arg_flags() -> String {
+    let Ok(raw) = std::env::var(BU_MANAGED_BROWSER_ARGS_ENV) else {
+        return String::new();
+    };
+    let Ok(args) = serde_json::from_str::<Vec<String>>(&raw) else {
+        return String::new();
+    };
+    args.into_iter()
+        .filter(|arg| !arg.trim().is_empty())
+        .map(|arg| format!(" --arg {}", shell_quote_browser_arg(&arg)))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn enforce_selected_browser_mode(
@@ -948,13 +978,7 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
         "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
         "profile_id": profile_id,
         "domain_profiles": domain_profiles,
-        "connect_command": match normalize_browser_preference_mode(&mode)? {
-            "cloud" => "browser remote start",
-            "managed-headless" => "browser connect managed --headless",
-            "managed-headed" => "browser connect managed --headed",
-            "remote-cdp" => "browser connect remote-cdp",
-            _ => "browser connect local",
-        },
+        "connect_command": browser_connect_command_for_mode(&mode, profile_id.as_deref()),
     }))
 }
 
@@ -1056,8 +1080,8 @@ fn browser_profile_connect_next_step(mode: &str, profile_id: Option<&str>) -> St
                 )
             },
         ),
-        "managed-headless" => "browser connect managed --headless".to_string(),
-        "managed-headed" => "browser connect managed --headed".to_string(),
+        "managed-headless" => managed_browser_connect_command("--headless"),
+        "managed-headed" => managed_browser_connect_command("--headed"),
         _ => profile_id.map_or_else(
             || "browser connect local".to_string(),
             |profile_id| {
