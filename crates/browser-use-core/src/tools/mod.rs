@@ -2482,6 +2482,7 @@ mod tests {
             "semantic_scholar_citations",
             "arXiv",
             "wikidata_sparql",
+            "wikidata_education_award_cascade",
             "rows_snapshot",
             "extract_grid_rows",
             "extract_paginated_grid_rows",

@@ -3722,6 +3722,125 @@ def wikidata_sparql(query, timeout=20.0, limit=None):
     return {"count": len(rows), "variables": variables, "rows": rows}
 
 
+def wikidata_education_award_cascade(person_names, award_keywords=None, limit_per_person=50, timeout=20.0):
+    """Resolve people, then find other award winners educated at their institutions.
+
+    Use for public-knowledge cascades such as Nobel laureate -> PhD/education
+    institution -> other Nobel graduates. The helper resolves each input name
+    through Wikidata search, queries P69 education relationships, and returns
+    other people educated at the same institutions whose award labels match the
+    supplied keywords.
+    """
+    names = [str(name).strip() for name in (person_names or []) if str(name).strip()]
+    if not names:
+        raise ValueError("wikidata_education_award_cascade requires at least one person name")
+    keywords = [str(keyword).strip().lower() for keyword in (award_keywords or ["Nobel"]) if str(keyword).strip()]
+    if not keywords:
+        keywords = ["nobel"]
+
+    def search_entity(name):
+        url = "https://www.wikidata.org/w/api.php?" + urlencode(
+            {
+                "action": "wbsearchentities",
+                "format": "json",
+                "language": "en",
+                "type": "item",
+                "limit": 5,
+                "search": name,
+            }
+        )
+        payload = json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+        matches = []
+        for item in payload.get("search", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            entity_id = str(item.get("id") or "")
+            if not re.fullmatch(r"Q\d+", entity_id):
+                continue
+            label = str(item.get("label") or "")
+            description = str(item.get("description") or "")
+            score = 0
+            if label.lower() == name.lower():
+                score += 50
+            if "nobel" in description.lower() or "laureate" in description.lower() or "physicist" in description.lower():
+                score += 10
+            matches.append({"id": entity_id, "label": label, "description": description, "url": f"http://www.wikidata.org/entity/{entity_id}", "score": score})
+        matches.sort(key=lambda match: match.get("score", 0), reverse=True)
+        return matches
+
+    def cell_text(row, name):
+        value = row.get(f"{name}Label_text")
+        if value:
+            return value
+        cell = row.get(name)
+        return cell.get("value", "") if isinstance(cell, dict) else ""
+
+    people = []
+    records = []
+    unresolved = []
+    keyword_filter = " || ".join(
+        f"CONTAINS(LCASE(STR(?awardLabel)), {json.dumps(keyword)})" for keyword in keywords
+    )
+    for name in names:
+        matches = search_entity(name)
+        if not matches:
+            unresolved.append(name)
+            people.append({"name": name, "matches": [], "records": []})
+            continue
+        qid = matches[0]["id"]
+        query = f"""
+SELECT ?target ?targetLabel ?institution ?institutionLabel ?other ?otherLabel ?award ?awardLabel WHERE {{
+  VALUES ?target {{ wd:{qid} }}
+  ?target wdt:P69 ?institution .
+  ?other wdt:P69 ?institution .
+  ?other wdt:P166 ?award .
+  FILTER(?other != ?target)
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+  FILTER({keyword_filter})
+}}
+LIMIT {int(limit_per_person)}
+"""
+        result = wikidata_sparql(query, timeout=timeout)
+        person_records = []
+        seen = set()
+        for row in result.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            other = row.get("other") if isinstance(row.get("other"), dict) else {}
+            institution = row.get("institution") if isinstance(row.get("institution"), dict) else {}
+            award = row.get("award") if isinstance(row.get("award"), dict) else {}
+            key = (other.get("id") or other.get("value"), institution.get("id") or institution.get("value"), award.get("id") or award.get("value"))
+            if key in seen:
+                continue
+            seen.add(key)
+            record = {
+                "source_name": name,
+                "source_qid": qid,
+                "source_label": matches[0].get("label", ""),
+                "institution": cell_text(row, "institution"),
+                "institution_qid": institution.get("id", ""),
+                "institution_url": institution.get("url", institution.get("value", "")),
+                "other_person": cell_text(row, "other"),
+                "other_person_qid": other.get("id", ""),
+                "other_person_url": other.get("url", other.get("value", "")),
+                "award": cell_text(row, "award"),
+                "award_qid": award.get("id", ""),
+                "award_url": award.get("url", award.get("value", "")),
+            }
+            person_records.append(record)
+            records.append(record)
+        people.append({"name": name, "matches": matches, "selected_qid": qid, "records": person_records})
+
+    return {
+        "count": len(records),
+        "people_count": len(people),
+        "award_keywords": keywords,
+        "unresolved": unresolved,
+        "people": people,
+        "records": records,
+    }
+
+
 def _document_source_bytes(source, headers=None, timeout=30.0, binary=None):
     source_text = str(source or "")
     parsed = urlparse(source_text)
