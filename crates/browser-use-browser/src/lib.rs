@@ -8421,6 +8421,79 @@ print("browser_fetch ok")
     }
 
     #[test]
+    fn browser_script_browser_fetch_many_preserves_order_errors_and_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-browser-fetch-many-helper",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+checked = []
+calls = []
+
+def _ensure_navigation_allowed(url):
+    checked.append(url)
+    if "blocked" in url:
+        raise RuntimeError("blocked domain")
+
+def js(expression, target_id=None, returnByValue=True):
+    calls.append(expression)
+    assert "const items =" in expression
+    assert "fetch(url, {...requestInit, signal: controller.signal})" in expression
+    assert "credentials: 'include'" in expression
+    assert "Promise.all(workers)" in expression
+    assert "results[slot]" in expression
+    assert "return {index, url, ok: false, error:" in expression
+    assert "blocked.test" not in expression
+    if "const binary = true" in expression:
+        assert '"/asset.bin"' in expression, expression
+        return [{
+            "index": 0,
+            "url": "/asset.bin",
+            "ok": True,
+            "status_code": 206,
+            "content_base64": base64.b64encode(bytes([0, 159, 255])).decode("ascii"),
+        }]
+    assert '"index": 0' in expression and '"index": 2' in expression, expression
+    assert '"/api/a"' in expression and '"/api/b"' in expression, expression
+    assert '"X-Test": "yes"' in expression, expression
+    assert "Number(2)" in expression, expression
+    assert "timeoutMs = 1500" in expression, expression
+    return [
+        {"index": 2, "url": "/api/b", "ok": True, "status_code": 200, "json": {"item": "b"}},
+        {"index": 0, "url": "/api/a", "ok": True, "status_code": 200, "json": {"item": "a"}},
+    ]
+
+rows = browser_fetch_many(
+    ["/api/a", "https://blocked.test/api", "/api/b"],
+    headers={"X-Test": "yes"},
+    timeout=1.5,
+    max_concurrent=2,
+)
+assert [row["index"] for row in rows] == [0, 1, 2], rows
+assert rows[0]["json"]["item"] == "a", rows
+assert rows[1]["ok"] is False and "blocked domain" in rows[1]["error"], rows
+assert rows[2]["json"]["item"] == "b", rows
+assert checked == ["https://blocked.test/api"], checked
+
+binary_rows = browser_fetch_many(["/asset.bin"], binary=True)
+assert binary_rows[0]["status_code"] == 206, binary_rows
+assert binary_rows[0]["content_base64"] == base64.b64encode(bytes([0, 159, 255])).decode("ascii"), binary_rows
+
+only_errors = browser_fetch_many(["https://blocked.test/again"])
+assert only_errors[0]["ok"] is False and "blocked domain" in only_errors[0]["error"], only_errors
+assert len(calls) == 2, calls
+print("browser_fetch_many ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("browser_fetch_many ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");

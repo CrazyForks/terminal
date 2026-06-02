@@ -450,6 +450,97 @@ def browser_fetch(url, headers=None, method="GET", body=None, timeout=20.0, bina
     return js(expression)
 
 
+def browser_fetch_many(urls, headers=None, method="GET", body=None, timeout=20.0, binary=False, max_concurrent=8):
+    """Fetch many URLs from the current page context with browser credentials."""
+    urls = list(urls or [])
+    fetch_items = []
+    precomputed = {}
+    for index, url in enumerate(urls):
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme in ("http", "https"):
+            try:
+                _ensure_navigation_allowed(url)
+            except Exception as exc:
+                precomputed[index] = {"index": index, "url": url, "ok": False, "error": str(exc)}
+                continue
+        fetch_items.append({"index": index, "url": url})
+    if not fetch_items:
+        return [precomputed.get(index) for index in range(len(urls))]
+
+    expression = f"""
+(async () => {{
+  const items = {json.dumps(fetch_items)};
+  const maxConcurrent = Math.max(1, Math.min(Number({int(max_concurrent or 1)}) || 1, 16));
+  const requestInit = {{
+    method: {json.dumps(method)},
+    headers: {json.dumps(headers or {})},
+    body: {json.dumps(body) if body is not None else "undefined"},
+    credentials: 'include',
+  }};
+  const timeoutMs = {int(float(timeout) * 1000)};
+  const binary = {json.dumps(bool(binary))};
+  const encodeBytes = (bytes) => {{
+    let raw = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {{
+      raw += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }}
+    return btoa(raw);
+  }};
+  const fetchOne = async (item) => {{
+    const index = item.index;
+    const url = item.url;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      const response = await fetch(url, {{...requestInit, signal: controller.signal}});
+      const responseHeaders = Object.fromEntries(Array.from(response.headers.entries()));
+      const out = {{
+        index,
+        url,
+        final_url: response.url,
+        ok: response.ok,
+        status_code: response.status,
+        status: response.status,
+        status_text: response.statusText,
+        headers: responseHeaders,
+      }};
+      if (binary) {{
+        out.content_base64 = encodeBytes(new Uint8Array(await response.arrayBuffer()));
+      }} else {{
+        out.text = await response.text();
+        if ((responseHeaders['content-type'] || '').toLowerCase().includes('json')) {{
+          try {{ out.json = JSON.parse(out.text); }} catch (err) {{}}
+        }}
+      }}
+      return out;
+    }} catch (err) {{
+      return {{index, url, ok: false, error: String(err && (err.message || err))}};
+    }} finally {{
+      clearTimeout(timeoutId);
+    }}
+  }};
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({{length: Math.min(maxConcurrent, items.length)}}, async () => {{
+    while (next < items.length) {{
+      const slot = next++;
+      results[slot] = await fetchOne(items[slot]);
+    }}
+  }});
+  await Promise.all(workers);
+  return results;
+}})()
+"""
+    fetched = js(expression)
+    results = [precomputed.get(index) for index in range(len(urls))]
+    for record in fetched or []:
+        if isinstance(record, dict):
+            index = record.get("index")
+            if isinstance(index, int) and 0 <= index < len(results):
+                results[index] = record
+    return results
+
+
 def _truthy_env(name, default=False):
     value = os.environ.get(name)
     if value is None:
