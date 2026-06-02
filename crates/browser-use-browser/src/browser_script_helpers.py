@@ -1215,8 +1215,8 @@ def rows_snapshot(limit=8):
 (() => {{
  const clean=(t,m=260)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>60&&r.height>12&&s.display!=='none'&&s.visibility!=='hidden'}},fileRe=/(pdf|docx?|xlsx?|zip|download|file|filing|attachment|exhibit|transmittal)/i;
  const choices=['tbody tr','tr','[role="row"]','[data-rowindex]','[aria-rowindex]','[class*="row"]','[class*="record"]','[class*="result"]','li'];
- const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[];for(const r of rows.slice(0,8)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;samples.push(clean(r.innerText||r.textContent))}}return {{selector,count:rows.length,action_count,file_action_count,score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
- const r=candidates[0]||null;return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,candidates:candidates.slice(0,{int(limit)})}};
+ const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[],detail_actions=[];for(const r of rows.slice(0,10)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;for(const a of links){{if(a.href&&!detail_actions.some(x=>x.href===a.href))detail_actions.push({{text:clean([a.innerText||a.textContent||'',a.getAttribute('aria-label')||'',a.getAttribute('title')||''].filter(Boolean).join(' '),180),href:a.href,file_like:fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)}})}}samples.push(clean(r.innerText||r.textContent))}}const fanout_recommended=rows.length>=5&&detail_actions.length>=5;return {{selector,count:rows.length,action_count,file_action_count,detail_action_count:detail_actions.length,detail_actions:detail_actions.slice(0,8),fanout_recommended,fanout_reason:fanout_recommended?`Found ${{Math.min(rows.length,detail_actions.length)}} independent row actions; spawn one helper per row/file instead of sequential row visits.`:'',score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
+ const r=candidates[0]||null,fanoutRecommended=!!(r&&r.fanout_recommended);return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,fanout_recommended:fanoutRecommended,next_fanout_hint:fanoutRecommended?'Spawn one child agent per row/file action, then wait_agent and assemble the final answer.':null,candidates:candidates.slice(0,{int(limit)})}};
 }})()
 """
     return js(expression)
@@ -1237,8 +1237,39 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
  return [...document.querySelectorAll(selector)].slice(0,limit).map((row,index)=>{{const heads=[...(row.closest('table')?.querySelectorAll('thead th,thead td')||[])].map(h=>clean(h.textContent,120)),raw=[...row.querySelectorAll(':scope>td,:scope>th,:scope>[role="cell"],:scope>[role="gridcell"],:scope>[data-label]')];const kids=raw.length?raw:[...row.children].slice(0,20),cells=kids.map((c,i)=>{{const header=clean(c.getAttribute('data-label')||c.getAttribute('aria-label')||heads[i]||'',160);return {{index:i,header,headers:header?[header]:[],text:clean(c.innerText||c.textContent,900),links:[...c.querySelectorAll('a[href]')].slice(0,6).map(link),buttons:[...c.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,6).map(button)}}}}).filter(c=>c.text||c.header||c.links.length||c.buttons.length),links=[...row.querySelectorAll('a[href]')].slice(0,16).map(link),buttons=[...row.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,16).map(button),file_actions=links.filter(l=>l.file_like),description_fields=cells.filter(c=>/(description|title|subject|name|document|file|requirement|summary)/i.test(c.header)).map(c=>({{header:c.header,text:c.text}})).slice(0,8),rec={{index,text:clean(row.innerText||row.textContent,1800),rect:rect(row),cells,description_fields,links,buttons,file_actions}};if(includeHtml)rec.html=clean(row.outerHTML,4000);return rec}});
 }})()
 """
-    records = js(expression)
-    return {"selector": selector, "count": len(records or []), "records": records or []}
+    records = js(expression) or []
+    detail_actions = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        row_text = record.get("text") or ""
+        for link in (record.get("file_actions") or record.get("links") or []):
+            if not isinstance(link, dict):
+                continue
+            href = link.get("href")
+            if not href or any(action.get("href") == href for action in detail_actions):
+                continue
+            detail_actions.append(
+                {
+                    "row_index": record.get("index"),
+                    "row_text": row_text[:240],
+                    "text": link.get("text") or "",
+                    "href": href,
+                    "file_like": bool(link.get("file_like")),
+                }
+            )
+    fanout_recommended = len(records) >= 5 and len(detail_actions) >= 5
+    return {
+        "selector": selector,
+        "count": len(records or []),
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": "Spawn one child agent per row/file action, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+        "detail_action_count": len(detail_actions),
+        "detail_actions": detail_actions[:12],
+        "records": records or [],
+    }
 
 
 extract_rows = extract_grid_rows

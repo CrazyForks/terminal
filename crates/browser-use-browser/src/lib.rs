@@ -5863,18 +5863,40 @@ def js(expression, returnByValue=True):
             }
         ]
     assert "row-like table/grid/list records" in rows_snapshot.__doc__
+    assert "detail_action_count" in expression
+    assert "detail_actions" in expression
+    assert "fanout_recommended" in expression
+    assert "next_fanout_hint" in expression
+    assert "Spawn one child agent per row/file action" in expression
     return {
         "recommended_action": "extract_grid_rows",
         "recommended_selector": "tbody tr",
         "next_extract_hint": "extract_grid_rows(selector=\"tbody tr\")",
-        "candidates": [{"selector": "tbody tr", "count": 2, "action_count": 3, "file_action_count": 2, "samples": ["CP23-29 Transmittal Letter filing.pdf"]}],
+        "fanout_recommended": True,
+        "next_fanout_hint": "Spawn one child agent per row/file action, then wait_agent and assemble the final answer.",
+        "candidates": [{
+            "selector": "tbody tr",
+            "count": 6,
+            "action_count": 7,
+            "file_action_count": 6,
+            "detail_action_count": 6,
+            "detail_actions": [{"text": "filing.pdf", "href": "https://example.test/filing.pdf", "file_like": True}],
+            "fanout_recommended": True,
+            "fanout_reason": "Found 6 independent row actions; spawn one helper per row/file instead of sequential row visits.",
+            "samples": ["CP23-29 Transmittal Letter filing.pdf"],
+        }],
     }
 
 snapshot = rows_snapshot()
 assert snapshot["recommended_action"] == "extract_grid_rows"
+assert snapshot["fanout_recommended"] is True
+assert "row/file action" in snapshot["next_fanout_hint"]
 rows = extract_grid_rows(snapshot["recommended_selector"])
 assert rows["selector"] == "tbody tr"
 assert rows["count"] == 1
+assert rows["fanout_recommended"] is False
+assert rows["detail_action_count"] == 1
+assert rows["detail_actions"][0]["row_index"] == 0
 row = rows["records"][0]
 assert row["description_fields"][0]["text"] == "Transmittal Letter"
 assert row["cells"][2]["header"] == "Files"
