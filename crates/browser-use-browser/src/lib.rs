@@ -7148,6 +7148,53 @@ print("arxiv_query ok")
     }
 
     #[test]
+    fn browser_script_wikidata_sparql_normalizes_entity_bindings() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-wikidata-sparql",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    assert "query.wikidata.org/sparql" in url, url
+    assert "format=json" in url, url
+    assert "LIMIT+5" in url, url
+    assert headers["Accept"] == "application/sparql-results+json"
+    return json.dumps({
+        "head": {"vars": ["person", "personLabel", "phd", "phdLabel"]},
+        "results": {
+            "bindings": [
+                {
+                    "person": {"type": "uri", "value": "http://www.wikidata.org/entity/Q123"},
+                    "personLabel": {"type": "literal", "xml:lang": "en", "value": "Example Laureate"},
+                    "phd": {"type": "uri", "value": "http://www.wikidata.org/entity/Q456"},
+                    "phdLabel": {"type": "literal", "xml:lang": "en", "value": "Example University"},
+                }
+            ]
+        },
+    })
+
+result = wikidata_sparql("SELECT ?person ?personLabel ?phd ?phdLabel WHERE { ?person wdt:P69 ?phd . }", limit=5)
+assert result["count"] == 1, result
+row = result["rows"][0]
+assert row["person"]["id"] == "Q123", row
+assert row["person"]["url"] == "http://www.wikidata.org/entity/Q123", row
+assert row["personLabel_text"] == "Example Laureate", row
+assert row["phd"]["id"] == "Q456", row
+assert row["phdLabel_text"] == "Example University", row
+print("wikidata_sparql ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("wikidata_sparql ok"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

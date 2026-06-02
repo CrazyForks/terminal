@@ -2330,6 +2330,46 @@ def arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="subm
     }
 
 
+def wikidata_sparql(query, timeout=20.0, limit=None):
+    """Run a Wikidata SPARQL query and return normalized bindings.
+
+    Useful for public-knowledge cascades after live source verification, such
+    as Nobel laureates, Wikipedia-linked people, universities, awards, and
+    other entity relationship lookups. Results include QID/PID ids and entity
+    URLs when the binding value is a Wikidata entity URI.
+    """
+    query_text = str(query).strip()
+    if limit is not None and re.search(r"\blimit\s+\d+\b", query_text, re.I) is None:
+        query_text = f"{query_text}\nLIMIT {int(limit)}"
+    url = "https://query.wikidata.org/sparql?" + urlencode({"query": query_text, "format": "json"})
+    payload = json.loads(str(http_get(url, headers={"Accept": "application/sparql-results+json"}, timeout=timeout)))
+    variables = payload.get("head", {}).get("vars", [])
+    rows = []
+    for binding in payload.get("results", {}).get("bindings", []):
+        row = {}
+        for name in variables:
+            item = binding.get(name)
+            if not isinstance(item, dict):
+                row[name] = None
+                continue
+            value = item.get("value", "")
+            cell = {
+                "value": value,
+                "type": item.get("type", ""),
+                "datatype": item.get("datatype", ""),
+                "lang": item.get("xml:lang", ""),
+            }
+            if isinstance(value, str) and value.startswith("http://www.wikidata.org/entity/"):
+                entity_id = value.rsplit("/", 1)[-1]
+                cell["id"] = entity_id
+                cell["url"] = value
+            row[name] = cell
+            if name.endswith("Label") and isinstance(value, str):
+                row[f"{name}_text"] = value
+        rows.append(row)
+    return {"count": len(rows), "variables": variables, "rows": rows}
+
+
 def _document_source_bytes(source, headers=None, timeout=30.0, binary=None):
     source_text = str(source or "")
     parsed = urlparse(source_text)

@@ -2475,6 +2475,7 @@ mod tests {
             "pdftotext",
             "arxiv_query",
             "arXiv",
+            "wikidata_sparql",
             "rows_snapshot",
             "extract_grid_rows",
             "pagination_controls_snapshot",
