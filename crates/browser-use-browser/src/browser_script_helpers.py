@@ -31,6 +31,47 @@ def cdp(method, session_id=None, **params):
     return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
+def _env_bool(name):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _configured_viewport_params(default=True):
+    if _env_bool("BU_BROWSER_NO_VIEWPORT") is True:
+        return None
+    raw = os.environ.get("BU_BROWSER_VIEWPORT")
+    if raw:
+        try:
+            value = json.loads(raw)
+            width = int(value["width"])
+            height = int(value["height"])
+            if width <= 0 or height <= 0:
+                raise ValueError("invalid viewport size")
+            params = {
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": float(value.get("deviceScaleFactor", 1)),
+                "mobile": False,
+            }
+            if "screenWidth" in value:
+                params["screenWidth"] = int(value["screenWidth"])
+            if "screenHeight" in value:
+                params["screenHeight"] = int(value["screenHeight"])
+            return params
+        except Exception:
+            pass
+    if default:
+        return {"width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False}
+    return None
+
+
 def cdp_batch(calls):
     out = []
     for call in calls:
@@ -548,8 +589,10 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
         cdp("Page.bringToFront")
         version = cdp("Browser.getVersion", session_id=None)
         if "Headless" in (version.get("userAgent") or ""):
-            cdp("Emulation.setDeviceMetricsOverride", width=1280, height=720, deviceScaleFactor=1, mobile=False)
-            _time.sleep(0.2)
+            viewport = _configured_viewport_params()
+            if viewport:
+                cdp("Emulation.setDeviceMetricsOverride", **viewport)
+                _time.sleep(0.2)
     except Exception:
         pass
     params = {"format": kwargs.pop("format", "png")}

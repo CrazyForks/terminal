@@ -28,7 +28,9 @@ use tungstenite::{connect, Message, WebSocket};
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const BU_BROWSER_ACCEPT_DOWNLOADS_ENV: &str = "BU_BROWSER_ACCEPT_DOWNLOADS";
 const BU_BROWSER_DOWNLOADS_PATH_ENV: &str = "BU_BROWSER_DOWNLOADS_PATH";
+const BU_BROWSER_NO_VIEWPORT_ENV: &str = "BU_BROWSER_NO_VIEWPORT";
 const BU_BROWSER_PERMISSIONS_ENV: &str = "BU_BROWSER_PERMISSIONS";
+const BU_BROWSER_VIEWPORT_ENV: &str = "BU_BROWSER_VIEWPORT";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
@@ -2205,6 +2207,7 @@ impl BrowserSession {
         self.last_target_id = None;
         self.last_session_id = None;
         self.attach_first_page()?;
+        self.apply_configured_browser_viewport();
         self.apply_configured_browser_permissions();
         self.apply_configured_browser_downloads();
         Ok(())
@@ -2234,6 +2237,35 @@ impl BrowserSession {
             Ok(_) => self.log(format!("applied {BU_BROWSER_PERMISSIONS_ENV}")),
             Err(error) => self.log(format!(
                 "failed to apply {BU_BROWSER_PERMISSIONS_ENV}: {error:#}"
+            )),
+        }
+    }
+
+    fn apply_configured_browser_viewport(&mut self) {
+        let params = match browser_viewport_params_from_env() {
+            Ok(Some(params)) => params,
+            Ok(None) => return,
+            Err(error) => {
+                self.log(format!(
+                    "failed to parse {BU_BROWSER_VIEWPORT_ENV}: {error:#}"
+                ));
+                return;
+            }
+        };
+        let Some(session_id) = self.current_session_id.clone() else {
+            self.log(format!(
+                "failed to apply {BU_BROWSER_VIEWPORT_ENV}: no attached page session"
+            ));
+            return;
+        };
+        match self.cdp(
+            "Emulation.setDeviceMetricsOverride",
+            Some(&session_id),
+            params,
+        ) {
+            Ok(_) => self.log(format!("applied {BU_BROWSER_VIEWPORT_ENV}")),
+            Err(error) => self.log(format!(
+                "failed to apply {BU_BROWSER_VIEWPORT_ENV}: {error:#}"
             )),
         }
     }
@@ -3742,6 +3774,59 @@ fn browser_download_behavior_params_from_env() -> Result<Option<Value>> {
         })));
     }
     Ok(None)
+}
+
+fn browser_viewport_params_from_env() -> Result<Option<Value>> {
+    if let Ok(raw) = std::env::var(BU_BROWSER_NO_VIEWPORT_ENV) {
+        if parse_browser_env_bool(BU_BROWSER_NO_VIEWPORT_ENV, &raw)? {
+            return Ok(None);
+        }
+    }
+    let Ok(raw) = std::env::var(BU_BROWSER_VIEWPORT_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let value = serde_json::from_str::<Value>(raw)
+        .with_context(|| format!("{BU_BROWSER_VIEWPORT_ENV} must be a JSON object"))?;
+    let width = browser_viewport_positive_i64(&value, "width")?;
+    let height = browser_viewport_positive_i64(&value, "height")?;
+    let device_scale_factor = value
+        .get("deviceScaleFactor")
+        .and_then(Value::as_f64)
+        .filter(|factor| *factor >= 0.0)
+        .unwrap_or(1.0);
+
+    let mut params = json!({
+        "width": width,
+        "height": height,
+        "deviceScaleFactor": device_scale_factor,
+        "mobile": false,
+    });
+    if let Some(screen_width) = browser_viewport_optional_positive_i64(&value, "screenWidth")? {
+        params["screenWidth"] = json!(screen_width);
+    }
+    if let Some(screen_height) = browser_viewport_optional_positive_i64(&value, "screenHeight")? {
+        params["screenHeight"] = json!(screen_height);
+    }
+    Ok(Some(params))
+}
+
+fn browser_viewport_positive_i64(value: &Value, key: &str) -> Result<i64> {
+    browser_viewport_optional_positive_i64(value, key)?
+        .with_context(|| format!("{BU_BROWSER_VIEWPORT_ENV}.{key} must be a positive integer"))
+}
+
+fn browser_viewport_optional_positive_i64(value: &Value, key: &str) -> Result<Option<i64>> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(number) = raw.as_i64().filter(|number| *number > 0) else {
+        bail!("{BU_BROWSER_VIEWPORT_ENV}.{key} must be a positive integer");
+    };
+    Ok(Some(number))
 }
 
 fn parse_browser_env_bool(name: &str, raw: &str) -> Result<bool> {
@@ -7040,6 +7125,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(params, json!({ "behavior": "deny" }));
+    }
+
+    #[test]
+    fn browser_viewport_env_parses_device_metrics() {
+        let _env = EnvRestore::set(&[
+            (
+                BU_BROWSER_VIEWPORT_ENV,
+                r#"{"width":1024,"height":768,"deviceScaleFactor":2,"screenWidth":1440,"screenHeight":900}"#,
+            ),
+            (BU_BROWSER_NO_VIEWPORT_ENV, "false"),
+        ]);
+
+        let params = browser_viewport_params_from_env().unwrap().unwrap();
+
+        assert_eq!(params["width"], 1024);
+        assert_eq!(params["height"], 768);
+        assert_eq!(params["deviceScaleFactor"], 2.0);
+        assert_eq!(params["mobile"], false);
+        assert_eq!(params["screenWidth"], 1440);
+        assert_eq!(params["screenHeight"], 900);
+    }
+
+    #[test]
+    fn browser_viewport_env_honors_no_viewport() {
+        let _env = EnvRestore::set(&[
+            (BU_BROWSER_VIEWPORT_ENV, r#"{"width":1024,"height":768}"#),
+            (BU_BROWSER_NO_VIEWPORT_ENV, "true"),
+        ]);
+
+        assert!(browser_viewport_params_from_env().unwrap().is_none());
     }
 
     #[test]
