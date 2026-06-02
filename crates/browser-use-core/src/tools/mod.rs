@@ -2472,6 +2472,7 @@ mod tests {
             "JSON-LD",
             "__NEXT_DATA__",
             "network_resources_snapshot",
+            "json_api_records",
             "pricing_cards_snapshot",
             "read_document_text",
             "pdftotext",

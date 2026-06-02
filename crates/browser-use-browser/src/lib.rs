@@ -6406,6 +6406,76 @@ print("network_resources_snapshot ok")
     }
 
     #[test]
+    fn browser_script_json_api_records_extracts_nested_record_arrays() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-json-api-records",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+    def json(self):
+        return self.payload
+
+def http_get(url, timeout=20.0, headers=None):
+    calls.append(("http_get", url, timeout))
+    return FakeResponse({
+        "meta": {"total": 3},
+        "data": {
+            "items": [
+                {"id": 1, "name": "Alpha", "source": {"url": "https://example.test/a"}, "tags": ["one", "two"]},
+                {"id": 2, "name": "Beta", "source": {"url": "https://example.test/b"}, "tags": []},
+                {"id": 3, "name": "Gamma", "source": {"url": "https://example.test/c"}, "tags": ["three"]},
+            ],
+            "facets": [{"name": "small"}],
+        },
+    })
+
+def browser_fetch(url, timeout=20.0):
+    calls.append(("browser_fetch", url, timeout))
+    return {"json": {"payload": {"results": [{"id": 4, "name": "Delta"}]}}}
+
+records = json_api_records(["https://example.test/api/search.json"], limit=10)
+assert records["count"] == 3, records
+assert records["source_count"] == 1, records
+source = records["sources"][0]
+assert source["ok"] is True, records
+assert source["selected_path"] == "$.data.items", records
+assert source["record_count"] == 3, records
+assert "name" in source["fields"], records
+assert source["records"][0]["source"]["url"] == "https://example.test/a", records
+assert records["records"][1]["source_url"] == "https://example.test/api/search.json", records
+assert records["records"][2]["record"]["name"] == "Gamma", records
+
+explicit = json_api_records("https://example.test/api/search.json", records_path="data.facets", limit=5)
+assert explicit["sources"][0]["selected_path"] == "data.facets", explicit
+assert explicit["sources"][0]["record_count"] == 1, explicit
+assert explicit["records"][0]["record"]["name"] == "small", explicit
+
+browser_context = json_api_records("https://example.test/api/private.json", use_browser_fetch=True, limit=5)
+assert browser_context["used_browser_fetch"] is True, browser_context
+assert browser_context["sources"][0]["selected_path"] == "$.payload.results", browser_context
+assert browser_context["records"][0]["record"]["name"] == "Delta", browser_context
+assert calls == [
+    ("http_get", "https://example.test/api/search.json", 20.0),
+    ("http_get", "https://example.test/api/search.json", 20.0),
+    ("browser_fetch", "https://example.test/api/private.json", 20.0),
+], calls
+print("json_api_records ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("json_api_records ok"));
+    }
+
+    #[test]
     fn browser_script_shopify_products_api_normalizes_catalog_pages() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
