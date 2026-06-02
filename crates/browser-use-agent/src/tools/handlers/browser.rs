@@ -78,6 +78,7 @@ const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 const BU_MANAGED_BROWSER_ARGS_ENV: &str = "BU_MANAGED_BROWSER_ARGS";
+const BU_MANAGED_BROWSER_PROFILE_ENV: &str = "BU_MANAGED_BROWSER_PROFILE";
 
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -855,9 +856,19 @@ fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> Str
 
 fn managed_browser_connect_command(headed_flag: &str) -> String {
     format!(
-        "browser connect managed {headed_flag}{}",
+        "browser connect managed {headed_flag}{}{}",
+        managed_browser_profile_flag(),
         managed_browser_arg_flags()
     )
+}
+
+fn managed_browser_profile_flag() -> String {
+    std::env::var(BU_MANAGED_BROWSER_PROFILE_ENV)
+        .ok()
+        .map(|profile| profile.trim().to_string())
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| format!(" --profile {}", shell_quote_browser_arg(&profile)))
+        .unwrap_or_default()
 }
 
 fn managed_browser_arg_flags() -> String {

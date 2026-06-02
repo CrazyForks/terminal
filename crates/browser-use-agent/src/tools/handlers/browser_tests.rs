@@ -364,6 +364,25 @@ async fn bare_browser_connect_resolves_to_selected_managed_mode_with_launch_args
 }
 
 #[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_managed_mode_with_profile_dir() {
+    let _env = EnvVarRestore::set("BU_MANAGED_BROWSER_PROFILE", "/tmp/browser use profile");
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("managed-headed".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser connect managed --headed --profile '/tmp/browser use profile'".to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn selected_remote_cdp_mode_allows_remote_cdp_connect() {
     let backend = Arc::new(FakeBackend::default());
     let tool =
