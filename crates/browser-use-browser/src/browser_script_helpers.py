@@ -2479,6 +2479,125 @@ def arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="subm
     }
 
 
+def _localized_text(value, lang="en"):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get(lang) or value.get("en") or next((v for v in value.values() if isinstance(v, str)), ""))
+    if isinstance(value, list):
+        return " ".join(_localized_text(item, lang) for item in value if item)
+    return ""
+
+
+def _nobel_links(value):
+    links = []
+    if isinstance(value, dict):
+        href = value.get("href")
+        if href:
+            links.append({"href": href, "rel": value.get("rel", ""), "action": value.get("action", ""), "type": value.get("type", "")})
+        for child in value.values():
+            links.extend(_nobel_links(child))
+    elif isinstance(value, list):
+        for child in value:
+            links.extend(_nobel_links(child))
+    return links
+
+
+def nobel_prize_api(endpoint="laureates", params=None, timeout=20.0, lang="en"):
+    """Call the official Nobel Prize API v2.1 and normalize laureate/prize records.
+
+    Use after live browser verification for Nobel tasks. The helper returns
+    official nobelprize.org HTML links and compact prize metadata; pair it with
+    wikidata_sparql(...) for relationship cascades such as PhD institution and
+    other laureates educated there.
+    """
+    endpoint_name = str(endpoint or "laureates").strip().strip("/")
+    endpoint_aliases = {
+        "laureate": "laureates",
+        "laureates": "laureates",
+        "nobel_prizes": "nobelPrizes",
+        "nobel-prizes": "nobelPrizes",
+        "prizes": "nobelPrizes",
+        "nobelPrizes": "nobelPrizes",
+    }
+    endpoint_name = endpoint_aliases.get(endpoint_name, endpoint_name)
+    if endpoint_name not in {"laureates", "nobelPrizes"}:
+        raise ValueError("nobel_prize_api endpoint must be 'laureates' or 'nobelPrizes'")
+    query_params = dict(params or {})
+    url = f"https://api.nobelprize.org/2.1/{endpoint_name}"
+    if query_params:
+        url += "?" + urlencode(query_params)
+    payload = json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+
+    def normalize_prize(prize):
+        if not isinstance(prize, dict):
+            return {}
+        links = _nobel_links(prize.get("links"))
+        return {
+            "award_year": str(prize.get("awardYear") or ""),
+            "category": _localized_text(prize.get("category"), lang),
+            "category_full_name": _localized_text(prize.get("categoryFullName"), lang),
+            "sort_order": str(prize.get("sortOrder") or ""),
+            "portion": str(prize.get("portion") or ""),
+            "date_awarded": str(prize.get("dateAwarded") or ""),
+            "motivation": _localized_text(prize.get("motivation"), lang),
+            "prize_status": str(prize.get("prizeStatus") or ""),
+            "links": links,
+            "official_urls": [link["href"] for link in links if "www.nobelprize.org" in link.get("href", "")],
+        }
+
+    laureates = []
+    payload_laureates = payload.get("laureates", []) if isinstance(payload, dict) else []
+    for laureate in payload_laureates:
+        if not isinstance(laureate, dict):
+            continue
+        links = _nobel_links(laureate.get("links"))
+        laureates.append(
+            {
+                "id": str(laureate.get("id") or ""),
+                "known_name": _localized_text(laureate.get("knownName"), lang),
+                "full_name": _localized_text(laureate.get("fullName"), lang),
+                "given_name": _localized_text(laureate.get("givenName"), lang),
+                "family_name": _localized_text(laureate.get("familyName"), lang),
+                "gender": str(laureate.get("gender") or ""),
+                "birth": laureate.get("birth") if isinstance(laureate.get("birth"), dict) else {},
+                "death": laureate.get("death") if isinstance(laureate.get("death"), dict) else {},
+                "links": links,
+                "official_urls": [link["href"] for link in links if "www.nobelprize.org" in link.get("href", "")],
+                "nobel_prizes": [normalize_prize(prize) for prize in laureate.get("nobelPrizes", []) if isinstance(prize, dict)],
+            }
+        )
+
+    prizes = []
+    payload_prizes = payload.get("nobelPrizes", []) if isinstance(payload, dict) else []
+    for prize in payload_prizes:
+        if not isinstance(prize, dict):
+            continue
+        normalized = normalize_prize(prize)
+        normalized["laureates"] = [
+            {
+                "id": str(laureate.get("id") or ""),
+                "known_name": _localized_text(laureate.get("knownName"), lang),
+                "full_name": _localized_text(laureate.get("fullName"), lang),
+                "portion": str(laureate.get("portion") or ""),
+                "sort_order": str(laureate.get("sortOrder") or ""),
+                "motivation": _localized_text(laureate.get("motivation"), lang),
+                "links": _nobel_links(laureate.get("links")),
+            }
+            for laureate in prize.get("laureates", [])
+            if isinstance(laureate, dict)
+        ]
+        prizes.append(normalized)
+
+    return {
+        "endpoint": endpoint_name,
+        "url": url,
+        "count": len(laureates) if endpoint_name == "laureates" else len(prizes),
+        "laureates": laureates,
+        "nobel_prizes": prizes,
+    }
+
+
 def wikidata_sparql(query, timeout=20.0, limit=None):
     """Run a Wikidata SPARQL query and return normalized bindings.
 
