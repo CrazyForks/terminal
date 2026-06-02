@@ -5793,6 +5793,10 @@ def js(expression, returnByValue=True):
     assert "__PRICING_CARDS_SNAPSHOT__" in expression
     assert "priceRe" in expression
     assert "speedRe" in expression
+    assert "dataRe" in expression
+    assert "networkRe" in expression
+    assert "priceAmounts" in expression
+    assert "providerCandidates" in expression
     assert "contractRe" in expression
     assert "offerRe" in expression
     assert "img[src]" in expression
@@ -5807,10 +5811,18 @@ def js(expression, returnByValue=True):
                 "score": 72,
                 "text": "New customers DNA Netti 300M 19,90 €/kk 300 Mbps No binding",
                 "headings": ["DNA Netti 300M"],
+                "package_name": "DNA Netti 300M",
+                "provider_candidates": ["DNA"],
                 "prices": ["19,90 €/kk"],
+                "price_amounts": [{"raw": "19,90 €/kk", "amount": 19.9, "currency": "EUR", "billing_period": "monthly"}],
                 "speeds": ["300 Mbps"],
+                "data_allowances": ["300 Mbps"],
+                "network_types": ["broadband"],
                 "contracts": ["No binding"],
+                "contract_terms": ["No binding"],
                 "offer_types": ["New customers"],
+                "offer_labels": ["New customers"],
+                "labels": ["DNA Netti 300M product card"],
                 "links": [{"text": "See offer", "href": "https://example.test/dna-300"}],
                 "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": ""}],
                 "rect": {"x": 30, "y": 90, "width": 360, "height": 220, "in_viewport": True},
@@ -5822,9 +5834,19 @@ snapshot = pricing_cards_snapshot()
 assert snapshot["count"] == 1
 card = snapshot["cards"][0]
 assert card["prices"] == ["19,90 €/kk"]
+assert card["price_amounts"][0]["amount"] == 19.9
+assert card["price_amounts"][0]["currency"] == "EUR"
+assert card["price_amounts"][0]["billing_period"] == "monthly"
+assert card["package_name"] == "DNA Netti 300M"
+assert card["provider_candidates"] == ["DNA"]
 assert card["speeds"] == ["300 Mbps"]
+assert card["data_allowances"] == ["300 Mbps"]
+assert card["network_types"] == ["broadband"]
 assert card["contracts"] == ["No binding"]
+assert card["contract_terms"] == ["No binding"]
 assert card["offer_types"] == ["New customers"]
+assert card["offer_labels"] == ["New customers"]
+assert card["labels"] == ["DNA Netti 300M product card"]
 assert card["links"][0]["href"].endswith("/dna-300")
 assert card["images"][0]["src"].endswith("/dna.png")
 assert snapshot["detail_action_count"] == 1
