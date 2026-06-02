@@ -1280,9 +1280,37 @@ def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     if not isinstance(data, dict):
         return {"url": "", "title": "", "count": 0, "documents": [], "keywords": keyword_list, "latest_only": bool(latest_only), "raw": data}
     data.setdefault("documents", [])
-    data["count"] = len(data.get("documents") or [])
+    documents = data.get("documents") or []
+    data["count"] = len(documents)
     data.setdefault("keywords", keyword_list)
     data.setdefault("latest_only", bool(latest_only))
+    document_actions = []
+    for document in documents:
+        if not isinstance(document, dict) or not document.get("url"):
+            continue
+        text_parts = [
+            document.get("title") or "",
+            document.get("type") or "",
+            document.get("published_on") or "",
+            " ".join(document.get("period_tokens") or []),
+            document.get("context") or "",
+        ]
+        document_actions.append({"url": document.get("url"), "text": " | ".join(part for part in text_parts if part)})
+    fanout_recommended = len(document_actions) >= 5
+    data.setdefault("document_action_count", len(document_actions))
+    data.setdefault("fanout_recommended", fanout_recommended)
+    data.setdefault(
+        "next_fanout_hint",
+        "Spawn one child agent per investor/report document, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+    )
+    data.setdefault(
+        "fanout_tasks",
+        _fanout_tasks_from_actions("doc", document_actions, kind="investor/report document")
+        if fanout_recommended
+        else [],
+    )
     return data
 
 

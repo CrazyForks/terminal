@@ -6605,6 +6605,59 @@ print("investor_documents_snapshot ok")
     }
 
     #[test]
+    fn browser_script_investor_documents_snapshot_fans_out_document_bundles() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-investor-documents-fanout",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, *args, **kwargs):
+    assert "__INVESTOR_DOCUMENTS_SNAPSHOT__" in expression
+    return {
+        "url": "https://investor.example.test/reports",
+        "title": "Reports",
+        "documents": [
+            {
+                "title": f"FY2025 investor report part {i}",
+                "url": f"https://investor.example.test/fy2025-report-{i}.pdf",
+                "type": "investor_report",
+                "published_on": "2026-03-02",
+                "extension": "pdf",
+                "period_tokens": ["fy2025"],
+                "keyword_matches": ["report"],
+                "context": f"FY2025 investor report part {i}",
+                "score": 100 - i,
+            }
+            for i in range(1, 6)
+        ],
+        "keywords": ["report"],
+        "latest_only": False,
+    }
+
+snapshot = investor_documents_snapshot(limit=10, keywords=["report"])
+assert snapshot["count"] == 5, snapshot
+assert snapshot["document_action_count"] == 5, snapshot
+assert snapshot["fanout_recommended"] is True, snapshot
+assert "investor/report document" in snapshot["next_fanout_hint"], snapshot
+assert len(snapshot["fanout_tasks"]) == 5, snapshot
+assert snapshot["fanout_tasks"][0]["task_name"] == "doc_1", snapshot
+assert snapshot["fanout_tasks"][0]["url"] == "https://investor.example.test/fy2025-report-1.pdf", snapshot
+assert "FY2025 investor report part 1" in snapshot["fanout_tasks"][0]["item_text"], snapshot
+assert "investor/report document" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+print("investor_documents_snapshot fanout ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("investor_documents_snapshot fanout ok"));
+    }
+
+    #[test]
     fn browser_script_shopify_products_api_normalizes_catalog_pages() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
