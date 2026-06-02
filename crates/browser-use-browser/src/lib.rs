@@ -8341,6 +8341,86 @@ print("return detection ok")
     }
 
     #[test]
+    fn browser_script_browser_fetch_uses_page_context_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-browser-fetch-helper",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+checked = []
+calls = []
+
+def _ensure_navigation_allowed(url):
+    checked.append(url)
+    if "blocked" in url:
+        raise RuntimeError("blocked domain")
+
+def js(expression, target_id=None, returnByValue=True):
+    calls.append(expression)
+    assert "fetch(" in expression
+    assert "credentials: 'include'" in expression
+    assert "AbortController" in expression
+    assert "clearTimeout(timeoutId)" in expression
+    assert "content_base64" in expression
+    assert "JSON.parse" in expression
+    if "api" in expression:
+        assert '"POST"' in expression, expression
+        assert '"X-Test": "yes"' in expression, expression
+        assert '"hello"' in expression, expression
+        assert "1500" in expression, expression
+        assert "if (false)" in expression, expression
+        return {
+            "ok": True,
+            "status_code": 200,
+            "status": 200,
+            "status_text": "OK",
+            "url": "https://example.test/api",
+            "headers": {"content-type": "application/json"},
+            "text": "{\"answer\": 42}",
+            "json": {"answer": 42},
+        }
+    assert '"/asset.bin"' in expression, expression
+    assert "if (true)" in expression, expression
+    return {
+        "ok": True,
+        "status_code": 206,
+        "status": 206,
+        "status_text": "Partial Content",
+        "url": "https://example.test/asset.bin",
+        "headers": {"content-type": "application/octet-stream"},
+        "content_base64": base64.b64encode(bytes([0, 159, 255])).decode("ascii"),
+    }
+
+result = browser_fetch("https://example.test/api", headers={"X-Test": "yes"}, method="POST", body="hello", timeout=1.5)
+assert result["ok"] is True
+assert result["json"]["answer"] == 42
+assert checked == ["https://example.test/api"], checked
+
+binary_result = browser_fetch("/asset.bin", timeout=2, binary=True)
+assert binary_result["status_code"] == 206
+assert binary_result["content_base64"] == base64.b64encode(bytes([0, 159, 255])).decode("ascii")
+assert checked == ["https://example.test/api"], checked
+
+try:
+    browser_fetch("https://blocked.test/api")
+except RuntimeError as exc:
+    assert "blocked domain" in str(exc), exc
+else:
+    raise AssertionError("absolute browser_fetch URL should honor domain constraints")
+
+assert len(calls) == 2, calls
+print("browser_fetch ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("browser_fetch ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");
