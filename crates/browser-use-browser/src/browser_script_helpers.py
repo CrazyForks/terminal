@@ -1314,6 +1314,127 @@ def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     return data
 
 
+def document_links_snapshot(limit=100, keywords=None):
+    """Return generic filing/document links with row/context metadata and fanout tasks.
+
+    Use this on FERC, docket, regulatory, government, report, and search-result
+    pages where visible links point to PDFs, spreadsheets, filings, exhibits, or
+    document detail pages. It keeps document links associated with nearby row/card
+    context, docket/accession/date tokens, and returns a child-agent manifest for
+    larger document bundles.
+    """
+    keyword_list = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
+    expression = f"""
+(() => {{
+  // __DOCUMENT_LINKS_SNAPSHOT__
+  const limit = {int(limit)};
+  const keywords = {json.dumps(keyword_list)};
+  const clean = (text, max = 1200) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const visible = el => {{
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width >= 2 && r.height >= 2 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }};
+  const abs = value => {{ try {{ return value ? new URL(value, location.href).href : ''; }} catch (e) {{ return value || ''; }} }};
+  const docRe = /(\\.pdf($|[?#])|\\.docx?($|[?#])|\\.xlsx?($|[?#])|\\.csv($|[?#])|download|document|filing|attachment|exhibit|transmittal|order|notice|report|spreadsheet|submission|supplement|tariff|form)/i;
+  const dateRe = /\\b(?:20\\d{{2}}|19\\d{{2}})[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\\d|3[01])\\b|\\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\s+\\d{{1,2}},?\\s+(?:20\\d{{2}}|19\\d{{2}})\\b/i;
+  const docketRe = /\\b(?:[A-Z]{{1,4}}\\d{{2,4}}[-–]\\d{{1,5}}|[A-Z]{{1,4}}[-–]\\d{{2,4}}[-–]\\d{{1,5}}|Docket\\s+No\\.?\\s*[A-Z0-9-]+)\\b/ig;
+  const accessionRe = /\\b(?:accession|acc(?:ession)?\\s*no\\.?|document\\s*id|elibrary\\s*no\\.?)\\s*[:#]?\\s*([0-9]{{8,}}|[A-Z0-9-]{{8,}})\\b/i;
+  const extOf = url => ((url || '').split(/[?#]/)[0].match(/\\.([a-z0-9]{{2,6}})$/i) || [,''])[1].toLowerCase();
+  const classify = text => {{
+    const s = text.toLowerCase();
+    if (/transmittal/.test(s)) return 'transmittal';
+    if (/exhibit/.test(s)) return 'exhibit';
+    if (/tariff/.test(s)) return 'tariff';
+    if (/order/.test(s)) return 'order';
+    if (/notice/.test(s)) return 'notice';
+    if (/spreadsheet|xlsx?|csv|data/.test(s)) return 'data_table';
+    if (/report/.test(s)) return 'report';
+    if (/filing|submission|attachment|document/.test(s)) return 'filing_document';
+    return 'document';
+  }};
+  const nearestContext = a => {{
+    const row = a.closest('tr,[role="row"],article,li,section,.row,.result,.document,.filing,[data-testid],[data-test]') || a.parentElement || a;
+    return {{node: row, text: clean(row.innerText || row.textContent || '', 1800)}};
+  }};
+  const out = [], seen = new Set();
+  for (const a of Array.from(document.querySelectorAll('a[href]')).filter(visible).slice(0, limit * 20)) {{
+    const href = abs(a.href || a.getAttribute('href') || '');
+    const linkText = clean([a.innerText || a.textContent || '', a.getAttribute('aria-label') || '', a.getAttribute('title') || '', a.getAttribute('download') || ''].join(' '), 500);
+    const ctx = nearestContext(a);
+    const hay = [href, linkText, ctx.text].join(' ');
+    if (!href || !docRe.test(hay)) continue;
+    if (keywords.length && !keywords.some(kw => hay.toLowerCase().includes(kw))) {{
+      if (!docRe.test(linkText + ' ' + href)) continue;
+    }}
+    const key = href + '|' + linkText;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const date = (hay.match(dateRe) || [''])[0];
+    const docket_tokens = Array.from(new Set((hay.match(docketRe) || []).map(x => clean(x, 80)))).slice(0, 6);
+    const accession = ((hay.match(accessionRe) || [])[1] || '');
+    const extension = extOf(href);
+    let score = 20;
+    if (/\\.pdf($|[?#])/i.test(href)) score += 18;
+    if (/\\.xlsx?($|[?#])|\\.csv($|[?#])/i.test(href)) score += 12;
+    if (/filing|docket|ferc|accession|elibrary|transmittal|exhibit/i.test(hay)) score += 18;
+    if (date) score += 5;
+    if (docket_tokens.length) score += 8;
+    out.push({{
+      title: linkText || clean(ctx.text, 160),
+      url: href,
+      type: classify(hay),
+      extension,
+      published_on: date,
+      docket_tokens,
+      accession,
+      context: ctx.text,
+      source: 'visible_dom',
+      score,
+    }});
+  }}
+  out.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+  return {{url: location.href, title: document.title || '', keywords, count: out.length, documents: out.slice(0, limit)}};
+}})()
+"""
+    data = js(expression) or {}
+    documents = data.get("documents") if isinstance(data, dict) else []
+    actions = []
+    seen_urls = set()
+    for document in documents or []:
+        if not isinstance(document, dict):
+            continue
+        url = document.get("url")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        text_parts = [
+            document.get("title") or "",
+            document.get("type") or "",
+            document.get("published_on") or "",
+            " ".join(document.get("docket_tokens") or []),
+            document.get("accession") or "",
+            document.get("context") or "",
+        ]
+        actions.append({"url": url, "text": " | ".join(part for part in text_parts if part)})
+    fanout_recommended = len(actions) >= 5
+    return {
+        "url": data.get("url") if isinstance(data, dict) else "",
+        "title": data.get("title") if isinstance(data, dict) else "",
+        "keywords": keyword_list,
+        "count": len(documents or []),
+        "documents": documents or [],
+        "document_action_count": len(actions),
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": "Spawn one child agent per filing/document link, then wait_agent and assemble the final answer."
+        if fanout_recommended
+        else None,
+        "fanout_tasks": _fanout_tasks_from_actions("doc", actions, kind="filing/document link")
+        if fanout_recommended
+        else [],
+    }
+
+
 def sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitemaps=8, timeout=10.0):
     """Discover public routes from robots.txt and XML sitemaps.
 

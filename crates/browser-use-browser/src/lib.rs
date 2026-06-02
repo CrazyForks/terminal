@@ -6715,6 +6715,69 @@ print("investor_documents_snapshot fanout ok")
     }
 
     #[test]
+    fn browser_script_document_links_snapshot_fans_out_filing_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-document-links-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    assert "__DOCUMENT_LINKS_SNAPSHOT__" in expression
+    assert "docketRe" in expression
+    assert "accessionRe" in expression
+    assert "transmittal" in expression
+    assert "filing/document link" not in expression
+    documents = []
+    for index in range(6):
+        documents.append({
+            "title": f"CP23-29 Transmittal Letter {index + 1}",
+            "url": f"https://ferc.example.test/elibrary/file-{index + 1}.pdf",
+            "type": "transmittal",
+            "extension": "pdf",
+            "published_on": "2026-02-03",
+            "docket_tokens": ["CP23-29"],
+            "accession": f"20260203{index + 1:03d}",
+            "context": f"CP23-29 Accession 20260203{index + 1:03d} Transmittal Letter filing.pdf",
+            "source": "visible_dom",
+            "score": 80 - index,
+        })
+    return {
+        "url": "https://ferc.example.test/elibrary/search",
+        "title": "FERC eLibrary Search Results",
+        "keywords": ["ferc", "docket"],
+        "count": len(documents),
+        "documents": documents,
+    }
+
+snapshot = document_links_snapshot(limit=20, keywords=["FERC", "docket"])
+assert snapshot["url"].endswith("/elibrary/search"), snapshot
+assert snapshot["keywords"] == ["ferc", "docket"], snapshot
+assert snapshot["count"] == 6, snapshot
+doc = snapshot["documents"][0]
+assert doc["type"] == "transmittal", snapshot
+assert doc["docket_tokens"] == ["CP23-29"], snapshot
+assert doc["accession"] == "20260203001", snapshot
+assert doc["published_on"] == "2026-02-03", snapshot
+assert snapshot["document_action_count"] == 6, snapshot
+assert snapshot["fanout_recommended"] is True, snapshot
+assert "filing/document link" in snapshot["next_fanout_hint"], snapshot
+assert len(snapshot["fanout_tasks"]) == 6, snapshot
+assert snapshot["fanout_tasks"][0]["task_name"] == "doc_1", snapshot
+assert snapshot["fanout_tasks"][5]["url"].endswith("file-6.pdf"), snapshot
+assert "CP23-29" in snapshot["fanout_tasks"][0]["item_text"], snapshot
+assert "filing/document link" in snapshot["fanout_tasks"][0]["instruction"], snapshot
+print("document_links_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("document_links_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_shopify_products_api_normalizes_catalog_pages() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
