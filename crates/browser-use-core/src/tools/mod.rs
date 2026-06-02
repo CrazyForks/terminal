@@ -2475,6 +2475,8 @@ mod tests {
             "fill_form_field",
             "action_controls_snapshot",
             "click_button",
+            "overlay_actions_snapshot",
+            "dismiss_overlay",
             "form_controls_snapshot",
             "toggle_form_control",
             "select_controls_snapshot",

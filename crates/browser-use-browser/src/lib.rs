@@ -6173,6 +6173,65 @@ print("action helpers ok")
     }
 
     #[test]
+    fn browser_script_overlay_helpers_dismiss_cookie_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-overlay-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "cookie|consent|privacy" in expression
+    assert "getBoundingClientRect" in expression
+    assert "CSS.escape" in expression
+    if "pref=" in expression:
+        assert "prefRe" in expression
+        return {
+            "selector": "button[aria-label=\"Accept all\"]",
+            "matched_text": "Accept all cookies",
+            "score": 200,
+            "x": 312,
+            "y": 688,
+        }
+    return [
+        {
+            "selector": "button[aria-label=\"Accept all\"]",
+            "tag": "button",
+            "text": "Accept all cookies",
+            "score": 200,
+            "overlay": {"text": "We use cookies", "role": "dialog", "z": 1000, "rect": {"x": 0, "y": 600, "width": 800, "height": 120}},
+            "rect": {"x": 240, "y": 668, "width": 144, "height": 40, "in_viewport": True},
+            "center": {"x": 312, "y": 688},
+        }
+    ]
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = overlay_actions_snapshot()
+assert snapshot["count"] == 1
+assert snapshot["actions"][0]["text"] == "Accept all cookies"
+result = dismiss_overlay(prefer="accept", timeout=0)
+assert result["clicked"] is True
+assert result["matched_text"] == "Accept all cookies"
+assert clicked_points == [{"x": 312, "y": 688, "button": "left", "clicks": 1}]
+assert len(calls) == 2
+print("overlay helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("overlay helpers ok"));
+    }
+
+    #[test]
     fn browser_script_form_control_helpers_toggle_labeled_controls() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

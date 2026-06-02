@@ -1596,6 +1596,46 @@ def click_button(label_or_text, timeout=3.0):
     return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def overlay_actions_snapshot(limit=20):
+    """Return likely cookie/privacy/modal overlay actions with text and rects."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=220)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','data-testid','data-test','name']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const txt=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.id].filter(Boolean).join(' '));
+ const vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}};
+ const overlay=e=>{{for(let n=e;n&&n!==document.body;n=n.parentElement){{const r=n.getBoundingClientRect(),s=getComputedStyle(n),hay=clean(`${{n.id}} ${{n.className}} ${{n.getAttribute('role')||''}} ${{n.getAttribute('aria-label')||''}} ${{n.innerText||''}}`,900).toLowerCase();if(s.position==='fixed'||s.position==='sticky'||n.getAttribute('role')==='dialog'||/(cookie|consent|privacy|gdpr|modal|dialog|popup|banner)/i.test(hay))return {{text:clean(n.innerText||'',500),role:n.getAttribute('role')||'',z:Number(s.zIndex)||0,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}}}}}}return null}};
+ const nodes=[...document.querySelectorAll('button,input[type=button],input[type=submit],a[href],[role=button],[aria-label],[title]')].filter(vis),out=[];
+ for(const e of nodes){{const o=overlay(e),t=txt(e),hay=`${{t}} ${{o?o.text:''}}`.toLowerCase();let score=0;if(o)score+=40;if(/accept all|accept cookies|allow all|i agree|agree|ok|got it|continue|reject all|decline|necessary only|close|dismiss|×|x/i.test(t))score+=80;if(/cookie|consent|privacy|gdpr|modal|dialog|popup|banner/i.test(hay))score+=40;if(score){{const r=e.getBoundingClientRect();out.push({{selector:sel(e),tag:e.tagName.toLowerCase(),text:t,score,overlay:o,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:true}},center:{{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}}}})}}}}
+ return out.sort((a,b)=>b.score-a.score).slice(0,{int(limit)});
+}})()
+"""
+    actions = js(expression) or []
+    return {"count": len(actions), "actions": actions}
+
+
+def dismiss_overlay(prefer="accept", timeout=1.0):
+    """Click a likely cookie/privacy/modal action by preference using real mouse events."""
+    pref = str(prefer or "accept").strip().lower()
+    expression = f"""
+(() => {{
+ const pref={json.dumps(pref)},clean=(t,m=220)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['aria-label','title','data-testid','data-test','name']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const txt=e=>clean([e.innerText,e.value,e.getAttribute('aria-label'),e.getAttribute('title'),e.id].filter(Boolean).join(' ')),vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}};
+ const overlay=e=>{{for(let n=e;n&&n!==document.body;n=n.parentElement){{const r=n.getBoundingClientRect(),s=getComputedStyle(n),hay=clean(`${{n.id}} ${{n.className}} ${{n.getAttribute('role')||''}} ${{n.getAttribute('aria-label')||''}} ${{n.innerText||''}}`,900).toLowerCase();if(s.position==='fixed'||s.position==='sticky'||n.getAttribute('role')==='dialog'||/(cookie|consent|privacy|gdpr|modal|dialog|popup|banner)/i.test(hay))return true}}return false}};
+ const prefRe=pref.startsWith('reject')||pref.startsWith('decline')?/reject all|reject|decline|necessary only|essential only/i:pref.startsWith('close')||pref.startsWith('dismiss')?/close|dismiss|×|^x$/i:/accept all|accept cookies|allow all|i agree|agree|ok|got it|continue/i;
+ let best=null,bestScore=-1,bestText='';for(const e of [...document.querySelectorAll('button,input[type=button],input[type=submit],a[href],[role=button],[aria-label],[title]')]){{if(!vis(e))continue;const t=txt(e),hay=t.toLowerCase();let score=0;if(overlay(e))score+=40;if(prefRe.test(t))score+=120;if(/cookie|consent|privacy|gdpr/.test(hay))score+=20;if(/modal|dialog|popup|banner/.test(hay))score+=10;if(score>bestScore){{best=e;bestScore=score;bestText=t}}}}
+ if(!best||bestScore<=0)return null;const r=best.getBoundingClientRect();return {{selector:sel(best),matched_text:bestText,score:bestScore,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        actions = overlay_actions_snapshot(limit=20)
+        raise RuntimeError(f"dismiss_overlay: no likely overlay action matched prefer={prefer!r}; actions={actions}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(float(timeout), 2.0))
+    return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
+
+
 def form_controls_snapshot(limit=30):
     """Return compact rendered checkboxes/radios/toggles with labels and state."""
     expression = f"""

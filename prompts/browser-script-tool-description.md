@@ -49,6 +49,8 @@ form_fields_snapshot(limit=30)
 fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0)
 action_controls_snapshot(limit=30)
 click_button(label_or_text, timeout=3.0)
+overlay_actions_snapshot(limit=20)
+dismiss_overlay(prefer="accept", timeout=1.0)
 form_controls_snapshot(limit=30)
 toggle_form_control(label_or_text, checked=True, timeout=1.0)
 select_controls_snapshot(limit=20, option_limit=30)
@@ -89,6 +91,7 @@ Usage guidance:
 - First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
+- On first page load, if a cookie/privacy/modal overlay blocks content or intercepts clicks, call `overlay_actions_snapshot()` when uncertain and `dismiss_overlay(prefer="accept")` or `dismiss_overlay(prefer="reject")` to click the rendered consent/dismissal control.
 - For forms with labeled fields, split address fields, or autocomplete-like controls, call `form_fields_snapshot()` before coordinate guessing. Use `fill_form_field(label_or_placeholder, value)` to target visible/rendered fields by label, placeholder, name, selector, or nearby text while preserving real browser input events.
 - For named actions after filling/search/filter forms, call `action_controls_snapshot()` when uncertain and use `click_button(label_or_text)` for visible buttons/links such as Search, Submit, Apply, Next, Download, or Save. It clicks the rendered control center through browser input events instead of synthesizing DOM clicks.
 - For labeled checkboxes, radios, and switches, call `form_controls_snapshot()` when uncertain and use `toggle_form_control(label_or_text, checked=True/False)` to click only when the current state differs.
