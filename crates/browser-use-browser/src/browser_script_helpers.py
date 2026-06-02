@@ -1288,6 +1288,66 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     return {"selector": selector, "count": len(records or []), "records": records or []}
 
 
+def pricing_cards_snapshot(limit=50):
+    """Return visible pricing/product/package cards with extracted commercial signals."""
+    expression = f"""
+(() => {{
+  // __PRICING_CARDS_SNAPSHOT__
+  const limit={int(limit)},clean=(t,m=1200)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m);
+  const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>=60&&r.height>=24&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&r.bottom>=0&&r.top<=innerHeight*1.5}};
+  const priceRe=/(?:[$€£¥]\\s?\\d[\\d.,]*(?:\\s?(?:\\/|per)\\s?(?:mo|month|mth|yr|year|day|night|kk|mdr|måned|maaned))?|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|dkk|sek|nok|kr|ron|aud|cad|nzd|jpy)(?:\\s?(?:\\/|per)\\s?(?:mo|month|mth|yr|year|day|night|kk|mdr|måned|maaned))?)/ig;
+  const speedRe=/\\b(?:\\d+(?:[.,]\\d+)?\\s?(?:gb|mb|tb|gbit|mbit|gbps|mbps)|unlimited|ubegrænset|ubegrenset|fri data|5g|4g|fiber|fibre|coax|cable|broadband|mobile)\\b/ig;
+  const dataRe=/\\b(?:(?:\\d+(?:[.,]\\d+)?\\s?(?:gb|mb|tb)\\s*(?:data|datapakke|internet)?|unlimited\\s+data|unlimited|ubegrænset\\s+data|ubegrænset|ubegrenset|fri\\s+data))\\b/ig;
+  const networkRe=/\\b(?:5g|4g|lte|fiber|fibre|fibernet|coax|cable|dsl|broadband|mobile broadband|mobilt bredbånd|internet)\\b/ig;
+  const contractRe=/\\b(?:no\\s+(?:binding|commitment|contract)|without commitment|sans engagement|ingen binding|binding|commitment|contract|\\d+\\s?(?:month|months|måneder|maaneder|år|year|years))\\b/ig;
+  const offerRe=/\\b(?:new customer|new customers|student|standard|senior|family|promo|promotion|discount|offer|early bird|sale|para nuevos clientes|nuevos clientes|ny kunde|nye kunder)\\b/ig;
+  const planLabelRe=/\\b(?:plan|package|pakke|subscription|abonnement|tariff|ticket|bundle|deal|membership|product)\\b[:\\s-]*([A-ZÆØÅa-zæøå0-9][A-ZÆØÅa-zæøå0-9 .,+/&-]{{2,80}})/i;
+  const textOf=e=>clean([e.innerText||e.textContent||'',e.getAttribute('aria-label')||'',e.getAttribute('title')||''].filter(Boolean).join(' '));
+  const uniq=a=>Array.from(new Set(a.map(x=>clean(x,160)).filter(Boolean))).slice(0,12);
+  const links=e=>Array.from(e.querySelectorAll('a[href]')).slice(0,6).map(a=>({{text:textOf(a).slice(0,180),href:a.href}}));
+  const images=e=>Array.from(e.querySelectorAll('img[src],img[srcset],img[data-src],picture source[srcset]')).slice(0,6).map(img=>({{alt:clean(img.getAttribute('alt'),180),src:img.currentSrc||img.src||img.getAttribute('src')||'',srcset:img.getAttribute('srcset')||'',data_src:img.getAttribute('data-src')||''}})).filter(i=>i.alt||i.src||i.srcset||i.data_src);
+  const headings=e=>Array.from(e.querySelectorAll('h1,h2,h3,h4,[role=heading]')).map(h=>clean(h.textContent,160)).filter(Boolean).slice(0,6);
+  const labelled=e=>Array.from(e.querySelectorAll('[aria-label],[title],[alt],[itemprop],[data-testid],[data-test]')).flatMap(n=>['aria-label','title','alt','itemprop','data-testid','data-test'].map(a=>clean(n.getAttribute(a),120))).filter(Boolean).slice(0,24);
+  const currencyOf=raw=>{{const s=(raw||'').toLowerCase();if(/\\baud\\b/.test(s))return 'AUD';if(/\\bcad\\b/.test(s))return 'CAD';if(/\\bnzd\\b/.test(s))return 'NZD';if(/\\busd\\b/.test(s)||/[$]/.test(raw))return 'USD';if(/€|eur/.test(s))return 'EUR';if(/£|gbp/.test(s))return 'GBP';if(/¥|jpy/.test(s))return 'JPY';if(/\\bdkk\\b/.test(s))return 'DKK';if(/\\bsek\\b/.test(s))return 'SEK';if(/\\bnok\\b/.test(s))return 'NOK';if(/\\bkr\\b/.test(s))return 'KR';if(/\\bron\\b/.test(s))return 'RON';return null}};
+  const amountOf=raw=>{{const m=(raw||'').match(/\\d[\\d.,]*/);if(!m)return null;let n=m[0];if(n.includes(',')&&n.includes('.'))n=n.lastIndexOf(',')>n.lastIndexOf('.')?n.replace(/\\./g,'').replace(',','.'):n.replace(/,/g,'');else if(n.includes(','))n=n.replace(',','.');const v=Number(n.replace(/[^\\d.]/g,''));return Number.isFinite(v)?v:null}};
+  const billingOf=raw=>{{const s=(raw||'').toLowerCase();if(/\\/\\s*(mo|month|mth)|per\\s+(mo|month|mth)|\\/kk|mdr|måned|maaned/.test(s))return 'monthly';if(/\\/\\s*(yr|year)|per\\s+year|årlig|aarlig/.test(s))return 'yearly';if(/\\/\\s*day|per\\s+day/.test(s))return 'daily';if(/\\/\\s*night|per\\s+night/.test(s))return 'nightly';return null}};
+  const priceAmounts=prices=>prices.map(raw=>({{raw,amount:amountOf(raw),currency:currencyOf(raw),billing_period:billingOf(raw)}}));
+  const packageName=(hs,text)=>clean((hs&&hs[0])||((text.match(planLabelRe)||[])[1])||'',160);
+  const tokenTest=(re,v)=>{{re.lastIndex=0;return re.test(v)}};
+  const providerCandidates=(hs,labels,imgs,text)=>uniq([...hs,...labels,...imgs.map(i=>i.alt||''),...text.split(/[|•\\n]/).slice(0,3)].map(v=>clean(v,80)).filter(v=>v&&!tokenTest(priceRe,v)&&!tokenTest(speedRe,v)&&!tokenTest(contractRe,v))).slice(0,5);
+  const sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['data-testid','data-test','data-cy','data-component','itemtype']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}const cls=[...e.classList].filter(c=>!/^(css-|sc-|ng-|flex|grid|block|row|col|p[trblxy]?-|m[trblxy]?-|text-|bg-|border|rounded|shadow|w-|h-)/i.test(c)).slice(0,2);return e.tagName.toLowerCase()+(cls.length?'.'+cls.map(c=>CSS.escape(c)).join('.'):'')}};
+  const nodes=[...document.querySelectorAll('article,section,li,tr,[role=listitem],[role=row],[role=article],[itemscope],[itemtype],[class*=card],[class*=tile],[class*=plan],[class*=package],[class*=offer],[class*=product],[class*=price],[data-testid],[data-test]')].filter(visible);
+  const seen=new Set(),out=[];
+  for(const e of nodes){{const text=textOf(e);if(text.length<8)continue;const prices=uniq(text.match(priceRe)||[]),speeds=uniq(text.match(speedRe)||[]),data_allowances=uniq(text.match(dataRe)||[]),network_types=uniq(text.match(networkRe)||[]),contracts=uniq(text.match(contractRe)||[]),offers=uniq(text.match(offerRe)||[]);const hs=headings(e),ls=links(e),imgs=images(e),labels=labelled(e),package_name=packageName(hs,text),providers=providerCandidates(hs,labels,imgs,text),price_amounts=priceAmounts(prices);let score=prices.length*18+speeds.length*8+data_allowances.length*6+network_types.length*5+contracts.length*6+offers.length*5+hs.length*4+labels.length+ls.length*2+imgs.length*2;if(/price|plan|package|offer|product|card|tile|subscription|tariff|ticket/i.test(`${{e.className||''}} ${{e.id||''}} ${{e.getAttribute('data-testid')||''}} ${{e.getAttribute('data-test')||''}}`))score+=10;if(!prices.length&&score<18)continue;const r=e.getBoundingClientRect(),key=`${{prices.join('|')}}|${{hs.join('|')}}|${{text.slice(0,120)}}`;if(seen.has(key))continue;seen.add(key);out.push({{selector:sel(e),tag:e.tagName.toLowerCase(),score,text:clean(text,1800),headings:hs,package_name,provider_candidates:providers,prices,price_amounts,speeds,data_allowances,network_types,contracts,contract_terms:contracts,offer_types:offers,offer_labels:offers,labels,links:ls,images:imgs,rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}}}})}}
+  out.sort((a,b)=>b.score-a.score);
+  return {{count:out.length,cards:out.slice(0,limit)}};
+}})()
+"""
+    data = js(expression) or {}
+    cards = data.get("cards") if isinstance(data, dict) else []
+    detail_actions = []
+    seen_hrefs = set()
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        card_text = card.get("text") or " ".join(card.get("headings") or [])
+        for link in card.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            href = link.get("href")
+            if not href or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            detail_actions.append({"text": card_text or link.get("text"), "href": href})
+            break
+    return {
+        "count": len(cards or []),
+        "cards": cards or [],
+        "detail_action_count": len(detail_actions),
+        "detail_actions": detail_actions,
+    }
+
+
 def rows_snapshot(limit=8):
     """Find row-like table/grid/list records and suggest row-scoped extraction.
 

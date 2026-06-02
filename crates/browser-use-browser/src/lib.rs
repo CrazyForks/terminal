@@ -8291,6 +8291,89 @@ print("repeated_items ok")
     }
 
     #[test]
+    fn browser_script_pricing_cards_snapshot_surfaces_commercial_signals() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pricing-cards-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    for needle in [
+        "__PRICING_CARDS_SNAPSHOT__",
+        "priceRe",
+        "speedRe",
+        "dataRe",
+        "networkRe",
+        "priceAmounts",
+        "providerCandidates",
+        "contractRe",
+        "offerRe",
+        "billingOf",
+        "amountOf",
+        "img[src]",
+        "a[href]",
+        "CSS.escape",
+    ]:
+        assert needle in expression, needle
+    return {
+        "count": 1,
+        "cards": [{
+            "selector": "article.plan-card",
+            "tag": "article",
+            "score": 72,
+            "text": "New customers DNA Netti 300M 19,90 €/kk 300 Mbps No binding",
+            "headings": ["DNA Netti 300M"],
+            "package_name": "DNA Netti 300M",
+            "provider_candidates": ["DNA"],
+            "prices": ["19,90 €/kk"],
+            "price_amounts": [{"raw": "19,90 €/kk", "amount": 19.9, "currency": "EUR", "billing_period": "monthly"}],
+            "speeds": ["300 Mbps"],
+            "data_allowances": ["300 Mbps"],
+            "network_types": ["broadband"],
+            "contracts": ["No binding"],
+            "contract_terms": ["No binding"],
+            "offer_types": ["New customers"],
+            "offer_labels": ["New customers"],
+            "labels": ["DNA Netti 300M product card"],
+            "links": [{"text": "See offer", "href": "https://example.test/dna-300"}],
+            "images": [{"alt": "DNA modem", "src": "https://example.test/dna.png", "srcset": "", "data_src": ""}],
+            "rect": {"x": 30, "y": 90, "width": 360, "height": 220, "in_viewport": True},
+        }],
+    }
+
+snapshot = pricing_cards_snapshot()
+assert snapshot["count"] == 1
+card = snapshot["cards"][0]
+assert card["prices"] == ["19,90 €/kk"]
+assert card["price_amounts"][0]["amount"] == 19.9
+assert card["price_amounts"][0]["currency"] == "EUR"
+assert card["price_amounts"][0]["billing_period"] == "monthly"
+assert card["package_name"] == "DNA Netti 300M"
+assert card["provider_candidates"] == ["DNA"]
+assert card["speeds"] == ["300 Mbps"]
+assert card["data_allowances"] == ["300 Mbps"]
+assert card["network_types"] == ["broadband"]
+assert card["contracts"] == ["No binding"]
+assert card["contract_terms"] == ["No binding"]
+assert card["offer_types"] == ["New customers"]
+assert card["offer_labels"] == ["New customers"]
+assert card["labels"] == ["DNA Netti 300M product card"]
+assert card["links"][0]["href"].endswith("/dna-300")
+assert card["images"][0]["src"].endswith("/dna.png")
+assert snapshot["detail_action_count"] == 1
+assert snapshot["detail_actions"][0]["href"] == "https://example.test/dna-300"
+print("pricing_cards ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pricing_cards ok"));
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
