@@ -1087,6 +1087,46 @@ def extract_repeated_items(selector, limit=50, include_html=False):
     return {"selector": selector, "count": len(records or []), "records": records or []}
 
 
+def rows_snapshot(limit=8):
+    """Find row-like table/grid/list records and suggest row-scoped extraction.
+
+    Use this on search-result grids, docket tables, comparison tables, and SPA
+    row lists where links/buttons must be associated with the correct row.
+    """
+    expression = f"""
+(() => {{
+ const clean=(t,m=260)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>60&&r.height>12&&s.display!=='none'&&s.visibility!=='hidden'}},fileRe=/(pdf|docx?|xlsx?|zip|download|file|filing|attachment|exhibit|transmittal)/i;
+ const choices=['tbody tr','tr','[role="row"]','[data-rowindex]','[aria-rowindex]','[class*="row"]','[class*="record"]','[class*="result"]','li'];
+ const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[];for(const r of rows.slice(0,8)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;samples.push(clean(r.innerText||r.textContent))}}return {{selector,count:rows.length,action_count,file_action_count,score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
+ const r=candidates[0]||null;return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,candidates:candidates.slice(0,{int(limit)})}};
+}})()
+"""
+    return js(expression)
+
+
+def extract_grid_rows(selector=None, limit=50, include_html=False):
+    """Extract row-scoped cells, links, buttons, and file/document actions."""
+    if not selector:
+        snapshot = rows_snapshot(limit=1)
+        selector = snapshot.get("recommended_selector")
+        if not selector:
+            return {"selector": None, "count": 0, "records": [], "diagnosis": "no row selector found"}
+    expression = f"""
+(() => {{
+ const selector={json.dumps(selector)},limit={int(limit)},includeHtml={json.dumps(bool(include_html))},clean=(t,m=1400)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),fileRe=/(\\.pdf($|[?#])|\\.docx?($|[?#])|\\.xlsx?($|[?#])|\\.zip($|[?#])|download|file|filing|attachment|exhibit|transmittal)/i;
+ const rect=e=>{{const r=e.getBoundingClientRect();return {{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),center_x:Math.round(r.x+r.width/2),center_y:Math.round(r.y+r.height/2)}}}},txt=e=>clean([e.innerText||e.textContent||e.value||'',e.getAttribute('aria-label')||'',e.getAttribute('title')||''].filter(Boolean).join(' '),200);
+ const link=a=>{{const text=txt(a),href=a.href||a.getAttribute('href')||'',file_like=fileRe.test(`${{href}} ${{text}}`);return {{text,href,file_like,rect:rect(a)}}}},button=b=>({{text:txt(b),role:clean(b.getAttribute('role'),80)||(b.tagName||'').toLowerCase(),rect:rect(b)}});
+ return [...document.querySelectorAll(selector)].slice(0,limit).map((row,index)=>{{const heads=[...(row.closest('table')?.querySelectorAll('thead th,thead td')||[])].map(h=>clean(h.textContent,120)),raw=[...row.querySelectorAll(':scope>td,:scope>th,:scope>[role="cell"],:scope>[role="gridcell"],:scope>[data-label]')];const kids=raw.length?raw:[...row.children].slice(0,20),cells=kids.map((c,i)=>{{const header=clean(c.getAttribute('data-label')||c.getAttribute('aria-label')||heads[i]||'',160);return {{index:i,header,headers:header?[header]:[],text:clean(c.innerText||c.textContent,900),links:[...c.querySelectorAll('a[href]')].slice(0,6).map(link),buttons:[...c.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,6).map(button)}}}}).filter(c=>c.text||c.header||c.links.length||c.buttons.length),links=[...row.querySelectorAll('a[href]')].slice(0,16).map(link),buttons=[...row.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,16).map(button),file_actions=links.filter(l=>l.file_like),description_fields=cells.filter(c=>/(description|title|subject|name|document|file|requirement|summary)/i.test(c.header)).map(c=>({{header:c.header,text:c.text}})).slice(0,8),rec={{index,text:clean(row.innerText||row.textContent,1800),rect:rect(row),cells,description_fields,links,buttons,file_actions}};if(includeHtml)rec.html=clean(row.outerHTML,4000);return rec}});
+}})()
+"""
+    records = js(expression)
+    return {"selector": selector, "count": len(records or []), "records": records or []}
+
+
+extract_rows = extract_grid_rows
+grid_rows_snapshot = rows_snapshot
+
+
 def current_tab():
     page = _send_meta("current_tab")
     target_id = page.get("targetId") or page.get("target_id")

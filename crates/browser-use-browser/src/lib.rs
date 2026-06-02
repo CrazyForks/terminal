@@ -5609,7 +5609,7 @@ print("browser_fetch ok")
 calls = []
 def js(expression, returnByValue=True):
     calls.append(expression)
-    if "querySelectorAll(selector)" in expression:
+    if "record.cells" in expression:
         assert "el.matches('a[href]')" in expression
         assert "seenLinks" in expression
         assert "buttonNodes" in expression
@@ -5718,6 +5718,67 @@ print(json.dumps({"snapshot": snapshot, "records": records}, ensure_ascii=False)
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("extract_repeated_items"));
         assert!(output.text.contains("19,90"));
+    }
+
+    #[test]
+    fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-grid-row-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    if '"tbody tr"' in expression:
+        return [
+            {
+                "index": 0,
+                "text": "CP23-29 Transmittal Letter filing.pdf",
+                "attributes": {"role": "row", "data-rowindex": "1"},
+                "rect": {"x": 10, "y": 40, "width": 800, "height": 48, "center_x": 410, "center_y": 64},
+                "cells": [
+                    {"index": 0, "header": "Docket", "headers": ["Docket"], "text": "CP23-29", "links": [], "buttons": []},
+                    {"index": 1, "header": "Description", "headers": ["Description"], "text": "Transmittal Letter", "links": [], "buttons": []},
+                    {"index": 2, "header": "Files", "headers": ["Files"], "text": "filing.pdf", "links": [{"text": "filing.pdf", "href": "https://example.test/filing.pdf", "file_like": True}], "buttons": []},
+                ],
+                "description_fields": [{"header": "Description", "text": "Transmittal Letter"}],
+                "links": [{"text": "filing.pdf", "href": "https://example.test/filing.pdf", "file_like": True, "rect": {"center_x": 700, "center_y": 64}}],
+                "buttons": [{"text": "Open", "role": "button"}],
+                "file_actions": [{"text": "filing.pdf", "href": "https://example.test/filing.pdf", "file_like": True}],
+            }
+        ]
+    assert "row-like table/grid/list records" in rows_snapshot.__doc__
+    return {
+        "recommended_action": "extract_grid_rows",
+        "recommended_selector": "tbody tr",
+        "next_extract_hint": "extract_grid_rows(selector=\"tbody tr\")",
+        "candidates": [{"selector": "tbody tr", "count": 2, "action_count": 3, "file_action_count": 2, "samples": ["CP23-29 Transmittal Letter filing.pdf"]}],
+    }
+
+snapshot = rows_snapshot()
+assert snapshot["recommended_action"] == "extract_grid_rows"
+rows = extract_grid_rows(snapshot["recommended_selector"])
+assert rows["selector"] == "tbody tr"
+assert rows["count"] == 1
+row = rows["records"][0]
+assert row["description_fields"][0]["text"] == "Transmittal Letter"
+assert row["cells"][2]["header"] == "Files"
+assert row["file_actions"][0]["href"] == "https://example.test/filing.pdf"
+assert row["links"][0]["rect"]["center_x"] == 700
+assert extract_rows is extract_grid_rows
+assert grid_rows_snapshot is rows_snapshot
+assert any("querySelectorAll(selector)" in call for call in calls)
+print(json.dumps({"snapshot": snapshot, "rows": rows}, ensure_ascii=False))
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("extract_grid_rows"));
+        assert!(output.text.contains("filing.pdf"));
     }
 
     #[test]
