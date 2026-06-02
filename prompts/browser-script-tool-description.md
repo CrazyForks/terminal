@@ -61,6 +61,7 @@ overlay_actions_snapshot(limit=20)
 dismiss_overlay(prefer="accept", timeout=1.0)
 pagination_controls_snapshot(limit=20)
 click_pagination(label_or_text="next", timeout=2.0)
+click_pagination_until_stable(label_or_text="load more", max_clicks=20, wait_seconds=0.8, idle_timeout=3.0, count_selector=None)
 result_count_snapshot(limit=12)
 form_controls_snapshot(limit=30)
 toggle_form_control(label_or_text, checked=True, timeout=1.0)
@@ -121,7 +122,7 @@ Usage guidance:
 - For Wikipedia/Wikidata/Nobel/public-knowledge cascades, verify the user-named source page in the browser first. Use `nobel_prize_api(...)` for official Nobel laureate/prize records and nobelprize.org biography links, then use `wikidata_sparql(...)` for entity relationship lookups such as laureate -> PhD institution -> other Nobel graduates.
 - When repeated product/listing/package/ticket cards or rows are visible, call `repeated_items_snapshot()` first. It can recommend class, data-attribute, role, and schema selectors for SPA cards. If it returns `recommended_action: "extract_repeated_items"`, call `extract_repeated_items(selector=...)` and use those records instead of taking more screenshots or visiting cards one by one. If it returns `fanout_recommended: true`, use `fanout_tasks` as the child manifest and spawn one child agent per detail link/item before opening detail pages in the parent. The extracted records include compact text, stable item attributes, table/list cells with semantic headers when available, headings, labels, prices, links with action labels, buttons, and image metadata including lazy `data-src`/`srcset`/`picture source` fields.
 - For pricing/product/package/ticket cards, call `pricing_cards_snapshot()` to get visible commercial records with price tokens, speed/data tokens, contract hints, offer-type hints, links, and images before writing custom extraction JavaScript. If it returns `fanout_recommended: true`, use `fanout_tasks` as the child manifest and spawn one child agent per pricing/product card before visiting card detail pages in the parent.
-- For paginated listings, result pages, and "Load more" flows, call `pagination_controls_snapshot()` before guessing. Use `click_pagination("next")` or `click_pagination("load more")`, then wait and re-run the relevant extraction helper.
+- For paginated listings, result pages, and "Load more" flows, call `pagination_controls_snapshot()` before guessing. When the task needs all pages/items, use `click_pagination_until_stable("next" or "load more", max_clicks=...)`, then re-run the relevant extraction helper. Use `click_pagination(...)` for one deliberate page advance.
 - For result-count or page-count evidence such as "Matches 1 - 25 of 58", "Records 1 through 10 of N", "Page 1 of 3", or "710 exhibitors", call `result_count_snapshot()` and keep its `evidence` text with the parsed count.
 - The common screenshot call is `screenshot(label)`, for example `screenshot("before_submit")`.
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.

@@ -2481,6 +2481,7 @@ mod tests {
             "extract_grid_rows",
             "pagination_controls_snapshot",
             "click_pagination",
+            "click_pagination_until_stable",
             "result_count_snapshot",
             "file_actions",
             "form_fields_snapshot",

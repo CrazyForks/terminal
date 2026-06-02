@@ -2114,6 +2114,129 @@ def click_pagination(label_or_text="next", timeout=2.0):
     return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "href": match.get("href", ""), "rel": match.get("rel", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def _pagination_progress_state(count_selector=None):
+    selector = str(count_selector or "").strip()
+    expression = f"""
+(() => {{
+ // __PAGINATION_PROGRESS_STATE__
+ const sel={json.dumps(selector)};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}};
+ const countSel=s=>{{try{{return [...document.querySelectorAll(s)].filter(visible).length}}catch(e){{return null}}}};
+ const itemSelectors=['article','li','tr','[role=listitem]','[class*=card i]','[class*=item i]','[class*=result i]','[class*=product i]','[data-testid*=card i]','[data-testid*=item i]','[data-testid*=result i]'];
+ let itemCount=sel?countSel(sel):null;
+ const selectorCounts={{}};
+ for(const s of itemSelectors){{const c=countSel(s);selectorCounts[s]=c;if((itemCount===null||c>itemCount)&&c!==null)itemCount=c}}
+ const text=(document.body&&document.body.innerText||'').replace(/\\s+/g,' ').trim();
+ return {{count_selector:sel,item_count:itemCount||0,text_length:text.length,text_sample:text.slice(0,500),selector_counts:selectorCounts,url:location.href,title:document.title||''}};
+}})()
+"""
+    try:
+        state = js(expression) or {}
+    except Exception as exc:
+        return {"count_selector": selector, "item_count": 0, "text_length": 0, "text_sample": "", "error": str(exc)}
+    if not isinstance(state, dict):
+        return {"count_selector": selector, "item_count": 0, "text_length": 0, "text_sample": "", "raw": state}
+    return state
+
+
+def click_pagination_until_stable(label_or_text="load more", max_clicks=20, wait_seconds=0.8, idle_timeout=3.0, count_selector=None):
+    """Click Next/Load More repeatedly until no matching control or page progress stops."""
+    needle = str(label_or_text or "load more").strip().lower()
+    try:
+        max_clicks_int = int(max_clicks)
+    except Exception:
+        max_clicks_int = 20
+    max_clicks_int = max(0, min(max_clicks_int, 50))
+    wait_s = max(0.0, min(float(wait_seconds or 0), 5.0))
+    idle_s = max(0.0, min(float(idle_timeout or 0), 10.0))
+
+    def matching_control(controls):
+        best = None
+        best_score = -10**9
+        for control in controls or []:
+            if not isinstance(control, dict):
+                continue
+            text = str(control.get("text") or "").strip().lower()
+            hay = " ".join([
+                text,
+                str(control.get("rel") or "").lower(),
+                str(control.get("selector") or "").lower(),
+            ])
+            disabled = control.get("aria_disabled") is True or str(control.get("aria_disabled") or "").lower() == "true"
+            if disabled:
+                continue
+            score = int(control.get("score") or 0)
+            if needle and (needle == text or needle in hay):
+                score += 200
+            if needle == "next" and ("next" in hay or control.get("rel") == "next" or "›" in hay or "»" in hay):
+                score += 160
+            if "more" in needle and ("load more" in hay or "show more" in hay or "more results" in hay):
+                score += 160
+            if ("load more" in hay or "show more" in hay or "more results" in hay or "older" in hay or "continue" in hay) and needle in ("next", "more", "load more"):
+                score += 80
+            if "prev" in hay or "previous" in hay or "back" in hay:
+                score -= 120
+            if score > best_score:
+                best = control
+                best_score = score
+        return best if best is not None and best_score > 0 else None
+
+    states = []
+    clicks = []
+    stopped_reason = "max_clicks"
+    unchanged_runs = 0
+    previous_signature = None
+    initial_state = _pagination_progress_state(count_selector=count_selector)
+    states.append(initial_state)
+    previous_signature = (initial_state.get("item_count"), initial_state.get("text_length"), initial_state.get("url"))
+
+    for _ in range(max_clicks_int):
+        snapshot = pagination_controls_snapshot(limit=20)
+        control = matching_control(snapshot.get("controls", []))
+        if not control:
+            stopped_reason = "no_matching_control"
+            break
+        try:
+            click_result = click_pagination(label_or_text, timeout=0)
+        except Exception as exc:
+            stopped_reason = "click_failed"
+            clicks.append({"control": control, "error": str(exc)})
+            break
+        clicks.append({"control": control, "result": click_result})
+        if wait_s:
+            _time.sleep(wait_s)
+        if idle_s:
+            try:
+                wait_for_network_idle(timeout=idle_s)
+            except Exception:
+                pass
+        state = _pagination_progress_state(count_selector=count_selector)
+        states.append(state)
+        signature = (state.get("item_count"), state.get("text_length"), state.get("url"))
+        if signature == previous_signature:
+            unchanged_runs += 1
+        else:
+            unchanged_runs = 0
+        previous_signature = signature
+        if unchanged_runs >= 2:
+            stopped_reason = "stable_after_click"
+            break
+
+    final_state = states[-1] if states else {}
+    final_controls = pagination_controls_snapshot(limit=20)
+    return {
+        "clicks": len(clicks),
+        "stopped_reason": stopped_reason,
+        "states": states,
+        "clicked": clicks,
+        "final_controls": final_controls,
+        "final_count": final_state.get("item_count", 0),
+        "final_text_length": final_state.get("text_length", 0),
+        "count_selector": str(count_selector or "").strip(),
+        "label_or_text": label_or_text,
+    }
+
+
 def result_count_snapshot(limit=12):
     """Return parsed visible result/page-count snippets with evidence text."""
     expression = f"""

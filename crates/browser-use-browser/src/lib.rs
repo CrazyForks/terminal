@@ -6719,6 +6719,81 @@ print("pagination helpers ok")
     }
 
     #[test]
+    fn browser_script_pagination_until_stable_clicks_until_no_control() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pagination-until-stable",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+page = {"clicks": 0, "items": 10}
+network_idle_calls = []
+js_calls = []
+
+def pagination_controls_snapshot(limit=20):
+    if page["clicks"] >= 3:
+        return {"count": 0, "page_hint": "", "controls": []}
+    return {
+        "count": 1,
+        "page_hint": f"Showing {page['items']} results",
+        "controls": [{
+            "selector": "button[data-testid=\"load-more\"]",
+            "tag": "button",
+            "text": "Load more",
+            "href": "",
+            "rel": "",
+            "aria_current": None,
+            "aria_disabled": None,
+            "score": 180,
+            "rect": {"x": 320, "y": 680, "width": 120, "height": 40, "in_viewport": True},
+            "center": {"x": 380, "y": 700},
+        }],
+    }
+
+def click_pagination(label_or_text="next", timeout=2.0):
+    assert label_or_text == "load more"
+    page["clicks"] += 1
+    page["items"] += 10
+    return {"clicked": True, "matched_text": "Load more", "selector": "button[data-testid=\"load-more\"]"}
+
+def wait_for_network_idle(timeout=10):
+    network_idle_calls.append(timeout)
+    return True
+
+def js(expression, *args, **kwargs):
+    js_calls.append(expression)
+    assert "__PAGINATION_PROGRESS_STATE__" in expression
+    return {
+        "count_selector": ".result-card",
+        "item_count": page["items"],
+        "text_length": page["items"] * 50,
+        "text_sample": "result " * page["items"],
+        "selector_counts": {".result-card": page["items"]},
+        "url": "https://example.test/results",
+        "title": "Results",
+    }
+
+result = click_pagination_until_stable("load more", max_clicks=5, wait_seconds=0, idle_timeout=0.1, count_selector=".result-card")
+assert result["clicks"] == 3, result
+assert result["stopped_reason"] == "no_matching_control", result
+assert result["final_count"] == 40, result
+assert result["final_text_length"] == 2000, result
+assert len(result["states"]) == 4, result
+assert len(result["clicked"]) == 3, result
+assert result["final_controls"]["count"] == 0, result
+assert network_idle_calls == [0.1, 0.1, 0.1], network_idle_calls
+assert len(js_calls) == 4, js_calls
+print("pagination until stable ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pagination until stable ok"));
+    }
+
+    #[test]
     fn browser_script_result_count_snapshot_parses_visible_count_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
