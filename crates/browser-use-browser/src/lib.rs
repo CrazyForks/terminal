@@ -6044,6 +6044,10 @@ def js(expression, returnByValue=True):
     assert "document.querySelectorAll('a[href]')" in expression
     assert "document.querySelectorAll('form')" in expression
     assert "script[src]" in expression
+    assert "urlTokenRe" in expression
+    assert "script:not([src])" in expression
+    assert "data-api" in expression
+    assert "data-attribute" in expression
     assert "apiRe" in expression
     assert "extRe" in expression
     assert "http_get_many" not in expression
@@ -6052,8 +6056,8 @@ def js(expression, returnByValue=True):
     return {
         "url": "https://example.test/search",
         "title": "Search",
-        "count": 2,
-        "by_type": {"fetch": 1, "link": 1},
+        "count": 4,
+        "by_type": {"fetch": 1, "link": 1, "inline-url": 1, "data-url": 1},
         "resources": [
             {
                 "source": "performance",
@@ -6075,14 +6079,30 @@ def js(expression, returnByValue=True):
                 "rel": "",
                 "download": "results.csv",
             },
+            {
+                "source": "inline-script",
+                "type": "inline-url",
+                "url": "https://example.test/api/catalog.json",
+                "score": 32,
+                "text": "app-config",
+            },
+            {
+                "source": "data-attribute",
+                "type": "data-url",
+                "url": "https://example.test/documents/report.pdf",
+                "score": 30,
+                "text": "data-download",
+            },
         ],
     }
 
 snapshot = network_resources_snapshot(keywords=["results", "download"], limit=20)
-assert snapshot["count"] == 2
+assert snapshot["count"] == 4
 assert snapshot["resources"][0]["url"].endswith("page=2")
 assert snapshot["resources"][0]["initiator_type"] == "fetch"
 assert snapshot["resources"][1]["download"] == "results.csv"
+assert snapshot["resources"][2]["source"] == "inline-script"
+assert snapshot["resources"][3]["type"] == "data-url"
 assert snapshot["by_type"]["fetch"] == 1
 assert len(calls) == 1
 print("network_resources_snapshot ok")

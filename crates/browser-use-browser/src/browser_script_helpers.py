@@ -847,6 +847,7 @@ def network_resources_snapshot(limit=80, keywords=None):
   const abs=u=>{{try{{return new URL(u, location.href).href}}catch(e){{return ''}}}};
   const extRe=/\\.(?:json|csv|xml|pdf|docx?|xlsx?|zip|rss|atom)(?:$|[?#])/i;
   const apiRe=/(?:\\/api\\/|graphql|search|query|results?|list|catalog|products?|locations?|documents?|download|export|ajax|rest|svc|feed|wp-json|json)/i;
+  const urlTokenRe=/(?:https?:\\/\\/[^\\s"'<>\\\\)]+|\\/[A-Za-z0-9_./~:@!$&()*+,;=%?-]*(?:api|graphql|search|query|results?|list|catalog|products?|locations?|documents?|download|export|ajax|rest|svc|feed|wp-json|json|\\.pdf|\\.csv|\\.xml|\\.xlsx?|\\.docx?|\\.zip)[A-Za-z0-9_./~:@!$&()*+,;=%?-]*)/ig;
   const uniq=new Map();
   const add=(source,type,url,extra={{}})=>{{
     const href=abs(url); if(!href) return;
@@ -876,6 +877,16 @@ def network_resources_snapshot(limit=80, keywords=None):
   for(const f of document.querySelectorAll('form')) add('form','form',f.getAttribute('action')||location.href,{{method:(f.getAttribute('method')||'GET').toUpperCase(),text:clean([f.getAttribute('aria-label')||'',f.getAttribute('name')||'',f.id||'',f.innerText||''].filter(Boolean).join(' '),320)}});
   for(const link of document.querySelectorAll('link[href][rel]')) add('head','link',link.href,{{rel:link.rel||'',type:link.type||'',text:clean(link.getAttribute('title')||'',160)}});
   for(const script of document.querySelectorAll('script[src]')) add('script','script',script.src,{{type:script.type||''}});
+  const scanText=(source,type,text,context='')=>{{
+    for(const match of String(text||'').matchAll(urlTokenRe)) {{
+      const token=(match[0]||'').replace(/[\\]}}),.;]+$/,'');
+      add(source,type,token,{{text:clean(context,180)}});
+    }}
+  }};
+  for(const script of Array.from(document.querySelectorAll('script:not([src])')).slice(0,30)) scanText('inline-script','inline-url',script.textContent||'',script.id||script.type||'');
+  for(const el of Array.from(document.querySelectorAll('[data-api],[data-url],[data-href],[data-endpoint],[data-src],[data-download],[data-feed],[data-query]')).slice(0,200)) {{
+    for(const attr of el.attributes) if(/^data-/i.test(attr.name)) scanText('data-attribute','data-url',attr.value,attr.name);
+  }}
   const items=Array.from(uniq.values()).sort((a,b)=>b.score-a.score||a.url.localeCompare(b.url)).slice(0,limit);
   const by_type={{}};
   for(const item of items) by_type[item.type]=(by_type[item.type]||0)+1;
