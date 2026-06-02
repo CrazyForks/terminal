@@ -951,16 +951,36 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
     const priceSignals = samples.filter(text => priceRe.test(text)).length;
     const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
     const links = new Set();
+    const detailLinks = [];
     let imageCount = 0;
     for (const el of items.slice(0, 10)) {{
-      if (el.matches('a[href]')) links.add(el.href);
-      for (const a of el.querySelectorAll('a[href]')) links.add(a.href);
+      const itemLinks = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
+      for (const a of itemLinks) {{
+        if (!a.href) continue;
+        links.add(a.href);
+        if (!detailLinks.some(link => link.href === a.href)) {{
+          detailLinks.push({{ text: clean([a.innerText || a.textContent || '', a.getAttribute('aria-label') || '', a.getAttribute('title') || ''].filter(Boolean).join(' '), 200), href: a.href }});
+        }}
+      }}
       imageCount += el.querySelectorAll('img[src],img[srcset],picture source[srcset]').length;
     }}
     let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8) + Math.min(imageCount, 6);
     if (priceSignals) score += priceSignals * 6;
     if (/^(li|div|article|section|tr)($|[.#])/.test(selector)) score += 1;
-    return {{ selector, count: items.length, price_signal_count: priceSignals, link_count: links.size, image_count: imageCount, score, samples }};
+    const fanoutRecommended = items.length >= 5 && links.size >= 5;
+    return {{
+      selector,
+      count: items.length,
+      price_signal_count: priceSignals,
+      link_count: links.size,
+      detail_link_count: links.size,
+      detail_links: detailLinks.slice(0, 8),
+      fanout_recommended: fanoutRecommended,
+      fanout_reason: fanoutRecommended ? `Found ${{Math.min(items.length, links.size)}} independent detail links; spawn one helper per item instead of sequential visits.` : '',
+      image_count: imageCount,
+      score,
+      samples,
+    }};
   }};
   const groups = new Map();
   for (const el of document.querySelectorAll('article, section, li, tr, [role="listitem"], [role="article"], [role="row"], [role="gridcell"], [role="option"], [itemscope], [itemtype], [data-testid], [data-test], [data-cy], [data-component], a[href], button, [role="button"], [class]')) {{
@@ -981,10 +1001,13 @@ def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
   }}
   candidates.sort((a, b) => b.score - a.score || b.price_signal_count - a.price_signal_count || b.count - a.count);
   const recommended = candidates[0] || null;
+  const fanoutRecommended = !!(recommended && recommended.fanout_recommended);
   return {{
     recommended_action: recommended ? 'extract_repeated_items' : null,
     recommended_selector: recommended ? recommended.selector : null,
     next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
+    fanout_recommended: fanoutRecommended,
+    next_fanout_hint: fanoutRecommended ? 'Spawn one child agent per detail link/item, then wait_agent and assemble the final answer.' : null,
     candidates: candidates.slice(0, limit),
   }};
 }})()

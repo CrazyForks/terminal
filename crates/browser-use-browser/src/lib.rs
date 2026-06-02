@@ -5716,16 +5716,26 @@ def js(expression, returnByValue=True):
     assert "for (const selector of selectorCandidates(el))" in expression
     assert "image_count" in expression
     assert "picture source[srcset]" in expression
+    assert "detail_links" in expression
+    assert "fanout_recommended" in expression
+    assert "next_fanout_hint" in expression
+    assert "Spawn one child agent per detail link/item" in expression
     return {
         "recommended_action": "extract_repeated_items",
         "recommended_selector": "div.subscriptioncard",
         "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
+        "fanout_recommended": True,
+        "next_fanout_hint": "Spawn one child agent per detail link/item, then wait_agent and assemble the final answer.",
         "candidates": [
             {
                 "selector": "div.subscriptioncard",
-                "count": 3,
+                "count": 6,
                 "price_signal_count": 3,
-                "link_count": 0,
+                "link_count": 6,
+                "detail_link_count": 6,
+                "detail_links": [{"text": "DNA Netti 300M product page", "href": "https://example.test/dna-300"}],
+                "fanout_recommended": True,
+                "fanout_reason": "Found 6 independent detail links; spawn one helper per item instead of sequential visits.",
                 "image_count": 3,
                 "samples": ["DNA Netti 300M 19,90 €/kk"],
             }
@@ -5735,6 +5745,9 @@ def js(expression, returnByValue=True):
 snapshot = repeated_items_snapshot()
 assert snapshot["recommended_action"] == "extract_repeated_items"
 assert snapshot["recommended_selector"] == "div.subscriptioncard"
+assert snapshot["fanout_recommended"] is True
+assert "child agent" in snapshot["next_fanout_hint"]
+assert snapshot["candidates"][0]["detail_link_count"] == 6
 records = extract_repeated_items(snapshot["recommended_selector"])
 assert records["count"] == 1
 assert records["records"][0]["prices"] == ["19,90 €/kk"]
