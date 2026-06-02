@@ -1302,6 +1302,11 @@ fn wait_agent_output_schema() -> Value {
                 "type": "array",
                 "description": "Compact live-agent status summaries after the wait. Completed statuses include each agent's final result when available.",
                 "items": agent_status_summary_output_schema()
+            },
+            "unfinished_agents": {
+                "type": "array",
+                "description": "When timed_out is true, child agents that are still not final. Use these names/messages to decide whether to wait again, close stragglers, or finish with enough completed results.",
+                "items": agent_status_summary_output_schema()
             }
         },
         "required": ["message", "timed_out", "agents"],
@@ -2317,7 +2322,7 @@ fn wait_agent_tool_spec(multi_agent_config: &MultiAgentToolSpecConfig) -> ToolSp
             .tool_namespace
             .as_ref()
             .map(|_| MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string()),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. For browser/data fan-out, call this after spawning helpers and read the returned `agents` array: completed helpers appear as `agent_status: {\"completed\": ...}` and that completed value is the helper's final result. If some helpers are still running, integrate the completed results and call wait_agent again until you have enough data or the task budget requires a partial answer. Returns a timeout summary if no mailbox update arrives before the deadline."
+        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. For browser/data fan-out, call this after spawning helpers and read the returned `agents` array: completed helpers appear as `agent_status: {\"completed\": ...}` and that completed value is the helper's final result. If some helpers are still running, integrate the completed results and call wait_agent again until you have enough data or the task budget requires a partial answer. Returns a timeout summary plus `unfinished_agents` if no mailbox update arrives before the deadline; use those child names/messages to wait again, close stragglers, or finish partial."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -2756,6 +2761,7 @@ mod tests {
         assert!(wait
             .description
             .contains("`agent_status: {\"completed\": ...}`"));
+        assert!(wait.description.contains("`unfinished_agents`"));
         let wait_properties = wait.input_schema["properties"].as_object().unwrap();
         assert!(wait_properties.contains_key("timeout_ms"));
         assert!(!wait_properties.contains_key("target"));
@@ -2773,6 +2779,10 @@ mod tests {
             wait.output_schema.as_ref().unwrap()["properties"]["agents"]["items"]["properties"]
                 ["agent_status"]["description"],
             "Last known status of the agent."
+        );
+        assert_eq!(
+            wait.output_schema.as_ref().unwrap()["properties"]["unfinished_agents"]["description"],
+            "When timed_out is true, child agents that are still not final. Use these names/messages to decide whether to wait again, close stragglers, or finish with enough completed results."
         );
 
         let send = specs

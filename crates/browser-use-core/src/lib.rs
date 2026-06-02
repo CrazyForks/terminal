@@ -25343,6 +25343,20 @@ fn dispatch_wait_agent_tool(
             "tool_call_id": call.id,
         }),
     )?;
+    let agents = agent_status_summaries(store, session, None, false)?;
+    let unfinished_agents = if timed_out {
+        agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .get("agent_status")
+                    .is_some_and(|status| !agent_status_is_final_for_wait(status))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
@@ -25353,7 +25367,8 @@ fn dispatch_wait_agent_tool(
             serde_json::json!({
                 "message": if timed_out { "Wait timed out." } else { "Wait completed." },
                 "timed_out": timed_out,
-                "agents": agent_status_summaries(store, session, None, false)?,
+                "agents": agents,
+                "unfinished_agents": unfinished_agents,
             }),
         )?],
     })
@@ -46180,10 +46195,8 @@ command = "explicit-mcp"
             },
             &AgentRunOptions::default(),
         )?;
-        let content = outcome.messages[0]["content"]
-            .as_str()
-            .context("tool content")?;
-        let data: Value = serde_json::from_str(content)?;
+        let content = message_content_text(&outcome.messages[0]);
+        let data: Value = serde_json::from_str(&content)?;
         assert_eq!(data["timed_out"], false);
         assert_eq!(data["message"], "Wait completed.");
         assert!(content.contains("second finished"));
@@ -46235,10 +46248,8 @@ command = "explicit-mcp"
             },
             &AgentRunOptions::default(),
         )?;
-        let content = outcome.messages[0]["content"]
-            .as_str()
-            .context("tool content")?;
-        let data: Value = serde_json::from_str(content)?;
+        let content = message_content_text(&outcome.messages[0]);
+        let data: Value = serde_json::from_str(&content)?;
         assert_eq!(data["timed_out"], false);
         assert_eq!(data["message"], "Wait completed.");
         assert!(content.contains("finished without mailbox"));
@@ -46439,6 +46450,67 @@ command = "explicit-mcp"
         assert!(!parent_events
             .iter()
             .any(|event| event.event_type == "agent.wait.started"));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_v2_timeout_returns_unfinished_agent_diagnostics() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/item_7"),
+            Some("Atlas"),
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "Handle item 7/9 and return JSON"}),
+        )?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![
+            (
+                "features.multi_agent_v2.min_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10),
+            ),
+            (
+                "features.multi_agent_v2.max_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10_000),
+            ),
+            (
+                "features.multi_agent_v2.default_wait_timeout_ms".to_string(),
+                toml::Value::Integer(10),
+            ),
+        ]);
+
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_timeout".to_string(),
+                name: "wait_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10}),
+            },
+            &options,
+        )?;
+        let content = message_content_text(&outcome.messages[0]);
+        let data: Value = serde_json::from_str(&content)
+            .with_context(|| format!("wait_agent content: {content}"))?;
+        assert_eq!(data["timed_out"], true);
+        assert_eq!(data["message"], "Wait timed out.");
+        assert_eq!(data["unfinished_agents"].as_array().unwrap().len(), 1);
+        assert_eq!(data["unfinished_agents"][0]["agent_name"], "/root/item_7");
+        assert_eq!(
+            data["unfinished_agents"][0]["last_task_message"],
+            "Handle item 7/9 and return JSON"
+        );
+        assert_eq!(data["unfinished_agents"][0]["agent_status"], "running");
+        assert!(data["agents"].as_array().unwrap().iter().any(|agent| {
+            agent["agent_name"] == "/root/item_7" && agent["agent_status"] == "running"
+        }));
         Ok(())
     }
 
