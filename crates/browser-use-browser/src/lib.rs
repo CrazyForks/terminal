@@ -6028,6 +6028,74 @@ print("embedded_data_snapshot ok")
     }
 
     #[test]
+    fn browser_script_network_resources_snapshot_surfaces_api_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-network-resources-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    assert "__NETWORK_RESOURCES_SNAPSHOT__" in expression
+    assert "performance.getEntriesByType('resource')" in expression
+    assert "document.querySelectorAll('a[href]')" in expression
+    assert "document.querySelectorAll('form')" in expression
+    assert "script[src]" in expression
+    assert "apiRe" in expression
+    assert "extRe" in expression
+    assert "http_get_many" not in expression
+    assert "results" in expression
+    assert "download" in expression
+    return {
+        "url": "https://example.test/search",
+        "title": "Search",
+        "count": 2,
+        "by_type": {"fetch": 1, "link": 1},
+        "resources": [
+            {
+                "source": "performance",
+                "type": "fetch",
+                "url": "https://example.test/api/search?query=reports&page=2",
+                "score": 43,
+                "text": "",
+                "initiator_type": "fetch",
+                "transfer_size": 1024,
+                "encoded_body_size": 900,
+                "duration_ms": 33,
+            },
+            {
+                "source": "anchor",
+                "type": "link",
+                "url": "https://example.test/export/results.csv",
+                "score": 32,
+                "text": "Download CSV results",
+                "rel": "",
+                "download": "results.csv",
+            },
+        ],
+    }
+
+snapshot = network_resources_snapshot(keywords=["results", "download"], limit=20)
+assert snapshot["count"] == 2
+assert snapshot["resources"][0]["url"].endswith("page=2")
+assert snapshot["resources"][0]["initiator_type"] == "fetch"
+assert snapshot["resources"][1]["download"] == "results.csv"
+assert snapshot["by_type"]["fetch"] == 1
+assert len(calls) == 1
+print("network_resources_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("network_resources_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_uses_project_python_environment_when_available() {
         let Some(repo_root) = repo_root_from_manifest() else {
             eprintln!("skipping project python environment test: missing repo root");

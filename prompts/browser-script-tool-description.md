@@ -32,6 +32,7 @@ goto_url(url)
 page_info()
 navigation_snapshot(keywords=None, limit=80)
 embedded_data_snapshot(limit=80, max_sources=12)
+network_resources_snapshot(limit=80, keywords=None)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
 extract_repeated_items(selector, limit=50, include_html=False)
 pricing_cards_snapshot(limit=50)
@@ -108,6 +109,7 @@ Usage guidance:
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.
 - Before deciding a site lacks a property/listing/document/investor/results page, call `navigation_snapshot(keywords=[...])`. It returns visible links plus collapsed menu/toggle controls with `aria-expanded`/`aria-controls`, stable selectors, keyword matches, and relevance scores. If it shows a collapsed menu/toggle control, click or press that control, wait, then call `navigation_snapshot` again before giving up.
 - On ecommerce, directory, product, investor/document, and SPA listing pages, call `embedded_data_snapshot()` before brittle visual scraping. It extracts bounded records from JSON-LD, `__NEXT_DATA__`, Nuxt payloads, JSON script tags, and product/document meta tags, including normalized names, URLs, images, prices, dates, brands, descriptions, and document links.
+- After navigation, search/filter actions, SPA route changes, or downloads, call `network_resources_snapshot(keywords=[...])` to discover XHR/API, document/download, pagination, form, and export URLs before manual page walking. Use promising URLs with `http_get_many(...)`, `browser_fetch_many(...)`, or `read_document_text(...)`.
 - For search-result tables, docket grids, comparison tables, or SPA row lists where row-scoped links/buttons matter, call `rows_snapshot()` and then `extract_grid_rows(selector=...)`. It returns header-labeled cells, description-like fields, row-scoped links/buttons, coordinates, and `file_actions` so filenames/download buttons stay associated with the correct row.
 - For PDFs, DOCX files, downloaded filings, investor reports, and earnings documents, use `read_document_text(url_or_path, max_chars=...)` after discovering a direct file URL/path. It fetches or reads the file and extracts bounded text using available PDF/DOCX parsers or `pdftotext`, with a low-fidelity PDF byte-string fallback.
 - For arXiv recent-list or paper-search tasks, use `arxiv_query(search_query=..., start=..., max_results=...)` instead of browsing arXiv list/abstract pages one by one. It returns normalized title, authors, abstract, abs/pdf URLs, categories, DOI/journal/comment metadata, and first-version submission time when exposed by arXiv.
