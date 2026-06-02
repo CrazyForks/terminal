@@ -242,6 +242,7 @@ struct BrowserScriptRun {
     bridge_errors: Arc<Mutex<Vec<String>>>,
     stream_path: PathBuf,
     stream_offset: u64,
+    script_path: PathBuf,
     frames_dir: PathBuf,
     last_frame_seq: i64,
     started_at_ms: u128,
@@ -572,16 +573,24 @@ fn spawn_browser_script(
         &frames_dir,
         code,
     )?;
+    let script_path = artifact_dir.as_ref().join(format!(".{run_id}.py"));
+    fs::write(&script_path, prelude)
+        .with_context(|| format!("write browser_script prelude {}", script_path.display()))?;
     let mut command = browser_script_python_command();
-    let mut child = command
-        .arg("-c")
-        .arg(prelude)
+    let child_result = command
+        .arg(&script_path)
         .current_dir(cwd.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .context("spawn browser_script python")?;
+        .spawn();
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = fs::remove_file(&script_path);
+            return Err(err).context("spawn browser_script python");
+        }
+    };
     let stdout_reader = child.stdout.take().map(read_browser_script_stdout);
     let stderr_reader = child.stderr.take().map(read_browser_script_stderr);
     Ok(BrowserScriptRun {
@@ -595,6 +604,7 @@ fn spawn_browser_script(
         bridge_errors,
         stream_path,
         stream_offset: 0,
+        script_path,
         frames_dir,
         last_frame_seq: -1,
         started_at_ms: unix_time_ms(),
@@ -611,6 +621,7 @@ fn finish_browser_script_run(
         let _ = run.child.kill();
     }
     let _ = run.child.wait().context("wait for browser_script python")?;
+    let _ = fs::remove_file(&run.script_path);
     run.bridge_stop.store(true, Ordering::SeqCst);
     let bridge_joined = run
         .bridge
@@ -740,6 +751,7 @@ fn finish_browser_script_run(
 
 fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<BrowserScriptOutput> {
     let _ = run.child.wait().context("wait for browser_script python")?;
+    let _ = fs::remove_file(&run.script_path);
     run.bridge_stop.store(true, Ordering::SeqCst);
     if let Some(bridge) = run.bridge.take() {
         let _ = join_bridge_with_timeout(bridge, Duration::from_secs(5));
@@ -8146,6 +8158,136 @@ print(json.dumps({"snapshot": snapshot, "rows": rows}, ensure_ascii=False))
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("extract_grid_rows"));
         assert!(output.text.contains("filing.pdf"));
+    }
+
+    #[test]
+    fn browser_script_repeated_item_helpers_surface_actionable_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-repeated-item-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    if "record.cells" not in expression:
+        assert "selectorCandidates" in expression
+        assert "data-testid', 'data-test', 'data-cy', 'data-component" in expression
+        assert '[role="listitem"]' in expression
+        assert "[itemtype]" in expression
+        assert "utilityClassRe" in expression
+        assert "detail_links" in expression
+        assert "image_count" in expression
+        assert "picture source[srcset]" in expression
+        return {
+            "recommended_action": "extract_repeated_items",
+            "recommended_selector": "div.subscriptioncard",
+            "next_extract_hint": "extract_repeated_items(selector=\"div.subscriptioncard\")",
+            "candidates": [{
+                "selector": "div.subscriptioncard",
+                "count": 6,
+                "price_signal_count": 3,
+                "link_count": 6,
+                "detail_link_count": 6,
+                "detail_links": [{"text": "DNA Netti 300M product page", "href": "https://example.test/dna-300"}],
+                "image_count": 3,
+                "samples": ["DNA Netti 300M 19,90 €/kk"],
+            }],
+        }
+
+    for needle in [
+        "el.matches('a[href]')",
+        "seenLinks",
+        "buttonNodes",
+        "aria-label",
+        "img[alt]",
+        "imageRecords",
+        "currentSrc",
+        "data-src",
+        "picture source[srcset]",
+        "stableAttributes",
+        "data-testid",
+        "itemprop",
+        "attrs.href",
+        "directCellNodes",
+        "tableHeadersForRow",
+        "ariaHeadersForRow",
+        "idRefTexts",
+        "rowHeaderTexts",
+        "headerLabelsForCell",
+        "getAttribute('headers')",
+        "aria-labelledby",
+        "colspan",
+        "rowgroup",
+        "cellRecords",
+        "columnheader",
+        "gridcell",
+        "data-label",
+        "record.cells",
+        "actionText",
+        "labels",
+        "images",
+    ]:
+        assert needle in expression, needle
+    return [{
+        "index": 0,
+        "text": "DNA Netti 300M 19,90 €/kk",
+        "attributes": {
+            "id": "plan-dna-300",
+            "role": "row",
+            "data-testid": "plan-row",
+            "itemtype": "https://schema.org/Product",
+        },
+        "headings": ["DNA Netti 300M"],
+        "labels": ["DNA Netti 300M product card"],
+        "prices": ["19,90 €/kk"],
+        "links": [{
+            "text": "DNA Netti 300M product page",
+            "aria_label": "DNA Netti 300M product page",
+            "title": "",
+            "href": "https://example.test/dna-300",
+        }],
+        "buttons": ["Valitse"],
+        "images": [{
+            "alt": "DNA modem",
+            "src": "https://example.test/dna.png",
+            "srcset": "",
+            "data_src": "https://example.test/lazy-dna.png",
+            "data_srcset": "",
+            "width": 200,
+            "height": 120,
+        }],
+        "cells": [
+            {"index": 0, "header": "Provider / Plan", "headers": ["Provider", "Plan"], "text": "DNA Netti 300M", "links": []},
+            {"index": 1, "header": "Provider / Price", "headers": ["Provider", "Price"], "text": "19,90 €/kk", "links": []},
+        ],
+    }]
+
+snapshot = repeated_items_snapshot()
+assert snapshot["recommended_action"] == "extract_repeated_items"
+assert snapshot["recommended_selector"] == "div.subscriptioncard"
+assert snapshot["candidates"][0]["detail_link_count"] == 6
+
+records = extract_repeated_items(snapshot["recommended_selector"])
+assert records["selector"] == "div.subscriptioncard"
+assert records["count"] == 1
+record = records["records"][0]
+assert record["prices"] == ["19,90 €/kk"]
+assert record["attributes"]["data-testid"] == "plan-row"
+assert record["images"][0]["data_src"] == "https://example.test/lazy-dna.png"
+assert record["links"][0]["aria_label"] == "DNA Netti 300M product page"
+assert record["cells"][1]["header"] == "Provider / Price"
+assert len(calls) == 2, calls
+print("repeated_items ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("repeated_items ok"));
     }
 
     #[test]

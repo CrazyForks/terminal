@@ -1019,6 +1019,275 @@ def embedded_data_snapshot(limit=80, max_sources=12):
     return js(expression)
 
 
+def repeated_items_snapshot(min_count=3, limit=8, include_prices=True):
+    """Find repeated visible cards/list items and suggest an extraction selector."""
+    expression = f"""
+(() => {{
+  const minCount = {int(min_count)};
+  const limit = {int(limit)};
+  const includePrices = {json.dumps(bool(include_prices))};
+  const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/i;
+  const visible = (el) => {{
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width >= 40 && r.height >= 20 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }};
+  const clean = (text, max = 240) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const recordText = (el, max = 500) => {{
+    const parts = [el.innerText || el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
+    for (const img of el.querySelectorAll('img[alt]')) parts.push(img.getAttribute('alt') || '');
+    return clean(parts.filter(Boolean).join(' '), max);
+  }};
+  const selectorCandidates = (el) => {{
+    if (!el || !el.tagName) return [];
+    const tag = el.tagName.toLowerCase();
+    const out = [];
+    const utilityClassRe = /^(?:ng-|css-|sc-|_[a-z0-9]|flex|grid|block|inline|hidden|relative|absolute|fixed|sticky|static|container|row|col|clearfix|sr-only|w-|h-|min-w-|min-h-|max-w-|max-h-|p[trblxy]?[-_]|m[trblxy]?[-_]|gap[-_]|space-[xy]-|text[-_]|font[-_]|leading[-_]|tracking[-_]|bg[-_]|border(?:[-_]|$)|rounded(?:[-_]|$)|shadow(?:[-_]|$)|opacity[-_]|overflow[-_]|z[-_]|items[-_]|justify[-_]|content[-_]|self[-_]|place[-_])/i;
+    const classes = [...el.classList].filter(c => c && !utilityClassRe.test(c)).slice(0, 2);
+    for (const attr of ['data-testid', 'data-test', 'data-cy', 'data-component']) {{
+      const value = el.getAttribute(attr);
+      if (value && value.length <= 80) out.push(`${{tag}}[${{attr}}="${{CSS.escape(value)}}"]`);
+    }}
+    const role = el.getAttribute('role');
+    if (role && /^(?:listitem|article|row|gridcell|option|menuitem|button|link)$/i.test(role)) {{
+      out.push(`${{tag}}[role="${{CSS.escape(role)}}"]`);
+    }}
+    const itemtype = el.getAttribute('itemtype');
+    if (itemtype && itemtype.length <= 160) out.push(`${{tag}}[itemtype="${{CSS.escape(itemtype)}}"]`);
+    if (classes.length) {{
+      out.push(`${{tag}}.${{classes.map(c => CSS.escape(c)).join('.')}}`);
+      for (const cls of classes) out.push(`${{tag}}.${{CSS.escape(cls)}}`);
+    }}
+    if (el.id) out.push(`${{tag}}#${{CSS.escape(el.id)}}`);
+    if (!out.length) out.push(tag);
+    return [...new Set(out)];
+  }};
+  const scoreGroup = (items, selector) => {{
+    const samples = items.slice(0, 5).map(el => recordText(el));
+    const nonempty = samples.filter(Boolean);
+    const priceSignals = samples.filter(text => priceRe.test(text)).length;
+    const avgLen = nonempty.reduce((sum, text) => sum + text.length, 0) / Math.max(1, nonempty.length);
+    const links = new Set();
+    const detailLinks = [];
+    let imageCount = 0;
+    for (const el of items.slice(0, 10)) {{
+      const itemLinks = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
+      for (const a of itemLinks) {{
+        if (!a.href) continue;
+        links.add(a.href);
+        if (!detailLinks.some(link => link.href === a.href)) {{
+          detailLinks.push({{ text: clean([a.innerText || a.textContent || '', a.getAttribute('aria-label') || '', a.getAttribute('title') || ''].filter(Boolean).join(' '), 200), href: a.href }});
+        }}
+      }}
+      imageCount += el.querySelectorAll('img[src],img[srcset],picture source[srcset]').length;
+    }}
+    let score = items.length * 2 + Math.min(avgLen / 30, 8) + Math.min(links.size, 8) + Math.min(imageCount, 6);
+    if (priceSignals) score += priceSignals * 6;
+    if (/^(li|div|article|section|tr)($|[.#])/.test(selector)) score += 1;
+    return {{
+      selector,
+      count: items.length,
+      price_signal_count: priceSignals,
+      link_count: links.size,
+      detail_link_count: links.size,
+      detail_links: detailLinks.slice(0, 8),
+      image_count: imageCount,
+      score,
+      samples,
+    }};
+  }};
+  const groups = new Map();
+  for (const el of document.querySelectorAll('article, section, li, tr, [role="listitem"], [role="article"], [role="row"], [role="gridcell"], [role="option"], [itemscope], [itemtype], [data-testid], [data-test], [data-cy], [data-component], a[href], button, [role="button"], [class]')) {{
+    if (!visible(el)) continue;
+    const text = recordText(el, 500);
+    if (text.length < 12) continue;
+    for (const selector of selectorCandidates(el)) {{
+      if (!groups.has(selector)) groups.set(selector, []);
+      groups.get(selector).push(el);
+    }}
+  }}
+  const candidates = [];
+  for (const [selector, items] of groups) {{
+    if (items.length < minCount) continue;
+    const scored = scoreGroup(items, selector);
+    if (includePrices && scored.price_signal_count === 0 && scored.link_count === 0 && scored.score < 14) continue;
+    candidates.push(scored);
+  }}
+  candidates.sort((a, b) => b.score - a.score || b.price_signal_count - a.price_signal_count || b.count - a.count);
+  const recommended = candidates[0] || null;
+  return {{
+    recommended_action: recommended ? 'extract_repeated_items' : null,
+    recommended_selector: recommended ? recommended.selector : null,
+    next_extract_hint: recommended ? `extract_repeated_items(selector=${{JSON.stringify(recommended.selector)}})` : null,
+    candidates: candidates.slice(0, limit),
+  }};
+}})()
+"""
+    return js(expression)
+
+
+def extract_repeated_items(selector, limit=50, include_html=False):
+    """Extract compact records from repeated page elements matching selector."""
+    expression = f"""
+(() => {{
+  const selector = {json.dumps(selector)};
+  const limit = {int(limit)};
+  const includeHtml = {json.dumps(bool(include_html))};
+  const clean = (text, max = 2000) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const imageAlts = (el) => Array.from(el.querySelectorAll('img[alt]')).map(img => clean(img.getAttribute('alt'), 200)).filter(Boolean).slice(0, 8);
+  const imageRecords = (el) => {{
+    const imgRecords = Array.from(el.querySelectorAll('img[src],img[srcset],img[data-src],img[data-srcset]')).map(img => {{
+      const rect = img.getBoundingClientRect();
+      return {{
+        alt: clean(img.getAttribute('alt'), 200),
+        src: img.currentSrc || img.src || img.getAttribute('src') || '',
+        srcset: img.getAttribute('srcset') || '',
+        data_src: img.getAttribute('data-src') || '',
+        data_srcset: img.getAttribute('data-srcset') || '',
+        width: Math.round(rect.width || img.naturalWidth || 0),
+        height: Math.round(rect.height || img.naturalHeight || 0),
+      }};
+    }});
+    const sourceRecords = Array.from(el.querySelectorAll('picture source[srcset],source[srcset]')).map(source => ({{
+      alt: '',
+      src: '',
+      srcset: source.getAttribute('srcset') || '',
+      data_src: '',
+      data_srcset: source.getAttribute('data-srcset') || '',
+      media: source.getAttribute('media') || '',
+      type: source.getAttribute('type') || '',
+      width: 0,
+      height: 0,
+    }}));
+    return imgRecords.concat(sourceRecords).filter(img => img.src || img.srcset || img.data_src || img.data_srcset || img.alt).slice(0, 8);
+  }};
+  const actionText = (el) => clean([
+    el.innerText || el.textContent || el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    ...imageAlts(el),
+  ].filter(Boolean).join(' '), 200);
+  const recordText = (el) => clean([
+    el.innerText || el.textContent || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    ...imageAlts(el),
+  ].filter(Boolean).join(' '));
+  const stableAttributes = (el) => {{
+    const attrs = {{}};
+    for (const name of ['id', 'role', 'data-testid', 'data-test', 'data-cy', 'data-component', 'itemtype', 'itemprop', 'aria-label', 'title']) {{
+      const value = clean(el.getAttribute(name), 240);
+      if (value) attrs[name] = value;
+    }}
+    if (el.matches('a[href]')) attrs.href = el.href;
+    return attrs;
+  }};
+  const directCellNodes = (el) => {{
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag === 'TR') {{
+      return Array.from(el.children).filter(child => ['TH', 'TD'].includes((child.tagName || '').toUpperCase()));
+    }}
+    if (el.getAttribute('role') === 'row') {{
+      return Array.from(el.children).filter(child => ['cell', 'gridcell', 'columnheader', 'rowheader'].includes(child.getAttribute('role') || ''));
+    }}
+    return [];
+  }};
+  const tableHeadersForRow = (row) => {{
+    if ((row.tagName || '').toUpperCase() !== 'TR') return [];
+    const table = row.closest('table');
+    if (!table) return [];
+    const headerRow = table.querySelector('thead tr') || Array.from(table.querySelectorAll('tr')).find(tr => tr.querySelector('th'));
+    if (!headerRow || headerRow === row) return [];
+    const out = [];
+    for (const cell of Array.from(headerRow.children).filter(cell => ['TH', 'TD'].includes((cell.tagName || '').toUpperCase()))) {{
+      const span = Math.max(1, parseInt(cell.getAttribute('colspan') || '1', 10) || 1);
+      for (let i = 0; i < span; i++) out.push(clean(cell.textContent, 200));
+    }}
+    return out;
+  }};
+  const ariaHeadersForRow = (row) => {{
+    const container = row.closest('[role="table"],[role="grid"],[role="treegrid"]');
+    if (!container) return [];
+    return Array.from(container.querySelectorAll('[role="columnheader"]')).map(cell => clean(cell.textContent, 200));
+  }};
+  const idRefTexts = (value) => (value || '').split(/\\s+/).map(id => {{
+    const node = id ? document.getElementById(id) : null;
+    return node ? clean(node.textContent, 200) : '';
+  }}).filter(Boolean);
+  const rowHeaderTexts = (cell, row) => {{
+    if (row.getAttribute('role') === 'row') {{
+      return Array.from(row.children)
+        .filter(other => other !== cell && other.getAttribute('role') === 'rowheader')
+        .map(other => clean(other.textContent, 200))
+        .filter(Boolean);
+    }}
+    return Array.from(row.children)
+      .filter(other => other !== cell && (other.tagName || '').toUpperCase() === 'TH')
+      .filter(other => ['row', 'rowgroup'].includes(other.getAttribute('scope') || '') || !other.getAttribute('scope'))
+      .map(other => clean(other.textContent, 200))
+      .filter(Boolean);
+  }};
+  const headerLabelsForCell = (cell, row, cellIndex, headers, ariaHeaders) => Array.from(new Set([
+    ...rowHeaderTexts(cell, row),
+    ...idRefTexts(cell.getAttribute('headers')),
+    ...idRefTexts(cell.getAttribute('aria-labelledby')),
+    headers[cellIndex] || '',
+    ariaHeaders[cellIndex] || '',
+    clean(cell.getAttribute('data-label'), 200),
+    clean(cell.getAttribute('aria-label'), 200),
+  ].filter(Boolean))).slice(0, 6);
+  const cellRecords = (el) => {{
+    const cells = directCellNodes(el);
+    if (!cells.length) return [];
+    const headers = tableHeadersForRow(el);
+    const ariaHeaders = headers.length ? [] : ariaHeadersForRow(el);
+    return cells.map((cell, cellIndex) => {{
+      const headerLabels = headerLabelsForCell(cell, el, cellIndex, headers, ariaHeaders);
+      const cellLinks = Array.from(cell.querySelectorAll('a[href]')).slice(0, 4).map(a => ({{
+        text: actionText(a),
+        aria_label: clean(a.getAttribute('aria-label'), 160),
+        title: clean(a.getAttribute('title'), 160),
+        href: a.href,
+      }}));
+      return {{
+        index: cellIndex,
+        header: headerLabels.join(' / '),
+        headers: headerLabels,
+        text: recordText(cell),
+        links: cellLinks,
+      }};
+    }}).filter(cell => cell.text || cell.header || cell.links.length).slice(0, 20);
+  }};
+  const priceRe = /(?:[$€£¥]\\s?\\d|\\d[\\d.,]*\\s?(?:€|eur|usd|gbp|kr|dkk|sek|nok)|\\d+\\s?(?:Mbit|Mbps|GB|TB))/ig;
+  return Array.from(document.querySelectorAll(selector)).slice(0, limit).map((el, index) => {{
+    const text = recordText(el);
+    const headings = Array.from(el.querySelectorAll('h1,h2,h3,h4,[role="heading"]')).map(h => clean(h.textContent, 200)).filter(Boolean);
+    const labels = Array.from(new Set([clean(el.getAttribute('aria-label'), 200), clean(el.getAttribute('title'), 200), ...imageAlts(el)].filter(Boolean))).slice(0, 12);
+    const linkNodes = (el.matches('a[href]') ? [el] : []).concat(Array.from(el.querySelectorAll('a[href]')));
+    const buttonNodes = (el.matches('button,[role="button"],input[type="button"],input[type="submit"]') ? [el] : []).concat(Array.from(el.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')));
+    const seenLinks = new Set();
+    const links = linkNodes.filter(a => {{
+      if (seenLinks.has(a.href)) return false;
+      seenLinks.add(a.href);
+      return true;
+    }}).slice(0, 8).map(a => ({{ text: actionText(a), aria_label: clean(a.getAttribute('aria-label'), 160), title: clean(a.getAttribute('title'), 160), href: a.href }}));
+    const buttons = buttonNodes.slice(0, 8).map(b => actionText(b)).filter(Boolean);
+    const prices = Array.from(new Set(text.match(priceRe) || [])).slice(0, 12);
+    const images = imageRecords(el);
+    const cells = cellRecords(el);
+    const attributes = stableAttributes(el);
+    const record = {{ index, text, attributes, headings, labels, prices, links, buttons, images }};
+    if (cells.length) record.cells = cells;
+    if (includeHtml) record.html = clean(el.outerHTML || '', 4000);
+    return record;
+  }});
+}})()
+"""
+    records = js(expression)
+    return {"selector": selector, "count": len(records or []), "records": records or []}
+
+
 def rows_snapshot(limit=8):
     """Find row-like table/grid/list records and suggest row-scoped extraction.
 

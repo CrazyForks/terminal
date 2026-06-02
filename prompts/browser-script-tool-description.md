@@ -32,6 +32,8 @@ goto_url(url)
 page_info()
 navigation_snapshot(keywords=None, limit=80)
 embedded_data_snapshot(limit=80, max_sources=12)
+repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
+extract_repeated_items(selector, limit=50, include_html=False)
 rows_snapshot(limit=8)
 extract_grid_rows(selector=None, limit=50, include_html=False)
 read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None)
@@ -79,6 +81,7 @@ Usage guidance:
 - First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab.
 - Use `navigation_snapshot(...)` before giving up on hidden routes, menus, listings, investor/report links, search/result pages, or document sections; it returns visible links and menu controls with selectors and relevance scores.
 - Use `embedded_data_snapshot()` on ecommerce, directory, SPA listing, investor/document, and product pages before brittle visual scraping; it extracts bounded records from JSON-LD, hydration payloads, JSON script tags, and product/document meta tags.
+- Use `repeated_items_snapshot()` on repeated product/listing/package/ticket cards or non-table lists; if it recommends `extract_repeated_items`, use that selector. Records include stable attributes, cells with headers, headings, labels, prices, links/buttons, and image metadata.
 - Use `rows_snapshot()` and then `extract_grid_rows(selector=...)` for search-result tables, docket grids, comparison tables, and SPA row lists where links/buttons/files must stay associated with the correct row.
 - Use `read_document_text(...)` for PDFs, DOCX files, downloaded filings, investor reports, and earnings documents after discovering a direct file URL or local path; it returns bounded extracted text plus source/kind/extractor metadata.
 - Use `arxiv_query(...)` for arXiv recent-list or paper-search tasks instead of browsing list/abstract pages one by one; it returns normalized title, authors, abstract, abs/pdf URLs, categories, DOI/journal/comment metadata, and submission timestamps.
