@@ -5925,6 +5925,55 @@ print(json.dumps({"snapshot": snapshot, "rows": rows}, ensure_ascii=False))
     }
 
     #[test]
+    fn browser_script_grid_rows_fan_out_many_files_across_few_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-grid-row-many-file-fanout",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    files = [
+        ("row1-a.pdf", "https://example.test/row1-a.pdf"),
+        ("row1-b.pdf", "https://example.test/row1-b.pdf"),
+        ("row1-c.pdf", "https://example.test/row1-c.pdf"),
+        ("row2-a.pdf", "https://example.test/row2-a.pdf"),
+        ("row2-b.pdf", "https://example.test/row2-b.pdf"),
+        ("row2-c.pdf", "https://example.test/row2-c.pdf"),
+    ]
+    records = []
+    for row_index in range(2):
+        row_files = files[row_index * 3 : row_index * 3 + 3]
+        links = [{"text": name, "href": href, "file_like": True} for name, href in row_files]
+        records.append({
+            "index": row_index,
+            "text": f"CP23-29 Row {row_index + 1} " + " ".join(name for name, _ in row_files),
+            "cells": [],
+            "description_fields": [{"header": "Description", "text": f"Row {row_index + 1} description"}],
+            "links": links,
+            "buttons": [],
+            "file_actions": links,
+        })
+    return records
+
+rows = extract_grid_rows("tbody tr")
+assert rows["count"] == 2, rows
+assert rows["detail_action_count"] == 6, rows
+assert rows["fanout_recommended"] is True, rows
+assert len(rows["fanout_tasks"]) == 6, rows
+assert rows["fanout_tasks"][0]["task_name"] == "row_1", rows
+assert rows["fanout_tasks"][5]["url"] == "https://example.test/row2-c.pdf", rows
+print("few rows many files fanout ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("few rows many files fanout ok"));
+    }
+
+    #[test]
     fn browser_script_navigation_snapshot_surfaces_menu_and_route_links() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
