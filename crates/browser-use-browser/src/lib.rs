@@ -8772,6 +8772,52 @@ print("http_get parity ok")
     }
 
     #[test]
+    fn browser_script_http_get_many_preserves_order_errors_and_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-http-get-many",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    calls.append((url, headers, timeout, binary))
+    assert headers == {"X-Test": "yes"}, calls
+    assert timeout == 1.5, calls
+    if url.endswith("/fail"):
+        raise RuntimeError("boom for fail")
+    if binary:
+        return _HttpGetBytes(bytes([0, 159, 255]), 206, {"content-type": "application/octet-stream"}, url + "?download=1")
+    return _HttpGetText("body:" + url.rsplit("/", 1)[-1], 200, {"content-type": "text/plain"}, url + "?ok=1")
+
+rows = http_get_many(
+    ["https://example.test/a", "https://example.test/fail", "https://example.test/b"],
+    headers={"X-Test": "yes"},
+    timeout=1.5,
+    max_workers=2,
+)
+assert [row["index"] for row in rows] == [0, 1, 2], rows
+assert rows[0]["ok"] is True and rows[0]["text"] == "body:a", rows
+assert rows[0]["final_url"].endswith("?ok=1"), rows
+assert rows[1]["ok"] is False and "boom for fail" in rows[1]["error"], rows
+assert rows[2]["ok"] is True and rows[2]["text"] == "body:b", rows
+
+binary_rows = http_get_many(["https://example.test/bin"], headers={"X-Test": "yes"}, timeout=1.5, binary=True)
+assert binary_rows[0]["ok"] is True, binary_rows
+assert binary_rows[0]["status_code"] == 206, binary_rows
+assert binary_rows[0]["content_base64"] == base64.b64encode(bytes([0, 159, 255])).decode("ascii"), binary_rows
+print("http_get_many ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("http_get_many ok"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
