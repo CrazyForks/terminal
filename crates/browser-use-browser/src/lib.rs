@@ -6113,7 +6113,7 @@ print("form field helpers ok")
             "script-action-control-helpers",
             temp.path(),
             temp.path().join("artifacts"),
-            r#"
+            r##"
 calls = []
 clicked_points = []
 
@@ -6163,13 +6163,81 @@ assert result["matched_text"] == "apply filters"
 assert clicked_points == [{"x": 88, "y": 144, "button": "left", "clicks": 1}]
 assert len(calls) == 2
 print("action helpers ok")
-"#,
+"##,
             10,
         )
         .unwrap();
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("action helpers ok"));
+    }
+
+    #[test]
+    fn browser_script_form_control_helpers_toggle_labeled_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-form-control-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "input[type=checkbox]" in expression
+    assert "[role=switch]" in expression
+    assert "label[for=" in expression
+    assert "CSS.escape" in expression
+    if "needle=" in expression:
+        assert "needs_click" in expression
+        return {
+            "selector": "#terms",
+            "score": 135,
+            "matched_text": "accept terms",
+            "type": "checkbox",
+            "state": False,
+            "want": True,
+            "needs_click": True,
+            "x": 24,
+            "y": 72,
+            "rect": {"x": 16, "y": 64, "width": 16, "height": 16},
+        }
+    return [
+        {
+            "index": 0,
+            "selector": "#terms",
+            "tag": "input",
+            "type": "checkbox",
+            "label": "Accept terms",
+            "name": "terms",
+            "checked": False,
+            "aria_checked": None,
+            "rect": {"x": 16, "y": 64, "width": 16, "height": 16, "in_viewport": True},
+        }
+    ]
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = form_controls_snapshot()
+assert snapshot["count"] == 1
+assert snapshot["controls"][0]["label"] == "Accept terms"
+result = toggle_form_control("accept terms", checked=True, timeout=0)
+assert result["changed"] is True
+assert result["selector"] == "#terms"
+assert result["checked"] is True
+assert clicked_points == [{"x": 24, "y": 72, "button": "left", "clicks": 1}]
+assert len(calls) == 2
+print("form control helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("form control helpers ok"));
     }
 
     #[test]

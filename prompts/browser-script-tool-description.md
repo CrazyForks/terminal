@@ -49,6 +49,8 @@ form_fields_snapshot(limit=30)
 fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0)
 action_controls_snapshot(limit=30)
 click_button(label_or_text, timeout=3.0)
+form_controls_snapshot(limit=30)
+toggle_form_control(label_or_text, checked=True, timeout=1.0)
 type_text(text)
 press_key(key, modifiers=0)  # accepts chords like "Meta+A"; modifiers: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8
 scroll(x=0, y=600)
@@ -87,6 +89,7 @@ Usage guidance:
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - For forms with labeled fields, split address fields, or autocomplete-like controls, call `form_fields_snapshot()` before coordinate guessing. Use `fill_form_field(label_or_placeholder, value)` to target visible/rendered fields by label, placeholder, name, selector, or nearby text while preserving real browser input events.
 - For named actions after filling/search/filter forms, call `action_controls_snapshot()` when uncertain and use `click_button(label_or_text)` for visible buttons/links such as Search, Submit, Apply, Next, Download, or Save. It clicks the rendered control center through browser input events instead of synthesizing DOM clicks.
+- For labeled checkboxes, radios, and switches, call `form_controls_snapshot()` when uncertain and use `toggle_form_control(label_or_text, checked=True/False)` to click only when the current state differs.
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
 - If the task is site-specific, call `domain_skills_for_url(url, include_content=True)` before inventing selectors, private API routes, or flows. `goto_url(url)` also returns matching `domain_skills` metadata when a skill root is available.
 - Use screenshots as labeled temporal checkpoints: initial load, before/after meaningful clicks, scrolls, route changes, dialogs, uploads, downloads, and final verification.

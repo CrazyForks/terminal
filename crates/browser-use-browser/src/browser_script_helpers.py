@@ -1596,6 +1596,48 @@ def click_button(label_or_text, timeout=3.0):
     return {"clicked": True, "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
 
 
+def form_controls_snapshot(limit=30):
+    """Return compact rendered checkboxes/radios/toggles with labels and state."""
+    expression = f"""
+(() => {{
+ const clean=(t,m=180)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return e.tagName.toLowerCase()}};
+ const label=e=>{{const bits=[e.getAttribute('aria-label'),e.getAttribute('name'),e.id];if(e.id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(e.id)}}"]`))bits.push(l.innerText);const p=e.closest('label,[aria-label],[data-label],.field,.form-group,li,div');if(p)bits.push(p.innerText,p.getAttribute('aria-label'),p.getAttribute('data-label'));return clean(bits.filter(Boolean).join(' '))}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ return [...document.querySelectorAll('input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]')].filter(e=>!e.disabled&&visible(e)).slice(0,{int(limit)}).map((e,i)=>{{const r=e.getBoundingClientRect(),role=e.getAttribute('role')||'',checked=e.checked===true||e.getAttribute('aria-checked')==='true';return {{index:i,selector:sel(e),tag:e.tagName.toLowerCase(),type:(e.getAttribute('type')||role),label:label(e),name:clean(e.getAttribute('name')),checked,aria_checked:e.getAttribute('aria-checked'),rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height),in_viewport:r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth}}}}}});
+}})()
+"""
+    controls = js(expression) or []
+    return {"count": len(controls), "controls": controls}
+
+
+def toggle_form_control(label_or_text, checked=True, timeout=1.0):
+    """Set a rendered checkbox/radio/switch by label/name/selector using a real click."""
+    needle = str(label_or_text or "").strip().lower()
+    if not needle:
+        raise RuntimeError("toggle_form_control requires a label_or_text")
+    expression = f"""
+(() => {{
+ const needle={json.dumps(needle)},want={json.dumps(bool(checked))},clean=t=>(t||'').replace(/\\s+/g,' ').trim(),sel=e=>{{if(e.id)return '#'+CSS.escape(e.id);for(const a of ['name','aria-label','data-testid','data-test']){{const v=e.getAttribute(a);if(v)return `${{e.tagName.toLowerCase()}}[${{a}}="${{CSS.escape(v)}}"]`}}return ''}};
+ const text=e=>{{const bits=[e.getAttribute('aria-label'),e.getAttribute('name'),e.id];if(e.id)for(const l of document.querySelectorAll(`label[for="${{CSS.escape(e.id)}}"]`))bits.push(l.innerText);const p=e.closest('label,[aria-label],[data-label],.field,.form-group,li,div');if(p)bits.push(p.innerText,p.getAttribute('aria-label'),p.getAttribute('data-label'));return clean(bits.filter(Boolean).join(' ')).toLowerCase()}};
+ const visible=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'}};
+ let best=null,bestScore=-1,bestText='';for(const e of document.querySelectorAll('input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]')){{if(e.disabled||!visible(e))continue;const s=sel(e),hay=text(e);let score=hay===needle?130:hay.includes(needle)?80:needle.includes(hay)&&hay.length>2?35:0;if(s&&s.toLowerCase()===needle)score=150;const r=e.getBoundingClientRect();if(score>0&&r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth)score+=5;if(score>bestScore){{best=e;bestScore=score;bestText=hay}}}}
+ if(!best||bestScore<=0)return null;
+ const r=best.getBoundingClientRect(),state=best.checked===true||best.getAttribute('aria-checked')==='true',type=(best.getAttribute('type')||best.getAttribute('role')||'').toLowerCase();return {{selector:sel(best),score:bestScore,matched_text:bestText,type,state,want,needs_click:state!==want,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),rect:{{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}}}};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = form_controls_snapshot(limit=20)
+        raise RuntimeError(f"toggle_form_control: no rendered control matched {label_or_text!r}; controls={controls}")
+    if match.get("type") == "radio" and not checked:
+        raise RuntimeError(f"toggle_form_control: cannot unset a radio button directly: {label_or_text!r}")
+    if match.get("needs_click"):
+        click_at_xy(match["x"], match["y"])
+        if timeout:
+            _time.sleep(min(float(timeout), 2.0))
+    return {"changed": bool(match.get("needs_click")), "selector": match.get("selector", ""), "matched_text": match.get("matched_text", ""), "checked": bool(checked), "score": match.get("score"), "x": match.get("x"), "y": match.get("y")}
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
