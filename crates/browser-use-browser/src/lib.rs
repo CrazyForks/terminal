@@ -5140,6 +5140,7 @@ const DOM_HIGHLIGHT_CONTAINER_ID: &str = "browser-use-terminal-highlights";
 const DOM_HIGHLIGHT_ACCENT: &str = "#3b82f6";
 const DOM_HIGHLIGHT_DURATION_MS: u64 = 1000;
 const DOM_HIGHLIGHT_Z_INDEX: u64 = 2_147_483_647;
+const BROWSER_TERMINAL_HIGHLIGHT_DURATION_ENV: &str = "BROWSER_USE_TERMINAL_HIGHLIGHT_DURATION_MS";
 
 fn browser_terminal_highlight_enabled() -> bool {
     match std::env::var("BROWSER_USE_TERMINAL_AUTO_HIGHLIGHT") {
@@ -5156,6 +5157,13 @@ fn browser_terminal_highlight_color() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DOM_HIGHLIGHT_ACCENT.to_string())
+}
+
+fn browser_terminal_highlight_duration_ms() -> u64 {
+    std::env::var(BROWSER_TERMINAL_HIGHLIGHT_DURATION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DOM_HIGHLIGHT_DURATION_MS)
 }
 
 fn browser_session_mouse_press_xy(method: &str, params: &Value) -> Option<(f64, f64)> {
@@ -5376,7 +5384,7 @@ fn bridge_highlight_box_expression(x: f64, y: f64, width: f64, height: f64) -> S
         "top": y,
         "width": width,
         "height": height,
-        "duration": DOM_HIGHLIGHT_DURATION_MS,
+        "duration": browser_terminal_highlight_duration_ms(),
         "color": browser_terminal_highlight_color(),
     }));
     format!(
@@ -5395,7 +5403,7 @@ fn bridge_highlight_element_at_xy_expression(x: f64, y: f64) -> String {
     let payload = bridge_highlight_payload(json!({
         "x": x,
         "y": y,
-        "duration": DOM_HIGHLIGHT_DURATION_MS,
+        "duration": browser_terminal_highlight_duration_ms(),
         "color": browser_terminal_highlight_color(),
     }));
     format!(
@@ -7385,6 +7393,19 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("rust")
         );
+    }
+
+    #[test]
+    fn browser_highlight_env_controls_color_and_duration() {
+        let _env = EnvRestore::set(&[
+            ("BROWSER_USE_TERMINAL_HIGHLIGHT_COLOR", "rgb(255, 127, 39)"),
+            (BROWSER_TERMINAL_HIGHLIGHT_DURATION_ENV, "1750"),
+        ]);
+
+        let expression = bridge_highlight_box_expression(1.0, 2.0, 30.0, 40.0);
+
+        assert!(expression.contains(r#""duration":1750"#));
+        assert!(expression.contains(r#""color":"rgb(255, 127, 39)""#));
     }
 
     #[test]
