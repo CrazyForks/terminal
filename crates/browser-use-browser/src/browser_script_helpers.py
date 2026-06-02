@@ -43,6 +43,34 @@ def _env_bool(name):
     return None
 
 
+def _env_ms(name, default_ms):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default_ms
+    try:
+        return max(0, int(float(value)))
+    except Exception:
+        return default_ms
+
+
+def _browser_minimum_wait_page_load_seconds():
+    return _env_ms("BU_BROWSER_MINIMUM_WAIT_PAGE_LOAD_MS", 0) / 1000
+
+
+def _browser_network_idle_ms():
+    return _env_ms("BU_BROWSER_NETWORK_IDLE_PAGE_LOAD_MS", 500)
+
+
+def _browser_wait_between_actions_seconds():
+    return _env_ms("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS", 0) / 1000
+
+
+def _after_browser_action_wait():
+    seconds = _browser_wait_between_actions_seconds()
+    if seconds > 0:
+        _time.sleep(seconds)
+
+
 def _configured_viewport_params(default=True):
     if _env_bool("BU_BROWSER_NO_VIEWPORT") is True:
         return None
@@ -395,6 +423,9 @@ def goto_url(url):
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
     wait_for_load(timeout=15)
+    minimum_wait = _browser_minimum_wait_page_load_seconds()
+    if minimum_wait > 0:
+        _time.sleep(minimum_wait)
     return result
 
 
@@ -544,8 +575,10 @@ def wait_for_element(selector, timeout=10.0, visible=False):
     return False
 
 
-def wait_for_network_idle(timeout=10.0, idle_ms=500):
+def wait_for_network_idle(timeout=10.0, idle_ms=None):
     timeout = _timeout_seconds(timeout)
+    if idle_ms is None:
+        idle_ms = _browser_network_idle_ms()
     deadline = _time.time() + timeout
     last_activity = _time.time()
     inflight = set()
@@ -644,11 +677,13 @@ def screenshot_clip(label, x, y, width, height):
 def click_at_xy(x, y, button="left", clicks=1):
     cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
     cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
+    _after_browser_action_wait()
     return True
 
 
 def type_text(text):
     cdp("Input.insertText", text=text)
+    _after_browser_action_wait()
     return True
 
 
@@ -741,11 +776,13 @@ def press_key(key, modifiers=0):
     event_type = "rawKeyDown" if modifiers else "keyDown"
     cdp("Input.dispatchKeyEvent", type=event_type, **base, **({"text": text} if text and not modifiers else {}))
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
+    _after_browser_action_wait()
     return True
 
 
 def scroll(x=0, y=0, dy=600, dx=0):
     cdp("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=dx, deltaY=dy)
+    _after_browser_action_wait()
     return True
 
 

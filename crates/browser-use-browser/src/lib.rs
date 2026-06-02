@@ -7702,6 +7702,37 @@ print(session_metadata()["outputs_dir"])
     }
 
     #[test]
+    fn browser_script_helpers_read_wait_timing_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[
+            ("BU_BROWSER_MINIMUM_WAIT_PAGE_LOAD_MS", "250"),
+            ("BU_BROWSER_NETWORK_IDLE_PAGE_LOAD_MS", "750"),
+            ("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS", "125"),
+        ]);
+        let output = run_browser_script(
+            "script-wait-timing-env",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+emit_output({
+    "minimum": _browser_minimum_wait_page_load_seconds(),
+    "network_idle_ms": _browser_network_idle_ms(),
+    "between": _browser_wait_between_actions_seconds(),
+}, label="timing")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
+        let timing = &output.outputs[0]["value"];
+        assert_eq!(timing["minimum"], 0.25);
+        assert_eq!(timing["network_idle_ms"], 750);
+        assert_eq!(timing["between"], 0.125);
+    }
+
+    #[test]
     fn browser_script_summary_comment_maps_output_to_display_summary() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
