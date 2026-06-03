@@ -1070,7 +1070,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
 
 fn browser_display_name(mode: &str) -> &'static str {
     match mode {
-        "cloud" => "Browser Use cloud",
+        "cloud" => "Browser Use Cloud",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
         _ => "Local Chrome",
@@ -1079,7 +1079,7 @@ fn browser_display_name(mode: &str) -> &'static str {
 
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
-        "Browser Use cloud" => Some("cloud"),
+        "Browser Use Cloud" => Some("cloud"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
         "Local Chrome" => Some("local"),

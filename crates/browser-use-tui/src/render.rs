@@ -1341,7 +1341,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::CookieSync => (
             "Cookie Sync",
-            "Import local browser cookies to Browser Use cloud",
+            "Import local browser cookies to Browser Use Cloud",
         ),
         Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
@@ -2547,26 +2547,41 @@ fn crop_model_lines(
     if lines.len() <= height {
         return lines.into_iter().map(|(_, line)| line).collect();
     }
-    let selected_line = lines
+    // Pin the leading query-input line at the top so the text caret stays
+    // visible and the popup's cursor lookup can always find the input row;
+    // scroll only the selectable rows beneath it. Without this, centering the
+    // window on a deep `selected_row` scrolls the input off-screen and the
+    // caret disappears.
+    let pinned = 1.min(height);
+    let head: Vec<Line<'static>> = lines[..pinned].iter().map(|(_, line)| line.clone()).collect();
+    let body = &lines[pinned..];
+    let visible = height - pinned;
+    if visible == 0 || body.len() <= visible {
+        let mut out = head;
+        out.extend(body.iter().map(|(_, line)| line.clone()));
+        return out;
+    }
+    let selected_line = body
         .iter()
         .position(|(row, _)| *row == Some(selected_row))
         .unwrap_or(0);
-    let visible = height;
     let mut start = selected_line.saturating_sub(visible / 2);
-    start = start.min(lines.len().saturating_sub(visible));
-    let end = (start + visible).min(lines.len());
-    let mut visible_lines = lines[start..end]
+    start = start.min(body.len().saturating_sub(visible));
+    let end = (start + visible).min(body.len());
+    let mut data = body[start..end]
         .iter()
         .map(|(_, line)| line.clone())
         .collect::<Vec<_>>();
     if start > 0 {
-        visible_lines[0] = Line::from(Span::styled("  ...", muted()));
+        data[0] = Line::from(Span::styled("  ...", muted()));
     }
-    if end < lines.len() {
-        let last = visible_lines.len().saturating_sub(1);
-        visible_lines[last] = Line::from(Span::styled("  ...", muted()));
+    if end < body.len() {
+        let last = data.len().saturating_sub(1);
+        data[last] = Line::from(Span::styled("  ...", muted()));
     }
-    visible_lines
+    let mut out = head;
+    out.extend(data);
+    out
 }
 
 fn model_row(choice: &ModelChoice, row_idx: usize, app: &App) -> Line<'static> {
@@ -2768,7 +2783,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ];
     match &app.cookie_sync.status {
         CookieSyncStatus::NeedsAuth => {
-            lines.push(Line::from("  Browser Use cloud key is missing."));
+            lines.push(Line::from("  Browser Use Cloud key is missing."));
             lines.push(Line::from(""));
             lines.push(selected("Add Browser Use key", 0, app.selected_row));
         }
@@ -2777,7 +2792,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         CookieSyncStatus::Ready => {
             lines.push(kv_line("scope", "all cookies"));
-            lines.push(kv_line("target", "new Browser Use cloud profile"));
+            lines.push(kv_line("target", "new Browser Use Cloud profile"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
             lines.push(Line::from(""));
@@ -3472,7 +3487,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "Credential",
     }

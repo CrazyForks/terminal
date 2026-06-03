@@ -114,7 +114,7 @@ pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
     ACCOUNT_DEEPSEEK,
 ];
 
-pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use cloud";
+pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 pub(crate) const BROWSER_LOCAL_CHROME: &str = "Local Chrome";

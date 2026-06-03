@@ -954,8 +954,11 @@ struct App {
     /// Live model ids for the typeahead of the currently-selected provider,
     /// seeded from the per-source cache and refreshed in the background.
     provider_models: Vec<ProviderModel>,
-    /// Receiver for an in-flight background provider model-list fetch.
-    provider_fetch: Option<mpsc::Receiver<Vec<ProviderModel>>>,
+    /// Receiver for an in-flight background provider model-list fetch. The
+    /// payload carries the `ModelSource` it was fetched for so a result that
+    /// arrives after the user switched providers can be discarded rather than
+    /// attributed to (and cached under) the wrong provider.
+    provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
     api_key_account: Option<String>,
@@ -3210,7 +3213,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             if let Ok(models) = fetch_provider_models(source, credential) {
-                let _ = tx.send(models);
+                let _ = tx.send((source, models));
             }
         });
         self.provider_fetch = Some(rx);
@@ -3298,15 +3301,18 @@ impl App {
             return Ok(false);
         };
         match rx.try_recv() {
-            Ok(models) => {
+            Ok((source, models)) => {
                 self.provider_fetch = None;
+                // Discard a result whose source no longer matches the selected
+                // provider — the user switched away while it was in flight, so
+                // applying it would show (and cache) the wrong provider's models.
+                if self.selected_provider.and_then(model_source_for_account) != Some(source) {
+                    return Ok(false);
+                }
                 if models.is_empty() {
                     return Ok(false);
                 }
-                if let (Some(dir), Some(source)) = (
-                    browser_use_terminal_home_dir(),
-                    self.selected_provider.and_then(model_source_for_account),
-                ) {
+                if let Some(dir) = browser_use_terminal_home_dir() {
                     let _ = save_cached_provider_models(&dir, source, &models);
                 }
                 self.provider_models = models;
@@ -5760,7 +5766,7 @@ impl App {
         self.persist_runtime_settings()?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
-                "Browser Use cloud key is required before cloud browser tasks can run.".to_string(),
+                "Browser Use Cloud key is required before cloud browser tasks can run.".to_string(),
             );
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
@@ -5801,7 +5807,7 @@ impl App {
                 self.open_cookie_sync()?;
                 return Ok(());
             }
-            self.status_notice = Some("Saved Browser Use cloud key.".to_string());
+            self.status_notice = Some("Saved Browser Use Cloud key.".to_string());
             if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
                 self.complete_setup()?;
                 self.close_surface();
@@ -5971,6 +5977,7 @@ impl App {
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
+        self.pending_model_search_after_auth = false;
         self.pending_cookie_sync_after_auth = false;
         if !self.setup_complete {
             self.setup_pending_account = None;
@@ -6555,7 +6562,7 @@ impl App {
     fn browser_notice(&self) -> Result<Option<String>> {
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             Ok(Some(
-                "Browser Use cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
+                "Browser Use Cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
                     .to_string(),
             ))
         } else {
@@ -6762,7 +6769,7 @@ fn cookie_sync_success_message(value: &serde_json::Value) -> String {
         .get("cloud_profile")
         .and_then(|profile| profile.get("name"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Browser Use cloud profile");
+        .unwrap_or("Browser Use Cloud profile");
     let synced_count = value
         .get("synced_cookie_count")
         .and_then(serde_json::Value::as_u64)
@@ -6847,7 +6854,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
@@ -10104,13 +10111,13 @@ mod redesign_tests {
 
             let _screen = render_dump(&mut app)?;
             // NOTE: the ready/welcome screen no longer carries the
-            // "Browser Use cloud needs key" warning. That warning still
+            // "Browser Use Cloud needs key" warning. That warning still
             // shows on the BrowserSelect surface (asserted below); the
             // welcome screen redesign needs a follow-up surface for it.
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use cloud . needs key"));
+            assert!(screen.contains("Browser Use Cloud . needs key"));
             Ok(())
         })();
         if let Some(value) = saved {
