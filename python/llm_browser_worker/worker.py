@@ -278,6 +278,28 @@ def _apply_browser_permissions(cdp: Any) -> None:
         cdp("Browser.grantPermissions", permissions=permissions)
 
 
+def _browser_download_behavior() -> dict[str, Any] | None:
+    accept_downloads = _env_bool("BU_BROWSER_ACCEPT_DOWNLOADS")
+    if accept_downloads is False:
+        return {"behavior": "deny"}
+
+    raw_path = os.environ.get("BU_BROWSER_DOWNLOADS_PATH")
+    if not raw_path or not raw_path.strip():
+        return None
+    download_path = Path(raw_path.strip()).expanduser().resolve()
+    with contextlib.suppress(OSError):
+        download_path.mkdir(parents=True, exist_ok=True)
+    return {"behavior": "allow", "downloadPath": str(download_path), "eventsEnabled": True}
+
+
+def _apply_browser_download_behavior(cdp: Any) -> None:
+    behavior = _browser_download_behavior()
+    if not behavior:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Browser.setDownloadBehavior", **behavior)
+
+
 def _annotate_error(msg: str) -> str:
     for pattern, hint in _HINT_PATTERNS:
         if pattern.search(msg):
@@ -680,6 +702,8 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
             admin.ensure_daemon()
         if method != "Browser.grantPermissions":
             _apply_browser_permissions(original_cdp)
+        if method != "Browser.setDownloadBehavior":
+            _apply_browser_download_behavior(original_cdp)
         if method != "Network.setUserAgentOverride":
             _apply_browser_user_agent_override(original_cdp, session_id=session_id)
         return original_cdp(method, session_id=session_id, **params)

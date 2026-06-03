@@ -326,6 +326,68 @@ def test_worker_cdp_grants_browser_permissions_env(monkeypatch) -> None:
     assert calls == [("Browser.grantPermissions", None, {"permissions": ["geolocation"]})]
 
 
+def test_worker_cdp_applies_browser_download_behavior_env(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    downloads_path = tmp_path / "downloads"
+    monkeypatch.setenv("BU_BROWSER_ACCEPT_DOWNLOADS", "true")
+    monkeypatch.setenv("BU_BROWSER_DOWNLOADS_PATH", str(downloads_path))
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://example.com")
+
+    assert result == {"method": "Page.navigate"}
+    assert admin.ensure_calls == 1
+    assert calls == [
+        (
+            "Browser.setDownloadBehavior",
+            None,
+            {
+                "behavior": "allow",
+                "downloadPath": str(downloads_path.resolve()),
+                "eventsEnabled": True,
+            },
+        ),
+        ("Page.navigate", "target-1", {"url": "https://example.com"}),
+    ]
+    assert downloads_path.exists()
+
+    calls.clear()
+    monkeypatch.setenv("BU_BROWSER_ACCEPT_DOWNLOADS", "false")
+    result = helpers.cdp("Runtime.evaluate", expression="1")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 2
+    assert calls == [
+        ("Browser.setDownloadBehavior", None, {"behavior": "deny"}),
+        ("Runtime.evaluate", None, {"expression": "1"}),
+    ]
+
+    calls.clear()
+    result = helpers.cdp("Browser.setDownloadBehavior", behavior="allowAndName")
+
+    assert result == {"method": "Browser.setDownloadBehavior"}
+    assert admin.ensure_calls == 3
+    assert calls == [("Browser.setDownloadBehavior", None, {"behavior": "allowAndName"})]
+
+
 def test_worker_page_info_fallback_reads_target_url_and_title(
     tmp_path: Path, monkeypatch
 ) -> None:
