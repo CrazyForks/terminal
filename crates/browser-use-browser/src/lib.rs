@@ -9623,6 +9623,75 @@ print("openreview_notes ok")
     }
 
     #[test]
+    fn browser_script_nobel_prize_api_normalizes_official_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-nobel-prize-api",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    assert "api.nobelprize.org/2.1/laureates" in url, url
+    assert "nobelPrizeYear=2024" in url, url
+    assert "nobelPrizeCategory=phy" in url, url
+    assert headers["Accept"] == "application/json"
+    return json.dumps({
+        "laureates": [
+            {
+                "id": "1039",
+                "knownName": {"en": "John J. Hopfield"},
+                "fullName": {"en": "John Joseph Hopfield"},
+                "givenName": {"en": "John"},
+                "familyName": {"en": "Hopfield"},
+                "gender": "male",
+                "links": [
+                    {"rel": "laureate", "href": "https://api.nobelprize.org/2.1/laureate/1039"},
+                    {"rel": "external", "href": "https://www.nobelprize.org/prizes/physics/2024/hopfield/biographical/"},
+                ],
+                "nobelPrizes": [
+                    {
+                        "awardYear": "2024",
+                        "category": {"en": "Physics"},
+                        "categoryFullName": {"en": "The Nobel Prize in Physics"},
+                        "sortOrder": "1",
+                        "portion": "1/2",
+                        "motivation": {"en": "for foundational discoveries"},
+                        "links": [
+                            {"rel": "nobelPrize", "href": "https://www.nobelprize.org/prizes/physics/2024/summary/"}
+                        ],
+                    }
+                ],
+            }
+        ]
+    })
+
+result = nobel_prize_api("laureates", params={"nobelPrizeYear": 2024, "nobelPrizeCategory": "phy"})
+assert result["endpoint"] == "laureates", result
+assert result["count"] == 1, result
+laureate = result["laureates"][0]
+assert laureate["id"] == "1039", laureate
+assert laureate["known_name"] == "John J. Hopfield", laureate
+assert laureate["full_name"] == "John Joseph Hopfield", laureate
+assert laureate["official_urls"] == ["https://www.nobelprize.org/prizes/physics/2024/hopfield/biographical/"], laureate
+prize = laureate["nobel_prizes"][0]
+assert prize["award_year"] == "2024", prize
+assert prize["category"] == "Physics", prize
+assert prize["category_full_name"] == "The Nobel Prize in Physics", prize
+assert prize["motivation"] == "for foundational discoveries", prize
+assert prize["official_urls"] == ["https://www.nobelprize.org/prizes/physics/2024/summary/"], prize
+print("nobel_prize_api ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("nobel_prize_api ok"));
+    }
+
+    #[test]
     fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
