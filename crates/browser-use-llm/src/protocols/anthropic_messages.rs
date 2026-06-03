@@ -159,15 +159,24 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             content,
             is_error,
         } => {
-            let blocks: Result<Vec<Value>, LlmError> =
-                content.iter().map(build_content_block).collect();
+            let blocks = if *is_error {
+                vec![json!({
+                    "type": "text",
+                    "text": flatten_error_tool_result_content(content),
+                })]
+            } else {
+                content
+                    .iter()
+                    .map(build_content_block)
+                    .collect::<Result<Vec<Value>, LlmError>>()?
+            };
             let mut block = Map::new();
             block.insert("type".to_string(), Value::String("tool_result".to_string()));
             block.insert(
                 "tool_use_id".to_string(),
                 Value::String(tool_call_id.clone()),
             );
-            block.insert("content".to_string(), Value::Array(blocks?));
+            block.insert("content".to_string(), Value::Array(blocks));
             if *is_error {
                 block.insert("is_error".to_string(), Value::Bool(true));
             }
@@ -188,6 +197,49 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
                 block.insert("signature".to_string(), Value::String(signature));
             }
             Ok(Value::Object(block))
+        }
+    }
+}
+
+fn flatten_error_tool_result_content(content: &[ContentPart]) -> String {
+    let mut chunks = Vec::new();
+    collect_error_tool_result_text(content, &mut chunks);
+    if chunks.is_empty() {
+        return "Tool call failed.".to_string();
+    }
+    chunks.join("\n")
+}
+
+fn collect_error_tool_result_text(content: &[ContentPart], chunks: &mut Vec<String>) {
+    for part in content {
+        match part {
+            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                if !text.trim().is_empty() {
+                    chunks.push(text.clone());
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+                ..
+            } => {
+                let pointer = url
+                    .as_deref()
+                    .map(|url| format!(" at {url}"))
+                    .unwrap_or_else(|| {
+                        data.as_ref()
+                            .map(|_| " inline".to_string())
+                            .unwrap_or_default()
+                    });
+                chunks.push(format!("[{mime_type} media{pointer}]"));
+            }
+            ContentPart::ToolCall { name, .. } => {
+                chunks.push(format!("[nested tool call: {name}]"));
+            }
+            ContentPart::ToolResult { content, .. } => {
+                collect_error_tool_result_text(content, chunks);
+            }
         }
     }
 }
@@ -697,6 +749,50 @@ mod tests {
                             "type": "tool_result",
                             "tool_use_id": "toolu_1",
                             "content": [ { "type": "text", "text": "Sunny, 20C" } ]
+                        }
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn build_body_flattens_error_tool_result_content_to_text_blocks() {
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "toolu_error".into(),
+                content: vec![
+                    ContentPart::text("browser script failed"),
+                    ContentPart::Media {
+                        mime_type: "image/png".into(),
+                        data: Some("base64-image".into()),
+                        url: None,
+                        detail: None,
+                    },
+                ],
+                is_error: true,
+            }],
+        ));
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_error",
+                            "is_error": true,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "browser script failed\n[image/png media inline]"
+                                }
+                            ]
                         }
                     ]
                 }
