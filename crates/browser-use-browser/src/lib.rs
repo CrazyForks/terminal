@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -189,7 +189,13 @@ struct BrowserSession {
     last_target_id: Option<String>,
     last_session_id: Option<String>,
     last_emitted_browser_payload: Option<Value>,
+    browser_profile_runtime: BrowserProfileRuntimeState,
     logs: VecDeque<String>,
+}
+
+#[derive(Default)]
+struct BrowserProfileRuntimeState {
+    applied_setup_keys: HashSet<String>,
 }
 
 impl Default for BrowserSession {
@@ -213,6 +219,7 @@ impl Default for BrowserSession {
             last_target_id: None,
             last_session_id: None,
             last_emitted_browser_payload: None,
+            browser_profile_runtime: BrowserProfileRuntimeState::default(),
             logs: VecDeque::new(),
         }
     }
@@ -1425,7 +1432,9 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
                 None | Some("temp") => ManagedProfile::Temp,
                 Some(path) => ManagedProfile::Path(PathBuf::from(path)),
             };
-            let extra_args = option_values(argv, "--arg");
+            let profile = managed_browser_profile_from_env(profile);
+            let mut extra_args = option_values(argv, "--arg");
+            extra_args.extend(managed_browser_extra_args_from_env());
             session.connect_managed(headless, profile, extra_args)
         }
         Some("remote-cdp") => {
@@ -1440,6 +1449,354 @@ fn dispatch_connect(session: &mut BrowserSession, argv: &[String]) -> Result<Val
         Some(other) => bail!("unknown browser connect mode: {other}"),
         None => bail!("browser connect requires local, managed, or remote-cdp"),
     }
+}
+
+#[derive(Debug)]
+struct BrowserProfileSetupCall {
+    key: String,
+    method: &'static str,
+    session_id: Option<String>,
+    params: Value,
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    match env_trimmed(name)?.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_json_string_list(name: &str) -> Vec<String> {
+    let Some(raw) = env_trimmed(name) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let Some(value) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if seen.insert(value.to_string()) {
+            out.push(value.to_string());
+        }
+    }
+    out
+}
+
+fn expand_browser_profile_path(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+fn managed_browser_profile_from_env(fallback: ManagedProfile) -> ManagedProfile {
+    env_trimmed("BU_MANAGED_BROWSER_PROFILE")
+        .map(|path| ManagedProfile::Path(expand_browser_profile_path(&path)))
+        .unwrap_or(fallback)
+}
+
+fn managed_browser_extra_args_from_env() -> Vec<String> {
+    let Some(raw) = env_trimmed("BU_MANAGED_BROWSER_ARGS") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|arg| !arg.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn browser_viewport_launch_args() -> Vec<String> {
+    if env_bool("BU_BROWSER_NO_VIEWPORT") == Some(true) {
+        return Vec::new();
+    }
+    let Some(raw) = env_trimmed("BU_BROWSER_VIEWPORT") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(width) = value.get("width").and_then(Value::as_i64) else {
+        return Vec::new();
+    };
+    let Some(height) = value.get("height").and_then(Value::as_i64) else {
+        return Vec::new();
+    };
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let mut args = vec![format!("--window-size={width},{height}")];
+    if let Some(scale) = value
+        .get("deviceScaleFactor")
+        .and_then(Value::as_f64)
+        .filter(|scale| *scale > 0.0)
+    {
+        args.push(format!("--force-device-scale-factor={scale}"));
+    }
+    args
+}
+
+fn browser_download_behavior() -> Option<(String, Value)> {
+    if env_bool("BU_BROWSER_ACCEPT_DOWNLOADS") == Some(false) {
+        return Some((
+            "downloads:false".to_string(),
+            json!({ "behavior": "deny" }),
+        ));
+    }
+    let raw_path = env_trimmed("BU_BROWSER_DOWNLOADS_PATH")?;
+    let path = expand_browser_profile_path(&raw_path);
+    let _ = fs::create_dir_all(&path);
+    Some((
+        format!("downloads:true:{}", path.display()),
+        json!({
+            "behavior": "allow",
+            "downloadPath": path.display().to_string(),
+            "eventsEnabled": true,
+        }),
+    ))
+}
+
+fn browser_storage_state_raw() -> Option<String> {
+    env_trimmed("BU_BROWSER_STORAGE_STATE")
+}
+
+fn browser_storage_state() -> Option<Value> {
+    serde_json::from_str::<Value>(&browser_storage_state_raw()?).ok()
+}
+
+fn browser_storage_cookies(storage_state: &Value) -> Vec<Value> {
+    storage_state
+        .get("cookies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(cookie_to_cdp_param)
+        .collect()
+}
+
+fn browser_storage_init_scripts(storage_state: &Value) -> Vec<String> {
+    let Some(origins) = storage_state.get("origins").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut scripts = Vec::new();
+    for origin_state in origins {
+        let Some(origin_state) = origin_state.as_object() else {
+            continue;
+        };
+        let origin = origin_state.get("origin").and_then(Value::as_str);
+        let mut statements = Vec::new();
+        for storage_name in ["localStorage", "sessionStorage"] {
+            let Some(items) = origin_state.get(storage_name).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(value) = item.get("value").and_then(Value::as_str) else {
+                    continue;
+                };
+                statements.push(format!(
+                    "window.{storage_name}.setItem({}, {});",
+                    serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string()),
+                    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+                ));
+            }
+        }
+        if statements.is_empty() {
+            continue;
+        }
+        let body = statements.join("\n    ");
+        if let Some(origin) = origin.filter(|origin| !origin.trim().is_empty()) {
+            scripts.push(format!(
+                "try {{\n  if (window.location.origin === {}) {{\n    {body}\n  }}\n}} catch (error) {{}}",
+                serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_string())
+            ));
+        } else {
+            scripts.push(format!("try {{\n  {body}\n}} catch (error) {{}}"));
+        }
+    }
+    scripts
+}
+
+fn browser_profile_setup_calls(session_id: Option<&str>) -> Vec<BrowserProfileSetupCall> {
+    let mut calls = Vec::new();
+
+    let permissions = env_json_string_list("BU_BROWSER_PERMISSIONS");
+    if !permissions.is_empty() {
+        calls.push(BrowserProfileSetupCall {
+            key: format!("permissions:{}", permissions.join("\0")),
+            method: "Browser.grantPermissions",
+            session_id: None,
+            params: json!({ "permissions": permissions }),
+        });
+    }
+
+    if let Some((key, params)) = browser_download_behavior() {
+        calls.push(BrowserProfileSetupCall {
+            key,
+            method: "Browser.setDownloadBehavior",
+            session_id: None,
+            params,
+        });
+    }
+
+    if let Some(storage_state) = browser_storage_state() {
+        if let Some(raw) = browser_storage_state_raw() {
+            let cookies = browser_storage_cookies(&storage_state);
+            if !cookies.is_empty() {
+                calls.push(BrowserProfileSetupCall {
+                    key: format!("storage-cookies:{raw}"),
+                    method: "Storage.setCookies",
+                    session_id: None,
+                    params: json!({ "cookies": cookies }),
+                });
+            }
+            if let Some(session_id) = session_id {
+                for (index, source) in browser_storage_init_scripts(&storage_state)
+                    .into_iter()
+                    .enumerate()
+                {
+                    calls.push(BrowserProfileSetupCall {
+                        key: format!("storage-script:{session_id}:{index}:{raw}"),
+                        method: "Page.addScriptToEvaluateOnNewDocument",
+                        session_id: Some(session_id.to_string()),
+                        params: json!({ "source": source, "runImmediately": true }),
+                    });
+                }
+            }
+        }
+    }
+
+    if let (Some(session_id), Some(user_agent)) = (session_id, env_trimmed("BU_BROWSER_USER_AGENT"))
+    {
+        calls.push(BrowserProfileSetupCall {
+            key: format!("user-agent:{session_id}:{user_agent}"),
+            method: "Network.setUserAgentOverride",
+            session_id: Some(session_id.to_string()),
+            params: json!({ "userAgent": user_agent }),
+        });
+    }
+
+    calls
+}
+
+fn is_root_domain_pattern(pattern: &str) -> bool {
+    !pattern.contains('*') && !pattern.contains("://") && pattern.matches('.').count() == 1
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let mut remainder = value;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(stripped) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = stripped;
+        } else if let Some(index) = remainder.find(part) {
+            remainder = &remainder[index + part.len()..];
+        } else {
+            return false;
+        }
+        first = false;
+    }
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn browser_domain_pattern_matches(url: &str, host: &str, scheme: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let host_lower = host.to_ascii_lowercase();
+    let pattern_lower = pattern.to_ascii_lowercase();
+    if let Some(domain) = pattern_lower.strip_prefix("*.") {
+        return matches!(scheme, "http" | "https")
+            && (host_lower == domain || host_lower.ends_with(&format!(".{domain}")));
+    }
+    if pattern_lower.ends_with("/*") {
+        return url
+            .to_ascii_lowercase()
+            .starts_with(pattern_lower.trim_end_matches('*'));
+    }
+    if pattern_lower.contains('*') {
+        let value = if pattern_lower.contains("://") {
+            format!("{scheme}://{host_lower}")
+        } else {
+            host_lower.clone()
+        };
+        return wildcard_match(&pattern_lower, &value);
+    }
+    if pattern_lower.contains("://") {
+        return url.to_ascii_lowercase().starts_with(&pattern_lower);
+    }
+    host_lower == pattern_lower
+        || (is_root_domain_pattern(&pattern_lower) && host_lower == format!("www.{pattern_lower}"))
+}
+
+fn browser_profile_url_allowed(raw_url: &str) -> bool {
+    if matches!(
+        raw_url,
+        "about:blank" | "chrome://new-tab-page/" | "chrome://new-tab-page" | "chrome://newtab/"
+    ) {
+        return true;
+    }
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
+        return false;
+    };
+    if matches!(url.scheme(), "data" | "blob") {
+        return true;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") == Some(true) && host.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+
+    let allowed_domains = env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS");
+    let prohibited_domains = env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS");
+    if !allowed_domains.is_empty() {
+        return allowed_domains
+            .iter()
+            .any(|pattern| browser_domain_pattern_matches(raw_url, host, url.scheme(), pattern));
+    }
+    if !prohibited_domains.is_empty() {
+        return !prohibited_domains
+            .iter()
+            .any(|pattern| browser_domain_pattern_matches(raw_url, host, url.scheme(), pattern));
+    }
+    true
 }
 
 fn dispatch_local(
@@ -2402,6 +2759,7 @@ impl BrowserSession {
                 "browser is not connected. Run `browser status --json` or `browser connect ...`."
             );
         }
+        self.prepare_browser_profile_runtime(method, session_id, &params)?;
         browser_session_prepare_cdp_visuals(self, method, session_id, &params);
         let Some(connection) = self.connection.as_mut() else {
             bail!(
@@ -2517,6 +2875,47 @@ impl BrowserSession {
                 bail!(message);
             }
         }
+    }
+
+    fn prepare_browser_profile_runtime(
+        &mut self,
+        method: &str,
+        session_id: Option<&str>,
+        params: &Value,
+    ) -> Result<()> {
+        if method == "Page.navigate" {
+            if let Some(url) = params.get("url").and_then(Value::as_str) {
+                if !browser_profile_url_allowed(url) {
+                    bail!("BrowserProfile domain constraints blocked navigation to {url}");
+                }
+            }
+        }
+
+        let setup_calls = browser_profile_setup_calls(session_id);
+        if setup_calls.is_empty() {
+            return Ok(());
+        }
+        let Some(connection) = self.connection.as_mut() else {
+            return Ok(());
+        };
+        for call in setup_calls {
+            if self
+                .browser_profile_runtime
+                .applied_setup_keys
+                .contains(&call.key)
+            {
+                continue;
+            }
+            if connection
+                .call(&call.method, call.session_id.as_deref(), call.params)
+                .is_ok()
+            {
+                self.browser_profile_runtime
+                    .applied_setup_keys
+                    .insert(call.key);
+            }
+        }
+        Ok(())
     }
 
     fn attach_first_page(&mut self) -> Result<()> {
@@ -3554,15 +3953,19 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
     ];
+    let viewport_args = browser_viewport_launch_args();
     if launch.headless {
         args.push("--headless=new".to_string());
-        args.push("--window-size=1280,720".to_string());
+        if viewport_args.is_empty() && env_bool("BU_BROWSER_NO_VIEWPORT") != Some(true) {
+            args.push("--window-size=1280,720".to_string());
+        }
     } else {
-        args.extend([
-            "--new-window".to_string(),
-            "--window-size=1512,900".to_string(),
-        ]);
+        args.push("--new-window".to_string());
+        if viewport_args.is_empty() {
+            args.push("--window-size=1512,900".to_string());
+        }
     }
+    args.extend(viewport_args);
     args.extend(launch.extra_args.clone());
     args.push("about:blank".to_string());
     let mut child = Command::new(&launch.executable)
@@ -7374,6 +7777,138 @@ print("browser profile wait timing ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("browser profile wait timing ok"));
+    }
+
+    #[test]
+    fn browser_profile_runtime_setup_calls_read_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let downloads_text = downloads.display().to_string();
+        let storage_state = json!({
+            "cookies": [{
+                "name": "sid",
+                "value": "secret",
+                "domain": ".example.com",
+                "path": "/"
+            }],
+            "origins": [{
+                "origin": "https://example.com",
+                "localStorage": [{"name": "theme", "value": "dark"}],
+                "sessionStorage": [{"name": "step", "value": "one"}]
+            }]
+        })
+        .to_string();
+        let _env = EnvRestore::set(&[
+            (
+                "BU_BROWSER_PERMISSIONS",
+                r#"["clipboardReadWrite","notifications","clipboardReadWrite",3]"#,
+            ),
+            ("BU_BROWSER_ACCEPT_DOWNLOADS", "true"),
+            ("BU_BROWSER_DOWNLOADS_PATH", &downloads_text),
+            ("BU_BROWSER_STORAGE_STATE", &storage_state),
+            ("BU_BROWSER_USER_AGENT", "BrowserUseRuntime/6.0"),
+        ]);
+
+        let calls = browser_profile_setup_calls(Some("session-1"));
+        let methods = calls.iter().map(|call| call.method).collect::<Vec<_>>();
+
+        assert_eq!(
+            methods,
+            vec![
+                "Browser.grantPermissions",
+                "Browser.setDownloadBehavior",
+                "Storage.setCookies",
+                "Page.addScriptToEvaluateOnNewDocument",
+                "Network.setUserAgentOverride",
+            ]
+        );
+        assert_eq!(
+            calls[0].params["permissions"],
+            json!(["clipboardReadWrite", "notifications"])
+        );
+        assert_eq!(calls[1].params["behavior"], "allow");
+        assert_eq!(calls[1].params["downloadPath"], downloads_text);
+        assert!(downloads.exists());
+        assert_eq!(calls[2].params["cookies"][0]["name"], "sid");
+        assert!(calls[3]
+            .params
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.contains("window.localStorage.setItem(\"theme\", \"dark\");")
+                && source.contains("window.sessionStorage.setItem(\"step\", \"one\");")));
+        assert_eq!(calls[4].session_id.as_deref(), Some("session-1"));
+        assert_eq!(calls[4].params["userAgent"], "BrowserUseRuntime/6.0");
+    }
+
+    #[test]
+    fn managed_browser_launch_reads_browser_profile_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let profile_text = profile.display().to_string();
+        let _env = EnvRestore::set(&[
+            ("BU_MANAGED_BROWSER_PROFILE", &profile_text),
+            (
+                "BU_MANAGED_BROWSER_ARGS",
+                r#"["--proxy-server=http://proxy.example:8080","--user-agent=BrowserUseManaged/1.0",3,""]"#,
+            ),
+            (
+                "BU_BROWSER_VIEWPORT",
+                r#"{"width":960,"height":720,"deviceScaleFactor":2}"#,
+            ),
+            ("BU_BROWSER_NO_VIEWPORT", "false"),
+        ]);
+
+        let ManagedProfile::Path(resolved_profile) =
+            managed_browser_profile_from_env(ManagedProfile::Temp)
+        else {
+            panic!("expected managed profile path from env");
+        };
+        assert_eq!(resolved_profile, profile);
+        assert_eq!(
+            managed_browser_extra_args_from_env(),
+            vec![
+                "--proxy-server=http://proxy.example:8080".to_string(),
+                "--user-agent=BrowserUseManaged/1.0".to_string(),
+            ]
+        );
+        assert_eq!(
+            browser_viewport_launch_args(),
+            vec![
+                "--window-size=960,720".to_string(),
+                "--force-device-scale-factor=2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_profile_runtime_domain_constraints_read_env() {
+        {
+            let _env = EnvRestore::set(&[
+                (
+                    "BU_BROWSER_ALLOWED_DOMAINS",
+                    r#"["example.com","*.browser-use.com"]"#,
+                ),
+                ("BU_BROWSER_PROHIBITED_DOMAINS", r#"["*.tracking.example"]"#),
+                ("BU_BROWSER_BLOCK_IP_ADDRESSES", "true"),
+            ]);
+
+            assert!(browser_profile_url_allowed("https://www.example.com/path"));
+            assert!(browser_profile_url_allowed("https://docs.browser-use.com/"));
+            assert!(browser_profile_url_allowed("about:blank"));
+            assert!(!browser_profile_url_allowed("https://iana.org/"));
+            assert!(!browser_profile_url_allowed("http://127.0.0.1/"));
+        }
+
+        {
+            let _env = EnvRestore::set(&[
+                ("BU_BROWSER_ALLOWED_DOMAINS", "[]"),
+                ("BU_BROWSER_PROHIBITED_DOMAINS", r#"["*.tracking.example"]"#),
+                ("BU_BROWSER_BLOCK_IP_ADDRESSES", "false"),
+            ]);
+
+            assert!(!browser_profile_url_allowed("https://ads.tracking.example/"));
+            assert!(browser_profile_url_allowed("https://example.com/"));
+        }
     }
 
     #[test]
