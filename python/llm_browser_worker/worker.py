@@ -27,6 +27,7 @@ from typing import Any, Dict
 _namespaces: Dict[str, Dict[str, Any]] = {}
 _managed_chrome: subprocess.Popen[Any] | None = None
 _managed_chrome_profile: Path | None = None
+_managed_chrome_profile_is_temporary = False
 _explicit_agent_workspace = os.environ.get("BH_AGENT_WORKSPACE")
 
 
@@ -375,6 +376,15 @@ def _managed_chrome_extra_args() -> list[str]:
     return [arg for arg in parsed if isinstance(arg, str) and arg]
 
 
+def _managed_chrome_profile_dir() -> tuple[Path, bool]:
+    configured = os.environ.get("BU_MANAGED_BROWSER_PROFILE")
+    if configured and configured.strip():
+        profile = Path(configured).expanduser()
+        profile.mkdir(parents=True, exist_ok=True)
+        return profile, False
+    return Path(tempfile.mkdtemp(prefix="but-managed-chrome.")), True
+
+
 def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -> list[str]:
     args = [
         chrome,
@@ -403,7 +413,7 @@ def _daemon_has_browser_connection(admin: Any) -> bool:
 
 
 def _cleanup_managed_chrome() -> None:
-    global _managed_chrome, _managed_chrome_profile
+    global _managed_chrome, _managed_chrome_profile, _managed_chrome_profile_is_temporary
     proc = _managed_chrome
     _managed_chrome = None
     if proc is not None and proc.poll() is None:
@@ -413,13 +423,14 @@ def _cleanup_managed_chrome() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
-    if _managed_chrome_profile is not None:
+    if _managed_chrome_profile is not None and _managed_chrome_profile_is_temporary:
         shutil.rmtree(_managed_chrome_profile, ignore_errors=True)
-        _managed_chrome_profile = None
+    _managed_chrome_profile = None
+    _managed_chrome_profile_is_temporary = False
 
 
 def _ensure_managed_chrome(admin: Any | None = None) -> None:
-    global _managed_chrome, _managed_chrome_profile
+    global _managed_chrome, _managed_chrome_profile, _managed_chrome_profile_is_temporary
     if not _should_start_managed_chrome():
         return
     if admin is not None and _daemon_has_browser_connection(admin):
@@ -428,7 +439,7 @@ def _ensure_managed_chrome(admin: Any | None = None) -> None:
         return
 
     port = _free_port()
-    profile = Path(tempfile.mkdtemp(prefix="but-managed-chrome."))
+    profile, profile_is_temporary = _managed_chrome_profile_dir()
     visible = _managed_chrome_is_visible()
     chrome = _pick_managed_chrome_path(visible)
     proc = subprocess.Popen(
@@ -450,11 +461,13 @@ def _ensure_managed_chrome(admin: Any | None = None) -> None:
             time.sleep(0.25)
     else:
         proc.terminate()
-        shutil.rmtree(profile, ignore_errors=True)
+        if profile_is_temporary:
+            shutil.rmtree(profile, ignore_errors=True)
         raise RuntimeError(f"managed Chrome DevTools did not become available: {last_error}")
 
     _managed_chrome = proc
     _managed_chrome_profile = profile
+    _managed_chrome_profile_is_temporary = profile_is_temporary
     os.environ["BU_CDP_URL"] = f"http://127.0.0.1:{port}"
     if not visible:
         atexit.register(_cleanup_managed_chrome)
