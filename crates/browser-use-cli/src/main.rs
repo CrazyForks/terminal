@@ -2297,19 +2297,13 @@ fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRe
     session_was_interrupted(events)
 }
 
-/// Whether `parent_id` is in a state that can still receive a child-completion
-/// mail. Port of legacy `parent_can_receive_subagent_completion_mail`
-/// (browser-use-core lib.rs:20931).
+/// Whether `parent_id` can still receive child-completion mail.
 fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
-    let Some(parent) = store.load_session(parent_id)? else {
+    let Some(_parent) = store.load_session(parent_id)? else {
         return Ok(false);
     };
-    if !matches!(
-        parent.status,
-        browser_use_protocol::SessionStatus::Created | browser_use_protocol::SessionStatus::Running
-    ) {
-        return Ok(false);
-    }
+    // Children can finish after the parent has ended its current turn. Keep the
+    // completion durable so the next parent turn or wait-agent command can see it.
     if store
         .agent_summary_for_child(parent_id)?
         .is_some_and(|agent| agent.status == "closed")
@@ -6129,6 +6123,45 @@ command = "test-mcp"
             event.event_type == "agent.wait.finished"
                 && event.payload["timed_out"].as_bool() == Some(true)
         }));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_completion_queues_mail_for_done_parent() -> Result<()> {
+        let temp = unique_cli_test_dir("done-parent-completion-mail")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.set_status(&parent.id, browser_use_protocol::SessionStatus::Done)?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "cli late result"}),
+        )?;
+        store.set_status(&child.id, browser_use_protocol::SessionStatus::Done)?;
+
+        update_parent_from_child_run(&store, &parent.id, &child.id, None, None)?;
+
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.completed"));
+        let mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(mail.len(), 1);
+        assert!(mail[0].content.contains("<subagent_notification>"));
+        assert!(mail[0].content.contains("cli late result"));
+        assert!(!mail[0].trigger_turn);
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
