@@ -2413,6 +2413,145 @@ def location_records_snapshot(limit=200, keywords=None):
     return data
 
 
+def form_controls_snapshot(limit=30):
+    """Return compact rendered checkboxes, radios, and switches with labels and state."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 30
+    limit_int = max(1, min(limit_int, 200))
+    expression = f"""
+(() => {{
+  // __FORM_CONTROLS_SNAPSHOT__
+  const clean = (text, max = 180) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const labelFor = el => {{
+    const bits = [el.getAttribute('aria-label'), el.getAttribute('name'), el.id];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parent = el.closest('label,[aria-label],[data-label],.field,.form-group,li,div');
+    if (parent) bits.push(parent.innerText, parent.getAttribute('aria-label'), parent.getAttribute('data-label'));
+    return clean(bits.filter(Boolean).join(' '));
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  return Array.from(document.querySelectorAll('input[type="checkbox"],input[type="radio"],[role="checkbox"],[role="radio"],[role="switch"]'))
+    .filter(el => !el.disabled && visible(el))
+    .slice(0, {limit_int})
+    .map((el, index) => {{
+      const r = el.getBoundingClientRect();
+      const role = el.getAttribute('role') || '';
+      const checked = el.checked === true || el.getAttribute('aria-checked') === 'true';
+      return {{
+        index,
+        selector: selectorFor(el),
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || role,
+        label: labelFor(el),
+        name: clean(el.getAttribute('name')),
+        checked,
+        aria_checked: el.getAttribute('aria-checked'),
+        rect: {{
+          x: Math.round(r.x), y: Math.round(r.y),
+          width: Math.round(r.width), height: Math.round(r.height),
+          in_viewport: r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth,
+        }},
+      }};
+    }});
+}})()
+"""
+    controls = js(expression) or []
+    return {"count": len(controls), "controls": controls}
+
+
+def toggle_form_control(label_or_text, checked=True, timeout=1.0):
+    """Set a rendered checkbox/radio/switch by label, name, or selector using a real click."""
+    needle = str(label_or_text or "").strip().lower()
+    if not needle:
+        raise RuntimeError("toggle_form_control requires a label_or_text")
+    expression = f"""
+(() => {{
+  // __TOGGLE_FORM_CONTROL__
+  const needle = {json.dumps(needle)};
+  const want = {json.dumps(bool(checked))};
+  const clean = text => (text || '').replace(/\\s+/g, ' ').trim();
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return '';
+  }};
+  const textFor = el => {{
+    const bits = [el.getAttribute('aria-label'), el.getAttribute('name'), el.id];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parent = el.closest('label,[aria-label],[data-label],.field,.form-group,li,div');
+    if (parent) bits.push(parent.innerText, parent.getAttribute('aria-label'), parent.getAttribute('data-label'));
+    return clean(bits.filter(Boolean).join(' ')).toLowerCase();
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  let best = null, bestScore = -1, bestText = '';
+  for (const el of document.querySelectorAll('input[type="checkbox"],input[type="radio"],[role="checkbox"],[role="radio"],[role="switch"]')) {{
+    if (el.disabled || !visible(el)) continue;
+    const selector = selectorFor(el);
+    const hay = textFor(el);
+    let score = hay === needle ? 130 : hay.includes(needle) ? 80 : needle.includes(hay) && hay.length > 2 ? 35 : 0;
+    if (selector && selector.toLowerCase() === needle) score = 150;
+    const r = el.getBoundingClientRect();
+    if (score > 0 && r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth) score += 5;
+    if (score > bestScore) {{ best = el; bestScore = score; bestText = hay; }}
+  }}
+  if (!best || bestScore <= 0) return null;
+  const r = best.getBoundingClientRect();
+  const state = best.checked === true || best.getAttribute('aria-checked') === 'true';
+  const type = (best.getAttribute('type') || best.getAttribute('role') || '').toLowerCase();
+  return {{
+    selector: selectorFor(best),
+    score: bestScore,
+    matched_text: bestText,
+    type,
+    state,
+    want,
+    needs_click: state !== want,
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+    rect: {{x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}},
+  }};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = form_controls_snapshot(limit=20)
+        raise RuntimeError(f"toggle_form_control: no rendered control matched {label_or_text!r}; controls={controls}")
+    if match.get("type") == "radio" and not checked:
+        raise RuntimeError(f"toggle_form_control: cannot unset a radio button directly: {label_or_text!r}")
+    if match.get("needs_click"):
+        click_at_xy(match["x"], match["y"])
+        if timeout:
+            _time.sleep(min(max(float(timeout), 0.0), 2.0))
+    return {
+        "changed": bool(match.get("needs_click")),
+        "selector": match.get("selector", ""),
+        "matched_text": match.get("matched_text", ""),
+        "checked": bool(checked),
+        "score": match.get("score"),
+        "x": match.get("x"),
+        "y": match.get("y"),
+    }
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])

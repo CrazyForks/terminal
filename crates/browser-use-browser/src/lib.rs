@@ -8648,6 +8648,76 @@ print("location_records_snapshot ok")
     }
 
     #[test]
+    fn browser_script_form_control_helpers_toggle_labeled_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-form-control-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "input[type=\"checkbox\"]" in expression
+    assert "[role=\"switch\"]" in expression
+    assert "label[for=" in expression
+    assert "CSS.escape" in expression
+    if "__TOGGLE_FORM_CONTROL__" in expression:
+        assert "needs_click" in expression
+        assert 'const needle = "accept terms"' in expression
+        return {
+            "selector": "#terms",
+            "score": 135,
+            "matched_text": "accept terms",
+            "type": "checkbox",
+            "state": False,
+            "want": True,
+            "needs_click": True,
+            "x": 24,
+            "y": 72,
+            "rect": {"x": 16, "y": 64, "width": 16, "height": 16},
+        }
+    assert "__FORM_CONTROLS_SNAPSHOT__" in expression
+    return [
+        {
+            "index": 0,
+            "selector": "#terms",
+            "tag": "input",
+            "type": "checkbox",
+            "label": "Accept terms",
+            "name": "terms",
+            "checked": False,
+            "aria_checked": None,
+            "rect": {"x": 16, "y": 64, "width": 16, "height": 16, "in_viewport": True},
+        }
+    ]
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = form_controls_snapshot()
+assert snapshot["count"] == 1, snapshot
+assert snapshot["controls"][0]["label"] == "Accept terms", snapshot
+result = toggle_form_control("accept terms", checked=True, timeout=0)
+assert result["changed"] is True, result
+assert result["selector"] == "#terms", result
+assert result["checked"] is True, result
+assert clicked_points == [{"x": 24, "y": 72, "button": "left", "clicks": 1}], clicked_points
+assert len(calls) == 2, calls
+print("form_control_helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("form_control_helpers ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
