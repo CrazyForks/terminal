@@ -260,6 +260,7 @@ enum Surface {
     Developer,
     Feedback,
     FeedbackThanks,
+    Thinking,
 }
 
 impl Surface {
@@ -5024,6 +5025,25 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } if self.composer.is_empty() => self.open_surface(Surface::Developer),
+            // Ctrl+O toggles the dedicated agent-thinking view. From the
+            // Thinking surface it closes back to Main; from anywhere else (with
+            // an empty composer, so it never steals a typed `o`) it opens.
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.surface == Surface::Thinking => self.close_surface(),
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.composer.is_empty() => self.open_surface(Surface::Thinking),
+            // `q` leaves the Thinking view (it has no text input of its own).
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Thinking => self.close_surface(),
             // `r` resumes the selected history row, but only when the live
             // filter is empty — otherwise it would steal a perfectly legal
             // letter mid-search ("foo<r>bar" → "fooba").
@@ -5510,6 +5530,8 @@ impl App {
                 self.surface = Surface::Main;
                 self.feedback_thanks_started = None;
             }
+            // The Thinking view is read-only; Enter just closes it.
+            Surface::Thinking => self.close_surface(),
             Surface::Main => {
                 self.close_surface();
             }
@@ -7244,6 +7266,7 @@ impl App {
             Surface::Developer => 1,
             Surface::Feedback => 0,
             Surface::FeedbackThanks => 0,
+            Surface::Thinking => 0,
         })
     }
 
@@ -10918,6 +10941,7 @@ mod redesign_tests {
             Surface::History => "History",
             Surface::Messages => "Messages",
             Surface::Developer => "Developer",
+            Surface::Thinking => "Thinking",
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
@@ -14452,6 +14476,98 @@ wire_api = "responses"
     }
 
     #[test]
+    fn settled_thinking_collapses_to_persistent_summary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "investigate"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking the schema in lib.rs."}),
+        )?;
+        // Usage settles the turn — the reasoning collapses into a summary.
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"output_tokens": 40, "reasoning_output_tokens": 2000}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        // The collapsed summary is committed to scrollback...
+        let scrollback = lines_plain_text(&transcript::all_scrollback_lines(&model, 100));
+        assert!(scrollback.contains("Thought for"), "{scrollback}");
+        assert!(scrollback.contains("2k tokens"), "{scrollback}");
+        // ...and it persists in the terminal scrollback (not transient).
+        let terminal = lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 100));
+        assert!(terminal.contains("Thought for"), "{terminal}");
+        // The full reasoning text is NOT dumped inline — only the summary.
+        assert!(
+            !scrollback.contains("Checking the schema in lib.rs."),
+            "{scrollback}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_view_shows_collapsed_reasoning_for_task() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "investigate"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        // Provider resends a growing snapshot, not a pure delta — the view must
+        // de-duplicate it rather than concatenate.
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking "}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking the repository structure."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"output_tokens": 40, "reasoning_output_tokens": 2000}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        // Ctrl+O opens the dedicated thinking view.
+        app.open_surface(Surface::Thinking);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Thinking"));
+        assert!(screen.contains("Thought for"));
+        assert!(screen.contains("2k tokens"));
+        assert!(screen.contains("Checking the repository structure."));
+        // The de-dup worked: no doubled "Checking Checking".
+        assert!(!screen.contains("Checking Checking"));
+        Ok(())
+    }
+
+    #[test]
     fn live_thinking_renders_compact_shimmer_status() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -14483,9 +14599,12 @@ wire_api = "responses"
         let lines = transcript::active_viewport_lines(Some(&model), 100, 20);
         let text = lines_plain_text(&lines);
 
+        // The reasoning now streams inline as it arrives...
         assert!(text.contains("Thinking..."), "{text}");
-        assert!(!text.contains("thinking line 1"), "{text}");
-        assert!(!text.contains("thinking line 12"), "{text}");
+        assert!(text.contains("thinking line 1"), "{text}");
+        assert!(text.contains("thinking line 12"), "{text}");
+        // ...with a live timer + token estimate beside the status.
+        assert!(text.contains("tokens"), "{text}");
         assert!(
             lines
                 .iter()

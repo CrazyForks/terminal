@@ -257,6 +257,11 @@ enum TranscriptKind {
         text: String,
         style: NodeStyle,
     },
+    /// A settled, collapsed reasoning block: `· Thought for 31s · 1.8k tokens`.
+    /// The full text lives in the Ctrl+O thinking view.
+    Thinking {
+        summary: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,6 +342,11 @@ impl TranscriptNode {
             TranscriptKind::Cancelled { title, text, style } => {
                 grouped_lines(title, std::slice::from_ref(text), *style, width)
             }
+            // Collapsed reasoning summary: a single gray line, expandable via Ctrl+O.
+            TranscriptKind::Thinking { summary } => vec![Line::from(vec![
+                Span::styled("· ".to_string(), dim()),
+                Span::styled(summary.clone(), muted()),
+            ])],
         }
     }
 
@@ -468,6 +478,7 @@ impl TranscriptNode {
                     format!("{GROUP_VALUE_LAST_PREFIX}{text}"),
                 ]
             }
+            TranscriptKind::Thinking { summary } => vec![format!("· {summary}")],
         }
     }
 
@@ -1283,6 +1294,10 @@ fn committed_node_for_event(
         }
         "model.turn.response" => pre_tool_commentary_node(root, events, event),
         "model.response.continued" => continued_response_commentary_node(root, events, event),
+        // Once the turn reports usage, its reasoning has settled — commit the
+        // collapsed "Thought for Xs · Nk tokens" summary so it persists in
+        // scrollback. The full text stays available in the Ctrl+O view.
+        "model.usage" => thinking_summary_node_before_event(root, events, event),
         // `plan.proposed` is legacy: planning mode was removed, so nothing
         // emits these anymore. Old persisted sessions can still contain them,
         // though — render the text as a plain assistant turn so historical
@@ -1668,7 +1683,6 @@ fn committed_node_for_event(
         | "model.delta"
         | "model.response.output_item.completed"
         | "model.config"
-        | "model.usage"
         | "session.compaction_started"
         | "session.compacted"
         | "session.created"
@@ -1884,6 +1898,16 @@ fn active_node_for_session(
     let mut active_nodes = Vec::new();
     let live_status = live_status_for_session(active_child_count, live_thinking_text, live_events);
 
+    // While thinking, the status detail carries the live timer + token estimate;
+    // otherwise it falls back to the subagent summary (if any).
+    let status_detail = if live_status == "Thinking..." {
+        live_thinking_text
+            .map(|text| live_thinking_status_detail(live_events, text))
+            .or_else(|| active_subagent_summary(active_child_count))
+    } else {
+        active_subagent_summary(active_child_count)
+    };
+
     if let Some(text) = live_streaming_text {
         let seq = events.last().map(|event| event.seq).unwrap_or_default();
         if !text.trim().is_empty() {
@@ -1895,6 +1919,26 @@ fn active_node_for_session(
                     markdown: text.to_string(),
                 },
             });
+        }
+    }
+
+    // Stream the agent's reasoning inline while it is still thinking and has not
+    // yet produced visible output. Gated on the Thinking state so a parent's
+    // reasoning stays hidden while a subagent is the active work. Once output
+    // begins this gives way to the streamed answer and, after the turn, to the
+    // collapsed "Thought for Xs".
+    if live_streaming_text.is_none() && live_status == "Thinking..." {
+        if let Some(thinking) = live_thinking_text {
+            let lines: Vec<String> = thinking.lines().map(str::to_string).collect();
+            if !lines.is_empty() {
+                active_nodes.push(active_status_node(
+                    root,
+                    events,
+                    "thinking",
+                    lines,
+                    NodeStyle::Thought,
+                ));
+            }
         }
     }
 
@@ -1937,7 +1981,7 @@ fn active_node_for_session(
             root,
             events,
             live_status,
-            active_subagent_summary(active_child_count).as_deref(),
+            status_detail.as_deref(),
         ));
     }
 
@@ -1957,7 +2001,7 @@ fn active_node_for_session(
         root,
         events,
         live_status,
-        active_subagent_summary(active_child_count).as_deref(),
+        status_detail.as_deref(),
     ))
 }
 
@@ -1985,6 +2029,221 @@ fn live_status_for_session(
         return "Thinking...";
     }
     "Working..."
+}
+
+/// The live "(29s · ↓ ~1.5k tokens)" detail shown beside the Thinking… status.
+/// Elapsed runs from the first thinking delta of the turn; the token count is a
+/// chars/4 estimate (exact reasoning tokens only arrive with the usage event).
+fn live_thinking_status_detail(live_events: &[EventRecord], thinking_text: &str) -> String {
+    let first_ts = live_events
+        .iter()
+        .find(|event| event.event_type == "model.thinking_delta")
+        .map(|event| event.ts_ms);
+    let elapsed_s = first_ts
+        .map(|start| now_ms().saturating_sub(start).max(0) / 1000)
+        .unwrap_or(0);
+    let est_tokens = (thinking_text.chars().count() as i64 + 3) / 4;
+    format!(
+        "({elapsed_s}s · ↓ ~{} tokens)",
+        crate::render::format_token_count(est_tokens)
+    )
+}
+
+/// Approximate characters per token — mirrors `product_analytics` so estimated
+/// reasoning-token counts stay consistent across the app.
+const APPROX_CHARS_PER_TOKEN: i64 = 4;
+
+/// One agent reasoning block: the full thinking text for a single model turn,
+/// plus the wall-clock time it took and the reasoning tokens it consumed. This
+/// is the shared source for both the inline collapsed summary and the Ctrl+O
+/// thinking view.
+pub(crate) struct ThinkingBlock {
+    pub(crate) text: String,
+    pub(crate) duration_s: i64,
+    /// Exact `reasoning_output_tokens` when the turn reported usage; otherwise a
+    /// chars/4 estimate.
+    pub(crate) tokens: i64,
+    /// True when `tokens` is the estimate rather than reported usage.
+    pub(crate) tokens_estimated: bool,
+}
+
+/// Walk events and split the agent's reasoning into per-turn blocks. Thinking
+/// deltas may arrive as true deltas or as growing snapshots, so we aggregate
+/// with the same prefix-aware logic the protocol uses.
+pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<ThinkingBlock> {
+    let mut blocks = Vec::new();
+    let mut text = String::new();
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: i64 = 0;
+    let mut reported_tokens: Option<i64> = None;
+
+    fn flush(
+        blocks: &mut Vec<ThinkingBlock>,
+        text: &mut String,
+        first_ts: &mut Option<i64>,
+        last_ts: i64,
+        reported_tokens: &mut Option<i64>,
+    ) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let duration_s = first_ts
+                .map(|start| (last_ts - start).max(0) / 1000)
+                .unwrap_or(0);
+            let (tokens, tokens_estimated) = match *reported_tokens {
+                Some(reported) => (reported, false),
+                None => {
+                    let chars = trimmed.chars().count() as i64;
+                    (
+                        (chars + APPROX_CHARS_PER_TOKEN - 1) / APPROX_CHARS_PER_TOKEN,
+                        true,
+                    )
+                }
+            };
+            blocks.push(ThinkingBlock {
+                text: trimmed.to_string(),
+                duration_s,
+                tokens,
+                tokens_estimated,
+            });
+        }
+        text.clear();
+        *first_ts = None;
+        *reported_tokens = None;
+    }
+
+    for event in events {
+        match event.event_type.as_str() {
+            "model.thinking_delta" => {
+                if let Some(delta) = event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    append_thinking_delta(&mut text, delta);
+                    if first_ts.is_none() {
+                        first_ts = Some(event.ts_ms);
+                    }
+                    last_ts = event.ts_ms;
+                }
+            }
+            // Usage closes out the turn's reasoning with the exact token count.
+            "model.usage" if first_ts.is_some() => {
+                reported_tokens = event
+                    .payload
+                    .get("reasoning_output_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|tokens| *tokens > 0)
+                    .or(reported_tokens);
+                flush(
+                    &mut blocks,
+                    &mut text,
+                    &mut first_ts,
+                    last_ts,
+                    &mut reported_tokens,
+                );
+            }
+            // Any new turn or task boundary ends the current reasoning block.
+            "model.turn.request" | "session.input" | "session.followup" | "session.done" => flush(
+                &mut blocks,
+                &mut text,
+                &mut first_ts,
+                last_ts,
+                &mut reported_tokens,
+            ),
+            _ => {}
+        }
+    }
+    flush(
+        &mut blocks,
+        &mut text,
+        &mut first_ts,
+        last_ts,
+        &mut reported_tokens,
+    );
+    blocks
+}
+
+/// Append a thinking delta, tolerating providers that resend growing snapshots
+/// instead of pure deltas (matches `append_streaming_text_delta` in protocol).
+fn append_thinking_delta(current: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(incoming);
+        return;
+    }
+    if incoming == current || incoming.trim() == current.trim() {
+        return;
+    }
+    if let Some(suffix) = incoming.strip_prefix(current.as_str()) {
+        current.push_str(suffix);
+        return;
+    }
+    if incoming.chars().count() >= 24 && current.ends_with(incoming) {
+        return;
+    }
+    current.push_str(incoming);
+}
+
+/// `Thought for 31s · 1.8k tokens` — the one-line summary for a reasoning block.
+pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
+    let tokens = if block.tokens_estimated {
+        format!("~{}", crate::render::format_token_count(block.tokens))
+    } else {
+        crate::render::format_token_count(block.tokens)
+    };
+    format!(
+        "Thought for {}s · {} tokens",
+        block.duration_s.max(0),
+        tokens
+    )
+}
+
+/// Build the collapsed reasoning summary for the turn that ends at `event`.
+/// The segment runs from the previous turn boundary up to and including the
+/// anchor event (so a usage event contributes its exact token count). Returns
+/// `None` when the turn produced no reasoning.
+fn thinking_summary_node_before_event(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> Option<TranscriptNode> {
+    if event.session_id != root.id {
+        return None;
+    }
+    let event_idx = events.iter().position(|candidate| {
+        candidate.session_id == event.session_id
+            && candidate.seq == event.seq
+            && candidate.event_type == event.event_type
+    })?;
+    let turn_start = events[..event_idx]
+        .iter()
+        .rposition(|candidate| {
+            candidate.session_id == root.id
+                && matches!(
+                    candidate.event_type.as_str(),
+                    "model.turn.request"
+                        | "model.turn.retry"
+                        | "model.turn.error"
+                        | "session.input"
+                        | "session.followup"
+                )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let segment = events.get(turn_start..=event_idx)?;
+    let block = thinking_blocks_for_session(segment)
+        .into_iter()
+        .next_back()?;
+    Some(TranscriptNode {
+        id: format!("{}:{}:thinking", event.session_id, event.seq),
+        seq: event.seq,
+        revision: event.seq.max(0) as u64,
+        kind: TranscriptKind::Thinking {
+            summary: thinking_block_summary(&block),
+        },
+    })
 }
 
 fn active_child_session_count(app: &App, root_id: &str) -> usize {

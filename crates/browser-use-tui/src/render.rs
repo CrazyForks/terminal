@@ -1393,6 +1393,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
         Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
         Surface::FeedbackThanks => ("Feedback", ""),
+        Surface::Thinking => ("Thinking", "Agent reasoning for this task"),
         Surface::Main => ("", ""),
     }
 }
@@ -1435,6 +1436,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Developer => "Esc:close",
         Surface::Feedback => "Enter:next | Esc:back",
         Surface::FeedbackThanks => "",
+        Surface::Thinking => "Ctrl+O / Esc / q:close",
         _ => "Enter:select | Esc:back",
     }
 }
@@ -1498,8 +1500,42 @@ fn surface_lines(
         Surface::Developer => developer_lines(app, state),
         Surface::Feedback => feedback_lines(app),
         Surface::FeedbackThanks => Vec::new(),
+        Surface::Thinking => thinking_view_lines(app, state, width),
         Surface::Main => Vec::new(),
     }
+}
+
+/// The dedicated agent-thinking surface (opened with Ctrl+O): every reasoning
+/// block for the current task, full text, in the distinct `thought()` color.
+/// The per-block aggregation lives in `transcript` so the inline collapsed
+/// summary and this view stay in lockstep.
+fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<Line<'static>> {
+    let Some(session) = state.current_session.as_ref() else {
+        return vec![Line::from(Span::styled("No task selected.", dim()))];
+    };
+    let events = app.cached_events_for_session(&session.id);
+    let blocks = transcript::thinking_blocks_for_session(events);
+    if blocks.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No agent thinking for this task yet.",
+            dim(),
+        ))];
+    }
+    let mut lines = Vec::new();
+    for (idx, block) in blocks.iter().enumerate() {
+        if idx > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            transcript::thinking_block_summary(block),
+            bold(),
+        )));
+        lines.push(Line::from(""));
+        for text_line in block.text.lines() {
+            lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
+        }
+    }
+    lines
 }
 
 /// Fused bordered composer: a single rounded box that contains the input area
@@ -1918,7 +1954,7 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
     usage
 }
 
-fn format_token_count(tokens: i64) -> String {
+pub(crate) fn format_token_count(tokens: i64) -> String {
     let tokens = tokens.max(0);
     if tokens < 1_000 {
         return tokens.to_string();
