@@ -8798,6 +8798,74 @@ print("select_helpers ok")
     }
 
     #[test]
+    fn browser_script_form_field_helpers_match_labels_and_fill_semantically() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-form-field-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+calls = []
+filled = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "input:not([type=\"hidden\"])" in expression
+    assert "[role=\"combobox\"]" in expression
+    assert "label[for=" in expression
+    assert "CSS.escape" in expression
+    if "__FILL_FORM_FIELD__" in expression:
+        assert "matched_text" in expression
+        assert 'const needle = "postal code"' in expression
+        return {
+            "selector": "input[name=\"zipcode\"]",
+            "score": 50,
+            "matched_text": "postal code zipcode",
+            "tag": "input",
+            "type": "text",
+        }
+    assert "__FORM_FIELDS_SNAPSHOT__" in expression
+    return [
+        {
+            "index": 0,
+            "selector": "input[name=\"zipcode\"]",
+            "tag": "input",
+            "type": "text",
+            "label": "Postal code",
+            "placeholder": "Postal code",
+            "name": "zipcode",
+            "value": "",
+            "required": True,
+            "autocomplete": "postal-code",
+            "aria_expanded": None,
+            "rect": {"x": 10, "y": 20, "width": 200, "height": 32, "in_viewport": True},
+        }
+    ]
+
+def fill_input(selector, text, clear=True, timeout=0.0):
+    filled.append({"selector": selector, "text": text, "clear": clear, "timeout": timeout})
+    return True
+
+snapshot = form_fields_snapshot()
+assert snapshot["count"] == 1, snapshot
+assert snapshot["fields"][0]["label"] == "Postal code", snapshot
+result = fill_form_field("postal code", "00510", timeout=2.5)
+assert result["filled"] is True, result
+assert result["selector"] == "input[name=\"zipcode\"]", result
+assert result["matched_text"] == "postal code zipcode", result
+assert filled == [{"selector": "input[name=\"zipcode\"]", "text": "00510", "clear": True, "timeout": 2.5}], filled
+assert len(calls) == 2, calls
+print("form_field_helpers ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("form_field_helpers ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

@@ -3844,6 +3844,124 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
     return True
 
 
+def form_fields_snapshot(limit=30):
+    """Return compact rendered form fields with labels, placeholders, and selectors."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 30
+    limit_int = max(1, min(limit_int, 200))
+    expression = f"""
+(() => {{
+  // __FORM_FIELDS_SNAPSHOT__
+  const clean = (text, max = 220) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'placeholder', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const labelFor = el => {{
+    const bits = [el.getAttribute('aria-label')];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parentLabel = el.closest('label');
+    if (parentLabel) bits.push(parentLabel.innerText);
+    const wrapper = el.closest('[aria-label],[data-label],.field,.form-group,li,div');
+    if (wrapper) bits.push(wrapper.getAttribute('aria-label') || wrapper.getAttribute('data-label') || '');
+    return clean(bits.filter(Boolean).join(' '));
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  return Array.from(document.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"],[role="combobox"],[role="textbox"]'))
+    .filter(el => !el.disabled && visible(el))
+    .slice(0, {limit_int})
+    .map((el, index) => {{
+      const r = el.getBoundingClientRect();
+      const type = (el.getAttribute('type') || el.tagName).toLowerCase();
+      return {{
+        index,
+        selector: selectorFor(el),
+        tag: el.tagName.toLowerCase(),
+        type,
+        label: labelFor(el),
+        placeholder: clean(el.getAttribute('placeholder')),
+        name: clean(el.getAttribute('name')),
+        value: clean(el.value || el.textContent, 300),
+        required: !!el.required,
+        autocomplete: clean(el.getAttribute('autocomplete')),
+        aria_expanded: el.getAttribute('aria-expanded'),
+        rect: {{
+          x: Math.round(r.x), y: Math.round(r.y),
+          width: Math.round(r.width), height: Math.round(r.height),
+          in_viewport: r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth,
+        }},
+      }};
+    }});
+}})()
+"""
+    fields = js(expression) or []
+    return {"count": len(fields), "fields": fields}
+
+
+def fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0):
+    """Fill a rendered text field by label, placeholder, name, selector, or nearby text."""
+    needle = str(label_or_placeholder or "").strip().lower()
+    if not needle:
+        raise RuntimeError("fill_form_field requires a label_or_placeholder")
+    expression = f"""
+(() => {{
+  // __FILL_FORM_FIELD__
+  const needle = {json.dumps(needle)};
+  const clean = text => (text || '').replace(/\\s+/g, ' ').trim();
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'placeholder', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return '';
+  }};
+  const textFor = el => {{
+    const bits = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parent = el.closest('label,[aria-label],[data-label],.field,.form-group,li,div');
+    if (parent) bits.push(parent.innerText, parent.getAttribute('aria-label'), parent.getAttribute('data-label'));
+    return clean(bits.filter(Boolean).join(' ')).toLowerCase();
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  let best = null, bestScore = -1;
+  for (const el of document.querySelectorAll('input:not([type="hidden"]),textarea,[contenteditable="true"],[role="combobox"],[role="textbox"]')) {{
+    if (el.disabled || !visible(el)) continue;
+    const selector = selectorFor(el);
+    const hay = textFor(el);
+    let score = hay === needle ? 100 : hay.includes(needle) ? 50 : needle.includes(hay) && hay.length > 2 ? 20 : 0;
+    if (selector && selector.toLowerCase() === needle) score = 120;
+    if (score > bestScore) {{ best = el; bestScore = score; }}
+  }}
+  return best && bestScore > 0 ? {{
+    selector: selectorFor(best),
+    score: bestScore,
+    matched_text: textFor(best),
+    tag: best.tagName.toLowerCase(),
+    type: (best.getAttribute('type') || best.tagName).toLowerCase(),
+  }} : null;
+}})()
+"""
+    match = js(expression)
+    if not match or not match.get("selector"):
+        fields = form_fields_snapshot(limit=20)
+        raise RuntimeError(f"fill_form_field: no rendered field matched {label_or_placeholder!r}; fields={fields}")
+    fill_input(match["selector"], value, clear=clear, timeout=timeout)
+    return {"filled": True, "selector": match["selector"], "matched_text": match.get("matched_text", ""), "score": match.get("score")}
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
