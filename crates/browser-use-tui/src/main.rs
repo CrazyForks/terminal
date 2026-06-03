@@ -1889,7 +1889,9 @@ impl App {
 
     fn drain_store_notifications(&mut self) -> Result<bool> {
         let mut changed = false;
+        let mut drained_any = false;
         while let Ok(notification) = self.store_rx.try_recv() {
+            drained_any = true;
             changed |= self
                 .state_cache
                 .apply_notification(&self.store, notification)?;
@@ -1897,14 +1899,23 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
-        if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
-            changed = true;
-            self.state_cache.refresh_all(&self.store)?;
-            self.refresh_cached_projection();
-        } else if self.maybe_start_goal_continuation()? {
-            changed = true;
-            self.state_cache.refresh_all(&self.store)?;
-            self.refresh_cached_projection();
+        // The follow-up flush and goal-continuation checks each read the full
+        // event history from the store, so they must not run on every keystroke
+        // (that made typing in a long session ~16ms/keystroke slower than the
+        // home screen). They only become relevant when the store changed or we
+        // switched sessions; otherwise the prior result still holds.
+        let session_changed = self.last_followup_check_session != self.selected_session_id;
+        if drained_any || session_changed {
+            self.last_followup_check_session = self.selected_session_id.clone();
+            if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
+                changed = true;
+                self.state_cache.refresh_all(&self.store)?;
+                self.refresh_cached_projection();
+            } else if self.maybe_start_goal_continuation()? {
+                changed = true;
+                self.state_cache.refresh_all(&self.store)?;
+                self.refresh_cached_projection();
+            }
         }
         Ok(changed)
     }
@@ -8183,6 +8194,42 @@ mod redesign_tests {
         app.store.set_setting("setup.complete", "1")?;
         app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
+    }
+
+    // Run with: cargo test -p browser-use-tui timing_drain_store_notifications_in_session -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn timing_drain_store_notifications_in_session() -> Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        let body = "x".repeat(400);
+        for i in 0..3000 {
+            app.store.append_event(
+                &session.id,
+                "model.turn.response",
+                serde_json::json!({"text": format!("{i}: {body}")}),
+            )?;
+        }
+        app.store
+            .set_status(&session.id, browser_use_protocol::SessionStatus::Done)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        // First drain does the one-time follow-up/continuation check; warm up
+        // past it, then measure the steady-state per-keystroke cost.
+        black_box(app.drain_store_notifications()?);
+        let reps = 50;
+        let t = Instant::now();
+        for _ in 0..reps {
+            black_box(app.drain_store_notifications()?);
+        }
+        let drain_us = t.elapsed().as_micros() as f64 / reps as f64;
+        eprintln!("TIMING3 events=3000 steady_drain_per_call={drain_us:.1}us (~2-3 calls per keystroke)");
+        Ok(())
     }
 
     #[test]
