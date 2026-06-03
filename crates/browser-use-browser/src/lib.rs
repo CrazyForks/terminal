@@ -7959,6 +7959,69 @@ print("sitemap_urls_snapshot ok")
     }
 
     #[test]
+    fn browser_script_route_candidates_snapshot_discovers_spa_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-route-candidates-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def page_info():
+    return {"url": "https://www.hostgenius.ca/"}
+
+def js(expression, *args, **kwargs):
+    calls.append(("js", expression))
+    assert "script[src]" in expression
+    assert "inlineScripts" in expression
+    return {
+        "url": "https://www.hostgenius.ca/",
+        "title": "HostGenius",
+        "attrs": [
+            {"tag": "script", "href": "https://www.hostgenius.ca/_next/static/app.js", "rel": "", "type": "", "text": ""},
+            {"tag": "link", "href": "https://www.hostgenius.ca/_next/static/css/app.css", "rel": "stylesheet", "type": "", "text": ""},
+            {"tag": "a", "href": "https://www.hostgenius.ca/about", "rel": "", "type": "", "text": "About"},
+        ],
+        "inlineScripts": [
+            {"source": "inline-script-1", "text": 'self.__BUILD_MANIFEST={"/properties":["/static/properties.js"],"/vacation-rentals/calgary-loft":[],"/stays/downtown-suite":[],"/accommodations":[]} booking availability'}
+        ],
+    }
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    calls.append(("http_get", url))
+    assert url == "https://www.hostgenius.ca/_next/static/app.js", url
+    return 'const routes=["/properties","/book-now","/availability/search","/homes","/static/app.js"];'
+
+snapshot = route_candidates_snapshot("https://www.hostgenius.ca", keywords=["properties", "rentals", "booking"], limit=10)
+assert snapshot["origin"] == "https://www.hostgenius.ca", snapshot
+assert snapshot["scripts_fetched"] == ["https://www.hostgenius.ca/_next/static/app.js"], snapshot
+urls = [item["url"] for item in snapshot["recommended"]]
+assert "https://www.hostgenius.ca/properties" in urls, snapshot
+assert "https://www.hostgenius.ca/vacation-rentals/calgary-loft" in urls, snapshot
+assert "https://www.hostgenius.ca/stays/downtown-suite" in urls, snapshot
+assert "https://www.hostgenius.ca/accommodations" in urls, snapshot
+assert "https://www.hostgenius.ca/homes" in urls, snapshot
+assert "https://www.hostgenius.ca/book-now" in urls, snapshot
+assert not any(url.endswith(".css") for url in urls), snapshot
+properties = next(item for item in snapshot["routes"] if item["url"].endswith("/properties"))
+assert properties["score"] >= 10, properties
+assert properties["keyword_matches"], properties
+assert any(call[0] == "js" for call in calls), calls
+
+string_keyword_snapshot = route_candidates_snapshot("www.hostgenius.ca", keywords="booking", limit=10)
+assert string_keyword_snapshot["keywords"] == ["booking"], string_keyword_snapshot
+print("route_candidates_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("route_candidates_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
