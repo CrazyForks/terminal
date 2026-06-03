@@ -4461,6 +4461,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         max_turns: config.max_turns,
         max_context_chars: AgentRunOptions::default().max_context_chars,
         browser_mode: Some(config.browser_mode.clone()),
+        dynamic_browser_mode_from_store: AgentRunOptions::default().dynamic_browser_mode_from_store,
         collaboration_mode: AgentRunOptions::default().collaboration_mode,
         include_environment_context: true,
         include_permissions_instructions: true,

@@ -38,7 +38,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail};
 use base64::{engine::general_purpose, Engine as _};
@@ -377,24 +377,38 @@ pub trait BrowserBackend: Send + Sync {
 /// Production backend: a thin delegation to `browser-use-browser`.
 #[derive(Debug, Clone, Default)]
 pub struct RealBackend {
-    browser_mode: Option<String>,
+    browser_mode: Arc<Mutex<Option<String>>>,
 }
 
 impl RealBackend {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(browser_mode)),
+        }
+    }
+
+    pub fn with_shared_browser_mode(browser_mode: Arc<Mutex<Option<String>>>) -> Self {
         Self { browser_mode }
     }
 
-    fn normalized_browser_mode(&self) -> Option<&str> {
-        self.browser_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|mode| !mode.is_empty())
-            .map(|mode| match mode {
+    fn normalized_browser_mode(&self) -> Option<String> {
+        let mode = self
+            .browser_mode
+            .lock()
+            .ok()
+            .and_then(|mode| mode.clone())?;
+        let mode = mode.trim();
+        if mode.is_empty() {
+            return None;
+        }
+        Some(
+            match mode {
                 "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
                 "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
                 other => other,
-            })
+            }
+            .to_string(),
+        )
     }
 
     fn should_ensure_before_command(&self, command: &str) -> bool {
@@ -419,7 +433,7 @@ impl RealBackend {
             return command.to_string();
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-        if self.normalized_browser_mode() == Some("cloud")
+        if self.normalized_browser_mode().as_deref() == Some("cloud")
             && matches!(
                 words.as_slice(),
                 ["browser", "local", ..]
@@ -454,20 +468,10 @@ impl RealBackend {
         let connected =
             status.content.get("connection").and_then(Value::as_str) == Some("connected");
         let current_mode = status.content.get("mode").and_then(Value::as_str);
-        let desired_command = match mode {
-            "cloud" => {
-                if connected && current_mode == Some("remote-cloud") {
-                    return Ok(events);
-                }
-                "browser remote start"
-            }
-            "managed-headless" => {
-                if connected && current_mode == Some("managed") {
-                    return Ok(events);
-                }
-                "browser connect managed --headless"
-            }
-            _ => return Ok(events),
+        let Some(desired_command) =
+            desired_browser_connect_command(mode.as_str(), connected, current_mode)
+        else {
+            return Ok(events);
         };
         let mut started = browser_use_browser::run_browser_command(
             session_id,
@@ -477,6 +481,37 @@ impl RealBackend {
         )?;
         events.append(&mut started.events);
         Ok(events)
+    }
+}
+
+pub(crate) fn desired_browser_connect_command(
+    selected_mode: &str,
+    connected: bool,
+    current_mode: Option<&str>,
+) -> Option<&'static str> {
+    match selected_mode {
+        "cloud" => {
+            if connected && current_mode == Some("remote-cloud") {
+                None
+            } else {
+                Some("browser remote start")
+            }
+        }
+        "local" | "local-chrome" => {
+            if connected && current_mode == Some("local") {
+                None
+            } else {
+                Some("browser connect local")
+            }
+        }
+        "managed-headless" => {
+            if connected && current_mode == Some("managed") {
+                None
+            } else {
+                Some("browser connect managed --headless")
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1316,7 +1351,9 @@ fn browser_script_error_detail(error: &str) -> String {
 #[derive(Clone)]
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    real_backend_mode: Option<Arc<Mutex<Option<String>>>>,
     selected_browser_mode: Option<String>,
+    dynamic_browser_mode_from_store: bool,
     default_script_timeout_secs: u64,
     session_id_fallback: Option<String>,
     persistence: Option<BrowserPersistence>,
@@ -1346,7 +1383,9 @@ impl BrowserTool {
     pub fn new() -> Self {
         Self {
             backend: Arc::new(RealBackend::default()),
+            real_backend_mode: None,
             selected_browser_mode: None,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1355,9 +1394,14 @@ impl BrowserTool {
 
     /// Construct a real browser tool with the run's configured browser mode.
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        let real_backend_mode = Arc::new(Mutex::new(browser_mode.clone()));
         Self {
-            backend: Arc::new(RealBackend::with_browser_mode(browser_mode.clone())),
+            backend: Arc::new(RealBackend::with_shared_browser_mode(Arc::clone(
+                &real_backend_mode,
+            ))),
+            real_backend_mode: Some(real_backend_mode),
             selected_browser_mode: browser_mode,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1368,7 +1412,9 @@ impl BrowserTool {
     pub fn with_backend(backend: Arc<dyn BrowserBackend>) -> Self {
         Self {
             backend,
+            real_backend_mode: None,
             selected_browser_mode: None,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1382,6 +1428,14 @@ impl BrowserTool {
     /// receives the same mode.
     pub fn with_selected_browser_mode(mut self, browser_mode: Option<String>) -> Self {
         self.selected_browser_mode = browser_mode;
+        self
+    }
+
+    pub fn with_dynamic_browser_mode_from_store(mut self, dynamic: bool) -> Self {
+        self.dynamic_browser_mode_from_store = dynamic;
+        if dynamic {
+            self.selected_browser_mode = None;
+        }
         self
     }
 
@@ -1524,6 +1578,31 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
             _ => {}
         }
 
+        let selected_browser_mode = self.selected_browser_mode.clone();
+        let selected_browser_mode =
+            if self.dynamic_browser_mode_from_store && self.real_backend_mode.is_some() {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    let dynamic_mode = persistence
+                        .store
+                        .lock()
+                        .map_err(|_| ToolError::Other(anyhow!("store mutex poisoned")))
+                        .and_then(|store| {
+                            preferred_browser_mode(Some(&store))
+                                .map(|mode| Some(mode.to_string()))
+                                .map_err(ToolError::Other)
+                        })?;
+                    if let Some(mode) = self.real_backend_mode.as_ref() {
+                        *mode.lock().map_err(|_| {
+                            ToolError::Other(anyhow!("browser mode mutex poisoned"))
+                        })? = dynamic_mode.clone();
+                    }
+                    None
+                } else {
+                    selected_browser_mode
+                }
+            } else {
+                selected_browser_mode
+            };
         let backend = Arc::clone(&self.backend);
         let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
@@ -1535,7 +1614,6 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();
         let persistence = self.persistence.clone();
-        let selected_browser_mode = self.selected_browser_mode.clone();
         let tool_call_id = ctx.call_id.clone();
         let tool_name = if ctx.tool_name.trim().is_empty() {
             match &action {
