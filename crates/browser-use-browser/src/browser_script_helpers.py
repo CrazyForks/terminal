@@ -3962,6 +3962,124 @@ def fill_form_field(label_or_placeholder, value, clear=True, timeout=3.0):
     return {"filled": True, "selector": match["selector"], "matched_text": match.get("matched_text", ""), "score": match.get("score")}
 
 
+def autocomplete_suggestions_snapshot(query=None, limit=20):
+    """Return likely visible autocomplete/typeahead suggestions with text and rects."""
+    needle = str(query or "").strip().lower()
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 20
+    limit_int = max(1, min(limit_int, 100))
+    expression = f"""
+(() => {{
+  // __AUTOCOMPLETE_SUGGESTIONS__
+  const needle = {json.dumps(needle)};
+  const clean = (text, max = 220) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['aria-label', 'title', 'data-testid', 'data-test', 'data-value', 'value']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' &&
+      r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth;
+  }};
+  const active = document.activeElement;
+  const controlled = new Set(((active && active.getAttribute('aria-controls')) || '').split(/\\s+/).filter(Boolean));
+  const out = [], seen = new Set();
+  const nodes = Array.from(document.querySelectorAll([
+    '[role="option"]', '[role="menuitem"]', '[role="treeitem"]', '[role="listitem"]',
+    'li', 'option', '[data-value]', '[data-testid]', '[data-test]',
+    '.suggestion', '.suggestions', '.autocomplete', '.typeahead', '.pac-item'
+  ].join(',')));
+  for (const el of nodes) {{
+    if (!visible(el)) continue;
+    const text = clean([
+      el.innerText || el.textContent || '',
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.getAttribute('data-value') || '',
+      el.value || '',
+    ].filter(Boolean).join(' '));
+    if (!text) continue;
+    const hay = [
+      text,
+      el.id || '',
+      String(el.className || ''),
+      el.getAttribute('role') || '',
+      el.getAttribute('data-testid') || '',
+      el.getAttribute('data-test') || '',
+    ].join(' ').toLowerCase();
+    let score = 0;
+    if (needle && hay.includes(needle)) score += 120;
+    if (needle && needle.includes(text.toLowerCase()) && text.length > 2) score += 35;
+    if (/option|menuitem|treeitem|listitem/.test(el.getAttribute('role') || '')) score += 45;
+    if (/suggest|autocomplete|typeahead|pac-item|result|dropdown|menu|listbox/.test(hay)) score += 40;
+    for (let node = el; node && node !== document.body; node = node.parentElement) {{
+      if (controlled.has(node.id)) score += 70;
+      const parentHay = [node.id || '', String(node.className || ''), node.getAttribute('role') || ''].join(' ').toLowerCase();
+      if (/suggest|autocomplete|typeahead|pac-container|results?|dropdown|listbox|menu/.test(parentHay)) score += 25;
+      if (node.getAttribute('role') === 'listbox' || node.getAttribute('role') === 'menu') score += 25;
+    }}
+    if (!needle && score < 40) continue;
+    if (needle && score < 80) continue;
+    const r = el.getBoundingClientRect();
+    const key = `${{Math.round(r.left)}}:${{Math.round(r.top)}}:${{text}}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({{
+      selector: selectorFor(el),
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || '',
+      text,
+      score,
+      rect: {{
+        x: Math.round(r.x), y: Math.round(r.y),
+        width: Math.round(r.width), height: Math.round(r.height),
+        in_viewport: true,
+      }},
+      center: {{x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)}},
+    }});
+  }}
+  return out.sort((a, b) => b.score - a.score).slice(0, {limit_int});
+}})()
+"""
+    suggestions = js(expression) or []
+    return {"count": len(suggestions), "query": query or "", "suggestions": suggestions}
+
+
+def select_autocomplete(label_or_placeholder, query, match_text=None, timeout=3.0):
+    """Fill an autocomplete field and click the best visible suggestion."""
+    filled = fill_form_field(label_or_placeholder, query, clear=True, timeout=timeout)
+    needle = str(match_text or query or "").strip().lower()
+    deadline = _time.monotonic() + _timeout_seconds(timeout)
+    snapshot = {"suggestions": []}
+    while True:
+        snapshot = autocomplete_suggestions_snapshot(needle, limit=20)
+        if snapshot["suggestions"]:
+            break
+        if _time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"select_autocomplete: no visible suggestion matched {needle!r}; suggestions={autocomplete_suggestions_snapshot(limit=20)}"
+            )
+        _time.sleep(0.2)
+    best = snapshot["suggestions"][0]
+    click_at_xy(best["center"]["x"], best["center"]["y"])
+    return {
+        "selected": True,
+        "field_selector": filled.get("selector", ""),
+        "selector": best.get("selector", ""),
+        "matched_text": best.get("text", ""),
+        "score": best.get("score"),
+        "x": best["center"]["x"],
+        "y": best["center"]["y"],
+    }
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]

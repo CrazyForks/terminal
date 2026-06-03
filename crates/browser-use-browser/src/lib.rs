@@ -8866,6 +8866,75 @@ print("form_field_helpers ok")
     }
 
     #[test]
+    fn browser_script_autocomplete_helpers_select_visible_suggestions() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-autocomplete-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+filled = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "CSS.escape" in expression
+    if "__AUTOCOMPLETE_SUGGESTIONS__" in expression:
+        assert "[role=\"option\"]" in expression
+        assert "aria-controls" in expression
+        assert "getBoundingClientRect" in expression
+        return [
+            {
+                "selector": "#addr-option",
+                "tag": "li",
+                "role": "option",
+                "text": "225 Garcia Ave, San Leandro, CA 94577",
+                "score": 235,
+                "rect": {"x": 120, "y": 180, "width": 420, "height": 36, "in_viewport": True},
+                "center": {"x": 330, "y": 198},
+            }
+        ]
+    if "__FILL_FORM_FIELD__" in expression:
+        return {
+            "selector": "input[aria-label=\"Address\"]",
+            "score": 100,
+            "matched_text": "address search address",
+            "tag": "input",
+            "type": "text",
+        }
+    raise AssertionError(f"unexpected js expression: {expression[:200]}")
+
+def fill_input(selector, text, clear=True, timeout=0.0):
+    filled.append({"selector": selector, "text": text, "clear": clear, "timeout": timeout})
+    return True
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = autocomplete_suggestions_snapshot("225 Garcia")
+assert snapshot["count"] == 1, snapshot
+assert snapshot["suggestions"][0]["text"].startswith("225 Garcia"), snapshot
+result = select_autocomplete("Address", "225 Garcia Ave", match_text="225 Garcia", timeout=1.0)
+assert result["selected"] is True, result
+assert result["field_selector"] == "input[aria-label=\"Address\"]", result
+assert result["selector"] == "#addr-option", result
+assert result["matched_text"] == "225 Garcia Ave, San Leandro, CA 94577", result
+assert filled == [{"selector": "input[aria-label=\"Address\"]", "text": "225 Garcia Ave", "clear": True, "timeout": 1.0}], filled
+assert clicked_points == [{"x": 330, "y": 198, "button": "left", "clicks": 1}], clicked_points
+assert len(calls) == 3, calls
+print("autocomplete_helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("autocomplete_helpers ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
