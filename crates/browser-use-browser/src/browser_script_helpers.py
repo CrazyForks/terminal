@@ -1769,6 +1769,315 @@ def product_records_snapshot(limit=80, keywords=None):
     }
 
 
+def pagination_controls_snapshot(limit=20):
+    """Return likely visible pagination/load-more controls with ranking evidence."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 20
+    limit_int = max(1, min(limit_int, 100))
+    expression = f"""
+(() => {{
+  // __PAGINATION_CONTROLS_SNAPSHOT__
+  const limit = {limit_int};
+  const clean = (text, max = 260) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const css = value => CSS.escape(String(value || ''));
+  const selectorFor = el => {{
+    if (!el) return '';
+    if (el.id) return '#' + css(el.id);
+    for (const attr of ['aria-label', 'title', 'rel', 'data-testid', 'data-test', 'name']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{css(value)}}"]`;
+    }}
+    const role = el.getAttribute('role');
+    if (role) return `${{el.tagName.toLowerCase()}}[role="${{css(role)}}"]`;
+    return el.tagName.toLowerCase();
+  }};
+  const visible = el => {{
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' &&
+      r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth;
+  }};
+  const textFor = el => clean([
+    el.innerText || el.textContent || '',
+    el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('rel') || '',
+    el.id || '',
+  ].join(' '));
+  const nodes = Array.from(document.querySelectorAll([
+    'a[href]', 'button', 'input[type="button"]', 'input[type="submit"]',
+    '[role="button"]', '[aria-label]', '[title]'
+  ].join(',')));
+  const controls = [];
+  for (const el of nodes) {{
+    if (el.disabled || !visible(el)) continue;
+    const label = textFor(el);
+    const hay = clean([
+      label,
+      el.className || '',
+      el.getAttribute('rel') || '',
+      el.getAttribute('aria-current') || '',
+      el.closest('nav,[role="navigation"],[class*="pagination" i],[id*="pagination" i],[class*="pager" i],[id*="pager" i]') ? 'pagination' : '',
+    ].join(' '), 1000).toLowerCase();
+    let score = 0;
+    if (/\\b(next|more|load more|show more|more results|older|forward|continue)\\b|›|»|>/.test(hay)) score += 90;
+    if (/\\b(page|pages|pagination|pager|results?|records?|items?)\\b/.test(hay)) score += 30;
+    if (el.getAttribute('rel') === 'next') score += 120;
+    if (/\\b(prev|previous|back|newer)\\b/.test(hay)) score -= 60;
+    if (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('disabled') !== null) score -= 120;
+    if (score <= 0) continue;
+    const r = el.getBoundingClientRect();
+    controls.push({{
+      selector: selectorFor(el),
+      tag: el.tagName.toLowerCase(),
+      text: label,
+      href: el.href || '',
+      rel: el.getAttribute('rel') || '',
+      aria_current: el.getAttribute('aria-current'),
+      aria_disabled: el.getAttribute('aria-disabled'),
+      score,
+      rect: {{
+        x: Math.round(r.x), y: Math.round(r.y),
+        width: Math.round(r.width), height: Math.round(r.height),
+        in_viewport: true,
+      }},
+      center: {{x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)}},
+    }});
+  }}
+  const bodyText = clean(document.body && document.body.innerText || '', 1800);
+  const pageHint = bodyText.match(/(?:page\\s+\\d+\\s+(?:of|\\/|from)\\s+\\d+|\\d+\\s*[-–]\\s*\\d+\\s+of\\s+\\d+|showing\\s+\\d+)/i);
+  controls.sort((a, b) => b.score - a.score || a.rect.y - b.rect.y);
+  return {{url: location.href, title: document.title || '', page_hint: pageHint ? pageHint[0] : '', count: controls.length, controls: controls.slice(0, limit)}};
+}})()
+"""
+    data = js(expression) or {}
+    controls = data.get("controls") if isinstance(data, dict) else data
+    return {
+        "url": data.get("url") if isinstance(data, dict) else "",
+        "title": data.get("title") if isinstance(data, dict) else "",
+        "count": len(controls or []),
+        "page_hint": data.get("page_hint", "") if isinstance(data, dict) else "",
+        "controls": controls or [],
+    }
+
+
+def click_pagination(label_or_text="next", timeout=2.0):
+    """Click a visible pagination/load-more control matched by label or intent."""
+    needle = str(label_or_text or "next").strip().lower()
+    expression = f"""
+(() => {{
+  // __CLICK_PAGINATION__
+  const needle = {json.dumps(needle)};
+  const clean = text => (text || '').replace(/\\s+/g, ' ').trim();
+  const css = value => CSS.escape(String(value || ''));
+  const selectorFor = el => {{
+    if (el.id) return '#' + css(el.id);
+    for (const attr of ['aria-label', 'title', 'rel', 'data-testid', 'data-test', 'name']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{css(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' &&
+      r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth;
+  }};
+  const textFor = el => clean([
+    el.innerText || el.textContent || '',
+    el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('rel') || '',
+    el.id || '',
+  ].join(' '));
+  let best = null, bestScore = -100000, bestText = '';
+  for (const el of document.querySelectorAll('a[href],button,input[type="button"],input[type="submit"],[role="button"],[aria-label],[title]')) {{
+    if (el.disabled || !visible(el) || el.getAttribute('aria-disabled') === 'true') continue;
+    const label = textFor(el);
+    const hay = clean([label, el.className || '', el.getAttribute('rel') || '', selectorFor(el)].join(' ')).toLowerCase();
+    let score = 0;
+    if (needle && (hay === needle || label.toLowerCase() === needle)) score += 160;
+    if (needle && hay.includes(needle)) score += 95;
+    if (needle === 'next' && (/\\bnext\\b|›|»|>/.test(hay) || el.getAttribute('rel') === 'next')) score += 130;
+    if ((needle.includes('more') || needle === 'next') && /\\b(load more|show more|more results|older|forward|continue)\\b/.test(hay)) score += 110;
+    if (/\\b(prev|previous|back|newer)\\b/.test(hay)) score -= 90;
+    if (score > bestScore) {{ best = el; bestScore = score; bestText = label; }}
+  }}
+  if (!best || bestScore <= 0) return null;
+  const r = best.getBoundingClientRect();
+  return {{
+    selector: selectorFor(best),
+    matched_text: bestText,
+    score: bestScore,
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+    href: best.href || '',
+    rel: best.getAttribute('rel') || '',
+  }};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = pagination_controls_snapshot(limit=20)
+        raise RuntimeError(f"click_pagination: no likely pagination control matched {label_or_text!r}; controls={controls}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(max(float(timeout), 0.0), 3.0))
+    return {
+        "clicked": True,
+        "selector": match.get("selector", ""),
+        "matched_text": match.get("matched_text", ""),
+        "href": match.get("href", ""),
+        "rel": match.get("rel", ""),
+        "score": match.get("score"),
+        "x": match.get("x"),
+        "y": match.get("y"),
+    }
+
+
+def _pagination_progress_state(count_selector=None):
+    selector = str(count_selector or "").strip()
+    expression = f"""
+(() => {{
+  // __PAGINATION_PROGRESS_STATE__
+  const selector = {json.dumps(selector)};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+  }};
+  const countVisible = css => {{
+    try {{ return Array.from(document.querySelectorAll(css)).filter(visible).length; }}
+    catch (e) {{ return null; }}
+  }};
+  const selectorCounts = {{}};
+  const fallbacks = ['article', 'li', 'tr', '[role="listitem"]', '[class*="card" i]', '[class*="item" i]', '[class*="result" i]', '[class*="product" i]', '[data-testid*="card" i]', '[data-testid*="item" i]', '[data-testid*="result" i]'];
+  let itemCount = selector ? countVisible(selector) : null;
+  for (const css of fallbacks) {{
+    const count = countVisible(css);
+    selectorCounts[css] = count;
+    if (count !== null && (itemCount === null || count > itemCount)) itemCount = count;
+  }}
+  const text = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+  return {{
+    count_selector: selector,
+    item_count: itemCount || 0,
+    text_length: text.length,
+    text_sample: text.slice(0, 500),
+    selector_counts: selectorCounts,
+    url: location.href,
+    title: document.title || '',
+  }};
+}})()
+"""
+    try:
+        state = js(expression) or {}
+    except Exception as exc:
+        return {"count_selector": selector, "item_count": 0, "text_length": 0, "text_sample": "", "error": str(exc)}
+    if isinstance(state, dict):
+        return state
+    return {"count_selector": selector, "item_count": 0, "text_length": 0, "text_sample": "", "raw": state}
+
+
+def click_pagination_until_stable(label_or_text="load more", max_clicks=20, wait_seconds=0.8, idle_timeout=3.0, count_selector=None):
+    """Click Next/Load More repeatedly until no matching control remains or progress stops."""
+    needle = str(label_or_text or "load more").strip().lower()
+    try:
+        max_clicks_int = int(max_clicks)
+    except Exception:
+        max_clicks_int = 20
+    max_clicks_int = max(0, min(max_clicks_int, 50))
+    wait_s = max(0.0, min(float(wait_seconds or 0), 5.0))
+    idle_s = max(0.0, min(float(idle_timeout or 0), 10.0))
+
+    def matching_control(controls):
+        best = None
+        best_score = -10**9
+        for control in controls or []:
+            if not isinstance(control, dict):
+                continue
+            text = str(control.get("text") or "").strip().lower()
+            hay = " ".join([
+                text,
+                str(control.get("rel") or "").lower(),
+                str(control.get("selector") or "").lower(),
+            ])
+            disabled = control.get("aria_disabled") is True or str(control.get("aria_disabled") or "").lower() == "true"
+            if disabled:
+                continue
+            score = int(control.get("score") or 0)
+            if needle and (needle == text or needle in hay):
+                score += 200
+            if needle == "next" and ("next" in hay or control.get("rel") == "next" or "›" in hay or "»" in hay):
+                score += 160
+            if "more" in needle and ("load more" in hay or "show more" in hay or "more results" in hay):
+                score += 160
+            if ("load more" in hay or "show more" in hay or "more results" in hay or "older" in hay or "continue" in hay) and needle in ("next", "more", "load more"):
+                score += 80
+            if "prev" in hay or "previous" in hay or "back" in hay:
+                score -= 120
+            if score > best_score:
+                best = control
+                best_score = score
+        return best if best is not None and best_score > 0 else None
+
+    states = []
+    clicked = []
+    stopped_reason = "max_clicks"
+    unchanged_runs = 0
+    initial_state = _pagination_progress_state(count_selector=count_selector)
+    states.append(initial_state)
+    previous_signature = (initial_state.get("item_count"), initial_state.get("text_length"), initial_state.get("url"))
+
+    for _ in range(max_clicks_int):
+        snapshot = pagination_controls_snapshot(limit=20)
+        control = matching_control(snapshot.get("controls", []))
+        if not control:
+            stopped_reason = "no_matching_control"
+            break
+        try:
+            click_result = click_pagination(label_or_text, timeout=0)
+        except Exception as exc:
+            stopped_reason = "click_failed"
+            clicked.append({"control": control, "error": str(exc)})
+            break
+        clicked.append({"control": control, "result": click_result})
+        if wait_s:
+            _time.sleep(wait_s)
+        if idle_s:
+            try:
+                wait_for_network_idle(timeout=idle_s)
+            except Exception:
+                pass
+        state = _pagination_progress_state(count_selector=count_selector)
+        states.append(state)
+        signature = (state.get("item_count"), state.get("text_length"), state.get("url"))
+        if signature == previous_signature:
+            unchanged_runs += 1
+        else:
+            unchanged_runs = 0
+        previous_signature = signature
+        if unchanged_runs >= 2:
+            stopped_reason = "stable_after_click"
+            break
+
+    final_state = states[-1] if states else {}
+    return {
+        "clicks": len(clicked),
+        "stopped_reason": stopped_reason,
+        "states": states,
+        "clicked": clicked,
+        "final_controls": pagination_controls_snapshot(limit=20),
+        "final_count": final_state.get("item_count", 0),
+        "final_text_length": final_state.get("text_length", 0),
+        "count_selector": str(count_selector or "").strip(),
+        "label_or_text": label_or_text,
+    }
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])

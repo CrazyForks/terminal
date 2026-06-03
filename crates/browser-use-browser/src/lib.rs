@@ -8383,6 +8383,117 @@ print("product_records_snapshot ok")
     }
 
     #[test]
+    fn browser_script_pagination_helpers_click_until_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-pagination-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+page = {"load_more_clicks": 0, "items": 10}
+clicked_points = []
+network_idle_calls = []
+js_calls = []
+
+def js(expression, *args, **kwargs):
+    js_calls.append(expression)
+    if "__PAGINATION_CONTROLS_SNAPSHOT__" in expression:
+        for needle in ["load more", "rel", "getBoundingClientRect", "CSS.escape", "page_hint"]:
+            assert needle in expression, needle
+        if page["load_more_clicks"] >= 3:
+            return {"url": "https://example.test/results", "title": "Results", "page_hint": "", "count": 0, "controls": []}
+        return {
+            "url": "https://example.test/results",
+            "title": "Results",
+            "page_hint": f"Showing {page['items']} results",
+            "count": 2,
+            "controls": [
+                {
+                    "selector": "button[data-testid=\"load-more\"]",
+                    "tag": "button",
+                    "text": "Load more",
+                    "href": "",
+                    "rel": "",
+                    "aria_current": None,
+                    "aria_disabled": None,
+                    "score": 180,
+                    "rect": {"x": 320, "y": 680, "width": 120, "height": 40, "in_viewport": True},
+                    "center": {"x": 380, "y": 700},
+                },
+                {
+                    "selector": "a[rel=\"next\"]",
+                    "tag": "a",
+                    "text": "Next",
+                    "href": "https://example.test/results?page=2",
+                    "rel": "next",
+                    "aria_current": None,
+                    "aria_disabled": None,
+                    "score": 160,
+                    "rect": {"x": 700, "y": 680, "width": 80, "height": 40, "in_viewport": True},
+                    "center": {"x": 740, "y": 700},
+                },
+            ],
+        }
+    if "__CLICK_PAGINATION__" in expression:
+        for needle in ["needle", "selectorFor", "matched_text", "CSS.escape"]:
+            assert needle in expression, needle
+        if 'const needle = "load more"' in expression:
+            return {"selector": "button[data-testid=\"load-more\"]", "matched_text": "Load more", "score": 205, "x": 380, "y": 700, "href": "", "rel": ""}
+        return {"selector": "a[rel=\"next\"]", "matched_text": "Next", "score": 230, "x": 740, "y": 700, "href": "https://example.test/results?page=2", "rel": "next"}
+    if "__PAGINATION_PROGRESS_STATE__" in expression:
+        assert ".result-card" in expression
+        return {
+            "count_selector": ".result-card",
+            "item_count": page["items"],
+            "text_length": page["items"] * 50,
+            "text_sample": "result " * page["items"],
+            "selector_counts": {".result-card": page["items"]},
+            "url": "https://example.test/results",
+            "title": "Results",
+        }
+    raise AssertionError(expression[:160])
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    if x == 380:
+        page["load_more_clicks"] += 1
+        page["items"] += 10
+    return True
+
+def wait_for_network_idle(timeout=10.0, idle_ms=None):
+    network_idle_calls.append(timeout)
+    return True
+
+snapshot = pagination_controls_snapshot(limit=5)
+assert snapshot["count"] == 2, snapshot
+assert snapshot["page_hint"] == "Showing 10 results", snapshot
+assert snapshot["controls"][0]["text"] == "Load more", snapshot
+next_click = click_pagination("next", timeout=0)
+assert next_click["clicked"] is True, next_click
+assert next_click["rel"] == "next", next_click
+assert clicked_points[-1] == {"x": 740, "y": 700, "button": "left", "clicks": 1}, clicked_points
+
+result = click_pagination_until_stable("load more", max_clicks=5, wait_seconds=0, idle_timeout=0.1, count_selector=".result-card")
+assert result["clicks"] == 3, result
+assert result["stopped_reason"] == "no_matching_control", result
+assert result["final_count"] == 40, result
+assert result["final_text_length"] == 2000, result
+assert result["final_controls"]["count"] == 0, result
+assert len(result["states"]) == 4, result
+assert len(result["clicked"]) == 3, result
+assert network_idle_calls == [0.1, 0.1, 0.1], network_idle_calls
+assert clicked_points.count({"x": 380, "y": 700, "button": "left", "clicks": 1}) == 3, clicked_points
+print("pagination helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("pagination helpers ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
