@@ -1186,6 +1186,177 @@ def network_resources_snapshot(limit=80, keywords=None):
     return js(expression)
 
 
+def json_api_records(urls, records_path=None, limit=200, max_urls=8, use_browser_fetch=False, timeout=20.0):
+    """Fetch JSON API URL(s) and return candidate record arrays.
+
+    Use this after `network_resources_snapshot(...)` discovers API/XHR/JSON
+    endpoints so agents do not hand-write recursive JSON traversal.
+    """
+    if isinstance(urls, str):
+        url_list = [urls]
+    else:
+        url_list = [str(url) for url in (urls or []) if str(url).strip()]
+    try:
+        max_urls_int = max(1, min(int(max_urls or 8), 25))
+    except Exception:
+        max_urls_int = 8
+    url_list = url_list[:max_urls_int]
+    try:
+        limit_int = max(1, min(int(limit or 200), 1000))
+    except Exception:
+        limit_int = 200
+
+    def clean(value, max_chars=1200):
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:max_chars]
+
+    def path_get(data, path):
+        current = data
+        if not path:
+            return current
+        for part in str(path).split("."):
+            if part == "":
+                continue
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except Exception:
+                    return None
+            else:
+                return None
+        return current
+
+    def flatten_record(record):
+        if not isinstance(record, dict):
+            return {"value": record}
+        out = {}
+        for key, value in record.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                out[str(key)] = value
+            elif isinstance(value, list):
+                out[str(key)] = value[:20]
+            elif isinstance(value, dict):
+                scalar = {str(k): v for k, v in value.items() if isinstance(v, (str, int, float, bool)) or v is None}
+                out[str(key)] = scalar if scalar else clean(json.dumps(value, ensure_ascii=False), 600)
+            else:
+                out[str(key)] = clean(value, 600)
+        return out
+
+    def array_fields(records):
+        fields = []
+        seen = set()
+        for record in records[:20]:
+            if isinstance(record, dict):
+                keys = record.keys()
+            else:
+                keys = ["value"]
+            for key in keys:
+                key = str(key)
+                if key not in seen:
+                    seen.add(key)
+                    fields.append(key)
+        return fields[:80]
+
+    def find_arrays(data, path="$", depth=0):
+        if depth > 7:
+            return []
+        found = []
+        if isinstance(data, list):
+            fields = array_fields(data)
+            dict_count = sum(1 for item in data[:50] if isinstance(item, dict))
+            score = len(data) * 4 + dict_count * 3 + len(fields)
+            if fields:
+                score += 10
+            found.append(
+                {
+                    "path": path,
+                    "count": len(data),
+                    "fields": fields,
+                    "score": score,
+                    "records": [flatten_record(item) for item in data[:limit_int]],
+                }
+            )
+            for index, item in enumerate(data[:10]):
+                if isinstance(item, (dict, list)):
+                    found.extend(find_arrays(item, f"{path}.{index}", depth + 1))
+        elif isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    found.extend(find_arrays(value, f"{path}.{key}", depth + 1))
+        return found
+
+    def parse_payload(payload):
+        if isinstance(payload, dict) and "json" in payload and payload.get("json") is not None:
+            return payload.get("json")
+        if hasattr(payload, "json"):
+            return payload.json()
+        if isinstance(payload, (dict, list)):
+            return payload
+        return json.loads(str(payload))
+
+    sources = []
+    aggregate = []
+    seen_records = set()
+    for url in url_list:
+        source = {"url": url, "ok": False, "selected_path": None, "record_count": 0, "records": [], "candidate_arrays": []}
+        try:
+            payload = browser_fetch(url, timeout=timeout) if use_browser_fetch else http_get(url, timeout=timeout)
+            data = parse_payload(payload)
+            arrays = []
+            if records_path:
+                selected = path_get(data, records_path)
+                if isinstance(selected, list):
+                    arrays.append(
+                        {
+                            "path": str(records_path),
+                            "count": len(selected),
+                            "fields": array_fields(selected),
+                            "score": len(selected) * 4 + 100,
+                            "records": [flatten_record(item) for item in selected[:limit_int]],
+                        }
+                    )
+            arrays.extend(find_arrays(data))
+            dedup = {}
+            for array in arrays:
+                key = array.get("path")
+                if key not in dedup or array.get("score", 0) > dedup[key].get("score", 0):
+                    dedup[key] = array
+            candidates = sorted(dedup.values(), key=lambda item: (-item.get("score", 0), item.get("path", "")))
+            chosen = candidates[0] if candidates else None
+            source.update(
+                {
+                    "ok": bool(chosen),
+                    "selected_path": chosen.get("path") if chosen else None,
+                    "record_count": chosen.get("count", 0) if chosen else 0,
+                    "fields": chosen.get("fields", []) if chosen else [],
+                    "records": chosen.get("records", []) if chosen else [],
+                    "candidate_arrays": [
+                        {k: v for k, v in candidate.items() if k != "records"} for candidate in candidates[:8]
+                    ],
+                }
+            )
+            for record in source["records"]:
+                key = json.dumps(record, sort_keys=True, default=str)[:1000]
+                if key in seen_records:
+                    continue
+                seen_records.add(key)
+                aggregate.append({"source_url": url, "record": record})
+                if len(aggregate) >= limit_int:
+                    break
+        except Exception as exc:
+            source["error"] = str(exc)[:500]
+        sources.append(source)
+    return {
+        "count": len(aggregate),
+        "records": aggregate,
+        "source_count": len(sources),
+        "sources": sources,
+        "records_path": records_path,
+        "used_browser_fetch": bool(use_browser_fetch),
+    }
+
+
 def embedded_data_snapshot(limit=80, max_sources=12):
     """Extract compact records from page-embedded structured/hydration data.
 
