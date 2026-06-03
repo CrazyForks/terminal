@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextlib
 import atexit
 import base64
+import fnmatch
 import hashlib
+import ipaddress
 import importlib
 import importlib.util
 import io
@@ -19,6 +21,7 @@ import mimetypes
 import re
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict
@@ -414,6 +417,90 @@ def _apply_browser_storage_state(
         else:
             if applied is not None:
                 applied.add(script_key)
+
+
+def _env_json_string_list(name: str) -> list[str]:
+    raw = os.environ.get(name)
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [value.strip() for value in parsed if isinstance(value, str) and value.strip()]
+
+
+def _is_root_domain(domain: str) -> bool:
+    if "*" in domain or "://" in domain:
+        return False
+    return domain.count(".") == 1
+
+
+def _is_ip_address(host: str) -> bool:
+    with contextlib.suppress(ValueError):
+        ipaddress.ip_address(host)
+        return True
+    return False
+
+
+def _domain_pattern_matches(url: str, host: str, scheme: str, pattern: str) -> bool:
+    full_url_pattern = f"{scheme}://{host}"
+    pattern = pattern.strip()
+    if not pattern:
+        return False
+    if "*" in pattern:
+        if pattern.startswith("*."):
+            domain_part = pattern[2:].lower()
+            host_lower = host.lower()
+            return scheme in {"http", "https"} and (
+                host_lower == domain_part or host_lower.endswith(f".{domain_part}")
+            )
+        if pattern.endswith("/*"):
+            return url.startswith(pattern[:-1])
+        return fnmatch.fnmatch(full_url_pattern if "://" in pattern else host, pattern)
+    if "://" in pattern:
+        return url.lower().startswith(pattern.lower())
+    host_lower = host.lower()
+    pattern_lower = pattern.lower()
+    if host_lower == pattern_lower:
+        return True
+    return _is_root_domain(pattern_lower) and host_lower == f"www.{pattern_lower}"
+
+
+def _browser_profile_url_allowed(url: str) -> bool:
+    if url in {"about:blank", "chrome://new-tab-page/", "chrome://new-tab-page", "chrome://newtab/"}:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme in {"data", "blob"}:
+        return True
+    host = parsed.hostname
+    if not host:
+        return False
+    if _env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") is True and _is_ip_address(host):
+        return False
+
+    allowed_domains = _env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS")
+    prohibited_domains = _env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS")
+    if allowed_domains:
+        return any(_domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in allowed_domains)
+    if prohibited_domains:
+        return not any(_domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in prohibited_domains)
+    return True
+
+
+def _enforce_browser_domain_constraints(method: str, params: dict[str, Any]) -> None:
+    if method != "Page.navigate":
+        return
+    url = params.get("url")
+    if not isinstance(url, str) or not url:
+        return
+    if not _browser_profile_url_allowed(url):
+        raise RuntimeError(f"BrowserProfile domain constraints blocked navigation to {url}")
 
 
 def _annotate_error(msg: str) -> str:
@@ -817,6 +904,7 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
             _ensure_cloud_browser(admin)
         else:
             admin.ensure_daemon()
+        _enforce_browser_domain_constraints(method, params)
         if method != "Browser.grantPermissions":
             _apply_browser_permissions(original_cdp)
         if method != "Browser.setDownloadBehavior":
