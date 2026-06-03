@@ -31,6 +31,28 @@ def test_worker_run_executes_in_persistent_session_namespace(tmp_path: Path) -> 
     assert second["data"] == 2
 
 
+def test_worker_run_applies_browser_wait_between_actions_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sleeps = []
+    monkeypatch.setenv("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS", "125")
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    response = worker._run(
+        {
+            "id": "wait-between",
+            "session_id": "task-wait-between",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "result = 'ok'",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"] == "ok"
+    assert sleeps == [0.125]
+
+
 def test_worker_records_artifacts_and_images(tmp_path: Path) -> None:
     source = tmp_path / "source.png"
     source.write_bytes(b"png")

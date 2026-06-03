@@ -7331,6 +7331,52 @@ print("time shadow ok")
     }
 
     #[test]
+    fn browser_script_goto_url_honors_browser_profile_wait_timing_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[
+            ("BU_BROWSER_MINIMUM_WAIT_PAGE_LOAD_MS", "250"),
+            ("BU_BROWSER_NETWORK_IDLE_PAGE_LOAD_MS", "750"),
+        ]);
+        let output = run_browser_script(
+            "script-browser-profile-wait-timing",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+sleeps = []
+loads = []
+network_waits = []
+navigations = []
+
+def cdp(method, **params):
+    navigations.append((method, params))
+    return {"ok": True}
+
+def wait_for_load(timeout=15.0):
+    loads.append(timeout)
+    return True
+
+def wait_for_network_idle(timeout=10.0, idle_ms=500):
+    network_waits.append((timeout, idle_ms))
+    return True
+
+_time.sleep = lambda seconds: sleeps.append(seconds)
+
+assert goto_url("https://example.com") == {"ok": True}
+assert navigations == [("Page.navigate", {"url": "https://example.com"})], navigations
+assert loads == [15], loads
+assert sleeps == [0.25], sleeps
+assert network_waits == [(1.0, 750)], network_waits
+print("browser profile wait timing ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("browser profile wait timing ok"));
+    }
+
+    #[test]
     fn browser_script_js_return_detection_ignores_nested_callbacks() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

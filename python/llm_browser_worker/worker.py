@@ -669,6 +669,25 @@ def _env_bool(name: str) -> bool | None:
     return None
 
 
+def _env_milliseconds_to_seconds(name: str) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return 0.0
+    try:
+        milliseconds = float(raw.strip())
+    except ValueError:
+        return 0.0
+    if milliseconds <= 0:
+        return 0.0
+    return milliseconds / 1000.0
+
+
+def _apply_browser_wait_between_actions() -> None:
+    wait_seconds = _env_milliseconds_to_seconds("BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS")
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+
 def _managed_chrome_viewport_args() -> list[str]:
     if _env_bool("BU_BROWSER_NO_VIEWPORT") is True:
         return []
@@ -2011,6 +2030,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
         assert ns is not None
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             exec(compile(code, "<browser-use-python-worker>", "exec"), ns)
+        _apply_browser_wait_between_actions()
         _auto_emit_browser_state(ns, request_id)
         _emit_browser_identity_events(ns, request_id)
         return {
