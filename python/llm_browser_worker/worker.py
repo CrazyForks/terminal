@@ -231,6 +231,22 @@ def _browser_mode() -> str:
     return os.environ.get("LLM_BROWSER_BROWSER_MODE", "").lower().replace("_", "-").replace(" ", "-")
 
 
+def _browser_user_agent() -> str | None:
+    value = os.environ.get("BU_BROWSER_USER_AGENT")
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _apply_browser_user_agent_override(cdp: Any, session_id: Any = None) -> None:
+    user_agent = _browser_user_agent()
+    if not user_agent:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Network.setUserAgentOverride", session_id=session_id, userAgent=user_agent)
+
+
 def _annotate_error(msg: str) -> str:
     for pattern, hint in _HINT_PATTERNS:
         if pattern.search(msg):
@@ -631,6 +647,8 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
             _ensure_cloud_browser(admin)
         else:
             admin.ensure_daemon()
+        if method != "Network.setUserAgentOverride":
+            _apply_browser_user_agent_override(original_cdp, session_id=session_id)
         return original_cdp(method, session_id=session_id, **params)
 
     helpers.__llm_browser_original_cdp__ = original_cdp

@@ -239,6 +239,46 @@ def test_worker_raw_cdp_capture_screenshot_attaches_image(
     assert Path(response["images"][0]["path"]).exists()
 
 
+def test_worker_cdp_applies_browser_user_agent_env(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("BU_BROWSER_USER_AGENT", " BrowserUseRuntime/3.0 ")
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Runtime.evaluate", session_id="target-1", expression="navigator.userAgent")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 1
+    assert calls == [
+        ("Network.setUserAgentOverride", "target-1", {"userAgent": "BrowserUseRuntime/3.0"}),
+        ("Runtime.evaluate", "target-1", {"expression": "navigator.userAgent"}),
+    ]
+
+    calls.clear()
+    result = helpers.cdp("Network.setUserAgentOverride", userAgent="Manual/1.0")
+
+    assert result == {"method": "Network.setUserAgentOverride"}
+    assert admin.ensure_calls == 2
+    assert calls == [("Network.setUserAgentOverride", None, {"userAgent": "Manual/1.0"})]
+
+
 def test_worker_page_info_fallback_reads_target_url_and_title(
     tmp_path: Path, monkeypatch
 ) -> None:
