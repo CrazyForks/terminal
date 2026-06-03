@@ -8318,6 +8318,71 @@ print("shopify_products_api ok")
     }
 
     #[test]
+    fn browser_script_product_records_snapshot_normalizes_catalog_products() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-product-records-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    for needle in [
+        "__PRODUCT_RECORDS_SNAPSHOT__",
+        "application/ld+json",
+        "og:title",
+        "productUrlRe",
+        "specRe",
+        'a[href*="/products"]',
+        '"unifi"',
+        "picture source[srcset]",
+    ]:
+        assert needle in expression, needle
+    assert "product record" not in expression
+    products = []
+    for index in range(3):
+        products.append({
+            "source": "visible_dom",
+            "title": f"UniFi Gateway {index + 1}",
+            "url": f"https://store.ui.example.test/products/gateway-{index + 1}",
+            "description": f"UniFi Gateway {index + 1} Cloud Gateway with 2.5 GbE WAN and PoE ports",
+            "price_texts": [f"${199 + index}.00"],
+            "specs": ["2.5 GbE WAN", "PoE ports"],
+            "image_url": f"https://store.ui.example.test/gateway-{index + 1}.png",
+            "labels": ["Product"],
+            "text": f"UniFi Gateway {index + 1} Cloud Gateway 2.5 GbE WAN PoE",
+            "score": 91 - index,
+        })
+    return {
+        "url": "https://store.ui.example.test/us/en/category/all-unifi-cloud-gateways",
+        "title": "UniFi Cloud Gateways",
+        "keywords": ["unifi", "gateway"],
+        "count": len(products),
+        "products": products,
+    }
+
+snapshot = product_records_snapshot(limit=20, keywords=["UniFi", "gateway"])
+assert snapshot["url"].endswith("/all-unifi-cloud-gateways"), snapshot
+assert snapshot["keywords"] == ["unifi", "gateway"], snapshot
+assert snapshot["count"] == 3, snapshot
+first = snapshot["products"][0]
+assert first["title"] == "UniFi Gateway 1", snapshot
+assert first["price_texts"] == ["$199.00"], snapshot
+assert first["specs"] == ["2.5 GbE WAN", "PoE ports"], snapshot
+assert first["image_url"].endswith("gateway-1.png"), snapshot
+assert snapshot["detail_action_count"] == 3, snapshot
+assert "fanout_tasks" not in snapshot, snapshot
+assert "fanout_recommended" not in snapshot, snapshot
+print("product_records_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("product_records_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
