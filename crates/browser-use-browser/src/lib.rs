@@ -8494,6 +8494,50 @@ print("pagination helpers ok")
     }
 
     #[test]
+    fn browser_script_result_count_snapshot_parses_visible_count_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-result-count-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "__RESULT_COUNT_SNAPSHOT__" in expression
+    assert "matches" in expression
+    assert "records" in expression
+    assert "page" in expression
+    assert "exhibitors" in expression
+    assert "aria-live" in expression
+    return {
+        "best": {"kind": "range_total", "evidence": "Matches 1 - 25 of 58", "score": 140, "start": 1, "end": 25, "total": 58},
+        "candidates": [
+            {"kind": "range_total", "evidence": "Matches 1 - 25 of 58", "score": 140, "start": 1, "end": 25, "total": 58},
+            {"kind": "page_total", "evidence": "Page 1 of 3", "score": 105, "current_page": 1, "total_pages": 3},
+            {"kind": "labeled_total", "evidence": "710 exhibitors", "score": 80, "total": 710, "label": "exhibitors"},
+        ],
+    }
+
+snapshot = result_count_snapshot(limit=8)
+assert snapshot["count"] == 3, snapshot
+assert snapshot["best"]["total"] == 58, snapshot
+assert snapshot["best"]["evidence"] == "Matches 1 - 25 of 58", snapshot
+assert snapshot["candidates"][1]["total_pages"] == 3, snapshot
+assert snapshot["candidates"][2]["total"] == 710, snapshot
+assert len(calls) == 1, calls
+print("result_count_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("result_count_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

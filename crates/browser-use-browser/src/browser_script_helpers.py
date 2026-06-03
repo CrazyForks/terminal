@@ -2078,6 +2078,67 @@ def click_pagination_until_stable(label_or_text="load more", max_clicks=20, wait
     }
 
 
+def result_count_snapshot(limit=12):
+    """Return parsed visible result/page-count snippets with evidence text."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 12
+    limit_int = max(1, min(limit_int, 100))
+    expression = f"""
+(() => {{
+  // __RESULT_COUNT_SNAPSHOT__
+  const clean = (text, max = 500) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const num = value => {{
+    const parsed = parseInt(String(value || '').replace(/,/g, ''), 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }};
+  const out = [], seen = new Set();
+  const add = (kind, evidence, score, fields = {{}}) => {{
+    evidence = clean(evidence);
+    const key = kind + '|' + evidence;
+    if (!evidence || seen.has(key)) return;
+    seen.add(key);
+    out.push(Object.assign({{kind, evidence, score}}, fields));
+  }};
+  const texts = [clean(document.body && document.body.innerText || '', 8000)];
+  for (const el of document.querySelectorAll('main,section,header,footer,nav,table,tbody,thead,tfoot,[role="status"],[aria-live],[class*="result" i],[id*="result" i],[class*="pagination" i],[id*="pagination" i],[class*="pager" i],[id*="pager" i]')) {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    if (r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden') {{
+      texts.push(clean(el.innerText || el.textContent || '', 1200));
+    }}
+  }}
+  for (const text of texts) {{
+    if (!text) continue;
+    let match;
+    const range = /\\b(?:matches|records|results?|entries|items?)\\s+(\\d[\\d,]*)\\s*(?:-|–|to|through)\\s*(\\d[\\d,]*)\\s+(?:of|from)\\s+(\\d[\\d,]*)\\b/ig;
+    while ((match = range.exec(text))) add('range_total', match[0], 140, {{start: num(match[1]), end: num(match[2]), total: num(match[3])}});
+    const showing = /\\b(?:showing|displaying|viewing)\\s+(\\d[\\d,]*)\\s*(?:-|–|to|through)\\s*(\\d[\\d,]*)\\s+(?:of|from)\\s+(\\d[\\d,]*)\\b/ig;
+    while ((match = showing.exec(text))) add('showing_total', match[0], 130, {{start: num(match[1]), end: num(match[2]), total: num(match[3])}});
+    const page = /\\bpage\\s+(\\d[\\d,]*)\\s*(?:of|\\/|from)\\s*(\\d[\\d,]*)\\b/ig;
+    while ((match = page.exec(text))) add('page_total', match[0], 105, {{current_page: num(match[1]), total_pages: num(match[2])}});
+    const compact = /\\b(\\d[\\d,]*)\\s+(?:of|\\/)\\s+(\\d[\\d,]*)\\b/ig;
+    if (/\\b(page|pagination|pager|next|previous|results?|records?|entries)\\b/i.test(text)) {{
+      while ((match = compact.exec(text))) add('compact_page_total', match[0], 70, {{current_page: num(match[1]), total_pages: num(match[2])}});
+    }}
+    const total = /\\b(\\d[\\d,]*)\\s+(exhibitors?|results?|records?|entries|items?|companies|matches)\\b/ig;
+    while ((match = total.exec(text))) add('labeled_total', match[0], 80, {{total: num(match[1]), label: match[2].toLowerCase()}});
+    const found = /\\b(?:found|total)\\s*:?\\s*(\\d[\\d,]*)\\s+(results?|records?|entries|items?|companies|matches)\\b/ig;
+    while ((match = found.exec(text))) add('found_total', match[0], 90, {{total: num(match[1]), label: match[2].toLowerCase()}});
+  }}
+  out.sort((a, b) => b.score - a.score);
+  return {{best: out[0] || null, candidates: out.slice(0, {limit_int})}};
+}})()
+"""
+    data = js(expression) or {}
+    candidates = data.get("candidates") if isinstance(data, dict) else []
+    return {
+        "count": len(candidates or []),
+        "best": data.get("best") if isinstance(data, dict) else None,
+        "candidates": candidates or [],
+    }
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])
