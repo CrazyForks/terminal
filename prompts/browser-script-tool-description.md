@@ -36,6 +36,7 @@ route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_scrip
 network_resources_snapshot(limit=80, keywords=None)
 json_api_records(urls, records_path=None, limit=200, max_urls=8, use_browser_fetch=False, timeout=20.0)
 tabular_data_records(source, delimiter=None, limit=500, use_browser_fetch=False, table_index=0, timeout=20.0)
+shopify_products_api(url_or_domain=None, limit=250, page_limit=20, timeout=12.0)
 embedded_data_snapshot(limit=80, max_sources=12)
 pricing_cards_snapshot(limit=50)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
@@ -93,6 +94,7 @@ Usage guidance:
 - Use `network_resources_snapshot(...)` after navigation, search/filter actions, SPA route changes, or downloads to discover XHR/API, JSON/CSV/table, document/download, pagination, form, and export URLs before manual page walking.
 - For JSON/API candidates from `network_resources_snapshot(...)`, call `json_api_records(urls=[...], records_path=...)` to fetch the URLs and return normalized candidate record arrays with fields, paths, source URLs, and deduped aggregate records.
 - For CSV, TSV, and simple HTML table exports, call `tabular_data_records(source, ...)` to fetch/read the source and return normalized fields and records; set `use_browser_fetch=True` for same-session exports that need browser cookies.
+- On Shopify storefront catalogs, call `shopify_products_api(...)` after confirming the store domain; it fetches public `/products.json` pages and normalizes titles, handles, URLs, vendors, product types, tags, descriptions, variants/prices, and images.
 - Use `embedded_data_snapshot()` on ecommerce, directory, SPA listing, investor/document, and product pages before brittle visual scraping; it extracts bounded records from JSON-LD, hydration payloads, JSON script tags, and product/document meta tags.
 - Use `pricing_cards_snapshot()` on commercial product, plan, package, ticket, or subscription cards; it normalizes prices, currency and billing periods, speeds/data allowances, contracts, offers, provider candidates, links, and images.
 - Use `repeated_items_snapshot()` on repeated product/listing/package/ticket cards or non-table lists; if it recommends `extract_repeated_items`, use that selector. Records include stable attributes, cells with headers, headings, labels, prices, links/buttons, and image metadata.
