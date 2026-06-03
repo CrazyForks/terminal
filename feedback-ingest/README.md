@@ -32,12 +32,6 @@ Inserts a feedback row. All fields except `category` are optional.
 }
 ```
 
-Returns `{"id":"<row uuid>"}` on success, `{"error":"..."}` on failure.
-
-`session_events` is only stored when `include_logs` is `true`; otherwise it is set to `null`.
-
-## Deploy to Railway
-
 1. Install the Railway CLI and log in:
    ```bash
    npm i -g @railway/cli
