@@ -9555,6 +9555,74 @@ print("semantic_scholar_helpers ok")
     }
 
     #[test]
+    fn browser_script_openreview_notes_normalizes_content_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-openreview-notes",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    assert "api2.openreview.net/notes/search" in url, url
+    assert "term=Yuri" in url, url
+    assert "group=NeurIPS.cc%2F2022%2FConference" in url, url
+    assert "limit=2" in url, url
+    assert "offset=1" in url, url
+    assert headers["Accept"] == "application/json"
+    return json.dumps({
+        "count": 1,
+        "notes": [
+            {
+                "id": "note123",
+                "forum": "forum456",
+                "number": 17,
+                "invitation": "NeurIPS.cc/2022/Conference/-/Blind_Submission",
+                "domain": "NeurIPS.cc/2022/Conference",
+                "signatures": ["NeurIPS.cc/2022/Conference/Authors"],
+                "readers": ["everyone"],
+                "writers": ["NeurIPS.cc/2022/Conference"],
+                "tcdate": 1660000000000,
+                "tmdate": 1660000500000,
+                "content": {
+                    "title": {"value": "A Certain Paper"},
+                    "authors": {"value": ["Yuri Example", "Ada Example"]},
+                    "decision": {"value": "Accept"},
+                    "recommendation": {"value": "certain"},
+                    "keywords": {"values": ["agents", "browsing"]},
+                    "nested": {"confidence": {"value": 4}},
+                },
+            }
+        ],
+    })
+
+result = openreview_notes(params={"term": "Yuri", "group": "NeurIPS.cc/2022/Conference"}, limit=2, offset=1)
+assert result["endpoint"] == "notes/search", result
+assert result["total"] == 1, result
+assert result["count"] == 1, result
+note = result["notes"][0]
+assert note["id"] == "note123", note
+assert note["forum"] == "forum456", note
+assert note["number"] == 17, note
+assert note["content"]["title"] == "A Certain Paper", note
+assert note["content"]["authors"] == ["Yuri Example", "Ada Example"], note
+assert note["content"]["decision"] == "Accept", note
+assert note["content"]["recommendation"] == "certain", note
+assert note["content"]["keywords"] == ["agents", "browsing"], note
+assert note["content"]["nested"]["confidence"] == 4, note
+assert note["tmdate"] == 1660000500000, note
+print("openreview_notes ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("openreview_notes ok"));
+    }
+
+    #[test]
     fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

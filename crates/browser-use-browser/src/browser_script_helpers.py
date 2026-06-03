@@ -5010,6 +5010,66 @@ def semantic_scholar_references(query_or_paper_id, year=None, limit=200, search_
     )
 
 
+def _openreview_content_value(value):
+    if isinstance(value, dict) and set(value.keys()) & {"value", "values"}:
+        if "value" in value:
+            return value.get("value")
+        return value.get("values")
+    if isinstance(value, dict):
+        return {key: _openreview_content_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_openreview_content_value(child) for child in value]
+    return value
+
+
+def openreview_notes(endpoint="search", params=None, limit=100, offset=0, timeout=20.0):
+    """Fetch OpenReview notes/search results and normalize note content values."""
+    endpoint_name = str(endpoint or "search").strip().strip("/")
+    endpoint_aliases = {
+        "search": "notes/search",
+        "notes/search": "notes/search",
+        "note_search": "notes/search",
+        "notes": "notes",
+        "note": "notes",
+    }
+    endpoint_name = endpoint_aliases.get(endpoint_name, endpoint_name)
+    if endpoint_name not in {"notes/search", "notes"}:
+        raise ValueError("openreview_notes endpoint must be 'search' or 'notes'")
+    query_params = {"limit": int(limit), "offset": int(offset)}
+    query_params.update(dict(params or {}))
+    url = f"https://api2.openreview.net/{endpoint_name}?" + urlencode(query_params, doseq=True)
+    payload = json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+    raw_notes = payload.get("notes") if isinstance(payload, dict) else payload
+    if not isinstance(raw_notes, list):
+        raw_notes = []
+    notes = []
+    for note in raw_notes:
+        if not isinstance(note, dict):
+            continue
+        notes.append(
+            {
+                "id": str(note.get("id") or ""),
+                "forum": str(note.get("forum") or ""),
+                "number": note.get("number"),
+                "invitation": str(note.get("invitation") or ""),
+                "domain": str(note.get("domain") or ""),
+                "signatures": note.get("signatures") if isinstance(note.get("signatures"), list) else [],
+                "readers": note.get("readers") if isinstance(note.get("readers"), list) else [],
+                "writers": note.get("writers") if isinstance(note.get("writers"), list) else [],
+                "content": _openreview_content_value(note.get("content") or {}),
+                "tcdate": note.get("tcdate"),
+                "tmdate": note.get("tmdate"),
+            }
+        )
+    return {
+        "endpoint": endpoint_name,
+        "url": url,
+        "count": len(notes),
+        "total": payload.get("count") if isinstance(payload, dict) else None,
+        "notes": notes,
+    }
+
+
 def read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None):
     """Fetch/read a document URL or local path and return bounded extracted text.
 
