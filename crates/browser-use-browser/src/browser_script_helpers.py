@@ -3419,6 +3419,126 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
     return {"selector": selector, "count": len(records or []), "records": records or []}
 
 
+def extract_paginated_grid_rows(
+    selector=None,
+    next_label="next",
+    max_pages=10,
+    per_page_limit=100,
+    include_html=False,
+    stop_on_duplicate_page=True,
+):
+    """Extract row-scoped records across paginated table/grid/list pages."""
+    if not selector:
+        snapshot = rows_snapshot(limit=1)
+        selector = snapshot.get("recommended_selector")
+        if not selector:
+            return {
+                "selector": None,
+                "count": 0,
+                "pages_visited": 0,
+                "pages": [],
+                "records": [],
+                "detail_action_count": 0,
+                "detail_actions": [],
+                "diagnosis": "no row selector found",
+            }
+    try:
+        max_pages_int = max(1, min(int(max_pages or 10), 50))
+    except Exception:
+        max_pages_int = 10
+    try:
+        per_page_limit_int = max(1, min(int(per_page_limit or 100), 500))
+    except Exception:
+        per_page_limit_int = 100
+
+    records = []
+    pages = []
+    seen_rows = set()
+    diagnosis = ""
+    for page_index in range(max_pages_int):
+        page = extract_grid_rows(selector=selector, limit=per_page_limit_int, include_html=include_html)
+        page_records = page.get("records") if isinstance(page, dict) else []
+        added = 0
+        duplicate = 0
+        for record in page_records or []:
+            if not isinstance(record, dict):
+                continue
+            row_links = tuple(
+                sorted(
+                    link.get("href")
+                    for link in (record.get("file_actions") or record.get("links") or [])
+                    if isinstance(link, dict) and link.get("href")
+                )
+            )
+            key = (record.get("text") or "", row_links)
+            if key in seen_rows:
+                duplicate += 1
+                continue
+            seen_rows.add(key)
+            record = dict(record)
+            record["page_index"] = page_index
+            records.append(record)
+            added += 1
+        pages.append(
+            {
+                "page_index": page_index,
+                "raw_count": len(page_records or []),
+                "added_count": added,
+                "duplicate_count": duplicate,
+            }
+        )
+        if page_index >= max_pages_int - 1:
+            break
+        if stop_on_duplicate_page and page_records and added == 0:
+            diagnosis = "stopped after duplicate page"
+            break
+        try:
+            click = click_pagination(next_label, timeout=0)
+        except Exception as exc:
+            diagnosis = f"stopped after page {page_index + 1}: {exc}"
+            break
+        if not isinstance(click, dict) or not click.get("clicked"):
+            diagnosis = f"stopped after page {page_index + 1}: no pagination click"
+            break
+        try:
+            wait_for_network_idle(timeout=2.0)
+        except Exception:
+            pass
+
+    detail_actions = []
+    seen_hrefs = set()
+    for record in records:
+        row_text = record.get("text") or ""
+        for link in (record.get("file_actions") or record.get("links") or []):
+            if not isinstance(link, dict):
+                continue
+            href = link.get("href")
+            if not href or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+            detail_actions.append(
+                {
+                    "page_index": record.get("page_index"),
+                    "row_index": record.get("index"),
+                    "row_text": row_text[:240],
+                    "text": link.get("text") or "",
+                    "href": href,
+                    "file_like": bool(link.get("file_like")),
+                }
+            )
+
+    return {
+        "selector": selector,
+        "count": len(records),
+        "pages_visited": len(pages),
+        "pages": pages,
+        "records": records,
+        "detail_action_count": len(detail_actions),
+        "detail_actions": detail_actions[:20],
+        "diagnosis": diagnosis,
+    }
+
+
 extract_rows = extract_grid_rows
 grid_rows_snapshot = rows_snapshot
 

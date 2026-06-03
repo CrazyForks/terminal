@@ -9453,6 +9453,73 @@ print(json.dumps({"snapshot": snapshot, "rows": rows}, ensure_ascii=False))
     }
 
     #[test]
+    fn browser_script_extract_paginated_grid_rows_collects_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-paginated-grid-row-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+page_index = 0
+clicks = []
+network_idle_calls = []
+
+def extract_grid_rows(selector=None, limit=50, include_html=False):
+    assert selector == "tbody tr"
+    assert limit == 3
+    rows = []
+    start = page_index * 3
+    for offset in range(3):
+        index = start + offset
+        href = f"https://example.test/file-{index + 1}.pdf"
+        link = {"text": f"file-{index + 1}.pdf", "href": href, "file_like": True}
+        rows.append({
+            "index": offset,
+            "text": f"Docket row {index + 1} file-{index + 1}.pdf",
+            "cells": [{"index": 0, "header": "Name", "headers": ["Name"], "text": f"Docket row {index + 1}", "links": [], "buttons": []}],
+            "description_fields": [{"header": "Name", "text": f"Docket row {index + 1}"}],
+            "links": [link],
+            "buttons": [],
+            "file_actions": [link],
+        })
+    return {"selector": selector, "count": len(rows), "records": rows}
+
+def click_pagination(label_or_text="next", timeout=2.0):
+    global page_index
+    clicks.append((label_or_text, timeout))
+    if page_index == 0:
+        page_index = 1
+        return {"clicked": True, "selector": "a.next"}
+    raise RuntimeError("no next page")
+
+def wait_for_network_idle(timeout=2.0):
+    network_idle_calls.append(timeout)
+    return True
+
+rows = extract_paginated_grid_rows(selector="tbody tr", next_label="next", max_pages=3, per_page_limit=3)
+assert rows["selector"] == "tbody tr", rows
+assert rows["count"] == 6, rows
+assert rows["pages_visited"] == 2, rows
+assert rows["pages"][0]["added_count"] == 3, rows
+assert rows["pages"][1]["added_count"] == 3, rows
+assert rows["records"][0]["page_index"] == 0, rows
+assert rows["records"][5]["page_index"] == 1, rows
+assert rows["detail_action_count"] == 6, rows
+assert rows["detail_actions"][5]["href"] == "https://example.test/file-6.pdf", rows
+assert clicks == [("next", 0), ("next", 0)], clicks
+assert network_idle_calls == [2.0], network_idle_calls
+assert "no next page" in rows["diagnosis"], rows
+print("paginated grid rows ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("paginated grid rows ok"));
+    }
+
+    #[test]
     fn browser_script_repeated_item_helpers_surface_actionable_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
