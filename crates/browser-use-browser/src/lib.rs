@@ -8022,6 +8022,100 @@ print("route_candidates_snapshot ok")
     }
 
     #[test]
+    fn browser_script_network_resources_snapshot_surfaces_api_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-network-resources-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, returnByValue=True):
+    calls.append(expression)
+    for needle in [
+        "__NETWORK_RESOURCES_SNAPSHOT__",
+        'const keywords=["results"];',
+        "performance.getEntriesByType('resource')",
+        "document.querySelectorAll('a[href]')",
+        "document.querySelectorAll('form')",
+        "script[src]",
+        "urlTokenRe",
+        "script:not([src])",
+        "data-api",
+        "data-attribute",
+        "apiRe",
+        "extRe",
+        "results",
+        "download",
+    ]:
+        assert needle in expression, needle
+    assert "http_get_many" not in expression
+    return {
+        "url": "https://example.test/search",
+        "title": "Search",
+        "keywords": ["results"],
+        "count": 4,
+        "by_type": {"fetch": 1, "link": 1, "inline-url": 1, "data-url": 1},
+        "resources": [
+            {
+                "source": "performance",
+                "type": "fetch",
+                "url": "https://example.test/api/search?query=reports&page=2",
+                "score": 43,
+                "text": "",
+                "initiator_type": "fetch",
+                "transfer_size": 1024,
+                "encoded_body_size": 900,
+                "duration_ms": 33,
+            },
+            {
+                "source": "anchor",
+                "type": "link",
+                "url": "https://example.test/export/results.csv",
+                "score": 32,
+                "text": "Download CSV results",
+                "rel": "",
+                "download": "results.csv",
+            },
+            {
+                "source": "inline-script",
+                "type": "inline-url",
+                "url": "https://example.test/api/catalog.json",
+                "score": 32,
+                "text": "app-config",
+            },
+            {
+                "source": "data-attribute",
+                "type": "data-url",
+                "url": "https://example.test/documents/report.pdf",
+                "score": 30,
+                "text": "data-download",
+            },
+        ],
+    }
+
+snapshot = network_resources_snapshot(keywords="results", limit=20)
+assert snapshot["keywords"] == ["results"], snapshot
+assert snapshot["count"] == 4
+assert snapshot["resources"][0]["url"].endswith("page=2")
+assert snapshot["resources"][0]["initiator_type"] == "fetch"
+assert snapshot["resources"][1]["download"] == "results.csv"
+assert snapshot["resources"][2]["source"] == "inline-script"
+assert snapshot["resources"][3]["type"] == "data-url"
+assert snapshot["by_type"]["fetch"] == 1
+assert len(calls) == 1
+print("network_resources_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("network_resources_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

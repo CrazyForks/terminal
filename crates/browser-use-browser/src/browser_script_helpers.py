@@ -1119,6 +1119,73 @@ def route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_s
     }
 
 
+def network_resources_snapshot(limit=80, keywords=None):
+    """Return page resource/API/form/download URL candidates.
+
+    Use this after navigation or a search/filter action to discover XHR/API,
+    document/download, pagination, and form endpoints before clicking through
+    pages one by one.
+    """
+    raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])
+    keyword_list = [str(k).strip().lower() for k in raw_keywords if str(k).strip()]
+    expression = f"""
+(() => {{
+  // __NETWORK_RESOURCES_SNAPSHOT__
+  const limit={int(limit)};
+  const keywords={json.dumps(keyword_list)};
+  const clean=(t,m=500)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m);
+  const abs=u=>{{try{{return new URL(u, location.href).href}}catch(e){{return ''}}}};
+  const extRe=/\\.(?:json|csv|xml|pdf|docx?|xlsx?|zip|rss|atom)(?:$|[?#])/i;
+  const apiRe=/(?:\\/api\\/|graphql|search|query|results?|list|catalog|products?|locations?|documents?|download|export|ajax|rest|svc|feed|wp-json|json)/i;
+  const urlTokenRe=/(?:https?:\\/\\/[^\\s"'<>\\\\)]+|\\/[A-Za-z0-9_./~:@!$&()*+,;=%?-]*(?:api|graphql|search|query|results?|list|catalog|products?|locations?|documents?|download|export|ajax|rest|svc|feed|wp-json|json|\\.pdf|\\.csv|\\.xml|\\.xlsx?|\\.docx?|\\.zip)[A-Za-z0-9_./~:@!$&()*+,;=%?-]*)/ig;
+  const uniq=new Map();
+  const add=(source,type,url,extra={{}})=>{{
+    const href=abs(url); if(!href) return;
+    const text=clean([href, extra.text||'', extra.name||'', extra.rel||'', extra.type||'', extra.initiator_type||''].join(' '),1200);
+    let score=0;
+    if(apiRe.test(text)) score+=18;
+    if(extRe.test(href)) score+=14;
+    if(/download|export|document|file|attachment|filing|pdf|csv|xlsx|zip/i.test(text)) score+=10;
+    if(/next|page|offset|cursor|limit|per_page|start=|from=/i.test(href)) score+=6;
+    for(const kw of keywords) if(kw && text.toLowerCase().includes(kw)) score+=8;
+    if(source==='performance') score+=3;
+    if(source==='form') score+=5;
+    if(source==='anchor') score+=2;
+    const key=href+'|'+type+'|'+source;
+    const item={{source,type,url:href,score,text:clean(extra.text||'',240),...extra}};
+    if(!uniq.has(key) || score>uniq.get(key).score) uniq.set(key, item);
+  }};
+  for(const e of performance.getEntriesByType('resource')) {{
+    add('performance', e.initiatorType||'resource', e.name, {{
+      initiator_type:e.initiatorType||'resource',
+      transfer_size:Math.round(e.transferSize||0),
+      encoded_body_size:Math.round(e.encodedBodySize||0),
+      duration_ms:Math.round(e.duration||0),
+    }});
+  }}
+  for(const a of document.querySelectorAll('a[href]')) add('anchor','link',a.href,{{text:clean([a.innerText||a.textContent||'',a.getAttribute('aria-label')||'',a.getAttribute('title')||'',a.getAttribute('download')||'',a.rel||''].filter(Boolean).join(' '),320),rel:a.rel||'',download:a.getAttribute('download')||''}});
+  for(const f of document.querySelectorAll('form')) add('form','form',f.getAttribute('action')||location.href,{{method:(f.getAttribute('method')||'GET').toUpperCase(),text:clean([f.getAttribute('aria-label')||'',f.getAttribute('name')||'',f.id||'',f.innerText||''].filter(Boolean).join(' '),320)}});
+  for(const link of document.querySelectorAll('link[href][rel]')) add('head','link',link.href,{{rel:link.rel||'',type:link.type||'',text:clean(link.getAttribute('title')||'',160)}});
+  for(const script of document.querySelectorAll('script[src]')) add('script','script',script.src,{{type:script.type||''}});
+  const scanText=(source,type,text,context='')=>{{
+    for(const match of String(text||'').matchAll(urlTokenRe)) {{
+      const token=(match[0]||'').replace(/[\\]}}),.;]+$/,'');
+      add(source,type,token,{{text:clean(context,180)}});
+    }}
+  }};
+  for(const script of Array.from(document.querySelectorAll('script:not([src])')).slice(0,30)) scanText('inline-script','inline-url',script.textContent||'',script.id||script.type||'');
+  for(const el of Array.from(document.querySelectorAll('[data-api],[data-url],[data-href],[data-endpoint],[data-src],[data-download],[data-feed],[data-query]')).slice(0,200)) {{
+    for(const attr of el.attributes) if(/^data-/i.test(attr.name)) scanText('data-attribute','data-url',attr.value,attr.name);
+  }}
+  const items=Array.from(uniq.values()).sort((a,b)=>b.score-a.score||a.url.localeCompare(b.url)).slice(0,limit);
+  const by_type={{}};
+  for(const item of items) by_type[item.type]=(by_type[item.type]||0)+1;
+  return {{url:location.href,title:document.title||'',keywords,count:items.length,by_type,resources:items}};
+}})()
+"""
+    return js(expression)
+
+
 def embedded_data_snapshot(limit=80, max_sources=12):
     """Extract compact records from page-embedded structured/hydration data.
 

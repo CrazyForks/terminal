@@ -33,6 +33,7 @@ page_info()
 navigation_snapshot(keywords=None, limit=80)
 sitemap_urls_snapshot(url_or_domain=None, keywords=None, limit=80, max_sitemaps=8, timeout=10.0)
 route_candidates_snapshot(url_or_domain=None, keywords=None, limit=80, max_scripts=12, timeout=10.0)
+network_resources_snapshot(limit=80, keywords=None)
 embedded_data_snapshot(limit=80, max_sources=12)
 pricing_cards_snapshot(limit=50)
 repeated_items_snapshot(min_count=3, limit=8, include_prices=True)
@@ -85,6 +86,7 @@ Usage guidance:
 - Use `navigation_snapshot(...)` before giving up on hidden routes, menus, listings, investor/report links, search/result pages, or document sections; it returns visible links and menu controls with selectors and relevance scores.
 - Use `sitemap_urls_snapshot(...)` before deciding a site lacks listing, product, document, investor, search, or booking routes; it reads robots.txt and XML sitemaps and ranks public URLs by keywords.
 - Use `route_candidates_snapshot(...)` on SPAs when routes may be hidden in link/script manifests or bundled JavaScript; it scans same-origin scripts and inline route strings for likely public listing, product, document, search, and booking paths.
+- Use `network_resources_snapshot(...)` after navigation, search/filter actions, SPA route changes, or downloads to discover XHR/API, JSON/CSV/table, document/download, pagination, form, and export URLs before manual page walking.
 - Use `embedded_data_snapshot()` on ecommerce, directory, SPA listing, investor/document, and product pages before brittle visual scraping; it extracts bounded records from JSON-LD, hydration payloads, JSON script tags, and product/document meta tags.
 - Use `pricing_cards_snapshot()` on commercial product, plan, package, ticket, or subscription cards; it normalizes prices, currency and billing periods, speeds/data allowances, contracts, offers, provider candidates, links, and images.
 - Use `repeated_items_snapshot()` on repeated product/listing/package/ticket cards or non-table lists; if it recommends `extract_repeated_items`, use that selector. Records include stable attributes, cells with headers, headings, labels, prices, links/buttons, and image metadata.
