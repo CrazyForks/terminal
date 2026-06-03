@@ -536,6 +536,40 @@ def test_visible_managed_browser_prefers_google_chrome(monkeypatch) -> None:
     )
 
 
+def test_managed_browser_profile_env_controls_worker_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_BROWSER_ID", raising=False)
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "managed_headed")
+    monkeypatch.setenv(
+        "BU_MANAGED_BROWSER_ARGS",
+        '["--proxy-server=http://proxy.example:8080","--user-agent=BrowserUseTest/1.0",3,""]',
+    )
+
+    assert worker._should_start_managed_chrome() is True
+    assert worker._managed_chrome_is_visible() is True
+
+    headed = worker._managed_chrome_args("/chrome", 9335, tmp_path / "profile", True)
+    assert "--new-window" in headed
+    assert "--proxy-server=http://proxy.example:8080" in headed
+    assert "--user-agent=BrowserUseTest/1.0" in headed
+    assert headed.index("--proxy-server=http://proxy.example:8080") < headed.index("about:blank")
+    assert "3" not in headed
+    assert "" not in headed
+
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "managed-headless")
+
+    assert worker._should_start_managed_chrome() is True
+    assert worker._managed_chrome_is_visible() is False
+
+    headless = worker._managed_chrome_args("/chrome", 9336, tmp_path / "profile", False)
+    assert "--headless=new" in headless
+    assert "--new-window" not in headless
+    assert "--proxy-server=http://proxy.example:8080" in headless
+
+
 def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:
     visible = worker._managed_chrome_args("/chrome", 9333, tmp_path / "profile", True)
     headless = worker._managed_chrome_args("/chrome", 9334, tmp_path / "profile", False)

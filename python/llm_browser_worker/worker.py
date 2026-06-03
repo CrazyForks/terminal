@@ -333,6 +333,11 @@ def _free_port() -> int:
 
 
 def _managed_chrome_is_visible() -> bool:
+    mode = _browser_mode()
+    if mode in {"managed-headed", "headed", "headful"}:
+        return True
+    if mode in {"managed-headless", "headless", "headless-chromium"}:
+        return False
     return os.environ.get("LLM_BROWSER_MANAGED_CHROME_VISIBLE") == "1"
 
 
@@ -340,7 +345,8 @@ def _should_start_managed_chrome() -> bool:
     if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BU_BROWSER_ID"):
         return False
     return (
-        _browser_mode() in {"headless", "headless-chromium"}
+        _browser_mode()
+        in {"managed-headless", "managed-headed", "headless", "headless-chromium", "headed", "headful"}
         or os.environ.get("LLM_BROWSER_AUTO_CHROME") == "1"
     )
 
@@ -356,6 +362,19 @@ def _pick_managed_chrome_path(visible: bool) -> str:
     return _pick_chromium_path()
 
 
+def _managed_chrome_extra_args() -> list[str]:
+    raw = os.environ.get("BU_MANAGED_BROWSER_ARGS")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [arg for arg in parsed if isinstance(arg, str) and arg]
+
+
 def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -> list[str]:
     args = [
         chrome,
@@ -369,6 +388,7 @@ def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -
         args.extend(["--new-window", "--window-size=1512,900"])
     else:
         args.append("--headless=new")
+    args.extend(_managed_chrome_extra_args())
     args.append("about:blank")
     return args
 
