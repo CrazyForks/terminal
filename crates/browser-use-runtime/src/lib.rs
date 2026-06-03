@@ -2671,19 +2671,6 @@ impl BrowserUseRuntime {
             .clone()
             .ok_or_else(|| RuntimeError::MissingParentAgent(child.agent_id.as_str().to_string()))?;
         let parent = self.agents.thread(&parent_agent_id)?;
-        child.set_status(if success {
-            AgentThreadStatus::Completed
-        } else {
-            AgentThreadStatus::Failed
-        });
-        self.state_index.finish_spawn_edge(
-            &child.session_id,
-            if success {
-                SpawnEdgeStatus::Done
-            } else {
-                SpawnEdgeStatus::Failed
-            },
-        )?;
 
         let terminal_event_kind = if success {
             RuntimeEventKind::AgentCompleted
@@ -2715,14 +2702,12 @@ impl BrowserUseRuntime {
                 "runtime_owned": true,
             }));
         completed.root_id = Some(child.root_id.clone());
-        self.publish_after_barrier(completed)?;
 
         let mut parent_terminal = RuntimeEvent::new(terminal_event_kind, Durability::Barrier)
             .with_session_id(parent.session_id.clone())
             .with_agent_id(parent.agent_id.clone())
             .with_payload(parent_payload.clone());
         parent_terminal.root_id = Some(parent.root_id.clone());
-        self.publish_after_barrier(parent_terminal)?;
 
         let notification_status = if success {
             json!({ "completed": terminal_text.clone() })
@@ -2766,7 +2751,24 @@ impl BrowserUseRuntime {
                 }));
         mailbox_event.root_id = Some(parent.root_id.clone());
         self.append_runtime_event(&mailbox_event)?;
+        self.append_runtime_event(&completed)?;
+        self.append_runtime_event(&parent_terminal)?;
+        child.set_status(if success {
+            AgentThreadStatus::Completed
+        } else {
+            AgentThreadStatus::Failed
+        });
+        self.state_index.finish_spawn_edge(
+            &child.session_id,
+            if success {
+                SpawnEdgeStatus::Done
+            } else {
+                SpawnEdgeStatus::Failed
+            },
+        )?;
         parent.mailbox.enqueue(mailbox_item);
+        self.events.publish(completed);
+        self.events.publish(parent_terminal);
         self.events.publish(mailbox_event);
         Ok(())
     }
@@ -3436,6 +3438,119 @@ mod tests {
             delivery_phase: MailboxDeliveryPhase::NextTurn,
             payload: json!({}),
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailingJournal {
+        inner: MemoryJournal,
+        fail_event_types: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl FailingJournal {
+        fn fail_event_type(&self, event_type: &str) {
+            self.fail_event_types
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(event_type.to_string());
+        }
+
+        fn should_fail(&self, event_type: &str) -> bool {
+            self.fail_event_types
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(event_type)
+        }
+    }
+
+    impl JournalSink for FailingJournal {
+        fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
+            if self.should_fail(event.event_type()) {
+                bail!("forced journal failure for {}", event.event_type());
+            }
+            self.inner.append_runtime_event(event)
+        }
+
+        fn append_session_event(
+            &self,
+            session_id: &SessionId,
+            event_type: &str,
+            payload: Value,
+            durability: Durability,
+        ) -> Result<JournalAppend> {
+            if self.should_fail(event_type) {
+                bail!("forced journal failure for {event_type}");
+            }
+            self.inner
+                .append_session_event(session_id, event_type, payload, durability)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl JournalReader for FailingJournal {
+        fn load_session(&self, session_id: &SessionId) -> Result<Option<SessionMeta>> {
+            self.inner.load_session(session_id)
+        }
+
+        fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+            self.inner.list_sessions()
+        }
+
+        fn events_for_session(&self, session_id: &SessionId) -> Result<Vec<EventRecord>> {
+            self.inner.events_for_session(session_id)
+        }
+
+        fn events_after_seq(
+            &self,
+            session_id: &SessionId,
+            after_seq: i64,
+        ) -> Result<Vec<EventRecord>> {
+            self.inner.events_after_seq(session_id, after_seq)
+        }
+    }
+
+    impl LiveThreadPersistence for FailingJournal {
+        fn create_thread(&self, request: CreateThreadRequest) -> Result<SessionMeta> {
+            self.inner.create_thread(request)
+        }
+    }
+
+    impl StateIndex for FailingJournal {
+        fn open_spawn_edge(&self, edge: SpawnEdge) -> Result<()> {
+            self.inner.open_spawn_edge(edge)
+        }
+
+        fn finish_spawn_edge(
+            &self,
+            child_session_id: &SessionId,
+            status: SpawnEdgeStatus,
+        ) -> Result<()> {
+            self.inner.finish_spawn_edge(child_session_id, status)
+        }
+
+        fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
+            self.inner.close_spawn_edge(child_session_id)
+        }
+
+        fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+            self.inner.list_children(parent_session_id)
+        }
+
+        fn list_descendants(&self, root_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+            self.inner.list_descendants(root_session_id)
+        }
+    }
+
+    fn runtime_with_failing_journal() -> (RuntimeHandle, Arc<FailingJournal>) {
+        let journal = Arc::new(FailingJournal::default());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        (
+            BrowserUseRuntime::new(persistence, state_index).handle(),
+            journal,
+        )
     }
 
     #[test]
@@ -4170,6 +4285,97 @@ mod tests {
             })
             .expect_err("trigger_turn messages to root must be rejected");
         assert!(err.to_string().contains("root agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn mailbox_barrier_failure_does_not_enqueue_or_publish() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        let mut rx = handle.events().subscribe();
+        journal.fail_event_type("mailbox.enqueued");
+
+        let err = handle
+            .send_agent_message(SendAgentMessageRequest {
+                author_agent_id: child.agent_id().clone(),
+                target_agent_id: root.agent_id().clone(),
+                content: "status update".to_string(),
+                trigger_turn: false,
+                kind: MailboxItemKind::Input,
+                delivery_phase: MailboxDeliveryPhase::NextTurn,
+                payload: json!({"source": "test"}),
+            })
+            .expect_err("mailbox enqueue must fail before wakeup");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(root.mailbox().pending_items().is_empty());
+        assert!(journal
+            .events_for_session(root.session_id())?
+            .iter()
+            .all(|event| event.event_type != "mailbox.enqueued"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn child_completion_barrier_failure_does_not_finish_or_wake_parent() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        let mut rx = handle.events().subscribe();
+        journal.fail_event_type("mailbox.enqueued");
+
+        let err = handle
+            .complete_agent(CompleteAgentRequest {
+                child_agent_id: child.agent_id().clone(),
+                result: "findings ready".to_string(),
+            })
+            .expect_err("child completion must fail before live finish");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert_eq!(child.snapshot().status, AgentThreadStatus::Created);
+        assert_eq!(
+            journal.list_children(root.session_id())?[0].status,
+            SpawnEdgeStatus::Open
+        );
+        assert!(root.mailbox().pending_items().is_empty());
+        assert!(journal
+            .events_for_session(root.session_id())?
+            .iter()
+            .all(|event| event.event_type != "mailbox.enqueued"
+                && event.event_type != "agent.completed"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         Ok(())
     }
 
