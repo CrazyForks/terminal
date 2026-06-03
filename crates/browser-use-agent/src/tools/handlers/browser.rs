@@ -783,7 +783,7 @@ fn resolve_browser_command_for_selected_mode(
 }
 
 fn local_connect_profile_preflight(
-    store: &Store,
+    has_stored_profile: bool,
     backend: &dyn BrowserBackend,
     session_id: &str,
     cwd: &std::path::Path,
@@ -793,11 +793,7 @@ fn local_connect_profile_preflight(
     if !is_plain_local_connect_command(resolved_command) {
         return Ok(None);
     }
-    if store
-        .get_setting(BROWSER_PREF_PROFILE)?
-        .as_deref()
-        .is_some_and(|profile| !profile.trim().is_empty())
-    {
+    if has_stored_profile {
         return Ok(None);
     }
     let Ok(profiles) = backend.command(
@@ -1637,8 +1633,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            let has_stored_profile = store
+                                .get_setting(BROWSER_PREF_PROFILE)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .as_deref()
+                                .is_some_and(|profile| !profile.trim().is_empty());
+                            drop(store);
                             if let Some(preflight) = local_connect_profile_preflight(
-                                &store,
+                                has_stored_profile,
                                 backend.as_ref(),
                                 &session_id,
                                 &cwd,
@@ -1649,7 +1651,6 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             {
                                 preflight
                             } else {
-                                drop(store);
                                 backend
                                     .command(&session_id, &cwd, &artifact_dir, &resolved)
                                     .map_err(ToolError::Other)?
