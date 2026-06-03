@@ -1487,7 +1487,11 @@ fn env_json_string_list(name: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for item in items {
-        let Some(value) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(value) = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
             continue;
         };
         if seen.insert(value.to_string()) {
@@ -1561,10 +1565,7 @@ fn browser_viewport_launch_args() -> Vec<String> {
 
 fn browser_download_behavior() -> Option<(String, Value)> {
     if env_bool("BU_BROWSER_ACCEPT_DOWNLOADS") == Some(false) {
-        return Some((
-            "downloads:false".to_string(),
-            json!({ "behavior": "deny" }),
-        ));
+        return Some(("downloads:false".to_string(), json!({ "behavior": "deny" })));
     }
     let raw_path = env_trimmed("BU_BROWSER_DOWNLOADS_PATH")?;
     let path = expand_browser_profile_path(&raw_path);
@@ -1771,21 +1772,24 @@ fn browser_profile_url_allowed(raw_url: &str) -> bool {
     ) {
         return true;
     }
+    let block_ip_addresses = env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") == Some(true);
+    let allowed_domains = env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS");
+    let prohibited_domains = env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS");
+    let constraints_active =
+        block_ip_addresses || !allowed_domains.is_empty() || !prohibited_domains.is_empty();
     let Ok(url) = reqwest::Url::parse(raw_url) else {
-        return false;
+        return !constraints_active;
     };
     if matches!(url.scheme(), "data" | "blob") {
         return true;
     }
     let Some(host) = url.host_str() else {
-        return false;
+        return !constraints_active;
     };
-    if env_bool("BU_BROWSER_BLOCK_IP_ADDRESSES") == Some(true) && host.parse::<IpAddr>().is_ok() {
+    if block_ip_addresses && host.parse::<IpAddr>().is_ok() {
         return false;
     }
 
-    let allowed_domains = env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS");
-    let prohibited_domains = env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS");
     if !allowed_domains.is_empty() {
         return allowed_domains
             .iter()
@@ -7834,7 +7838,8 @@ print("browser profile wait timing ok")
             .params
             .get("source")
             .and_then(Value::as_str)
-            .is_some_and(|source| source.contains("window.localStorage.setItem(\"theme\", \"dark\");")
+            .is_some_and(|source| source
+                .contains("window.localStorage.setItem(\"theme\", \"dark\");")
                 && source.contains("window.sessionStorage.setItem(\"step\", \"one\");")));
         assert_eq!(calls[4].session_id.as_deref(), Some("session-1"));
         assert_eq!(calls[4].params["userAgent"], "BrowserUseRuntime/6.0");
@@ -7906,9 +7911,33 @@ print("browser profile wait timing ok")
                 ("BU_BROWSER_BLOCK_IP_ADDRESSES", "false"),
             ]);
 
-            assert!(!browser_profile_url_allowed("https://ads.tracking.example/"));
+            assert!(!browser_profile_url_allowed(
+                "https://ads.tracking.example/"
+            ));
             assert!(browser_profile_url_allowed("https://example.com/"));
         }
+    }
+
+    #[test]
+    fn browser_profile_domain_constraints_are_passive_without_env() {
+        let _env = EnvRestore::unset(&[
+            "BU_BROWSER_ALLOWED_DOMAINS",
+            "BU_BROWSER_PROHIBITED_DOMAINS",
+            "BU_BROWSER_BLOCK_IP_ADDRESSES",
+        ]);
+
+        assert!(browser_profile_url_allowed(""));
+        assert!(browser_profile_url_allowed("/relative-path"));
+
+        drop(_env);
+        let _env = EnvRestore::set(&[
+            ("BU_BROWSER_ALLOWED_DOMAINS", r#"["example.com"]"#),
+            ("BU_BROWSER_PROHIBITED_DOMAINS", "[]"),
+            ("BU_BROWSER_BLOCK_IP_ADDRESSES", "false"),
+        ]);
+
+        assert!(!browser_profile_url_allowed(""));
+        assert!(!browser_profile_url_allowed("/relative-path"));
     }
 
     #[test]
