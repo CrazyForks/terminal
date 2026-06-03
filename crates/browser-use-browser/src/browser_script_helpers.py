@@ -2552,6 +2552,169 @@ def toggle_form_control(label_or_text, checked=True, timeout=1.0):
     }
 
 
+def select_controls_snapshot(limit=20, option_limit=30):
+    """Return rendered selects/comboboxes with labels, current values, and options."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 20
+    try:
+        option_limit_int = int(option_limit)
+    except Exception:
+        option_limit_int = 30
+    limit_int = max(1, min(limit_int, 100))
+    option_limit_int = max(1, min(option_limit_int, 200))
+    expression = f"""
+(() => {{
+  // __SELECT_CONTROLS_SNAPSHOT__
+  const clean = (text, max = 180) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'placeholder', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const labelFor = el => {{
+    const bits = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parent = el.closest('label,[aria-label],[data-label],.field,.form-group,li,div');
+    if (parent) bits.push(parent.innerText, parent.getAttribute('aria-label'), parent.getAttribute('data-label'));
+    return clean(bits.filter(Boolean).join(' '));
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  return Array.from(document.querySelectorAll('select,[role="combobox"],[aria-haspopup="listbox"],[aria-controls][aria-expanded]'))
+    .filter(el => !el.disabled && visible(el))
+    .slice(0, {limit_int})
+    .map((el, index) => {{
+      const r = el.getBoundingClientRect();
+      const tag = el.tagName.toLowerCase();
+      const options = tag === 'select'
+        ? Array.from(el.options).slice(0, {option_limit_int}).map(option => ({{text: clean(option.textContent), value: option.value, selected: option.selected}}))
+        : [];
+      return {{
+        index,
+        selector: selectorFor(el),
+        tag,
+        role: el.getAttribute('role') || '',
+        label: labelFor(el),
+        name: clean(el.getAttribute('name')),
+        value: clean(el.value || el.textContent, 240),
+        aria_expanded: el.getAttribute('aria-expanded'),
+        options,
+        rect: {{
+          x: Math.round(r.x), y: Math.round(r.y),
+          width: Math.round(r.width), height: Math.round(r.height),
+          in_viewport: r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth,
+        }},
+      }};
+    }});
+}})()
+"""
+    controls = js(expression) or []
+    return {"count": len(controls), "controls": controls}
+
+
+def select_option(label_or_placeholder, option_text_or_value, timeout=1.0):
+    """Select a native select/combobox option by field label and option text/value."""
+    needle = str(label_or_placeholder or "").strip().lower()
+    option = str(option_text_or_value or "").strip()
+    if not needle or not option:
+        raise RuntimeError("select_option requires both a field label and option text/value")
+    expression = f"""
+(() => {{
+  // __SELECT_OPTION__
+  const needle = {json.dumps(needle)};
+  const wanted = {json.dumps(option.lower())};
+  const clean = text => (text || '').replace(/\\s+/g, ' ').trim();
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'placeholder', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return '';
+  }};
+  const textFor = el => {{
+    const bits = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id];
+    if (el.id) for (const label of document.querySelectorAll(`label[for="${{CSS.escape(el.id)}}"]`)) bits.push(label.innerText);
+    const parent = el.closest('label,[aria-label],[data-label],.field,.form-group,li,div');
+    if (parent) bits.push(parent.innerText, parent.getAttribute('aria-label'), parent.getAttribute('data-label'));
+    return clean(bits.filter(Boolean).join(' ')).toLowerCase();
+  }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  let best = null, bestScore = -1, bestText = '';
+  for (const el of document.querySelectorAll('select,[role="combobox"],[aria-haspopup="listbox"],[aria-controls][aria-expanded]')) {{
+    if (el.disabled || !visible(el)) continue;
+    const selector = selectorFor(el);
+    const hay = textFor(el);
+    let score = hay === needle ? 130 : hay.includes(needle) ? 80 : needle.includes(hay) && hay.length > 2 ? 35 : 0;
+    if (selector && selector.toLowerCase() === needle) score = 150;
+    if (score > bestScore) {{ best = el; bestScore = score; bestText = hay; }}
+  }}
+  if (!best || bestScore <= 0) return null;
+  const r = best.getBoundingClientRect();
+  const tag = best.tagName.toLowerCase();
+  let optionIndex = -1, optionText = '', optionValue = '';
+  if (tag === 'select') {{
+    const options = Array.from(best.options);
+    optionIndex = options.findIndex(o => o.value.toLowerCase() === wanted || clean(o.textContent).toLowerCase() === wanted || clean(o.textContent).toLowerCase().includes(wanted));
+    if (optionIndex >= 0) {{
+      optionText = clean(options[optionIndex].textContent);
+      optionValue = options[optionIndex].value;
+    }}
+  }}
+  return {{
+    selector: selectorFor(best),
+    score: bestScore,
+    matched_text: bestText,
+    tag,
+    option_index: optionIndex,
+    option_text: optionText,
+    option_value: optionValue,
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+  }};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        controls = select_controls_snapshot(limit=20)
+        raise RuntimeError(f"select_option: no rendered select/combobox matched {label_or_placeholder!r}; controls={controls}")
+    selector = match.get("selector")
+    if match.get("tag") == "select":
+        if match.get("option_index", -1) < 0:
+            controls = select_controls_snapshot(limit=20)
+            raise RuntimeError(f"select_option: no option matched {option_text_or_value!r}; controls={controls}")
+        if not _focus_selector_like_user(selector, timeout=timeout):
+            raise RuntimeError(f"select_option: element not found: {selector!r}")
+        press_key("Home")
+        for _ in range(int(match["option_index"])):
+            press_key("ArrowDown")
+        press_key("Enter")
+    else:
+        click_at_xy(match["x"], match["y"])
+        if timeout:
+            _time.sleep(min(max(float(timeout), 0.0), 1.0))
+        type_text(option)
+        press_key("Enter")
+    return {
+        "selected": True,
+        "selector": selector,
+        "matched_text": match.get("matched_text", ""),
+        "option_text": match.get("option_text", option),
+        "option_value": match.get("option_value", ""),
+        "score": match.get("score"),
+    }
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])
