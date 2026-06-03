@@ -354,6 +354,7 @@ def goto_url(url):
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
     wait_for_load(timeout=15)
+    _wait_for_browser_profile_page_load()
     return result
 
 
@@ -467,6 +468,29 @@ def _timeout_seconds(timeout):
     if timeout > 1000:
         timeout = timeout / 1000
     return min(timeout, 60.0)
+
+
+def _env_milliseconds_to_seconds(name):
+    raw = os.environ.get(name)
+    if raw is None:
+        return 0.0
+    try:
+        milliseconds = float(str(raw).strip())
+    except ValueError:
+        return 0.0
+    if milliseconds <= 0:
+        return 0.0
+    return milliseconds / 1000.0
+
+
+def _wait_for_browser_profile_page_load():
+    minimum_wait = _env_milliseconds_to_seconds("BU_BROWSER_MINIMUM_WAIT_PAGE_LOAD_MS")
+    if minimum_wait > 0:
+        _time.sleep(minimum_wait)
+
+    network_idle_wait = _env_milliseconds_to_seconds("BU_BROWSER_NETWORK_IDLE_PAGE_LOAD_MS")
+    if network_idle_wait > 0:
+        wait_for_network_idle(timeout=max(network_idle_wait, 1.0), idle_ms=int(network_idle_wait * 1000))
 
 
 def wait_for_load(timeout=15.0):
