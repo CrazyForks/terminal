@@ -5194,6 +5194,42 @@ def nobel_prize_api(endpoint="laureates", params=None, timeout=20.0, lang="en"):
     }
 
 
+def wikidata_sparql(query, timeout=20.0, limit=None):
+    """Run a Wikidata SPARQL query and return normalized bindings."""
+    query_text = str(query).strip()
+    if limit is not None and re.search(r"\blimit\s+\d+\b", query_text, re.I) is None:
+        query_text = f"{query_text}\nLIMIT {int(limit)}"
+    url = "https://query.wikidata.org/sparql?" + urlencode({"query": query_text, "format": "json"})
+    payload = json.loads(str(http_get(url, headers={"Accept": "application/sparql-results+json"}, timeout=timeout)))
+    variables = payload.get("head", {}).get("vars", []) if isinstance(payload, dict) else []
+    rows = []
+    for binding in payload.get("results", {}).get("bindings", []) if isinstance(payload, dict) else []:
+        row = {}
+        if not isinstance(binding, dict):
+            continue
+        for name in variables:
+            item = binding.get(name)
+            if not isinstance(item, dict):
+                row[name] = None
+                continue
+            value = item.get("value", "")
+            cell = {
+                "value": value,
+                "type": item.get("type", ""),
+                "datatype": item.get("datatype", ""),
+                "lang": item.get("xml:lang", ""),
+            }
+            if isinstance(value, str) and value.startswith("http://www.wikidata.org/entity/"):
+                entity_id = value.rsplit("/", 1)[-1]
+                cell["id"] = entity_id
+                cell["url"] = value
+            row[name] = cell
+            if name.endswith("Label") and isinstance(value, str):
+                row[f"{name}_text"] = value
+        rows.append(row)
+    return {"count": len(rows), "variables": variables, "rows": rows}
+
+
 def read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None):
     """Fetch/read a document URL or local path and return bounded extracted text.
 
