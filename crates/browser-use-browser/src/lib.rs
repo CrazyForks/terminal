@@ -9392,6 +9392,169 @@ print("arxiv_query ok")
     }
 
     #[test]
+    fn browser_script_semantic_scholar_helpers_normalize_paper_graphs() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-semantic-scholar-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+
+seen = []
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    seen.append(url)
+    assert headers["Accept"] == "application/json"
+    if "/paper/search?" in url and "Parameter-efficient" in url:
+        assert "limit=3" in url, url
+        return json.dumps({
+            "data": [
+                {
+                    "paperId": "paper123",
+                    "title": "Parameter-efficient fine-tuning of large-scale pre-trained language models",
+                    "abstract": "Fine tuning survey.",
+                    "year": 2023,
+                    "venue": "Nature Machine Intelligence",
+                    "citationCount": 42,
+                    "url": "https://www.semanticscholar.org/paper/paper123",
+                    "externalIds": {"DOI": "10.1038/example"},
+                    "authors": [{"authorId": "174", "name": "Ning Ding"}],
+                }
+            ]
+        })
+    if "/paper/paper123/citations?" in url:
+        if "offset=2" in url:
+            return json.dumps({
+                "data": [
+                    {
+                        "citingPaper": {
+                            "paperId": "cite2024b",
+                            "title": "Adapters for Browser Agents",
+                            "authors": [{"authorId": "4", "name": "Browser Example"}],
+                            "venue": "ACL",
+                            "year": 2024,
+                            "citationCount": 9,
+                        }
+                    }
+                ]
+            })
+        return json.dumps({
+            "next": 2,
+            "data": [
+                {
+                    "citingPaper": {
+                        "paperId": "cite2024",
+                        "title": "Efficient Adapters for Agents",
+                        "authors": [{"authorId": "1", "name": "Ada Example"}, {"authorId": "2", "name": "Grace Example"}],
+                        "venue": "ICLR",
+                        "year": 2024,
+                        "citationCount": 7,
+                        "url": "https://www.semanticscholar.org/paper/cite2024",
+                        "openAccessPdf": {"url": "https://example.test/cite2024.pdf"},
+                        "publicationTypes": ["Conference"],
+                    }
+                },
+                {
+                    "citingPaper": {
+                        "paperId": "cite2023",
+                        "title": "Older Adapter Work",
+                        "authors": [{"authorId": "3", "name": "Old Example"}],
+                        "venue": "NeurIPS",
+                        "year": 2023,
+                        "citationCount": 3,
+                    }
+                }
+            ]
+        })
+    if "/paper/search?" in url and "Browser+Agent+Survey" in url:
+        assert "limit=4" in url, url
+        assert "abstract" in url, url
+        return json.dumps({
+            "data": [
+                {
+                    "paperId": "paperabc",
+                    "title": "Browser Agent Survey",
+                    "abstract": "A survey of browser agents.",
+                    "year": 2025,
+                    "venue": "SurveyConf",
+                    "citationCount": 99,
+                    "url": "https://www.semanticscholar.org/paper/paperabc",
+                    "authors": [{"authorId": "10", "name": "Survey Author"}],
+                }
+            ]
+        })
+    if "/paper/paperabc/references?" in url:
+        return json.dumps({
+            "data": [
+                {
+                    "citedPaper": {
+                        "paperId": f"ref{i}",
+                        "title": f"Reference Paper {i}",
+                        "abstract": f"Reference abstract {i}",
+                        "authors": [{"authorId": str(i), "name": f"Author {i}"}],
+                        "venue": "ACL",
+                        "year": 2024,
+                        "citationCount": i,
+                        "url": f"https://www.semanticscholar.org/paper/ref{i}",
+                        "openAccessPdf": {"url": f"https://example.test/ref{i}.pdf"},
+                    }
+                }
+                for i in range(1, 6)
+            ] + [
+                {
+                    "citedPaper": {
+                        "paperId": "oldref",
+                        "title": "Old Reference",
+                        "authors": [{"authorId": "9", "name": "Old Author"}],
+                        "venue": "OldConf",
+                        "year": 2022,
+                        "citationCount": 1,
+                    }
+                }
+            ]
+        })
+    raise AssertionError(url)
+
+citations = semantic_scholar_citations(
+    "Parameter-efficient fine-tuning of large-scale pre-trained language models",
+    year=2024,
+    limit=5,
+    search_limit=3,
+)
+assert citations["selected_paper"]["paper_id"] == "paper123", citations
+assert citations["selected_paper"]["author_names"] == ["Ning Ding"], citations
+assert citations["selected_paper"]["abstract"] == "Fine tuning survey.", citations
+assert citations["year_filter"] == 2024, citations
+assert citations["count"] == 2, citations
+assert citations["citations"][0]["paper_id"] == "cite2024", citations
+assert citations["citations"][0]["author_names"] == ["Ada Example", "Grace Example"], citations
+assert citations["citations"][0]["venue"] == "ICLR", citations
+assert citations["citations"][0]["pdf_url"] == "https://example.test/cite2024.pdf", citations
+assert citations["citations"][1]["paper_id"] == "cite2024b", citations
+assert citations["citations"][1]["url"] == "https://www.semanticscholar.org/paper/cite2024b", citations
+
+references = semantic_scholar_references("Browser Agent Survey", year=2024, limit=10, search_limit=4)
+assert references["selected_paper"]["paper_id"] == "paperabc", references
+assert references["selected_paper"]["abstract"] == "A survey of browser agents.", references
+assert references["year_filter"] == 2024, references
+assert references["count"] == 5, references
+assert references["references"][0]["paper_id"] == "ref1", references
+assert references["references"][0]["abstract"] == "Reference abstract 1", references
+assert references["references"][0]["pdf_url"] == "https://example.test/ref1.pdf", references
+assert references["references"][4]["author_names"] == ["Author 5"], references
+assert len(seen) == 5, seen
+print("semantic_scholar_helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("semantic_scholar_helpers ok"));
+    }
+
+    #[test]
     fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

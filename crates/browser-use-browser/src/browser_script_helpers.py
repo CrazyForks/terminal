@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
@@ -4816,6 +4816,198 @@ def arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="subm
         "count": len(entries),
         "entries": entries,
     }
+
+
+_SEMANTIC_SCHOLAR_API_BASE = "https://api.semanticscholar.org/graph/v1"
+_SEMANTIC_SCHOLAR_PAPER_FIELDS = (
+    "paperId,title,abstract,authors,venue,year,citationCount,"
+    "externalIds,url,publicationVenue,publicationTypes,openAccessPdf"
+)
+
+
+def _semantic_scholar_clean(value, max_chars=4000):
+    return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()[:max_chars]
+
+
+def _semantic_scholar_int(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _semantic_scholar_normalize_paper(paper):
+    if not isinstance(paper, dict):
+        paper = {}
+    authors = []
+    for author in paper.get("authors") or []:
+        if not isinstance(author, dict):
+            continue
+        name = _semantic_scholar_clean(author.get("name"), 240)
+        if name:
+            authors.append({"author_id": str(author.get("authorId") or ""), "name": name})
+    open_access_pdf = paper.get("openAccessPdf") if isinstance(paper.get("openAccessPdf"), dict) else {}
+    publication_venue = paper.get("publicationVenue") if isinstance(paper.get("publicationVenue"), dict) else {}
+    paper_id = str(paper.get("paperId") or "")
+    url = str(paper.get("url") or "")
+    if not url and paper_id:
+        url = f"https://www.semanticscholar.org/paper/{paper_id}"
+    return {
+        "paper_id": paper_id,
+        "title": _semantic_scholar_clean(paper.get("title"), 500),
+        "abstract": _semantic_scholar_clean(paper.get("abstract"), 2500),
+        "authors": authors,
+        "author_names": [author["name"] for author in authors],
+        "venue": _semantic_scholar_clean(paper.get("venue") or publication_venue.get("name"), 240),
+        "publication_venue": _semantic_scholar_clean(publication_venue.get("name"), 240),
+        "year": paper.get("year"),
+        "citation_count": paper.get("citationCount"),
+        "url": url,
+        "pdf_url": str(open_access_pdf.get("url") or ""),
+        "external_ids": paper.get("externalIds") if isinstance(paper.get("externalIds"), dict) else {},
+        "publication_types": paper.get("publicationTypes") if isinstance(paper.get("publicationTypes"), list) else [],
+    }
+
+
+def _semantic_scholar_looks_like_paper_id(value):
+    return (
+        re.match(r"^[0-9a-f]{40}$", value, re.I)
+        or re.match(r"^(?:CorpusID|DOI|ARXIV|PMID|PMCID|MAG|ACL|URL):", value, re.I)
+        or value.startswith("https://")
+        or value.startswith("http://")
+    )
+
+
+def _semantic_scholar_api_json(url, timeout):
+    return json.loads(str(http_get(url, headers={"Accept": "application/json"}, timeout=timeout)))
+
+
+def _semantic_scholar_select_paper(target, search_limit, timeout):
+    search_results = []
+    if _semantic_scholar_looks_like_paper_id(target):
+        paper_lookup_url = f"{_SEMANTIC_SCHOLAR_API_BASE}/paper/{quote(target, safe=':/.')}?" + urlencode(
+            {"fields": _SEMANTIC_SCHOLAR_PAPER_FIELDS}
+        )
+        return _semantic_scholar_normalize_paper(_semantic_scholar_api_json(paper_lookup_url, timeout)), search_results, ""
+
+    search_url = f"{_SEMANTIC_SCHOLAR_API_BASE}/paper/search?" + urlencode(
+        {"query": target, "limit": search_limit, "fields": _SEMANTIC_SCHOLAR_PAPER_FIELDS}
+    )
+    search_payload = _semantic_scholar_api_json(search_url, timeout)
+    search_results = [
+        _semantic_scholar_normalize_paper(item)
+        for item in (search_payload.get("data", []) if isinstance(search_payload, dict) else [])
+        if isinstance(item, dict)
+    ]
+    if not search_results:
+        return {}, [], "no_search_results"
+    lower_target = _semantic_scholar_clean(target).lower()
+    selected = max(
+        search_results,
+        key=lambda paper: (
+            100 if paper.get("title", "").lower() == lower_target else 0,
+            60 if lower_target and lower_target in paper.get("title", "").lower() else 0,
+            int(paper.get("citation_count") or 0),
+        ),
+    )
+    return selected, search_results, ""
+
+
+def _semantic_scholar_related_papers(query_or_paper_id, *, relation, row_key, result_key, year, limit, search_limit, timeout):
+    target = str(query_or_paper_id or "").strip()
+    if not target:
+        raise ValueError(f"semantic_scholar_{result_key} requires a title, DOI:, CorpusID:, URL, or paperId")
+    limit_int = _semantic_scholar_int(limit or 200, 200, 1, 1000)
+    search_limit_int = _semantic_scholar_int(search_limit or 5, 5, 1, 20)
+    selected_paper, search_results, diagnosis = _semantic_scholar_select_paper(target, search_limit_int, timeout)
+    empty = {
+        "query": target,
+        "selected_paper": selected_paper,
+        "search_results": search_results,
+        "count": 0,
+        "year_filter": year,
+        result_key: [],
+    }
+    if diagnosis:
+        empty["diagnosis"] = diagnosis
+        return empty
+    paper_id = selected_paper.get("paper_id")
+    if not paper_id:
+        empty["diagnosis"] = "missing_paper_id"
+        return empty
+
+    related = []
+    seen_keys = set()
+    offset = 0
+    page_size = min(100, limit_int)
+    relation_fields = row_key + "." + _SEMANTIC_SCHOLAR_PAPER_FIELDS.replace(",", f",{row_key}.")
+    while len(related) < limit_int:
+        page_limit = min(page_size, limit_int - len(related))
+        url = f"{_SEMANTIC_SCHOLAR_API_BASE}/paper/{quote(paper_id, safe='')}/{relation}?" + urlencode(
+            {"offset": offset, "limit": page_limit, "fields": relation_fields}
+        )
+        payload = _semantic_scholar_api_json(url, timeout)
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            paper = _semantic_scholar_normalize_paper(row.get(row_key) if isinstance(row, dict) else {})
+            if year is not None and str(paper.get("year") or "") != str(year):
+                continue
+            if not paper.get("paper_id") and not paper.get("title"):
+                continue
+            key = paper.get("paper_id") or paper.get("title")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            related.append(paper)
+            if len(related) >= limit_int:
+                break
+        next_offset = payload.get("next") if isinstance(payload, dict) else None
+        if next_offset is None:
+            break
+        try:
+            offset = int(next_offset)
+        except Exception:
+            break
+
+    return {
+        "query": target,
+        "selected_paper": selected_paper,
+        "search_results": search_results,
+        "count": len(related),
+        "year_filter": year,
+        result_key: related,
+    }
+
+
+def semantic_scholar_citations(query_or_paper_id, year=None, limit=200, search_limit=5, timeout=20.0):
+    """Search/fetch a Semantic Scholar paper and return normalized citing papers."""
+    return _semantic_scholar_related_papers(
+        query_or_paper_id,
+        relation="citations",
+        row_key="citingPaper",
+        result_key="citations",
+        year=year,
+        limit=limit,
+        search_limit=search_limit,
+        timeout=timeout,
+    )
+
+
+def semantic_scholar_references(query_or_paper_id, year=None, limit=200, search_limit=5, timeout=20.0):
+    """Search/fetch a Semantic Scholar paper and return normalized referenced papers."""
+    return _semantic_scholar_related_papers(
+        query_or_paper_id,
+        relation="references",
+        row_key="citedPaper",
+        result_key="references",
+        year=year,
+        limit=limit,
+        search_limit=search_limit,
+        timeout=timeout,
+    )
 
 
 def read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None):
