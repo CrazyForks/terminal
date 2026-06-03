@@ -9741,6 +9741,111 @@ print("wikidata_sparql ok")
     }
 
     #[test]
+    fn browser_script_wikidata_education_award_cascade_resolves_and_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-wikidata-education-award-cascade",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import json
+from urllib.parse import parse_qs, urlparse, unquote_plus
+
+calls = []
+
+def http_get(url, headers=None, timeout=20.0, binary=None):
+    calls.append(url)
+    assert headers["Accept"] in ("application/json", "application/sparql-results+json")
+    if "w/api.php" in url:
+        query = parse_qs(urlparse(url).query)
+        assert query["action"] == ["wbsearchentities"], query
+        assert query["search"] == ["Example Laureate"], query
+        return json.dumps({
+            "search": [
+                {"id": "Q123", "label": "Example Laureate", "description": "Nobel Prize laureate and physicist"},
+                {"id": "Q999", "label": "Other Example", "description": "writer"},
+            ]
+        })
+    assert "query.wikidata.org/sparql" in url, url
+    query_text = unquote_plus(parse_qs(urlparse(url).query)["query"][0])
+    assert "VALUES ?target { wd:Q123 }" in query_text, query_text
+    assert "?target p:P69 ?targetEducationStatement" in query_text, query_text
+    assert "?targetEducationStatement ps:P69 ?institution" in query_text, query_text
+    assert "?targetEducationStatement pq:P512 ?targetDegree" in query_text, query_text
+    assert "?other p:P69 ?otherEducationStatement" in query_text, query_text
+    assert "?otherEducationStatement ps:P69 ?institution" in query_text, query_text
+    assert "?otherEducationStatement pq:P512 ?otherDegree" in query_text, query_text
+    assert "?other wdt:P166 ?award" in query_text, query_text
+    assert "nobel" in query_text.lower(), query_text
+    return json.dumps({
+        "head": {"vars": ["target", "targetLabel", "institution", "institutionLabel", "targetDegree", "targetDegreeLabel", "other", "otherLabel", "otherDegree", "otherDegreeLabel", "award", "awardLabel"]},
+        "results": {
+            "bindings": [
+                {
+                    "target": {"type": "uri", "value": "http://www.wikidata.org/entity/Q123"},
+                    "targetLabel": {"type": "literal", "xml:lang": "en", "value": "Example Laureate"},
+                    "institution": {"type": "uri", "value": "http://www.wikidata.org/entity/Q456"},
+                    "institutionLabel": {"type": "literal", "xml:lang": "en", "value": "Example University"},
+                    "targetDegree": {"type": "uri", "value": "http://www.wikidata.org/entity/Q752297"},
+                    "targetDegreeLabel": {"type": "literal", "xml:lang": "en", "value": "Doctor of Philosophy"},
+                    "other": {"type": "uri", "value": "http://www.wikidata.org/entity/Q789"},
+                    "otherLabel": {"type": "literal", "xml:lang": "en", "value": "Other Nobel Graduate"},
+                    "otherDegree": {"type": "uri", "value": "http://www.wikidata.org/entity/Q752297"},
+                    "otherDegreeLabel": {"type": "literal", "xml:lang": "en", "value": "Doctor of Philosophy"},
+                    "award": {"type": "uri", "value": "http://www.wikidata.org/entity/Q7191"},
+                    "awardLabel": {"type": "literal", "xml:lang": "en", "value": "Nobel Prize"},
+                },
+                {
+                    "target": {"type": "uri", "value": "http://www.wikidata.org/entity/Q123"},
+                    "targetLabel": {"type": "literal", "xml:lang": "en", "value": "Example Laureate"},
+                    "institution": {"type": "uri", "value": "http://www.wikidata.org/entity/Q456"},
+                    "institutionLabel": {"type": "literal", "xml:lang": "en", "value": "Example University"},
+                    "targetDegree": {"type": "uri", "value": "http://www.wikidata.org/entity/Q752297"},
+                    "targetDegreeLabel": {"type": "literal", "xml:lang": "en", "value": "Doctor of Philosophy"},
+                    "other": {"type": "uri", "value": "http://www.wikidata.org/entity/Q789"},
+                    "otherLabel": {"type": "literal", "xml:lang": "en", "value": "Other Nobel Graduate"},
+                    "otherDegree": {"type": "uri", "value": "http://www.wikidata.org/entity/Q752297"},
+                    "otherDegreeLabel": {"type": "literal", "xml:lang": "en", "value": "Doctor of Philosophy"},
+                    "award": {"type": "uri", "value": "http://www.wikidata.org/entity/Q7191"},
+                    "awardLabel": {"type": "literal", "xml:lang": "en", "value": "Nobel Prize"},
+                },
+            ]
+        },
+    })
+
+result = wikidata_education_award_cascade(["Example Laureate"], award_keywords=["Nobel"], limit_per_person=25)
+assert result["count"] == 1, result
+assert result["people_count"] == 1, result
+assert result["award_keywords"] == ["nobel"], result
+assert result["unresolved"] == [], result
+person = result["people"][0]
+assert person["selected_qid"] == "Q123", person
+assert person["matches"][0]["label"] == "Example Laureate", person
+record = result["records"][0]
+assert record["source_name"] == "Example Laureate", record
+assert record["source_qid"] == "Q123", record
+assert record["relationship"] == "educated_at", record
+assert record["institution"] == "Example University", record
+assert record["institution_qid"] == "Q456", record
+assert record["source_degree"] == "Doctor of Philosophy", record
+assert record["source_degree_qid"] == "Q752297", record
+assert record["other_person"] == "Other Nobel Graduate", record
+assert record["other_person_qid"] == "Q789", record
+assert record["other_degree"] == "Doctor of Philosophy", record
+assert record["other_degree_qid"] == "Q752297", record
+assert record["award"] == "Nobel Prize", record
+assert len(calls) == 2, calls
+print("wikidata_education_award_cascade ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("wikidata_education_award_cascade ok"));
+    }
+
+    #[test]
     fn browser_script_grid_row_helpers_surface_row_scoped_actions() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
