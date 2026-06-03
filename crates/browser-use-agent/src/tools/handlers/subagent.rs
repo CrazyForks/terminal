@@ -44,8 +44,7 @@ use crate::subagents::{
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
     final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
     resolve_agent_path_v2, resolve_agent_reference_in_tree_v2, session_was_interrupted,
-    store_collect_agent_tree, store_resolve_agent_reference_in_tree,
-    store_resolve_agent_reference_in_tree_v2, store_root_session_id,
+    store_collect_agent_tree, store_resolve_agent_reference_in_tree_v2, store_root_session_id,
 };
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
@@ -402,7 +401,7 @@ fn check_store_thread_limit(deps: &SubagentToolDeps) -> Result<(), ToolError> {
     let live_threads = store_collect_agent_tree(&store, &root_id)
         .map_err(|err| tool_err("collect agent tree failed", err))?
         .into_iter()
-        .filter(|agent| agent.status != "closed")
+        .filter(|agent| agent.status == "open")
         .count();
     if live_threads >= limit {
         return Err(ToolError::Other(anyhow::anyhow!(
@@ -1485,7 +1484,6 @@ fn store_list_agents(
 
 async fn store_wait_agent(
     deps: &SubagentToolDeps,
-    agent_path: Option<&str>,
     timeout: Duration,
 ) -> Result<Option<ExecOutput>, ToolError> {
     let Some(shared_store) = deps.store.as_ref() else {
@@ -1493,47 +1491,6 @@ async fn store_wait_agent(
     };
     let (watcher, mut cursor) = store_notification_watcher(shared_store)?;
     let deadline = Instant::now() + timeout;
-    if let Some(target) = agent_path {
-        let (target_id, target_path) = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            let resolved = store_resolve_agent_reference_in_tree(&store, &deps.session_id, target)
-                .map_err(|err| tool_err("resolve agent target failed", err))?
-                .ok_or_else(|| {
-                    ToolError::Other(anyhow::anyhow!("live agent path `{target}` not found"))
-                })?;
-            (resolved.session_id, resolved.agent_path)
-        };
-        loop {
-            let status = {
-                let store = shared_store
-                    .lock()
-                    .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-                let statuses = final_statuses_for_v1_wait(&store, &[target_id.as_str()])
-                    .map_err(|err| tool_err("read target status failed", err))?;
-                statuses.values().next().cloned()
-            };
-            if let Some(status) = status {
-                return Ok(Some(ok_output(json!({
-                    "agent_path": target_path,
-                    "agent_id": target_id,
-                    "status": status,
-                    "timed_out": false,
-                }))));
-            }
-            if Instant::now() >= deadline
-                || !wait_for_store_change(&watcher, &mut cursor, deadline).await?
-            {
-                return Ok(Some(ok_output(json!({
-                    "agent_path": target_path,
-                    "agent_id": target_id,
-                    "status": "running",
-                    "timed_out": true,
-                }))));
-            }
-        }
-    }
 
     loop {
         let has_mail = {
@@ -1600,23 +1557,16 @@ fn wait_timeout(
     requested_ms: Option<i64>,
     options: WaitAgentTimeoutOptions,
 ) -> Result<Duration, ToolError> {
-    let timeout_ms = match requested_ms {
-        Some(ms) if ms < options.min_timeout_ms => {
-            return Err(ToolError::Other(anyhow::anyhow!(
-                "timeout_ms must be at least {}",
-                options.min_timeout_ms
-            )));
-        }
-        Some(ms) if ms > options.max_timeout_ms => {
-            return Err(ToolError::Other(anyhow::anyhow!(
-                "timeout_ms must be at most {}",
-                options.max_timeout_ms
-            )));
-        }
-        Some(ms) => ms as u64,
-        None => options.default_timeout_ms as u64,
-    };
-    Ok(Duration::from_millis(timeout_ms))
+    let timeout_ms = requested_ms.unwrap_or(options.default_timeout_ms);
+    if timeout_ms <= 0 {
+        return Err(ToolError::Other(anyhow::anyhow!(
+            "timeout_ms must be greater than zero"
+        )));
+    }
+    let max_timeout_ms = options.max_timeout_ms.max(1);
+    let min_timeout_ms = options.min_timeout_ms.clamp(1, max_timeout_ms);
+    let timeout_ms = timeout_ms.clamp(min_timeout_ms, max_timeout_ms);
+    Ok(Duration::from_millis(timeout_ms as u64))
 }
 
 fn wait_timeout_v1(
@@ -1668,14 +1618,22 @@ async fn wait_for_store_change(
 
 fn wait_finished_payload(output: &ExecOutput) -> Value {
     let body = serde_json::from_str::<Value>(&output.stdout).unwrap_or(Value::Null);
-    json!({
-        "timed_out": body
-            .get("timed_out")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "status": body.get("status").cloned(),
-        "message": body.get("message").cloned(),
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "timed_out".to_string(),
+        Value::Bool(
+            body.get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    if let Some(status) = body.get("status") {
+        payload.insert("status".to_string(), status.clone());
+    }
+    if let Some(message) = body.get("message") {
+        payload.insert("message".to_string(), message.clone());
+    }
+    Value::Object(payload)
 }
 
 fn store_close_agent(
@@ -1761,6 +1719,11 @@ fn store_close_agent_v1(
         .ok_or_else(|| ToolError::Other(anyhow::anyhow!("root is not a spawned agent")))?;
     let previous_status = local_agent_status_value(&store, &child, Some(&summary))
         .map_err(|err| tool_err("read previous status failed", err))?;
+    if summary.status == "closed" {
+        return Ok(Some(ok_output(json!({
+            "previous_status": previous_status,
+        }))));
+    }
     let _cleaned_runtime =
         cleanup_agent_runtime_state_for_agent_subtree(&store, target, |session_id| {
             cleanup_runtime_for_session(deps, session_id)
@@ -1792,8 +1755,8 @@ fn store_close_agent_v1(
 /// The `spawn_agent` tool: delegate a task to a freshly-spawned child agent.
 ///
 /// The model's args are [`SpawnAgentArgs`] (`task_name` + `message`, with the
-/// optional `agent_type` / `model` / `reasoning_effort` / `service_tier` /
-/// `fork_turns` overrides). On success it returns the new child's
+/// optional `agent_type` / `model` / `reasoning_effort` / `fork_turns`
+/// overrides). On success it returns the new child's
 /// `{ agent_path, agent_id }` so the model can later `wait_agent` / `send_input`.
 pub struct SpawnAgentTool {
     deps: SubagentToolDeps,
@@ -2167,7 +2130,7 @@ impl ToolRuntime<WaitAgentRequest, ExecOutput> for WaitAgentTool {
             }),
         );
         if self.deps.store.is_some() {
-            let output = store_wait_agent(&self.deps, None, timeout)
+            let output = store_wait_agent(&self.deps, timeout)
                 .await?
                 .ok_or_else(|| {
                     ToolError::Other(anyhow::anyhow!(

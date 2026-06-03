@@ -1349,6 +1349,9 @@ fn register_subagent_tools<S, A>(
         ),
         None => (Arc::new(NoopSubagentSink), String::new()),
     };
+    let is_spawned_subagent = user_input
+        .as_ref()
+        .is_some_and(|(store, sid)| session_is_spawned_subagent_for_tools(store, sid.as_str()));
 
     let deps = SubagentToolDeps {
         manager,
@@ -1401,6 +1404,7 @@ fn register_subagent_tools<S, A>(
                         .multi_agent_v2
                         .max_concurrent_threads_per_session,
                 ),
+                is_spawned_subagent,
             },
         )),
         false,
@@ -1547,6 +1551,9 @@ fn register_legacy_subagent_tools<S, A>(
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         ),
+        is_spawned_subagent: user_input
+            .as_ref()
+            .is_some_and(|(store, sid)| session_is_spawned_subagent_for_tools(store, sid.as_str())),
     };
     let wait_options = WaitAgentDefinitionOptions {
         default_timeout_ms: WaitAgentTimeoutOptions::default().default_timeout_ms,
@@ -1611,7 +1618,7 @@ fn agent_type_description(
         }
     }
     format!(
-        "Optional type name for the new agent. If omitted, `default` is used.\nAvailable roles:\n{}",
+        "Optional type name for the new agent. If omitted, `default` is used. For a normal full-history spawn, omit this field; do not send `agent_type: \"default\"`. Set this only to choose a non-default role, and then set `fork_turns` to `none` or a positive integer because full-history forks inherit this setting.\nAvailable roles:\n{}",
         formatted_roles.join("\n")
     )
 }
@@ -1787,6 +1794,27 @@ fn parent_agent_path_from_store(user_input: &Option<(SharedStore, SessionId)>) -
     let (store, session_id) = user_input.as_ref()?;
     let store = store.lock().ok()?;
     display_agent_path_for_session(&store, session_id.as_str()).ok()
+}
+
+fn session_is_spawned_subagent_for_tools(store: &SharedStore, session_id: &str) -> bool {
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    let has_parent = store
+        .load_session(session_id)
+        .ok()
+        .flatten()
+        .and_then(|session| session.parent_id)
+        .is_some();
+    has_parent
+        && store
+            .events_for_session(session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .any(|event| event.event_type == "agent.context")
+            })
+            .unwrap_or(false)
 }
 
 fn agent_path_depth(agent_path: &str) -> i32 {
@@ -2623,6 +2651,24 @@ mod tests {
     }
 
     #[test]
+    fn spawn_agent_agent_type_guidance_discourages_default_override() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
+            .with_options(crate::config_overrides::AgentRunOptions::default());
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let spawn = dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .expect("spawn_agent tool");
+        let description = spawn.input_schema["properties"]["agent_type"]
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .expect("agent_type description");
+        assert!(description.contains("do not send `agent_type: \"default\"`"));
+        assert!(description.contains("full-history forks inherit this setting"));
+    }
+
+    #[test]
     fn subagent_tools_are_hidden_when_multi_agent_features_disabled() {
         let options = crate::config_overrides::AgentRunOptions {
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
@@ -2698,7 +2744,7 @@ mod tests {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),
                 hide_spawn_agent_metadata: true,
-                min_wait_timeout_ms: 0,
+                min_wait_timeout_ms: 1,
                 default_wait_timeout_ms: 100,
                 max_wait_timeout_ms: 1000,
                 usage_hint_text: Some("Use sparingly.".to_string()),
@@ -2731,7 +2777,7 @@ mod tests {
         assert_eq!(
             wait.input_schema["properties"]["timeout_ms"]["description"],
             serde_json::json!(
-                "Optional timeout in milliseconds. Defaults to 100, min 0, max 1000."
+                "Optional timeout in milliseconds. Defaults to 100, min 1, max 1000."
             )
         );
     }
@@ -2989,8 +3035,8 @@ mod tests {
             child_agent_runner: Some(runner),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
-                min_wait_timeout_ms: 0,
-                default_wait_timeout_ms: 0,
+                min_wait_timeout_ms: 1,
+                default_wait_timeout_ms: 1,
                 max_wait_timeout_ms: 1000,
                 ..Default::default()
             },
@@ -3042,7 +3088,7 @@ mod tests {
         let wait_out = reg
             .dispatch(
                 "wait_agent",
-                &serde_json::json!({ "timeout_ms": 0 }),
+                &serde_json::json!({ "timeout_ms": 1 }),
                 &wait_ctx,
                 &env,
                 AskForApproval::Never,

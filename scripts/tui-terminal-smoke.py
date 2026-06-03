@@ -537,9 +537,10 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "/")
         palette = wait_for(session, "/model", "slash-palette-open")
         assert_contains(palette, "/task", "slash palette should show the first product action")
-        assert_contains(palette, "/mode", "slash palette should expose collaboration mode")
-        assert_contains(palette, "/plan", "slash palette should expose Plan mode")
+        assert_not_contains(palette, "/plan", "slash palette should not expose removed Plan mode")
         assert_contains(palette, "/model", "slash palette should show the model command in the visible window")
+        assert_contains(palette, "/goal", "slash palette should show the goal command")
+        assert_contains(palette, "/sync-cookies", "slash palette should show cookie sync")
         assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
         assert_not_contains(palette, "/auth", "slash palette overflows extra actions into filtering")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
@@ -918,40 +919,28 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_double_escape_opens_message_selector(binary: Path) -> None:
+def smoke_escape_stops_running_task(binary: Path) -> None:
     session = f"but-smoke-esc-stop-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-stop-"))
     try:
         start_session(session, binary, state_dir)
         wait_for(session, "Type to steer the agent", "double-escape-running")
         tmux_send(session, "Escape")
-        armed = wait_for(session, "esc again to edit messages", "double-escape-armed")
-        assert_contains(armed, "Type to steer the agent", "first escape should keep the task running")
-        assert_no_legacy_dashboard_chrome(armed, "first escape should not restore old dashboard chrome")
-        tmux_send(session, "Escape")
-        selector = wait_for(session, "Messages", "double-escape-messages")
-        assert_contains(
-            selector,
-            "Find the top 5 Hacker News posts",
-            "message selector should show the submitted prompt",
+        stopped = wait_for(session, "stopped", "escape-stopped")
+        assert_not_contains(
+            stopped,
+            "esc again to edit messages",
+            "escape should stop the running task without arming the message selector",
         )
-        assert_contains(
-            selector,
-            "Edit submitted prompts or cancel queued follow-ups",
-            "message selector should describe the actual submitted/queued actions",
-        )
-        assert_contains(selector, "Enter:edit | Esc:close", "submitted message selector should not advertise delete")
-        assert_not_contains(selector, "Del:remove", "submitted messages cannot be literally deleted")
-        assert_not_contains(selector, "^[[", "double escape should not leak escape sequences")
-        tmux_send(session, "C-c")
-        stopped = wait_for(session, "stopped", "ctrl-c-stopped-after-message-selector")
-        assert_not_contains(stopped, "^[[", "ctrl+c stop should not leak escape sequences")
+        assert_not_contains(stopped, "Messages", "escape stop should not open the message selector")
+        assert_not_contains(stopped, "^[[", "escape stop should not leak escape sequences")
+        assert_no_legacy_dashboard_chrome(stopped, "escape stop should not restore old dashboard chrome")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_escape_reclaims_prompt_before_output(binary: Path) -> None:
+def smoke_escape_stops_submitted_prompt_without_reclaim(binary: Path) -> None:
     session = f"but-smoke-esc-reclaim-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-reclaim-"))
     prompt = "take this back"
@@ -971,33 +960,26 @@ def smoke_escape_reclaims_prompt_before_output(binary: Path) -> None:
         time.sleep(0.5)
 
         tmux_send(session, "Escape")
-        reclaimed = wait_for(session, "Message returned to composer.", "esc-reclaim-returned")
-        assert_contains(
-            reclaimed,
-            f"> {prompt}",
-            "single escape before output should return the submitted prompt to composer",
-        )
+        stopped = wait_for(session, "stopped", "esc-submitted-stopped")
         assert_not_contains(
-            reclaimed,
+            stopped,
             "esc again to edit messages",
-            "single escape before output should reclaim instead of arming the message selector",
+            "single escape should stop instead of arming the message selector",
         )
+        assert_not_contains(stopped, "Message returned to composer.", "escape should not reclaim submitted prompts")
         with sqlite3.connect(state_dir / "state.db") as conn:
             rollback_count = conn.execute(
                 "SELECT COUNT(*) FROM events WHERE type = 'session.rollback' "
                 "AND payload_json LIKE '%\"action\":\"take_back\"%'"
             ).fetchone()[0]
-        if rollback_count != 1:
-            raise AssertionError(f"expected one take_back rollback event, saw {rollback_count}")
-
-        tmux_send(session, "C-u")
-        cleared = capture_after_idle(session, "esc-reclaim-cleared", visible_only=True)
-        assert_not_contains(
-            cleared,
-            prompt,
-            "clearing the reclaimed composer text should remove the prompt from the visible terminal",
-        )
-        assert_not_contains(cleared, "^[[", "escape reclaim should not leak escape sequences")
+            cancel_count = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE type = 'session.cancel_requested'"
+            ).fetchone()[0]
+        if rollback_count != 0:
+            raise AssertionError(f"expected no take_back rollback events, saw {rollback_count}")
+        if cancel_count != 1:
+            raise AssertionError(f"expected one cancel request event, saw {cancel_count}")
+        assert_not_contains(stopped, "^[[", "escape stop should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1980,8 +1962,8 @@ def main() -> int:
     smoke_ready_resize_does_not_leave_stale_frames(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
-    smoke_double_escape_opens_message_selector(binary)
-    smoke_escape_reclaims_prompt_before_output(binary)
+    smoke_escape_stops_running_task(binary)
+    smoke_escape_stops_submitted_prompt_without_reclaim(binary)
     smoke_tab_queues_followup_after_current_turn(binary)
     smoke_enter_previews_followup_after_next_tool(binary)
     smoke_escape_reclaims_pending_active_followup(binary)

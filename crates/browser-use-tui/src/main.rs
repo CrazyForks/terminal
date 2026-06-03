@@ -1906,7 +1906,9 @@ impl App {
         let session_changed = self.last_followup_check_session != self.selected_session_id;
         if drained_any || session_changed {
             self.last_followup_check_session = self.selected_session_id.clone();
-            if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
+            if self.flush_ready_pending_active_followups()?
+                || self.flush_ready_queued_followups()?
+            {
                 changed = true;
                 self.state_cache.refresh_all(&self.store)?;
                 self.refresh_cached_projection();
@@ -8221,7 +8223,9 @@ mod redesign_tests {
             black_box(app.drain_store_notifications()?);
         }
         let drain_us = t.elapsed().as_micros() as f64 / reps as f64;
-        eprintln!("TIMING3 events=3000 steady_drain_per_call={drain_us:.1}us (~2-3 calls per keystroke)");
+        eprintln!(
+            "TIMING3 events=3000 steady_drain_per_call={drain_us:.1}us (~2-3 calls per keystroke)"
+        );
         Ok(())
     }
 
@@ -10046,7 +10050,7 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
-        assert!(!screen.contains("/mode"));
+        assert!(!screen.lines().any(|line| line.contains("/mode ")));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
@@ -14465,11 +14469,11 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_once_reclaims_initial_prompt_before_output() -> Result<()> {
+    fn escape_once_stops_initial_prompt_without_reclaiming_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
-        let submitted = app.store.append_event(
+        app.store.append_event(
             &session.id,
             "session.input",
             serde_json::json!({"text": "whats up"}),
@@ -14489,8 +14493,11 @@ wire_api = "responses"
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
-        assert_eq!(app.composer.input(), "whats up");
-        assert_eq!(app.selected_session_id, None);
+        assert!(app.composer.input().is_empty());
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some(session.id.as_str())
+        );
         assert!(!app.escape_stop_is_pending());
         assert_eq!(app.surface, Surface::Main);
         assert_eq!(
@@ -14500,13 +14507,12 @@ wire_api = "responses"
             Some(SessionStatus::Cancelled)
         );
         let events = app.store.events_for_session(&session.id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == SESSION_ROLLBACK_EVENT
-                && event.payload["action"] == "take_back"
-                && event.payload["source"] == "tui_escape"
-                && event.payload["target_seq"] == submitted.seq
-                && event.payload["num_turns"] == 1
-        }));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
         let visible_submissions =
             browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
                 .into_iter()
@@ -14518,12 +14524,12 @@ wire_api = "responses"
                 })
                 .filter_map(event_payload_text)
                 .collect::<Vec<_>>();
-        assert!(visible_submissions.is_empty());
+        assert_eq!(visible_submissions, vec!["whats up"]);
         Ok(())
     }
 
     #[test]
-    fn escape_once_reclaims_followup_before_output_without_clearing_history() -> Result<()> {
+    fn escape_once_stops_followup_without_reclaiming_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14552,13 +14558,19 @@ wire_api = "responses"
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
-        assert_eq!(app.composer.input(), "revise this");
+        assert!(app.composer.input().is_empty());
         assert_eq!(
             app.selected_session_id.as_deref(),
             Some(session.id.as_str())
         );
         assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
         let visible_submissions =
             browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
                 .into_iter()
@@ -14570,7 +14582,7 @@ wire_api = "responses"
                 })
                 .filter_map(event_payload_text)
                 .collect::<Vec<_>>();
-        assert_eq!(visible_submissions, vec!["initial task"]);
+        assert_eq!(visible_submissions, vec!["initial task", "revise this"]);
         Ok(())
     }
 
@@ -14595,8 +14607,11 @@ wire_api = "responses"
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
 
         assert!(app.composer.input().is_empty());
-        assert!(app.escape_stop_is_pending());
+        assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
         assert!(!events
             .iter()
             .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
@@ -14641,7 +14656,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_twice_opens_message_selector_and_ctrl_c_stops_running_task() -> Result<()> {
+    fn escape_stops_running_task_without_opening_message_selector() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14658,32 +14673,17 @@ wire_api = "responses"
         app.selected_session_id = Some(running.id.clone());
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
-        assert!(app.escape_stop_is_pending());
-        assert_eq!(
-            app.store
-                .load_session(&running.id)?
-                .map(|session| session.status),
-            Some(SessionStatus::Running)
-        );
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("esc again to edit messages"));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
         assert!(!app.escape_stop_is_pending());
-        assert_eq!(app.surface, Surface::Messages);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Messages"));
-        assert!(screen.contains("run"));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL))?);
         assert_eq!(
             app.store
                 .load_session(&running.id)?
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
-        assert_eq!(app.surface, Surface::Main);
         let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("esc again to edit messages"));
+        assert_ne!(app.surface, Surface::Messages);
+        assert_eq!(app.surface, Surface::Main);
         assert!(screen.contains("stopped"));
         Ok(())
     }

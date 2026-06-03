@@ -664,6 +664,7 @@ pub mod definitions {
         pub include_usage_hint: bool,
         pub usage_hint_text: Option<String>,
         pub max_concurrent_threads_per_session: Option<usize>,
+        pub is_spawned_subagent: bool,
     }
 
     impl Default for SpawnAgentDefinitionOptions {
@@ -678,6 +679,7 @@ pub mod definitions {
                 include_usage_hint: false,
                 usage_hint_text: None,
                 max_concurrent_threads_per_session: None,
+                is_spawned_subagent: false,
             }
         }
     }
@@ -1265,6 +1267,9 @@ The new agent's canonical task name will be provided to it along with the messag
                 description.push_str(usage_hint);
             }
         }
+        if options.is_spawned_subagent {
+            description.push_str("\nYou are already a subagent. Do not use spawn_agent merely because inherited parent history asked for agents. Only use spawn_agent if your direct current subagent task explicitly asks you to delegate further.");
+        }
         description
     }
 
@@ -1566,13 +1571,6 @@ Agent-role guidance below only helps choose which agent to use after spawning is
                     "description": "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
                 }),
             );
-            properties.insert(
-                "service_tier".to_string(),
-                json!({
-                    "type": "string",
-                    "description": SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION
-                }),
-            );
         }
         ToolDefinition {
             name: "spawn_agent".to_string(),
@@ -1657,12 +1655,14 @@ Agent-role guidance below only helps choose which agent to use after spawning is
     pub fn wait_agent() -> ToolDefinition {
         wait_agent_with_timeouts(WaitAgentDefinitionOptions {
             default_timeout_ms: 30_000,
-            min_timeout_ms: 10_000,
+            min_timeout_ms: 1,
             max_timeout_ms: 3_600_000,
         })
     }
 
     pub fn wait_agent_with_timeouts(options: WaitAgentDefinitionOptions) -> ToolDefinition {
+        let max_timeout_ms = options.max_timeout_ms.max(1);
+        let min_timeout_ms = options.min_timeout_ms.clamp(1, max_timeout_ms);
         ToolDefinition {
             name: "wait_agent".to_string(),
             description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
@@ -1675,8 +1675,8 @@ Agent-role guidance below only helps choose which agent to use after spawning is
                         "description": format!(
                             "Optional timeout in milliseconds. Defaults to {}, min {}, max {}.",
                             options.default_timeout_ms,
-                            options.min_timeout_ms,
-                            options.max_timeout_ms
+                            min_timeout_ms,
+                            max_timeout_ms
                         )
                     }
                 },

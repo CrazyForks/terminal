@@ -227,9 +227,9 @@ impl SubagentManager {
             self.check_concurrent_thread_limit(reservations.paths.len())?;
 
             // 2. Apply requested model/reasoning overrides and the role layer
-            //    onto a copy of the parent's live config. Codex validates
-            //    model/reasoning before role layering, then resolves the final
-            //    service tier after the role may have replaced the model/tier.
+            //    onto a copy of the parent's live config. Full-history forks keep
+            //    the inherited config; partial/non-forking spawns may layer role
+            //    and metadata overrides.
             let mut config = parent.base_config.clone();
             let parent_service_tier = config.service_tier.clone();
             if let Some(service_tier) = &args.service_tier {
@@ -587,9 +587,7 @@ fn reject_full_history_spawn_overrides(
     args: &SpawnAgentArgs,
     fork_turns_mode: ForkTurns,
 ) -> Result<(), String> {
-    if matches!(fork_turns_mode, ForkTurns::All)
-        && (args.role_name().is_some() || args.model.is_some() || args.reasoning_effort.is_some())
-    {
+    if matches!(fork_turns_mode, ForkTurns::All) && args.has_full_history_metadata_override() {
         return Err(
             "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork."
                 .to_string(),

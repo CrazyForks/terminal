@@ -426,7 +426,7 @@ async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
     let (_dir, _store, _root_id, _child_id, _sink, mut deps) = deps_with_store_tree();
     deps.wait_timeouts = WaitAgentTimeoutOptions {
         default_timeout_ms: 1,
-        min_timeout_ms: 0,
+        min_timeout_ms: 1,
         max_timeout_ms: 10,
     };
     deps.manager.mailbox().enqueue(InterAgentCommunication::new(
@@ -441,13 +441,15 @@ async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
     let out = run_handler(
         &wait,
         &WaitAgentRequest {
-            timeout_ms: Some(0),
+            timeout_ms: Some(1),
         },
     )
     .await
     .expect("store-backed v2 wait should return from the durable store path");
     let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
     assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+    assert!(body.get("status").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -478,8 +480,8 @@ async fn wait_returns_child_completion_via_mailbox() {
 async fn wait_uses_configured_timeout_bounds() {
     let (_manager, _sink, mut deps) = deps_with_fake();
     deps.wait_timeouts = WaitAgentTimeoutOptions {
-        default_timeout_ms: 50,
-        min_timeout_ms: 0,
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
         max_timeout_ms: 50,
     };
     let wait = WaitAgentTool::new(deps);
@@ -488,61 +490,111 @@ async fn wait_uses_configured_timeout_bounds() {
         .await
         .expect("default timeout should be accepted");
     let body: serde_json::Value = serde_json::from_str(&default_timeout.stdout).unwrap();
-    assert_eq!(body["timed_out"].as_bool(), Some(true));
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+    assert!(body.get("status").is_none(), "{body}");
 
-    run_handler(
+    let min_timeout = run_handler(
         &wait,
         &WaitAgentRequest {
-            timeout_ms: Some(0),
+            timeout_ms: Some(1),
         },
     )
     .await
     .expect("configured minimum should be accepted");
+    let body: serde_json::Value = serde_json::from_str(&min_timeout.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
 
-    let too_large = run_handler(
+    let above_max = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(51),
         },
     )
     .await
-    .expect_err("timeout above configured maximum must fail");
-    assert!(
-        format!("{too_large:?}").contains("at most 50"),
-        "unexpected error: {too_large:?}"
-    );
+    .expect("timeout above configured maximum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&above_max.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
 }
 
 #[tokio::test]
-async fn wait_rejects_codex_timeout_bounds() {
-    let (_manager, _sink, deps) = deps_with_fake();
+async fn store_backed_wait_times_out_when_mailbox_is_empty() {
+    let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .close_child_agent(&child_id, "test no-live wait")
+            .expect("close child");
+    }
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
     let wait = WaitAgentTool::new(deps);
 
-    let too_small = run_handler(
+    let out = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect("wait timeout ok");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
+    assert!(body.get("status").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn wait_uses_codex_timeout_bounds() {
+    let (_manager, _sink, deps) = deps_with_fake();
+    deps.manager.mailbox().enqueue(InterAgentCommunication::new(
+        "/root/worker",
+        "/root",
+        Vec::new(),
+        "pending mail",
+        true,
+    ));
+    let wait = WaitAgentTool::new(deps);
+
+    let zero = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(0),
+        },
+    )
+    .await
+    .expect_err("zero timeout must fail");
+    assert!(
+        format!("{zero:?}").contains("greater than zero"),
+        "unexpected error: {zero:?}"
+    );
+
+    let below_min = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(9_999),
         },
     )
     .await
-    .expect_err("timeout below codex v2 minimum must fail");
-    assert!(
-        format!("{too_small:?}").contains("at least 10000"),
-        "unexpected error: {too_small:?}"
-    );
+    .expect("positive timeout below configured minimum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&below_min.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
 
-    let too_large = run_handler(
+    let above_max = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(3_600_001),
         },
     )
     .await
-    .expect_err("timeout above codex v2 maximum must fail");
-    assert!(
-        format!("{too_large:?}").contains("at most 3600000"),
-        "unexpected error: {too_large:?}"
-    );
+    .expect("timeout above configured maximum should clamp");
+    let body: serde_json::Value = serde_json::from_str(&above_max.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
 }
 
 #[tokio::test]
@@ -867,15 +919,59 @@ async fn close_agent_marks_target_closed() {
 }
 
 #[tokio::test]
+async fn store_backed_close_agent_rejects_already_closed_child() {
+    let (_dir, store, _root_id, child_id, _sink, deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .close_child_agent(&child_id, "already closed")
+            .expect("close child");
+    }
+    let close = CloseAgentTool::new(deps);
+
+    let err = run_handler(
+        &close,
+        &CloseAgentRequest {
+            target: "worker".to_string(),
+        },
+    )
+    .await
+    .expect_err("closed child is no longer a live v2 close target");
+    assert!(
+        format!("{err:?}").contains("live agent path `worker` not found"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn store_thread_limit_ignores_terminal_child_edges() {
+    let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_child_agent_status(&child_id, "done")
+            .expect("mark child terminal");
+    }
+    deps.max_concurrent_threads_per_session = Some(1);
+    let spawn = SpawnAgentTool::new(deps);
+
+    let out = run_handler(&spawn, &spawn_args("next", "new task"))
+        .await
+        .expect("terminal persisted edge must not consume spawn capacity");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["task_name"].as_str(), Some("/root/next"));
+}
+
+#[tokio::test]
 async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
     let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    seed_child_run_config_marker(&store, &child_id);
     {
         let store = store.lock().unwrap();
         store
             .set_status(&child_id, SessionStatus::Done)
             .expect("child idle");
     }
-    seed_child_run_config_marker(&store, &child_id);
 
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_for_runner = Arc::clone(&captured);

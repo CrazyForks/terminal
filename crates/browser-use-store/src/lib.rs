@@ -1192,6 +1192,8 @@ fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> 
     match event_type {
         "session.input" => Some(SessionStatus::Running),
         "session.followup" => Some(SessionStatus::Running),
+        "agent.mailbox_input" => Some(SessionStatus::Running),
+        "agent.run.started" => Some(SessionStatus::Running),
         "session.done" => Some(SessionStatus::Done),
         "session.failed" => Some(SessionStatus::Failed),
         "session.cancelled" => Some(SessionStatus::Cancelled),
@@ -1324,6 +1326,41 @@ mod tests {
             store
                 .load_session(&session.id)?
                 .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_input_events_mark_session_running() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, "/tmp")?;
+        let child = store.create_child_session(
+            &parent.id,
+            "/tmp",
+            Some("/root/worker"),
+            Some("worker"),
+            Some("default"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.mailbox_input",
+            serde_json::json!({"content": "direct task"}),
+        )?;
+        assert_eq!(
+            store.load_session(&child.id)?.map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+
+        store.set_status(&child.id, SessionStatus::Created)?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({"run_id": "run-1"}),
+        )?;
+        assert_eq!(
+            store.load_session(&child.id)?.map(|session| session.status),
             Some(SessionStatus::Running)
         );
         Ok(())

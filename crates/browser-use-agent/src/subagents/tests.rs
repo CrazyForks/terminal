@@ -437,7 +437,6 @@ fn deserialize_model_style_args() {
         "agent_type": "worker",
         "model": "fast",
         "reasoning_effort": "high",
-        "service_tier": "priority",
         "fork_turns": "all"
     });
     let args = SpawnAgentArgs::from_value(value).expect("valid args");
@@ -445,6 +444,21 @@ fn deserialize_model_style_args() {
     assert_eq!(args.task_name, "do_thing");
     assert_eq!(args.role_name(), Some("worker"));
     assert_eq!(args.fork_turns_mode().unwrap(), ForkTurns::All);
+}
+
+#[test]
+fn deserialize_rejects_non_codex_v2_service_tier() {
+    let value = serde_json::json!({
+        "message": "do the thing",
+        "task_name": "do_thing",
+        "service_tier": "priority"
+    });
+
+    let err = SpawnAgentArgs::from_value(value).expect_err("service_tier is not a v2 argument");
+    assert!(
+        err.contains("unknown field") && err.contains("service_tier"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -477,6 +491,28 @@ async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
         )
         .await
         .expect_err("full-history fork must reject role/model/reasoning overrides");
+    assert!(
+        err.0.contains("Full-history forked agents inherit"),
+        "unexpected error: {}",
+        err.0
+    );
+}
+
+#[tokio::test]
+async fn omitted_fork_turns_with_agent_type_rejects_like_full_history_fork() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+    let args = SpawnAgentArgs::from_value(serde_json::json!({
+        "message": "inspect disk usage",
+        "task_name": "home_large_dirs",
+        "agent_type": "explorer"
+    }))
+    .expect("valid args");
+
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("omitted fork_turns defaults to full-history and must reject overrides");
     assert!(
         err.0.contains("Full-history forked agents inherit"),
         "unexpected error: {}",
@@ -539,6 +575,7 @@ fn tool_spec_has_codex_name_and_required_params() {
     assert!(required.iter().any(|v| v == "message"));
     // additionalProperties: false (deny extras at the schema level too).
     assert_eq!(spec["parameters"]["additionalProperties"], false);
+    assert!(spec["parameters"]["properties"]["service_tier"].is_null());
 }
 
 #[tokio::test]
@@ -563,7 +600,7 @@ async fn spawn_rejects_invalid_overrides() {
 }
 
 #[tokio::test]
-async fn spawn_validates_model_reasoning_and_service_tier_like_codex() {
+async fn spawn_validates_model_reasoning_and_internal_service_tier() {
     let spawner = Arc::new(RecordingSpawner::default());
     let manager = SubagentManager::with_config(
         spawner.clone(),

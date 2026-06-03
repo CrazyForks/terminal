@@ -979,16 +979,16 @@ fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -
                     }),
                 );
             }
-            let envelope = serde_json::json!({
-                "author": author_path,
-                "recipient": recipient_path,
-                "other_recipients": [],
-                "content": content,
-                "trigger_turn": trigger_turn,
-            });
+            let label = if trigger_turn {
+                "Direct task from parent"
+            } else {
+                "Inter-agent message"
+            };
             vec![Message::new(
-                MessageRole::Assistant,
-                vec![ContentPart::text(envelope.to_string())],
+                MessageRole::User,
+                vec![ContentPart::text(format!(
+                    "{label} {author_path} to you {recipient_path}:\n{content}"
+                ))],
             )]
         })
         .collect()
@@ -3707,16 +3707,14 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert!(!state.has_pending_input().await);
 
-        assert_eq!(drained[0].role, MessageRole::Assistant);
+        assert_eq!(drained[0].role, MessageRole::User);
         let ContentPart::Text { text } = &drained[0].content[0] else {
-            panic!("mailbox input should be a text envelope");
+            panic!("mailbox input should be direct task text");
         };
-        let envelope: serde_json::Value =
-            serde_json::from_str(text).expect("mailbox envelope json");
-        assert_eq!(envelope["author"], "/root/worker");
-        assert_eq!(envelope["recipient"], "/root");
-        assert_eq!(envelope["content"], "child update");
-        assert_eq!(envelope["trigger_turn"], false);
+        assert_eq!(
+            text,
+            "Inter-agent message /root/worker to you /root:\nchild update"
+        );
 
         let root_events = events(&store, &root_id);
         let mailbox_event = root_events

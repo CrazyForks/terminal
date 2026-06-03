@@ -1027,30 +1027,7 @@ fn committed_node_for_event(
                 ))
             }
         }
-        "collab_waiting_begin" => {
-            if has_later_root_event(events, event, "agent.wait.started") {
-                None
-            } else {
-                Some(subagent_lifecycle_node(
-                    app,
-                    event,
-                    "waiting",
-                    NodeStyle::Muted,
-                ))
-            }
-        }
-        "collab_waiting_end" => {
-            if has_later_root_event(events, event, "agent.wait.finished") {
-                None
-            } else {
-                Some(timeline_node(
-                    event,
-                    "subagent wait finished",
-                    Vec::new(),
-                    NodeStyle::Muted,
-                ))
-            }
-        }
+        "collab_waiting_begin" | "collab_waiting_end" => None,
         "collab_close_end" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1090,27 +1067,8 @@ fn committed_node_for_event(
             },
             NodeStyle::Muted,
         )),
-        "agent.wait.started" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "waiting",
-            NodeStyle::Muted,
-        )),
-        "agent.wait.finished" => Some(timeline_node(
-            event,
-            if event
-                .payload
-                .get("timed_out")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                "subagent wait timed out"
-            } else {
-                "subagent wait finished"
-            },
-            Vec::new(),
-            NodeStyle::Muted,
-        )),
+        "agent.wait.started" => None,
+        "agent.wait.finished" => agent_wait_finished_node(event),
         "agent.resumed" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -3510,6 +3468,23 @@ fn browser_event_label(event: &EventRecord) -> String {
     .to_string()
 }
 
+fn agent_wait_finished_node(event: &EventRecord) -> Option<TranscriptNode> {
+    if !event
+        .payload
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(timeline_node(
+        event,
+        "subagent wait timed out",
+        Vec::new(),
+        NodeStyle::Muted,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3528,6 +3503,41 @@ mod tests {
 
     fn filtered_seqs(events: &[EventRecord]) -> Vec<i64> {
         events.iter().map(|event| event.seq).collect()
+    }
+
+    #[test]
+    fn successful_agent_wait_finished_is_hidden_from_transcript() {
+        let event = EventRecord {
+            seq: 1,
+            id: "wait-finished".to_string(),
+            session_id: "s".to_string(),
+            ts_ms: 0,
+            event_type: "agent.wait.finished".to_string(),
+            payload: serde_json::json!({ "timed_out": false }),
+        };
+
+        assert!(agent_wait_finished_node(&event).is_none());
+    }
+
+    #[test]
+    fn timed_out_agent_wait_finished_stays_visible() {
+        let event = EventRecord {
+            seq: 1,
+            id: "wait-timeout".to_string(),
+            session_id: "s".to_string(),
+            ts_ms: 0,
+            event_type: "agent.wait.finished".to_string(),
+            payload: serde_json::json!({ "timed_out": true }),
+        };
+
+        let node = agent_wait_finished_node(&event).expect("timeout should render");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("subagent wait timed out"), "{text}");
     }
 
     // The cache's extend path must produce exactly what a full rebuild would,
@@ -3607,7 +3617,11 @@ mod tests {
         cache.with_filtered("s", &raw, |events| black_box(events.len()));
         let t = Instant::now();
         for i in 0..reps {
-            raw.push(ev(raw.last().unwrap().seq + 1, "model.turn.response", &body));
+            raw.push(ev(
+                raw.last().unwrap().seq + 1,
+                "model.turn.response",
+                &body,
+            ));
             cache.with_filtered("s", &raw, |events| black_box(events.len()));
             black_box(i);
         }
