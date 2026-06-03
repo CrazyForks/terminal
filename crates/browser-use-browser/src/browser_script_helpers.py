@@ -4210,6 +4210,153 @@ def click_button(label_or_text, timeout=3.0):
     }
 
 
+def overlay_actions_snapshot(limit=20):
+    """Return likely cookie/privacy/modal overlay actions with text and rects."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 20
+    limit_int = max(1, min(limit_int, 100))
+    expression = f"""
+(() => {{
+  // __OVERLAY_ACTIONS_SNAPSHOT__
+  const clean = (text, max = 220) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['aria-label', 'title', 'data-testid', 'data-test', 'name']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const textFor = el => clean([el.innerText || '', el.value || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.id || ''].filter(Boolean).join(' '));
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' &&
+      r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth;
+  }};
+  const overlayFor = el => {{
+    for (let node = el; node && node !== document.body; node = node.parentElement) {{
+      const r = node.getBoundingClientRect(), s = getComputedStyle(node);
+      const hay = clean(`${{node.id}} ${{node.className}} ${{node.getAttribute('role') || ''}} ${{node.getAttribute('aria-label') || ''}} ${{node.innerText || ''}}`, 900).toLowerCase();
+      if (s.position === 'fixed' || s.position === 'sticky' || node.getAttribute('role') === 'dialog' || /(cookie|consent|privacy|gdpr|modal|dialog|popup|banner)/i.test(hay)) {{
+        return {{
+          text: clean(node.innerText || '', 500),
+          role: node.getAttribute('role') || '',
+          z: Number(s.zIndex) || 0,
+          rect: {{x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}},
+        }};
+      }}
+    }}
+    return null;
+  }};
+  const out = [];
+  const nodes = Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"],a[href],[role="button"],[aria-label],[title]')).filter(visible);
+  for (const el of nodes) {{
+    const overlay = overlayFor(el);
+    const text = textFor(el);
+    const hay = `${{text}} ${{overlay ? overlay.text : ''}}`.toLowerCase();
+    let score = 0;
+    if (overlay) score += 40;
+    if (/accept all|accept cookies|allow all|i agree|agree|ok|got it|continue|reject all|decline|necessary only|close|dismiss|×|x/i.test(text)) score += 80;
+    if (/cookie|consent|privacy|gdpr|modal|dialog|popup|banner/i.test(hay)) score += 40;
+    if (!score) continue;
+    const r = el.getBoundingClientRect();
+    out.push({{
+      selector: selectorFor(el),
+      tag: el.tagName.toLowerCase(),
+      text,
+      score,
+      overlay,
+      rect: {{
+        x: Math.round(r.x), y: Math.round(r.y),
+        width: Math.round(r.width), height: Math.round(r.height),
+        in_viewport: true,
+      }},
+      center: {{x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)}},
+    }});
+  }}
+  return out.sort((a, b) => b.score - a.score).slice(0, {limit_int});
+}})()
+"""
+    actions = js(expression) or []
+    return {"count": len(actions), "actions": actions}
+
+
+def dismiss_overlay(prefer="accept", timeout=1.0):
+    """Click a likely cookie/privacy/modal action by preference using real mouse events."""
+    pref = str(prefer or "accept").strip().lower()
+    expression = f"""
+(() => {{
+  // __DISMISS_OVERLAY__
+  const pref = {json.dumps(pref)};
+  const clean = (text, max = 220) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['aria-label', 'title', 'data-testid', 'data-test', 'name']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return '';
+  }};
+  const textFor = el => clean([el.innerText || '', el.value || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.id || ''].filter(Boolean).join(' '));
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' &&
+      r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth;
+  }};
+  const hasOverlayAncestor = el => {{
+    for (let node = el; node && node !== document.body; node = node.parentElement) {{
+      const s = getComputedStyle(node);
+      const hay = clean(`${{node.id}} ${{node.className}} ${{node.getAttribute('role') || ''}} ${{node.getAttribute('aria-label') || ''}} ${{node.innerText || ''}}`, 900).toLowerCase();
+      if (s.position === 'fixed' || s.position === 'sticky' || node.getAttribute('role') === 'dialog' || /(cookie|consent|privacy|gdpr|modal|dialog|popup|banner)/i.test(hay)) return true;
+    }}
+    return false;
+  }};
+  const prefRe = pref.startsWith('reject') || pref.startsWith('decline')
+    ? /reject all|reject|decline|necessary only|essential only/i
+    : pref.startsWith('close') || pref.startsWith('dismiss')
+      ? /close|dismiss|×|^x$/i
+      : /accept all|accept cookies|allow all|i agree|agree|ok|got it|continue/i;
+  let best = null, bestScore = -1, bestText = '';
+  for (const el of document.querySelectorAll('button,input[type="button"],input[type="submit"],a[href],[role="button"],[aria-label],[title]')) {{
+    if (!visible(el)) continue;
+    const text = textFor(el), hay = text.toLowerCase();
+    let score = 0;
+    if (hasOverlayAncestor(el)) score += 40;
+    if (prefRe.test(text)) score += 120;
+    if (/cookie|consent|privacy|gdpr/.test(hay)) score += 20;
+    if (/modal|dialog|popup|banner/.test(hay)) score += 10;
+    if (score > bestScore) {{ best = el; bestScore = score; bestText = text; }}
+  }}
+  if (!best || bestScore <= 0) return null;
+  const r = best.getBoundingClientRect();
+  return {{
+    selector: selectorFor(best),
+    matched_text: bestText,
+    score: bestScore,
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+  }};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        actions = overlay_actions_snapshot(limit=20)
+        raise RuntimeError(f"dismiss_overlay: no likely overlay action matched prefer={prefer!r}; actions={actions}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(max(float(timeout), 0.0), 2.0))
+    return {
+        "clicked": True,
+        "selector": match.get("selector", ""),
+        "matched_text": match.get("matched_text", ""),
+        "score": match.get("score"),
+        "x": match.get("x"),
+        "y": match.get("y"),
+    }
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
