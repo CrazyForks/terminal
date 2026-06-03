@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from llm_browser_worker import worker
@@ -386,6 +387,73 @@ def test_worker_cdp_applies_browser_download_behavior_env(tmp_path: Path, monkey
     assert result == {"method": "Browser.setDownloadBehavior"}
     assert admin.ensure_calls == 3
     assert calls == [("Browser.setDownloadBehavior", None, {"behavior": "allowAndName"})]
+
+
+def test_worker_cdp_applies_browser_storage_state_env(monkeypatch) -> None:
+    calls = []
+    cookie = {"name": "sid", "value": "secret", "domain": ".example.com", "path": "/"}
+    monkeypatch.setenv(
+        "BU_BROWSER_STORAGE_STATE",
+        json.dumps(
+            {
+                "cookies": [cookie, {"name": "bad"}],
+                "origins": [
+                    {
+                        "origin": "https://example.com",
+                        "localStorage": [{"name": "theme", "value": "dark"}, {"name": 3}],
+                        "sessionStorage": [{"name": "step", "value": "one"}],
+                    }
+                ],
+            }
+        ),
+    )
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://example.com")
+
+    assert result == {"method": "Page.navigate"}
+    assert admin.ensure_calls == 1
+    assert calls[0] == ("Storage.setCookies", "target-1", {"cookies": [cookie]})
+    assert calls[1][0] == "Page.addScriptToEvaluateOnNewDocument"
+    assert calls[1][1] == "target-1"
+    assert calls[1][2]["runImmediately"] is True
+    script = calls[1][2]["source"]
+    assert 'window.location.origin === "https://example.com"' in script
+    assert 'window.localStorage.setItem("theme", "dark");' in script
+    assert 'window.sessionStorage.setItem("step", "one");' in script
+    assert calls[2] == ("Page.navigate", "target-1", {"url": "https://example.com"})
+
+    calls.clear()
+    result = helpers.cdp("Runtime.evaluate", session_id="target-1", expression="1")
+
+    assert result == {"method": "Runtime.evaluate"}
+    assert admin.ensure_calls == 2
+    assert calls == [("Runtime.evaluate", "target-1", {"expression": "1"})]
+
+    calls.clear()
+    result = helpers.cdp("Storage.setCookies", session_id="target-1", cookies=[])
+
+    assert result == {"method": "Storage.setCookies"}
+    assert admin.ensure_calls == 3
+    assert calls == [("Storage.setCookies", "target-1", {"cookies": []})]
 
 
 def test_worker_page_info_fallback_reads_target_url_and_title(

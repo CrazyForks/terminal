@@ -300,6 +300,122 @@ def _apply_browser_download_behavior(cdp: Any) -> None:
         cdp("Browser.setDownloadBehavior", **behavior)
 
 
+def _browser_storage_state_raw() -> str | None:
+    raw = os.environ.get("BU_BROWSER_STORAGE_STATE")
+    if not raw or not raw.strip():
+        return None
+    return raw
+
+
+def _browser_storage_state() -> dict[str, Any] | None:
+    raw = _browser_storage_state_raw()
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _browser_storage_cookies(storage_state: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_cookies = storage_state.get("cookies")
+    if not isinstance(raw_cookies, list):
+        return []
+    cookies: list[dict[str, Any]] = []
+    for cookie in raw_cookies:
+        if not isinstance(cookie, dict):
+            continue
+        if not isinstance(cookie.get("name"), str) or not isinstance(cookie.get("value"), str):
+            continue
+        cookies.append(cookie)
+    return cookies
+
+
+def _browser_storage_init_scripts(storage_state: dict[str, Any]) -> list[str]:
+    origins = storage_state.get("origins")
+    if not isinstance(origins, list):
+        return []
+    scripts: list[str] = []
+    for origin_state in origins:
+        if not isinstance(origin_state, dict):
+            continue
+        origin = origin_state.get("origin")
+        statements: list[str] = []
+        for storage_name in ("localStorage", "sessionStorage"):
+            items = origin_state.get(storage_name)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                value = item.get("value")
+                if not isinstance(name, str) or not isinstance(value, str):
+                    continue
+                statements.append(
+                    f"window.{storage_name}.setItem({json.dumps(name)}, {json.dumps(value)});"
+                )
+        if not statements:
+            continue
+        body = "\n".join(statements)
+        if isinstance(origin, str) and origin:
+            scripts.append(
+                "try {\n"
+                f"  if (window.location.origin === {json.dumps(origin)}) {{\n"
+                f"    {body}\n"
+                "  }\n"
+                "} catch (error) {}"
+            )
+        else:
+            scripts.append(f"try {{\n  {body}\n}} catch (error) {{}}")
+    return scripts
+
+
+def _apply_browser_storage_state(
+    cdp: Any,
+    session_id: Any = None,
+    applied: set[tuple[Any, ...]] | None = None,
+) -> None:
+    raw = _browser_storage_state_raw()
+    if raw is None:
+        return
+    storage_state = _browser_storage_state()
+    if not storage_state:
+        return
+
+    signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    cookies = _browser_storage_cookies(storage_state)
+    cookie_key = ("storage_cookies", signature)
+    if cookies and (applied is None or cookie_key not in applied):
+        try:
+            cdp("Storage.setCookies", session_id=session_id, cookies=cookies)
+        except Exception:
+            pass
+        else:
+            if applied is not None:
+                applied.add(cookie_key)
+
+    if session_id is None:
+        return
+    for index, script in enumerate(_browser_storage_init_scripts(storage_state)):
+        script_key = ("storage_script", str(session_id), signature, index)
+        if applied is not None and script_key in applied:
+            continue
+        try:
+            cdp(
+                "Page.addScriptToEvaluateOnNewDocument",
+                session_id=session_id,
+                source=script,
+                runImmediately=True,
+            )
+        except Exception:
+            pass
+        else:
+            if applied is not None:
+                applied.add(script_key)
+
+
 def _annotate_error(msg: str) -> str:
     for pattern, hint in _HINT_PATTERNS:
         if pattern.search(msg):
@@ -694,6 +810,7 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
     if getattr(helpers, "__llm_browser_cdp_patched__", False):
         return
     original_cdp = helpers.cdp
+    applied_browser_profile_state: set[tuple[Any, ...]] = set()
 
     def cdp_with_daemon(method: str, session_id: Any = None, **params: Any) -> Any:
         if _browser_mode() == "cloud":
@@ -704,6 +821,12 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
             _apply_browser_permissions(original_cdp)
         if method != "Browser.setDownloadBehavior":
             _apply_browser_download_behavior(original_cdp)
+        if method not in {"Storage.setCookies", "Page.addScriptToEvaluateOnNewDocument"}:
+            _apply_browser_storage_state(
+                original_cdp,
+                session_id=session_id,
+                applied=applied_browser_profile_state,
+            )
         if method != "Network.setUserAgentOverride":
             _apply_browser_user_agent_override(original_cdp, session_id=session_id)
         return original_cdp(method, session_id=session_id, **params)
