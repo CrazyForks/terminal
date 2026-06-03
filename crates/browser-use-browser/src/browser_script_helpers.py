@@ -3383,6 +3383,92 @@ def pricing_cards_snapshot(limit=50):
     }
 
 
+def _fanout_tasks_from_actions(prefix, actions, kind="item"):
+    tasks = []
+    for index, action in enumerate((actions or [])[:10]):
+        if not isinstance(action, dict):
+            continue
+        href = action.get("href") or action.get("url")
+        if not href:
+            continue
+        text = action.get("text") or action.get("item_text") or action.get("row_text") or ""
+        task_name = f"{prefix}_{index + 1}"
+        instruction = _fanout_instruction(kind, href)
+        tasks.append(
+            {
+                "task_name": task_name,
+                "url": href,
+                "item_text": text[:260],
+                "instruction": instruction,
+                "spawn_message": _fanout_spawn_message(index, href, text, instruction),
+            }
+        )
+    return tasks
+
+
+def _fanout_instruction(kind, href):
+    return (
+        f"Open this {kind} URL from the parent manifest, extract only the fields "
+        "requested by the parent task for this one target, and return a concise "
+        f"done(result=...) with the target name, URL, and extracted fields: {href}"
+    )
+
+
+def _fanout_spawn_message(index, href, text, instruction):
+    return (
+        f"Handle only manifest item {index + 1}: {(text or '')[:220] or href}. "
+        f"{instruction} Do not process sibling manifest items. If the page is blocked "
+        "or incomplete, return a concise partial result with the blocker and source URL."
+    )
+
+
+def _fanout_hint(kind):
+    return (
+        "Use fanout_tasks as the child manifest: pass each task.spawn_message to "
+        f"spawn_agent for one {kind}, then wait_agent and assemble the final answer."
+    )
+
+
+def _ensure_fanout_spawn_messages(tasks, *, kind):
+    if not isinstance(tasks, list):
+        return tasks
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        href = task.get("url") or task.get("href")
+        if not href:
+            continue
+        text = task.get("item_text") or task.get("text") or task.get("row_text") or task.get("task_name") or ""
+        if not task.get("instruction"):
+            task["instruction"] = _fanout_instruction(kind, href)
+        if not task.get("spawn_message"):
+            task["spawn_message"] = _fanout_spawn_message(index, href, text, task["instruction"])
+    return tasks
+
+
+def _attach_fanout_tasks(data, *, prefix, kind):
+    if not isinstance(data, dict):
+        return data
+    _ensure_fanout_spawn_messages(data.get("fanout_tasks"), kind=kind)
+    if data.get("fanout_recommended") and not data.get("next_fanout_hint"):
+        data["next_fanout_hint"] = _fanout_hint(kind)
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return data
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("fanout_recommended"):
+            continue
+        if not candidate.get("fanout_tasks"):
+            actions = candidate.get("detail_actions") or candidate.get("detail_links") or []
+            candidate["fanout_tasks"] = _fanout_tasks_from_actions(prefix, actions, kind=kind)
+        else:
+            _ensure_fanout_spawn_messages(candidate.get("fanout_tasks"), kind=kind)
+        if data.get("fanout_recommended") and not data.get("fanout_tasks"):
+            data["fanout_tasks"] = candidate.get("fanout_tasks") or []
+        _ensure_fanout_spawn_messages(data.get("fanout_tasks"), kind=kind)
+    return data
+
+
 def rows_snapshot(limit=8):
     """Find row-like table/grid/list records and suggest row-scoped extraction.
 
@@ -3393,11 +3479,12 @@ def rows_snapshot(limit=8):
 (() => {{
  const clean=(t,m=260)=>(t||'').replace(/\\s+/g,' ').trim().slice(0,m),vis=e=>{{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>60&&r.height>12&&s.display!=='none'&&s.visibility!=='hidden'}},fileRe=/(pdf|docx?|xlsx?|zip|download|file|filing|attachment|exhibit|transmittal)/i;
  const choices=['tbody tr','tr','[role="row"]','[data-rowindex]','[aria-rowindex]','[class*="row"]','[class*="record"]','[class*="result"]','li'];
- const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[];for(const r of rows.slice(0,8)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;samples.push(clean(r.innerText||r.textContent))}}return {{selector,count:rows.length,action_count,file_action_count,score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
- const r=candidates[0]||null;return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,candidates:candidates.slice(0,{int(limit)})}};
+ const candidates=choices.map(selector=>{{const rows=[...document.querySelectorAll(selector)].filter(r=>vis(r)&&clean(r.innerText||r.textContent,800).length>12).slice(0,80);let action_count=0,file_action_count=0,samples=[],detail_actions=[];for(const r of rows.slice(0,10)){{const links=[...r.querySelectorAll('a[href]')],buttons=[...r.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')];action_count+=links.length+buttons.length;file_action_count+=links.filter(a=>fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)).length;for(const a of links){{if(a.href&&!detail_actions.some(x=>x.href===a.href))detail_actions.push({{text:clean([a.innerText||a.textContent||'',a.getAttribute('aria-label')||'',a.getAttribute('title')||''].filter(Boolean).join(' '),180),href:a.href,file_like:fileRe.test(`${{a.href}} ${{a.textContent}} ${{a.getAttribute('aria-label')||''}}`)}})}}samples.push(clean(r.innerText||r.textContent))}}const fanout_recommended=detail_actions.length>=5;return {{selector,count:rows.length,action_count,file_action_count,detail_action_count:detail_actions.length,detail_actions:detail_actions.slice(0,8),fanout_recommended,fanout_reason:fanout_recommended?`Found ${{detail_actions.length}} independent row/file actions across ${{rows.length}} row(s); spawn one helper per row/file instead of sequential document visits.`:'',score:rows.length*3+action_count*2+file_action_count*5,samples:samples.filter(Boolean).slice(0,4)}}}}).filter(c=>c.count&&c.action_count).sort((a,b)=>b.score-a.score||b.file_action_count-a.file_action_count);
+ const r=candidates[0]||null,fanoutRecommended=!!(r&&r.fanout_recommended);return {{recommended_action:r?'extract_grid_rows':null,recommended_selector:r?r.selector:null,next_extract_hint:r?`extract_grid_rows(selector=${{JSON.stringify(r.selector)}})`:null,fanout_recommended:fanoutRecommended,next_fanout_hint:fanoutRecommended?{_fanout_hint("row/file action")!r}:null,candidates:candidates.slice(0,{int(limit)})}};
 }})()
 """
-    return js(expression)
+    data = js(expression) or {}
+    return _attach_fanout_tasks(data, prefix="row", kind="row/file action")
 
 
 def extract_grid_rows(selector=None, limit=50, include_html=False):
@@ -3415,8 +3502,40 @@ def extract_grid_rows(selector=None, limit=50, include_html=False):
  return [...document.querySelectorAll(selector)].slice(0,limit).map((row,index)=>{{const heads=[...(row.closest('table')?.querySelectorAll('thead th,thead td')||[])].map(h=>clean(h.textContent,120)),raw=[...row.querySelectorAll(':scope>td,:scope>th,:scope>[role="cell"],:scope>[role="gridcell"],:scope>[data-label]')];const kids=raw.length?raw:[...row.children].slice(0,20),cells=kids.map((c,i)=>{{const header=clean(c.getAttribute('data-label')||c.getAttribute('aria-label')||heads[i]||'',160);return {{index:i,header,headers:header?[header]:[],text:clean(c.innerText||c.textContent,900),links:[...c.querySelectorAll('a[href]')].slice(0,6).map(link),buttons:[...c.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,6).map(button)}}}}).filter(c=>c.text||c.header||c.links.length||c.buttons.length),links=[...row.querySelectorAll('a[href]')].slice(0,16).map(link),buttons=[...row.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')].slice(0,16).map(button),file_actions=links.filter(l=>l.file_like),description_fields=cells.filter(c=>/(description|title|subject|name|document|file|requirement|summary)/i.test(c.header)).map(c=>({{header:c.header,text:c.text}})).slice(0,8),rec={{index,text:clean(row.innerText||row.textContent,1800),rect:rect(row),cells,description_fields,links,buttons,file_actions}};if(includeHtml)rec.html=clean(row.outerHTML,4000);return rec}});
 }})()
 """
-    records = js(expression)
-    return {"selector": selector, "count": len(records or []), "records": records or []}
+    records = js(expression) or []
+    detail_actions = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        row_text = record.get("text") or ""
+        for link in (record.get("file_actions") or record.get("links") or []):
+            if not isinstance(link, dict):
+                continue
+            href = link.get("href")
+            if not href or any(action.get("href") == href for action in detail_actions):
+                continue
+            detail_actions.append(
+                {
+                    "row_index": record.get("index"),
+                    "row_text": row_text[:240],
+                    "text": link.get("text") or "",
+                    "href": href,
+                    "file_like": bool(link.get("file_like")),
+                }
+            )
+    fanout_recommended = len(detail_actions) >= 5
+    return {
+        "selector": selector,
+        "count": len(records or []),
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": _fanout_hint("row/file action") if fanout_recommended else None,
+        "detail_action_count": len(detail_actions),
+        "detail_actions": detail_actions[:12],
+        "fanout_tasks": _fanout_tasks_from_actions("row", detail_actions, kind="row/file action")
+        if fanout_recommended
+        else [],
+        "records": records or [],
+    }
 
 
 def extract_paginated_grid_rows(
@@ -3527,6 +3646,7 @@ def extract_paginated_grid_rows(
                 }
             )
 
+    fanout_recommended = len(detail_actions) >= 5
     return {
         "selector": selector,
         "count": len(records),
@@ -3535,6 +3655,11 @@ def extract_paginated_grid_rows(
         "records": records,
         "detail_action_count": len(detail_actions),
         "detail_actions": detail_actions[:20],
+        "fanout_recommended": fanout_recommended,
+        "next_fanout_hint": _fanout_hint("paginated row/file action") if fanout_recommended else None,
+        "fanout_tasks": _fanout_tasks_from_actions("row", detail_actions, kind="paginated row/file action")
+        if fanout_recommended
+        else [],
         "diagnosis": diagnosis,
     }
 

@@ -9907,6 +9907,88 @@ print(json.dumps({"snapshot": snapshot, "rows": rows}, ensure_ascii=False))
     }
 
     #[test]
+    fn browser_script_grid_rows_builds_fanout_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-grid-row-fanout-manifests",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    if 'const selector="tbody tr"' in expression:
+        records = []
+        for row_index in range(2):
+            links = []
+            for offset in range(3):
+                file_index = row_index * 3 + offset + 1
+                links.append({
+                    "text": f"file-{file_index}.pdf",
+                    "href": f"https://example.test/file-{file_index}.pdf",
+                    "file_like": True,
+                })
+            records.append({
+                "index": row_index,
+                "text": f"Docket row {row_index + 1} " + " ".join(link["text"] for link in links),
+                "cells": [],
+                "description_fields": [{"header": "Description", "text": f"Row {row_index + 1} description"}],
+                "links": links,
+                "buttons": [],
+                "file_actions": links,
+            })
+        return records
+    assert "detail_actions" in expression
+    assert "fanout_reason" in expression
+    actions = [
+        {"text": f"file-{index}.pdf", "href": f"https://example.test/file-{index}.pdf", "file_like": True}
+        for index in range(1, 7)
+    ]
+    return {
+        "recommended_action": "extract_grid_rows",
+        "recommended_selector": "tbody tr",
+        "next_extract_hint": "extract_grid_rows(selector=\"tbody tr\")",
+        "fanout_recommended": True,
+        "candidates": [{
+            "selector": "tbody tr",
+            "count": 6,
+            "action_count": 6,
+            "file_action_count": 6,
+            "detail_action_count": 6,
+            "detail_actions": actions,
+            "fanout_recommended": True,
+            "samples": ["Docket row 1 file-1.pdf"],
+        }],
+    }
+
+snapshot = rows_snapshot()
+assert snapshot["fanout_recommended"] is True, snapshot
+assert "row/file action" in snapshot["next_fanout_hint"], snapshot
+assert len(snapshot["fanout_tasks"]) == 6, snapshot
+assert snapshot["fanout_tasks"][0]["task_name"] == "row_1", snapshot
+assert snapshot["fanout_tasks"][0]["url"] == "https://example.test/file-1.pdf", snapshot
+assert "Do not process sibling manifest items" in snapshot["fanout_tasks"][0]["spawn_message"], snapshot
+assert snapshot["candidates"][0]["fanout_tasks"][5]["url"] == "https://example.test/file-6.pdf", snapshot
+
+rows = extract_grid_rows("tbody tr")
+assert rows["selector"] == "tbody tr", rows
+assert rows["count"] == 2, rows
+assert rows["detail_action_count"] == 6, rows
+assert rows["fanout_recommended"] is True, rows
+assert "row/file action" in rows["next_fanout_hint"], rows
+assert len(rows["fanout_tasks"]) == 6, rows
+assert rows["fanout_tasks"][5]["task_name"] == "row_6", rows
+assert rows["fanout_tasks"][5]["url"] == "https://example.test/file-6.pdf", rows
+assert rows["detail_actions"][0]["row_index"] == 0, rows
+print("grid row fanout manifests ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("grid row fanout manifests ok"));
+    }
+
+    #[test]
     fn browser_script_extract_paginated_grid_rows_collects_pages() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -9960,6 +10042,9 @@ assert rows["records"][0]["page_index"] == 0, rows
 assert rows["records"][5]["page_index"] == 1, rows
 assert rows["detail_action_count"] == 6, rows
 assert rows["detail_actions"][5]["href"] == "https://example.test/file-6.pdf", rows
+assert rows["fanout_recommended"] is True, rows
+assert len(rows["fanout_tasks"]) == 6, rows
+assert rows["fanout_tasks"][5]["url"] == "https://example.test/file-6.pdf", rows
 assert clicks == [("next", 0), ("next", 0)], clicks
 assert network_idle_calls == [2.0], network_idle_calls
 assert "no next page" in rows["diagnosis"], rows
