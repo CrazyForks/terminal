@@ -8325,6 +8325,81 @@ print("embedded_data_snapshot ok")
     }
 
     #[test]
+    fn browser_script_investor_documents_snapshot_classifies_visible_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-investor-documents-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    for needle in [
+        "__INVESTOR_DOCUMENTS_SNAPSHOT__",
+        "earnings_release",
+        "financial_supplement",
+        "investor_presentation",
+        "earnings_call_transcript",
+        "periodTokens",
+        "published_on",
+        "latestOnly",
+    ]:
+        assert needle in expression, needle
+    return {
+        "url": "https://investor.example.test/results",
+        "title": "Investor documents",
+        "documents": [
+            {
+                "title": "Q4 FY2025 earnings release",
+                "url": "https://investor.example.test/q4-fy2025-earnings-release.pdf",
+                "type": "earnings_release",
+                "published_on": "2026-03-02",
+                "extension": "pdf",
+                "period_tokens": ["q4", "fy2025"],
+                "keyword_matches": ["earnings"],
+                "context": "Q4 FY2025 earnings release March 2, 2026",
+                "score": 120,
+            },
+            {
+                "title": "Q4 FY2025 financial supplement",
+                "url": "https://investor.example.test/q4-fy2025-supplement.xlsx",
+                "type": "financial_supplement",
+                "published_on": "2026-03-02",
+                "extension": "xlsx",
+                "period_tokens": ["q4", "fy2025"],
+                "keyword_matches": ["supplement"],
+                "context": "Q4 FY2025 financial supplement",
+                "score": 110,
+            },
+        ],
+        "keywords": ["earnings", "supplement"],
+        "latest_only": True,
+    }
+
+snapshot = investor_documents_snapshot(limit=10, keywords=["earnings", "supplement"], latest_only=True)
+assert snapshot["count"] == 2, snapshot
+assert snapshot["latest_only"] is True, snapshot
+assert snapshot["documents"][0]["type"] == "earnings_release", snapshot
+assert snapshot["documents"][0]["published_on"] == "2026-03-02", snapshot
+assert snapshot["documents"][1]["extension"] == "xlsx", snapshot
+assert "fy2025" in snapshot["documents"][1]["period_tokens"], snapshot
+assert snapshot["keywords"] == ["earnings", "supplement"], snapshot
+assert snapshot["document_action_count"] == 2, snapshot
+assert "fanout_tasks" not in snapshot, snapshot
+assert len(calls) == 1
+print("investor_documents_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("investor_documents_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_read_document_text_extracts_common_document_formats() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
