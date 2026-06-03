@@ -2292,6 +2292,127 @@ def contact_details_snapshot(limit=50):
     return data
 
 
+def location_records_snapshot(limit=200, keywords=None):
+    """Return normalized visible/structured store, hospital, office, and directory location records."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 200
+    limit_int = max(1, min(limit_int, 500))
+    raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])
+    keyword_list = [str(keyword).strip().lower() for keyword in raw_keywords if str(keyword).strip()]
+    expression = f"""
+(() => {{
+  // __LOCATION_RECORDS_SNAPSHOT__
+  const limit = {limit_int};
+  const keywords = {json.dumps(keyword_list)};
+  const clean = (value, max = 500) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const abs = value => {{ try {{ return value ? new URL(value, location.href).href : ''; }} catch (e) {{ return ''; }} }};
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+  }};
+  const stateRe = /\\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY|DC)\\b/;
+  const phoneRe = /(?:\\+?1[\\s.-]?)?\\(?\\d{{3}}\\)?[\\s.-]?\\d{{3}}[\\s.-]?\\d{{4}}/;
+  const zipRe = /\\b\\d{{5}}(?:-\\d{{4}})?\\b/;
+  const records = [], seen = new Set();
+  const scoreText = text => keywords.reduce((score, keyword) => score + (text.toLowerCase().includes(keyword) ? 25 : 0), 0);
+  const normAddr = address => !address ? '' :
+    typeof address === 'string' ? clean(address, 300) :
+    typeof address === 'object' ? clean([address.streetAddress, address.addressLocality, address.addressRegion, address.postalCode, address.addressCountry].filter(Boolean).join(', '), 300) : '';
+  const add = raw => {{
+    const name = clean(raw.name, 240);
+    const address = clean(raw.address, 300);
+    const url = abs(raw.url || '');
+    if (!name && !address) return;
+    const key = (name + '|' + address + '|' + url).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const text = clean([name, address, raw.phone, raw.hours, raw.kind, raw.source].join(' '), 900);
+    const stateMatch = address.match(stateRe) || text.match(stateRe);
+    records.push({{
+      source: clean(raw.source || '', 80),
+      kind: clean(raw.kind || '', 80),
+      name,
+      address,
+      city: clean(raw.city || '', 120),
+      state: clean(raw.state || raw.region || (stateMatch ? stateMatch[1] : ''), 40),
+      postal_code: clean(raw.postal_code || '', 40),
+      country: clean(raw.country || '', 80),
+      phone: clean(raw.phone || '', 80),
+      url,
+      hours: clean(raw.hours || '', 500),
+      text,
+      score: (name ? 30 : 0) + (address ? 50 : 0) + (url ? 10 : 0) + (raw.phone ? 10 : 0) + scoreText(text),
+    }});
+  }};
+  const visit = value => {{
+    if (!value) return;
+    if (Array.isArray(value)) {{ for (const item of value) visit(item); return; }}
+    if (typeof value !== 'object') return;
+    const type = Array.isArray(value['@type']) ? value['@type'].join(' ') : String(value['@type'] || '');
+    if (/LocalBusiness|Store|Hospital|VeterinaryCare|MedicalBusiness|Organization|Place|LodgingBusiness|Restaurant|AutoDealer/i.test(type) || value.address) {{
+      const address = value.address || {{}};
+      add({{
+        source: 'json_ld',
+        kind: type,
+        name: value.name || value.legalName || '',
+        address: normAddr(address),
+        city: address.addressLocality || '',
+        state: address.addressRegion || '',
+        postal_code: address.postalCode || '',
+        country: address.addressCountry || '',
+        phone: value.telephone || value.phone || '',
+        url: value.url || '',
+      }});
+    }}
+    for (const child of Object.values(value)) if (child && typeof child === 'object') visit(child);
+  }};
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {{
+    try {{ visit(JSON.parse(script.textContent || '')); }} catch (e) {{}}
+  }}
+  const selectors = [
+    'article', 'li', 'section',
+    '[itemtype*="LocalBusiness"]', '[itemtype*="PostalAddress"]', '[itemtype*="Place"]',
+    '[class*="store" i]', '[class*="location" i]', '[class*="hospital" i]', '[class*="clinic" i]', '[class*="directory" i]',
+    '[data-testid*="store" i]', '[data-testid*="location" i]'
+  ].join(',');
+  for (const el of Array.from(document.querySelectorAll(selectors)).filter(visible).slice(0, limit * 6)) {{
+    const text = clean(el.innerText || el.textContent || '', 900);
+    if (text.length < 8) continue;
+    const hay = (text + ' ' + (el.className || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase();
+    if (!/@|address|hours?|phone|tel|store|location|hospital|clinic|practice|\\d{{5}}|\\b[A-Z]{{2}}\\b/.test(text) && !/store|location|hospital|clinic|practice|directory/.test(hay)) continue;
+    const link = el.querySelector('a[href]');
+    const phone = (text.match(phoneRe) || [''])[0];
+    const lines = text.split(/\\n+/).map(line => clean(line, 180)).filter(Boolean);
+    let name = clean(el.querySelector('h1,h2,h3,h4,[itemprop="name"],[class*="name" i],[class*="title" i]')?.innerText || lines[0] || '', 180);
+    let address = '';
+    const addressEl = el.querySelector('address,[itemprop="address"],[class*="address" i]');
+    if (addressEl) address = clean(addressEl.innerText || addressEl.textContent, 300);
+    if (!address) {{
+      const index = lines.findIndex(line => zipRe.test(line) || stateRe.test(line));
+      if (index >= 0) address = clean(lines.slice(Math.max(0, index - 2), index + 1).join(', '), 300);
+    }}
+    if (!address && text.length < 300 && /\\d{{2,}}/.test(text) && stateRe.test(text)) address = text;
+    const hours = clean(lines.filter(line => /\\b(mon|tue|wed|thu|fri|sat|sun|hours?|open|closed)\\b/i.test(line)).slice(0, 7).join('; '), 500);
+    add({{source: 'visible_dom', kind: 'location_card', name, address, phone, url: link ? link.href : '', hours}});
+  }}
+  records.sort((a, b) => b.score - a.score);
+  return {{url: location.href, title: document.title || '', count: records.length, records: records.slice(0, limit), keywords}};
+}})()
+"""
+    try:
+        data = js(expression) or {}
+    except Exception as exc:
+        return {"url": "", "title": "", "count": 0, "records": [], "keywords": keyword_list, "error": str(exc)}
+    if not isinstance(data, dict):
+        return {"url": "", "title": "", "count": 0, "records": [], "keywords": keyword_list, "raw": data}
+    data.setdefault("records", [])
+    data["count"] = len(data.get("records") or [])
+    data.setdefault("keywords", keyword_list)
+    return data
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])

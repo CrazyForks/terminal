@@ -8588,6 +8588,66 @@ print("contact_details_snapshot ok")
     }
 
     #[test]
+    fn browser_script_location_records_snapshot_normalizes_directory_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-location-records-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "__LOCATION_RECORDS_SNAPSHOT__" in expression
+    assert "application/ld+json" in expression
+    assert "LocalBusiness" in expression
+    assert "VeterinaryCare" in expression
+    assert "location_card" in expression
+    assert "general practice" in expression
+    return {
+        "url": "https://example.test/locations",
+        "title": "Locations",
+        "records": [
+            {
+                "source": "json_ld",
+                "kind": "VeterinaryCare",
+                "name": "Example Animal Hospital",
+                "address": "123 Market St, San Francisco, CA 94103",
+                "city": "San Francisco",
+                "state": "CA",
+                "postal_code": "94103",
+                "country": "US",
+                "phone": "+1 415 555 0101",
+                "url": "https://example.test/locations/sf",
+                "hours": "Mon-Fri 8-5",
+                "text": "Example Animal Hospital 123 Market St San Francisco CA",
+                "score": 110,
+            }
+        ],
+        "keywords": ["general practice"],
+    }
+
+snapshot = location_records_snapshot(limit=20, keywords=["general practice"])
+assert snapshot["count"] == 1, snapshot
+record = snapshot["records"][0]
+assert record["name"] == "Example Animal Hospital", record
+assert record["address"].startswith("123 Market"), record
+assert record["state"] == "CA", record
+assert record["url"].endswith("/sf"), record
+assert snapshot["keywords"] == ["general practice"], snapshot
+assert len(calls) == 1, calls
+print("location_records_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("location_records_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
