@@ -892,6 +892,9 @@ struct App {
     /// changed — never on every keystroke.
     last_followup_check_session: Option<String>,
     modal_background: Option<ModalBackgroundSnapshot>,
+    /// On-screen placement of the live-view URL, recorded during render and
+    /// painted as an OSC-8 hyperlink right after the frame is flushed.
+    live_link_overlay: std::cell::RefCell<Option<render::LiveLinkOverlay>>,
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
@@ -1785,6 +1788,7 @@ impl App {
             transcript_filtered_cache: transcript::FilteredEventCache::default(),
             last_followup_check_session: None,
             modal_background: None,
+            live_link_overlay: std::cell::RefCell::new(None),
             args,
             selected_session_id,
             composer: Composer::default(),
@@ -2928,8 +2932,11 @@ impl App {
     /// Sets `pending_auth_resume` so the next successful auth automatically
     /// starts the agent for this session.
     fn inject_no_key_nudge(&mut self, submission: UserSubmission) -> Result<()> {
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history.
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -3106,8 +3113,11 @@ impl App {
         if !self.ensure_agent_ready_for_selection(&selection)? {
             return Ok(());
         }
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history.
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
@@ -6996,6 +7006,7 @@ impl TerminalDriver {
         }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
+        draw_live_link_overlay(self.terminal.backend_mut(), app)?;
         if let Some(overlay) = manual_overlay.as_ref() {
             draw_manual_modal_overlay(self.terminal.backend_mut(), overlay)?;
         }
@@ -7138,6 +7149,43 @@ fn clear_manual_modal_overlay_rect(
         }
     }
     queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
+    target.flush()?;
+    Ok(())
+}
+
+/// OSC-8 hyperlink wrapper: `<open>text<close>`. The visible glyphs in `text`
+/// are reprinted between the open/close so the terminal tags exactly those
+/// cells with `url` as the click target.
+fn live_link_osc8(url: &str, text: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// Paint the live-view URL as a clickable OSC-8 hyperlink directly onto the
+/// terminal after the frame has been flushed. ratatui drew the visible
+/// (truncated) text already; here we reprint just those glyphs wrapped in the
+/// hyperlink escapes so the full URL becomes the click target. Done post-draw
+/// to avoid corrupting ratatui's cell-width diff (see `LiveLinkOverlay`).
+fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) -> Result<()> {
+    let overlay = app.live_link_overlay.borrow();
+    let Some(link) = overlay.as_ref() else {
+        return Ok(());
+    };
+    if link.text.is_empty() {
+        return Ok(());
+    }
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((0, 0));
+    if link.row >= term_h || link.col >= term_w {
+        return Ok(());
+    }
+    queue!(
+        target,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
+        MoveTo(link.col, link.row),
+        Print(live_link_osc8(&link.url, &link.text)),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+    )?;
     target.flush()?;
     Ok(())
 }
@@ -12083,6 +12131,18 @@ wire_api = "responses"
         assert!(!text.contains("• answer draft"));
         assert!(!text.contains("Live draft chunk"));
         Ok(())
+    }
+
+    #[test]
+    fn live_link_osc8_binds_full_url_to_truncated_text() {
+        // The visible text is truncated, but the OSC-8 target is the full URL
+        // (including the CDP endpoint that the status line couldn't fit).
+        let full = "https://live.browser-use.com/?wss=wss%3A%2F%2Fcdp";
+        let shown = "https://live.browser-...";
+        assert_eq!(
+            live_link_osc8(full, shown),
+            format!("\x1b]8;;{full}\x1b\\{shown}\x1b]8;;\x1b\\")
+        );
     }
 
     #[test]
