@@ -1,0 +1,4330 @@
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use browser_use_protocol::{EventRecord, SessionMeta};
+use browser_use_store::{AgentSummary, Store};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("agent limit reached: limit {limit}, open spawned agents {open_spawned_agents}")]
+    AgentLimitReached {
+        limit: usize,
+        open_spawned_agents: usize,
+    },
+    #[error("browser already in use: browser {browser_id}, active agent {active_agent_id}")]
+    BrowserAlreadyInUse {
+        browser_id: String,
+        active_agent_id: String,
+    },
+    #[error("unknown browser: {0}")]
+    UnknownBrowser(String),
+    #[error("browser lease mismatch: browser {browser_id}, owner {owner_agent_id:?}, caller {caller_agent_id}")]
+    BrowserLeaseMismatch {
+        browser_id: String,
+        owner_agent_id: Option<String>,
+        caller_agent_id: String,
+    },
+    #[error("unknown agent: {0}")]
+    UnknownAgent(String),
+    #[error("agent is missing a parent: {0}")]
+    MissingParentAgent(String),
+    #[error("queued spawn not found: {0}")]
+    QueuedSpawnNotFound(String),
+}
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4().simple().to_string())
+            }
+
+            pub fn from_string(value: impl Into<String>) -> Result<Self> {
+                let value = value.into();
+                if value.trim().is_empty() {
+                    bail!(concat!(stringify!($name), " must not be empty"));
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+id_type!(AgentId);
+id_type!(BrowserId);
+id_type!(EventId);
+id_type!(RootId);
+id_type!(RunId);
+id_type!(SessionId);
+id_type!(ToolCallId);
+id_type!(TurnId);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Durability {
+    Barrier,
+    BestEffort,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeEventKind {
+    RuntimeStarted,
+    RuntimeShutdown,
+    AgentCreated,
+    AgentStarted,
+    AgentQueued,
+    AgentResumed,
+    AgentCompleted,
+    AgentFailed,
+    AgentCancelRequested,
+    AgentCancelled,
+    AgentClosed,
+    AgentContinuationStarted,
+    AgentTurnStarted,
+    AgentTurnCompleted,
+    AgentTurnAborted,
+    SubagentSpawnRequested,
+    SubagentSpawnStarted,
+    SubagentSpawnQueued,
+    SubagentSpawnRejected,
+    SubagentSpawnCompleted,
+    MailboxEnqueued,
+    MailboxDelivered,
+    MailboxConsumed,
+    WaitAgentStarted,
+    WaitAgentCompleted,
+    WaitAgentTimedOut,
+    BrowserCreated,
+    BrowserStarted,
+    BrowserClaimed,
+    BrowserReleased,
+    BrowserClosed,
+    BrowserScriptStarted,
+    BrowserScriptOutputDelta,
+    BrowserScriptCompleted,
+    BrowserScriptCancelled,
+    ExecCommandBegin,
+    ExecCommandOutputDelta,
+    ExecCommandEnd,
+    PythonStarted,
+    PythonOutputDelta,
+    PythonCompleted,
+    McpConnected,
+    McpToolStarted,
+    McpToolCompleted,
+    ArtifactCreated,
+    ToolOutputDelta,
+    ToolCompleted,
+    ToolFailed,
+    StoreEventAppended,
+    ResourceLost,
+}
+
+impl RuntimeEventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RuntimeStarted => "runtime.started",
+            Self::RuntimeShutdown => "runtime.shutdown",
+            Self::AgentCreated => "agent.created",
+            Self::AgentStarted => "agent.started",
+            Self::AgentQueued => "agent.queued",
+            Self::AgentResumed => "agent.resumed",
+            Self::AgentCompleted => "agent.completed",
+            Self::AgentFailed => "agent.failed",
+            Self::AgentCancelRequested => "agent.cancel_requested",
+            Self::AgentCancelled => "agent.cancelled",
+            Self::AgentClosed => "agent.closed",
+            Self::AgentContinuationStarted => "agent.continuation_started",
+            Self::AgentTurnStarted => "agent.turn.started",
+            Self::AgentTurnCompleted => "agent.turn.completed",
+            Self::AgentTurnAborted => "agent.turn.aborted",
+            Self::SubagentSpawnRequested => "subagent.spawn_requested",
+            Self::SubagentSpawnStarted => "subagent.spawn_started",
+            Self::SubagentSpawnQueued => "subagent.spawn_queued",
+            Self::SubagentSpawnRejected => "subagent.spawn_rejected",
+            Self::SubagentSpawnCompleted => "subagent.spawn_completed",
+            Self::MailboxEnqueued => "mailbox.enqueued",
+            Self::MailboxDelivered => "mailbox.delivered",
+            Self::MailboxConsumed => "mailbox.consumed",
+            Self::WaitAgentStarted => "wait_agent.started",
+            Self::WaitAgentCompleted => "wait_agent.completed",
+            Self::WaitAgentTimedOut => "wait_agent.timed_out",
+            Self::BrowserCreated => "browser.created",
+            Self::BrowserStarted => "browser.started",
+            Self::BrowserClaimed => "browser.claimed",
+            Self::BrowserReleased => "browser.released",
+            Self::BrowserClosed => "browser.closed",
+            Self::BrowserScriptStarted => "browser.script.started",
+            Self::BrowserScriptOutputDelta => "browser.script.output_delta",
+            Self::BrowserScriptCompleted => "browser.script.completed",
+            Self::BrowserScriptCancelled => "browser.script.cancelled",
+            Self::ExecCommandBegin => "exec_command.begin",
+            Self::ExecCommandOutputDelta => "exec_command.output_delta",
+            Self::ExecCommandEnd => "exec_command.end",
+            Self::PythonStarted => "python.started",
+            Self::PythonOutputDelta => "python.output_delta",
+            Self::PythonCompleted => "python.completed",
+            Self::McpConnected => "mcp.connected",
+            Self::McpToolStarted => "mcp.tool.started",
+            Self::McpToolCompleted => "mcp.tool.completed",
+            Self::ArtifactCreated => "artifact.created",
+            Self::ToolOutputDelta => "tool.output_delta",
+            Self::ToolCompleted => "tool.completed",
+            Self::ToolFailed => "tool.failed",
+            Self::StoreEventAppended => "store.event.appended",
+            Self::ResourceLost => "resource.lost",
+        }
+    }
+
+    pub fn from_observed_event_type(event_type: &str) -> Self {
+        match event_type {
+            "exec_command.begin" => Self::ExecCommandBegin,
+            "exec_command.output_delta" => Self::ExecCommandOutputDelta,
+            "exec_command.end" => Self::ExecCommandEnd,
+            "browser_script.started" => Self::BrowserScriptStarted,
+            "browser_script.output_delta" => Self::BrowserScriptOutputDelta,
+            "browser_script.completed" => Self::BrowserScriptCompleted,
+            "browser_script.cancelled" => Self::BrowserScriptCancelled,
+            "python.started" => Self::PythonStarted,
+            "python.output_delta" => Self::PythonOutputDelta,
+            "python.completed" => Self::PythonCompleted,
+            "mcp.connected" => Self::McpConnected,
+            "mcp.tool.started" => Self::McpToolStarted,
+            "mcp.tool.completed" => Self::McpToolCompleted,
+            "artifact.created" => Self::ArtifactCreated,
+            "tool.output_delta" => Self::ToolOutputDelta,
+            "tool.completed" => Self::ToolCompleted,
+            "tool.failed" => Self::ToolFailed,
+            _ => Self::StoreEventAppended,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RuntimeEvent {
+    pub id: EventId,
+    pub ts_ms: i64,
+    pub durability: Durability,
+    pub kind: RuntimeEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<RootId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_id: Option<BrowserId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+impl RuntimeEvent {
+    pub fn new(kind: RuntimeEventKind, durability: Durability) -> Self {
+        Self {
+            id: EventId::new(),
+            ts_ms: now_ms(),
+            durability,
+            kind,
+            root_id: None,
+            agent_id: None,
+            session_id: None,
+            run_id: None,
+            browser_id: None,
+            turn_id: None,
+            tool_call_id: None,
+            payload: Value::Object(Default::default()),
+        }
+    }
+
+    pub fn with_session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    pub fn with_payload(mut self, payload: Value) -> Self {
+        self.payload = payload;
+        self
+    }
+
+    pub fn event_type(&self) -> &'static str {
+        self.kind.as_str()
+    }
+
+    pub fn journal_payload(&self) -> Value {
+        json!({
+            "runtime_event_id": self.id.as_str(),
+            "durability": self.durability,
+            "root_id": self.root_id.as_ref().map(|id| id.as_str()),
+            "agent_id": self.agent_id.as_ref().map(|id| id.as_str()),
+            "run_id": self.run_id.as_ref().map(|id| id.as_str()),
+            "browser_id": self.browser_id.as_ref().map(|id| id.as_str()),
+            "turn_id": self.turn_id.as_ref().map(|id| id.as_str()),
+            "tool_call_id": self.tool_call_id.as_ref().map(|id| id.as_str()),
+            "payload": self.payload,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JournalAppend {
+    pub seq: Option<i64>,
+    pub durability: Durability,
+}
+
+pub trait JournalSink: Send + Sync {
+    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend>;
+    fn append_session_event(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        payload: Value,
+        durability: Durability,
+    ) -> Result<JournalAppend>;
+    fn flush(&self) -> Result<()>;
+}
+
+pub trait JournalReader: Send + Sync {
+    fn load_session(&self, session_id: &SessionId) -> Result<Option<SessionMeta>>;
+    fn list_sessions(&self) -> Result<Vec<SessionMeta>>;
+    fn events_for_session(&self, session_id: &SessionId) -> Result<Vec<EventRecord>>;
+    fn events_after_seq(&self, session_id: &SessionId, after_seq: i64) -> Result<Vec<EventRecord>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateThreadRequest {
+    pub session_id: Option<SessionId>,
+    pub parent_session_id: Option<SessionId>,
+    pub cwd: PathBuf,
+    pub artifact_root: Option<PathBuf>,
+    pub agent_path: Option<String>,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+}
+
+pub trait LiveThreadPersistence: JournalReader + JournalSink {
+    fn create_thread(&self, request: CreateThreadRequest) -> Result<SessionMeta>;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnEdgeStatus {
+    Open,
+    Done,
+    Failed,
+    Closed,
+}
+
+impl SpawnEdgeStatus {
+    fn as_store_status(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Closed => "closed",
+        }
+    }
+
+    fn from_store_status(status: &str) -> Self {
+        match status {
+            "open" => Self::Open,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "closed" | "cancelled" => Self::Closed,
+            _ => Self::Open,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpawnEdge {
+    pub parent_session_id: SessionId,
+    pub child_session_id: SessionId,
+    pub status: SpawnEdgeStatus,
+    pub path: Option<String>,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+}
+
+pub trait StateIndex: Send + Sync {
+    fn open_spawn_edge(&self, edge: SpawnEdge) -> Result<()>;
+    fn finish_spawn_edge(
+        &self,
+        child_session_id: &SessionId,
+        status: SpawnEdgeStatus,
+    ) -> Result<()>;
+    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()>;
+    fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>>;
+    fn list_descendants(&self, root_session_id: &SessionId) -> Result<Vec<SpawnEdge>>;
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct BrowserConfig {
+    pub keep_alive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserStatus {
+    Created,
+    Started,
+    Claimed,
+    Released,
+    Closed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BrowserSnapshot {
+    pub id: BrowserId,
+    pub config: BrowserConfig,
+    pub status: BrowserStatus,
+    pub active_agent_id: Option<AgentId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserLease {
+    pub browser_id: BrowserId,
+    pub agent_id: AgentId,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserHandleState {
+    status: BrowserStatus,
+    active_agent_id: Option<AgentId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowserHandle {
+    id: BrowserId,
+    config: BrowserConfig,
+    state: Arc<Mutex<BrowserHandleState>>,
+}
+
+impl BrowserHandle {
+    fn new(id: BrowserId, config: BrowserConfig) -> Self {
+        Self {
+            id,
+            config,
+            state: Arc::new(Mutex::new(BrowserHandleState {
+                status: BrowserStatus::Created,
+                active_agent_id: None,
+            })),
+        }
+    }
+
+    pub fn id(&self) -> &BrowserId {
+        &self.id
+    }
+
+    pub fn snapshot(&self) -> BrowserSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BrowserSnapshot {
+            id: self.id.clone(),
+            config: self.config.clone(),
+            status: state.status.clone(),
+            active_agent_id: state.active_agent_id.clone(),
+        }
+    }
+
+    fn claim(&self, agent_id: AgentId) -> Result<BrowserLease> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active_agent_id) = state.active_agent_id.as_ref() {
+            if active_agent_id != &agent_id {
+                return Err(RuntimeError::BrowserAlreadyInUse {
+                    browser_id: self.id.as_str().to_string(),
+                    active_agent_id: active_agent_id.as_str().to_string(),
+                }
+                .into());
+            }
+        }
+        state.active_agent_id = Some(agent_id.clone());
+        state.status = BrowserStatus::Claimed;
+        Ok(BrowserLease {
+            browser_id: self.id.clone(),
+            agent_id,
+        })
+    }
+
+    fn release(&self, agent_id: &AgentId) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.active_agent_id.as_ref() {
+            Some(active_agent_id) if active_agent_id == agent_id => {
+                state.active_agent_id = None;
+                state.status = BrowserStatus::Released;
+                Ok(())
+            }
+            other => Err(RuntimeError::BrowserLeaseMismatch {
+                browser_id: self.id.as_str().to_string(),
+                owner_agent_id: other.map(|id| id.as_str().to_string()),
+                caller_agent_id: agent_id.as_str().to_string(),
+            }
+            .into()),
+        }
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active_agent_id) = state.active_agent_id.as_ref() {
+            bail!(
+                "browser {} is still claimed by agent {}",
+                self.id,
+                active_agent_id
+            );
+        }
+        state.status = BrowserStatus::Closed;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct BrowserManager {
+    browsers: Mutex<HashMap<BrowserId, BrowserHandle>>,
+}
+
+impl BrowserManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create_browser(&self, config: BrowserConfig) -> BrowserId {
+        let id = BrowserId::new();
+        let handle = BrowserHandle::new(id.clone(), config);
+        self.browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), handle);
+        id
+    }
+
+    pub fn snapshot(&self, browser_id: &BrowserId) -> Result<BrowserSnapshot> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        Ok(handle.snapshot())
+    }
+
+    pub fn claim_browser(&self, browser_id: &BrowserId, agent_id: AgentId) -> Result<BrowserLease> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        handle.claim(agent_id)
+    }
+
+    pub fn release_browser(&self, lease: &BrowserLease) -> Result<()> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(&lease.browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(lease.browser_id.as_str().to_string()))?;
+        handle.release(&lease.agent_id)
+    }
+
+    pub fn close_browser(&self, browser_id: &BrowserId) -> Result<()> {
+        let mut browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        handle.close()?;
+        browsers.remove(browser_id);
+        Ok(())
+    }
+
+    pub fn snapshots(&self) -> Vec<BrowserSnapshot> {
+        self.browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(BrowserHandle::snapshot)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityMode {
+    StrictReject,
+    Queue,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QueuedSpawn {
+    pub request_id: String,
+    pub child_agent_id: AgentId,
+    pub task_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SpawnAdmission {
+    Reserved(SpawnReservation),
+    Queued(QueuedSpawn),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SpawnReservation {
+    pub child_agent_id: AgentId,
+    pub open_spawned_agents: usize,
+    pub max_open_spawned_agents: usize,
+}
+
+#[derive(Debug)]
+struct SubagentSchedulerState {
+    open_spawned_agents: HashMap<AgentId, String>,
+    queued: VecDeque<QueuedSpawn>,
+}
+
+#[derive(Debug)]
+pub struct SubagentScheduler {
+    max_open_spawned_agents: usize,
+    capacity_mode: CapacityMode,
+    state: Mutex<SubagentSchedulerState>,
+}
+
+impl SubagentScheduler {
+    pub fn new(max_concurrent_threads_per_session: usize, capacity_mode: CapacityMode) -> Self {
+        Self {
+            max_open_spawned_agents: max_concurrent_threads_per_session.saturating_sub(1),
+            capacity_mode,
+            state: Mutex::new(SubagentSchedulerState {
+                open_spawned_agents: HashMap::new(),
+                queued: VecDeque::new(),
+            }),
+        }
+    }
+
+    pub fn admit_spawn(
+        &self,
+        child_agent_id: AgentId,
+        task_name: impl Into<String>,
+    ) -> Result<SpawnAdmission> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.open_spawned_agents.len() < self.max_open_spawned_agents {
+            let task_name = task_name.into();
+            state
+                .open_spawned_agents
+                .insert(child_agent_id.clone(), task_name);
+            return Ok(SpawnAdmission::Reserved(SpawnReservation {
+                child_agent_id,
+                open_spawned_agents: state.open_spawned_agents.len(),
+                max_open_spawned_agents: self.max_open_spawned_agents,
+            }));
+        }
+
+        match self.capacity_mode {
+            CapacityMode::StrictReject => Err(RuntimeError::AgentLimitReached {
+                limit: self.max_open_spawned_agents,
+                open_spawned_agents: state.open_spawned_agents.len(),
+            }
+            .into()),
+            CapacityMode::Queue => {
+                let queued = QueuedSpawn {
+                    request_id: Uuid::new_v4().simple().to_string(),
+                    child_agent_id,
+                    task_name: task_name.into(),
+                };
+                state.queued.push_back(queued.clone());
+                Ok(SpawnAdmission::Queued(queued))
+            }
+        }
+    }
+
+    pub fn close_spawned_agent(&self, child_agent_id: &AgentId) -> Option<SpawnReservation> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.open_spawned_agents.remove(child_agent_id)?;
+        if self.capacity_mode != CapacityMode::Queue {
+            return None;
+        }
+        let queued = state.queued.pop_front()?;
+        state
+            .open_spawned_agents
+            .insert(queued.child_agent_id.clone(), queued.task_name);
+        Some(SpawnReservation {
+            child_agent_id: queued.child_agent_id,
+            open_spawned_agents: state.open_spawned_agents.len(),
+            max_open_spawned_agents: self.max_open_spawned_agents,
+        })
+    }
+
+    pub fn open_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open_spawned_agents
+            .len()
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queued
+            .len()
+    }
+}
+
+#[derive(Default)]
+struct MemoryJournalState {
+    sessions: HashMap<String, SessionMeta>,
+    events: HashMap<String, Vec<EventRecord>>,
+    edges: HashMap<String, SpawnEdge>,
+    next_seq: i64,
+}
+
+#[derive(Clone, Default)]
+pub struct MemoryJournal {
+    inner: Arc<Mutex<MemoryJournalState>>,
+}
+
+impl MemoryJournal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl JournalSink for MemoryJournal {
+    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
+        let session_id = event
+            .session_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("memory journal runtime events require a session id for now"))?;
+        self.append_session_event(
+            session_id,
+            event.event_type(),
+            event.journal_payload(),
+            event.durability,
+        )
+    }
+
+    fn append_session_event(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        payload: Value,
+        durability: Durability,
+    ) -> Result<JournalAppend> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.sessions.contains_key(session_id.as_str()) {
+            bail!("unknown session id: {session_id}");
+        }
+        inner.next_seq = inner.next_seq.saturating_add(1);
+        let record = EventRecord {
+            seq: inner.next_seq,
+            id: Uuid::new_v4().simple().to_string(),
+            session_id: session_id.as_str().to_string(),
+            ts_ms: now_ms(),
+            event_type: event_type.to_string(),
+            payload,
+        };
+        inner
+            .events
+            .entry(session_id.as_str().to_string())
+            .or_default()
+            .push(record);
+        Ok(JournalAppend {
+            seq: Some(inner.next_seq),
+            durability,
+        })
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl JournalReader for MemoryJournal {
+    fn load_session(&self, session_id: &SessionId) -> Result<Option<SessionMeta>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(inner.sessions.get(session_id.as_str()).cloned())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(inner.sessions.values().cloned().collect())
+    }
+
+    fn events_for_session(&self, session_id: &SessionId) -> Result<Vec<EventRecord>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(inner
+            .events
+            .get(session_id.as_str())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn events_after_seq(&self, session_id: &SessionId, after_seq: i64) -> Result<Vec<EventRecord>> {
+        Ok(self
+            .events_for_session(session_id)?
+            .into_iter()
+            .filter(|event| event.seq > after_seq)
+            .collect())
+    }
+}
+
+impl LiveThreadPersistence for MemoryJournal {
+    fn create_thread(&self, request: CreateThreadRequest) -> Result<SessionMeta> {
+        let id = request.session_id.unwrap_or_default();
+        let now = now_ms();
+        let parent_session_id = request.parent_session_id.clone();
+        let artifact_root = request
+            .artifact_root
+            .unwrap_or_else(|| request.cwd.join("artifacts").join(id.as_str()));
+        let session = SessionMeta {
+            id: id.as_str().to_string(),
+            parent_id: parent_session_id.as_ref().map(|id| id.as_str().to_string()),
+            cwd: request.cwd.display().to_string(),
+            artifact_root: artifact_root.display().to_string(),
+            status: browser_use_protocol::SessionStatus::Created,
+            created_ms: now,
+            updated_ms: now,
+        };
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.sessions.contains_key(&session.id) {
+                bail!("session already exists: {}", session.id);
+            }
+            inner.sessions.insert(session.id.clone(), session.clone());
+            if let Some(parent_session_id) = parent_session_id {
+                inner.edges.insert(
+                    session.id.clone(),
+                    SpawnEdge {
+                        parent_session_id,
+                        child_session_id: id.clone(),
+                        status: SpawnEdgeStatus::Open,
+                        path: request.agent_path,
+                        nickname: request.nickname,
+                        role: request.role,
+                    },
+                );
+            }
+        }
+        let session_id = SessionId::from_string(session.id.clone())?;
+        self.append_session_event(
+            &session_id,
+            "session.created",
+            json!({}),
+            Durability::Barrier,
+        )?;
+        Ok(session)
+    }
+}
+
+impl StateIndex for MemoryJournal {
+    fn open_spawn_edge(&self, mut edge: SpawnEdge) -> Result<()> {
+        edge.status = SpawnEdgeStatus::Open;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .edges
+            .insert(edge.child_session_id.as_str().to_string(), edge);
+        Ok(())
+    }
+
+    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(edge) = inner.edges.get_mut(child_session_id.as_str()) {
+            edge.status = SpawnEdgeStatus::Closed;
+        }
+        Ok(())
+    }
+
+    fn finish_spawn_edge(
+        &self,
+        child_session_id: &SessionId,
+        status: SpawnEdgeStatus,
+    ) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(edge) = inner.edges.get_mut(child_session_id.as_str()) {
+            edge.status = status;
+        }
+        Ok(())
+    }
+
+    fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(inner
+            .edges
+            .values()
+            .filter(|edge| edge.parent_session_id == *parent_session_id)
+            .cloned()
+            .collect())
+    }
+
+    fn list_descendants(&self, root_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![root_session_id.clone()];
+        while let Some(parent) = frontier.pop() {
+            for edge in self.list_children(&parent)? {
+                frontier.push(edge.child_session_id.clone());
+                descendants.push(edge);
+            }
+        }
+        Ok(descendants)
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteJournal {
+    store: Arc<Mutex<Store>>,
+}
+
+impl SqliteJournal {
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            store: Arc::new(Mutex::new(Store::open(state_dir)?)),
+        })
+    }
+
+    pub fn from_store(store: Store) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    pub fn shared_store(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.store)
+    }
+}
+
+impl JournalSink for SqliteJournal {
+    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
+        let session_id = event.session_id.as_ref().context(
+            "sqlite journal runtime events require a session id until global events exist",
+        )?;
+        self.append_session_event(
+            session_id,
+            event.event_type(),
+            event.journal_payload(),
+            event.durability,
+        )
+    }
+
+    fn append_session_event(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        payload: Value,
+        durability: Durability,
+    ) -> Result<JournalAppend> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = store.append_event(session_id.as_str(), event_type, payload)?;
+        Ok(JournalAppend {
+            seq: Some(record.seq),
+            durability,
+        })
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl JournalReader for SqliteJournal {
+    fn load_session(&self, session_id: &SessionId) -> Result<Option<SessionMeta>> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.load_session(session_id.as_str())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.list_sessions()
+    }
+
+    fn events_for_session(&self, session_id: &SessionId) -> Result<Vec<EventRecord>> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.events_for_session(session_id.as_str())
+    }
+
+    fn events_after_seq(&self, session_id: &SessionId, after_seq: i64) -> Result<Vec<EventRecord>> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.events_after_seq(session_id.as_str(), after_seq)
+    }
+}
+
+impl LiveThreadPersistence for SqliteJournal {
+    fn create_thread(&self, request: CreateThreadRequest) -> Result<SessionMeta> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (
+            request.session_id,
+            request.parent_session_id,
+            request.artifact_root,
+        ) {
+            (None, None, None) => store.create_session(None, &request.cwd),
+            (None, Some(parent), None) => store.create_child_session(
+                parent.as_str(),
+                &request.cwd,
+                request.agent_path.as_deref(),
+                request.nickname.as_deref(),
+                request.role.as_deref(),
+            ),
+            (None, None, Some(artifact_root)) => {
+                store.create_session_with_artifact_root(None, &request.cwd, artifact_root)
+            }
+            (Some(child_id), Some(parent), None) => {
+                if let Some(existing) = store.load_session(child_id.as_str())? {
+                    return Ok(existing);
+                }
+                store.create_child_session_with_id(
+                    parent.as_str(),
+                    &request.cwd,
+                    request.agent_path.as_deref(),
+                    request.nickname.as_deref(),
+                    request.role.as_deref(),
+                    child_id.into_string(),
+                )
+            }
+            (Some(_), None, _) => {
+                bail!("sqlite journal cannot create caller-chosen root thread ids yet")
+            }
+            (Some(_), Some(_), Some(_)) => {
+                bail!("sqlite journal cannot create child thread with custom artifact root yet")
+            }
+            (None, Some(_), Some(_)) => {
+                bail!("sqlite journal cannot create child thread with custom artifact root yet")
+            }
+        }
+    }
+}
+
+impl StateIndex for SqliteJournal {
+    fn open_spawn_edge(&self, edge: SpawnEdge) -> Result<()> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store
+            .agent_summary_for_child(edge.child_session_id.as_str())?
+            .with_context(|| {
+                format!(
+                    "sqlite spawn edge must be created with its child thread: {}",
+                    edge.child_session_id
+                )
+            })?;
+        store.set_child_agent_status(edge.child_session_id.as_str(), "open")
+    }
+
+    fn close_spawn_edge(&self, child_session_id: &SessionId) -> Result<()> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_child_agent_status(child_session_id.as_str(), "closed")
+    }
+
+    fn finish_spawn_edge(
+        &self,
+        child_session_id: &SessionId,
+        status: SpawnEdgeStatus,
+    ) -> Result<()> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_child_agent_status(child_session_id.as_str(), status.as_store_status())
+    }
+
+    fn list_children(&self, parent_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store
+            .list_child_agents(parent_session_id.as_str())?
+            .into_iter()
+            .map(spawn_edge_from_agent_summary)
+            .collect()
+    }
+
+    fn list_descendants(&self, root_session_id: &SessionId) -> Result<Vec<SpawnEdge>> {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![root_session_id.clone()];
+        while let Some(parent_session_id) = frontier.pop() {
+            for edge in self.list_children(&parent_session_id)? {
+                frontier.push(edge.child_session_id.clone());
+                descendants.push(edge);
+            }
+        }
+        Ok(descendants)
+    }
+}
+
+fn spawn_edge_from_agent_summary(summary: AgentSummary) -> Result<SpawnEdge> {
+    Ok(SpawnEdge {
+        parent_session_id: SessionId::from_string(summary.parent_session_id)?,
+        child_session_id: SessionId::from_string(summary.child_session_id)?,
+        status: SpawnEdgeStatus::from_store_status(&summary.status),
+        path: summary.agent_path,
+        nickname: summary.agent_nickname,
+        role: summary.agent_role,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxDeliveryPhase {
+    CurrentTurn,
+    NextTurn,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxItemKind {
+    Completion,
+    Input,
+    Followup,
+    Notification,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MailboxItem {
+    pub seq: u64,
+    pub id: String,
+    pub kind: MailboxItemKind,
+    pub author_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    pub content: String,
+    pub trigger_turn: bool,
+    pub delivery_phase: MailboxDeliveryPhase,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentTarget {
+    Any,
+    AgentId(AgentId),
+    Path(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WaitAgentOutcome {
+    Completed(MailboxItem),
+    TimedOut,
+}
+
+struct AgentMailboxState {
+    next_seq: u64,
+    queue: VecDeque<MailboxItem>,
+}
+
+pub struct AgentMailbox {
+    seq_tx: watch::Sender<u64>,
+    state: Mutex<AgentMailboxState>,
+}
+
+impl Default for AgentMailbox {
+    fn default() -> Self {
+        let (seq_tx, _) = watch::channel(0);
+        Self {
+            seq_tx,
+            state: Mutex::new(AgentMailboxState {
+                next_seq: 0,
+                queue: VecDeque::new(),
+            }),
+        }
+    }
+}
+
+impl AgentMailbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.seq_tx.subscribe()
+    }
+
+    pub fn enqueue(&self, mut item: MailboxItem) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_seq = state.next_seq.saturating_add(1);
+        item.seq = state.next_seq;
+        let seq = item.seq;
+        state.queue.push_back(item);
+        drop(state);
+        let _ = self.seq_tx.send(seq);
+        seq
+    }
+
+    pub fn pending_items(&self) -> Vec<MailboxItem> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn has_pending_completion_for(&self, target: &AgentTarget) -> Option<MailboxItem> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .find(|item| item.kind == MailboxItemKind::Completion && target_matches(item, target))
+            .cloned()
+    }
+
+    pub fn has_pending_item_for(&self, target: &AgentTarget) -> Option<MailboxItem> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .find(|item| target_matches(item, target))
+            .cloned()
+    }
+
+    pub fn has_pending_phase(&self, delivery_phase: MailboxDeliveryPhase) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .any(|item| item.delivery_phase == delivery_phase)
+    }
+
+    pub fn has_pending_trigger_turn_phase(&self, delivery_phase: MailboxDeliveryPhase) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .any(|item| item.delivery_phase == delivery_phase && item.trigger_turn)
+    }
+
+    pub fn drain_phase(&self, delivery_phase: MailboxDeliveryPhase) -> Vec<MailboxItem> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut kept = VecDeque::with_capacity(state.queue.len());
+        let mut drained = Vec::new();
+        while let Some(item) = state.queue.pop_front() {
+            if item.delivery_phase == delivery_phase {
+                drained.push(item);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        state.queue = kept;
+        drained
+    }
+
+    pub async fn wait_for_completion(
+        &self,
+        target: AgentTarget,
+        timeout_duration: Duration,
+    ) -> Result<WaitAgentOutcome> {
+        if let Some(item) = self.has_pending_completion_for(&target) {
+            return Ok(WaitAgentOutcome::Completed(item));
+        }
+        let mut rx = self.subscribe();
+        let wait = async {
+            loop {
+                rx.changed().await.map_err(|_| anyhow!("mailbox closed"))?;
+                if let Some(item) = self.has_pending_completion_for(&target) {
+                    return Ok(WaitAgentOutcome::Completed(item));
+                }
+            }
+        };
+        match tokio::time::timeout(timeout_duration, wait).await {
+            Ok(outcome) => outcome,
+            Err(_) => Ok(WaitAgentOutcome::TimedOut),
+        }
+    }
+
+    pub async fn wait_for_item(
+        &self,
+        target: AgentTarget,
+        timeout_duration: Duration,
+    ) -> Result<WaitAgentOutcome> {
+        if let Some(item) = self.has_pending_item_for(&target) {
+            return Ok(WaitAgentOutcome::Completed(item));
+        }
+        let mut rx = self.subscribe();
+        let wait = async {
+            loop {
+                rx.changed().await.map_err(|_| anyhow!("mailbox closed"))?;
+                if let Some(item) = self.has_pending_item_for(&target) {
+                    return Ok(WaitAgentOutcome::Completed(item));
+                }
+            }
+        };
+        match tokio::time::timeout(timeout_duration, wait).await {
+            Ok(outcome) => outcome,
+            Err(_) => Ok(WaitAgentOutcome::TimedOut),
+        }
+    }
+}
+
+fn target_matches(item: &MailboxItem, target: &AgentTarget) -> bool {
+    match target {
+        AgentTarget::Any => true,
+        AgentTarget::AgentId(agent_id) => item.author_agent_id == *agent_id,
+        AgentTarget::Path(path) => item.target_path.as_deref() == Some(path.as_str()),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentThreadStatus {
+    Created,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Closed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentThreadSnapshot {
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub root_id: RootId,
+    pub cwd: PathBuf,
+    pub parent_agent_id: Option<AgentId>,
+    pub parent_session_id: Option<SessionId>,
+    pub agent_path: String,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+    pub status: AgentThreadStatus,
+}
+
+type AgentResourceCleanup = Arc<dyn Fn(Arc<dyn Any + Send + Sync>) -> usize + Send + Sync>;
+
+struct AgentResourceSlot {
+    handle: Arc<dyn Any + Send + Sync>,
+    cleanup: Option<AgentResourceCleanup>,
+}
+
+#[derive(Default)]
+pub struct AgentResourceSet {
+    slots: Mutex<HashMap<String, AgentResourceSlot>>,
+}
+
+impl AgentResourceSet {
+    pub fn get_or_insert_with<T, F, C>(&self, key: &str, init: F, cleanup: C) -> Result<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+        F: FnOnce() -> T,
+        C: Fn(Arc<T>) -> usize + Send + Sync + 'static,
+    {
+        self.try_get_or_insert_with(key, || Ok(init()), cleanup)
+    }
+
+    pub fn try_get_or_insert_with<T, F, C>(&self, key: &str, init: F, cleanup: C) -> Result<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+        F: FnOnce() -> Result<T>,
+        C: Fn(Arc<T>) -> usize + Send + Sync + 'static,
+    {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots.get(key) {
+            return Arc::downcast::<T>(Arc::clone(&slot.handle)).map_err(|_| {
+                anyhow!("runtime resource `{key}` has a different concrete type than requested")
+            });
+        }
+
+        let typed = Arc::new(init()?);
+        let erased: Arc<dyn Any + Send + Sync> = typed.clone();
+        let cleanup: AgentResourceCleanup = Arc::new(move |handle| {
+            Arc::downcast::<T>(handle)
+                .map(|typed| cleanup(typed))
+                .unwrap_or_default()
+        });
+        slots.insert(
+            key.to_string(),
+            AgentResourceSlot {
+                handle: erased,
+                cleanup: Some(cleanup),
+            },
+        );
+        Ok(typed)
+    }
+
+    pub fn get<T>(&self, key: &str) -> Result<Option<Arc<T>>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(slot) = slots.get(key) else {
+            return Ok(None);
+        };
+        Arc::downcast::<T>(Arc::clone(&slot.handle))
+            .map(Some)
+            .map_err(|_| anyhow!("runtime resource `{key}` has a different concrete type"))
+    }
+
+    pub fn cleanup_all(&self) -> usize {
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, slot)| slot)
+            .collect::<Vec<_>>();
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.cleanup
+                    .map(|cleanup| cleanup(slot.handle))
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+}
+
+pub struct AgentThread {
+    agent_id: AgentId,
+    session_id: SessionId,
+    root_id: RootId,
+    cwd: PathBuf,
+    parent_agent_id: Option<AgentId>,
+    parent_session_id: Option<SessionId>,
+    agent_path: String,
+    nickname: Option<String>,
+    role: Option<String>,
+    status_tx: watch::Sender<AgentThreadStatus>,
+    mailbox: AgentMailbox,
+    resources: AgentResourceSet,
+}
+
+impl AgentThread {
+    fn new(
+        agent_id: AgentId,
+        session_id: SessionId,
+        root_id: RootId,
+        cwd: PathBuf,
+        parent_agent_id: Option<AgentId>,
+        parent_session_id: Option<SessionId>,
+        agent_path: String,
+        nickname: Option<String>,
+        role: Option<String>,
+    ) -> Self {
+        let (status_tx, _) = watch::channel(AgentThreadStatus::Created);
+        Self {
+            agent_id,
+            session_id,
+            root_id,
+            cwd,
+            parent_agent_id,
+            parent_session_id,
+            agent_path,
+            nickname,
+            role,
+            status_tx,
+            mailbox: AgentMailbox::new(),
+            resources: AgentResourceSet::default(),
+        }
+    }
+
+    pub fn agent_id(&self) -> &AgentId {
+        &self.agent_id
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn mailbox(&self) -> &AgentMailbox {
+        &self.mailbox
+    }
+
+    pub fn resources(&self) -> &AgentResourceSet {
+        &self.resources
+    }
+
+    pub fn set_status(&self, status: AgentThreadStatus) {
+        self.status_tx.send_replace(status);
+    }
+
+    pub fn snapshot(&self) -> AgentThreadSnapshot {
+        AgentThreadSnapshot {
+            agent_id: self.agent_id.clone(),
+            session_id: self.session_id.clone(),
+            root_id: self.root_id.clone(),
+            cwd: self.cwd.clone(),
+            parent_agent_id: self.parent_agent_id.clone(),
+            parent_session_id: self.parent_session_id.clone(),
+            agent_path: self.agent_path.clone(),
+            nickname: self.nickname.clone(),
+            role: self.role.clone(),
+            status: self.status_tx.borrow().clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateRootAgentRequest {
+    pub cwd: PathBuf,
+    pub task: String,
+    pub max_concurrent_threads_per_session: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachRootAgentRequest {
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub task: String,
+    pub max_concurrent_threads_per_session: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachChildAgentRequest {
+    pub parent_agent_id: AgentId,
+    pub child_agent_id: AgentId,
+    pub child_session_id: SessionId,
+    pub cwd: PathBuf,
+    pub agent_path: String,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpawnChildRequest {
+    pub parent_agent_id: AgentId,
+    pub child_agent_id: Option<AgentId>,
+    pub child_session_id: Option<SessionId>,
+    pub task_name: String,
+    pub message: String,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompleteAgentRequest {
+    pub child_agent_id: AgentId,
+    pub result: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct FailAgentRequest {
+    pub child_agent_id: AgentId,
+    pub error: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CloseAgentRequest {
+    pub agent_id: AgentId,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SendAgentMessageRequest {
+    pub author_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub content: String,
+    pub trigger_turn: bool,
+    pub kind: MailboxItemKind,
+    pub delivery_phase: MailboxDeliveryPhase,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct SendAgentMessageResponse {
+    pub mailbox_item: MailboxItem,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum LocalRuntimeRequest {
+    Ping,
+    PendingAgentMail {
+        session_id: String,
+    },
+    SendAgentMessage {
+        author_agent_id: String,
+        target_agent_id: String,
+        content: String,
+        trigger_turn: bool,
+        kind: MailboxItemKind,
+        delivery_phase: MailboxDeliveryPhase,
+        #[serde(default)]
+        payload: Value,
+    },
+    SubmitUserInput {
+        session_id: String,
+        content: String,
+        trigger_turn: bool,
+        delivery_phase: MailboxDeliveryPhase,
+        #[serde(default)]
+        input_items: Option<Value>,
+        #[serde(default)]
+        payload: Value,
+    },
+    WaitAgent {
+        parent_agent_id: String,
+        #[serde(default)]
+        target: Option<LocalRuntimeWaitTarget>,
+        timeout_ms: u64,
+    },
+    CancelRun {
+        session_id: String,
+    },
+    CloseAgent {
+        agent_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum LocalRuntimeWaitTarget {
+    Any,
+    AgentId(String),
+    Path(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LocalRuntimeResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DrainAgentMailboxRequest {
+    pub session_id: SessionId,
+    pub delivery_phase: MailboxDeliveryPhase,
+}
+
+#[derive(Clone, Debug)]
+pub struct DrainAgentMailboxResponse {
+    pub mailbox_items: Vec<MailboxItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AgentControlSnapshot {
+    pub root_id: RootId,
+    pub root_agent_id: AgentId,
+    pub root_session_id: SessionId,
+    pub open_spawned_agents: usize,
+    pub queued_spawns: usize,
+}
+
+pub struct AgentControl {
+    root_id: RootId,
+    root_agent_id: AgentId,
+    root_session_id: SessionId,
+    scheduler: SubagentScheduler,
+}
+
+impl AgentControl {
+    fn new(
+        root_id: RootId,
+        root_agent_id: AgentId,
+        root_session_id: SessionId,
+        max_concurrent_threads_per_session: usize,
+    ) -> Self {
+        Self {
+            root_id,
+            root_agent_id,
+            root_session_id,
+            scheduler: SubagentScheduler::new(
+                max_concurrent_threads_per_session,
+                CapacityMode::StrictReject,
+            ),
+        }
+    }
+
+    pub fn snapshot(&self) -> AgentControlSnapshot {
+        AgentControlSnapshot {
+            root_id: self.root_id.clone(),
+            root_agent_id: self.root_agent_id.clone(),
+            root_session_id: self.root_session_id.clone(),
+            open_spawned_agents: self.scheduler.open_count(),
+            queued_spawns: self.scheduler.queued_count(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct AgentManager {
+    threads: Mutex<HashMap<AgentId, Arc<AgentThread>>>,
+    session_to_agent: Mutex<HashMap<SessionId, AgentId>>,
+    controls: Mutex<HashMap<RootId, Arc<AgentControl>>>,
+}
+
+#[derive(Default)]
+pub struct ActiveRunRegistry {
+    tokens: Mutex<HashMap<SessionId, CancellationToken>>,
+}
+
+impl ActiveRunRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, session_id: SessionId) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.register_with_token(session_id, token.clone());
+        token
+    }
+
+    pub fn register_with_token(
+        &self,
+        session_id: SessionId,
+        token: CancellationToken,
+    ) -> CancellationToken {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, token.clone());
+        token
+    }
+
+    pub fn unregister(&self, session_id: &SessionId) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    pub fn cancel(&self, session_id: &SessionId) -> bool {
+        let Some(token) = self
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+        else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
+}
+
+impl AgentManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert_thread(&self, thread: Arc<AgentThread>) {
+        self.session_to_agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread.session_id.clone(), thread.agent_id.clone());
+        self.threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread.agent_id.clone(), thread);
+    }
+
+    fn insert_control(&self, control: Arc<AgentControl>) {
+        self.controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(control.root_id.clone(), control);
+    }
+
+    pub fn thread(&self, agent_id: &AgentId) -> Result<Arc<AgentThread>> {
+        self.threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::UnknownAgent(agent_id.as_str().to_string()).into())
+    }
+
+    pub fn thread_for_session(&self, session_id: &SessionId) -> Result<Arc<AgentThread>> {
+        let agent_id = self
+            .session_to_agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::UnknownAgent(session_id.as_str().to_string()))?;
+        self.thread(&agent_id)
+    }
+
+    pub fn control_for_thread(&self, thread: &AgentThread) -> Result<Arc<AgentControl>> {
+        self.controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&thread.root_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::UnknownAgent(thread.agent_id.as_str().to_string()).into())
+    }
+
+    pub fn snapshots(&self) -> Vec<AgentThreadSnapshot> {
+        self.threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|thread| thread.snapshot())
+            .collect()
+    }
+
+    pub fn control_snapshots(&self) -> Vec<AgentControlSnapshot> {
+        self.controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|control| control.snapshot())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectedEventKind {
+    ThreadStatusChanged,
+    TurnStarted,
+    TurnCompleted,
+    ItemStarted,
+    ItemCompleted,
+    AgentMessageDelta,
+    CommandOutputDelta,
+    McpOutputDelta,
+    ToolUpdated,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProjectedEvent {
+    pub source_event_id: EventId,
+    pub kind: ProjectedEventKind,
+    pub session_id: Option<SessionId>,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct RuntimeSnapshot {
+    pub agents: Vec<AgentThreadSnapshot>,
+    pub agent_controls: Vec<AgentControlSnapshot>,
+    pub browsers: Vec<BrowserSnapshot>,
+}
+
+pub struct ProjectedRuntimeSubscription {
+    snapshot: RuntimeSnapshot,
+    rx: broadcast::Receiver<RuntimeEvent>,
+}
+
+impl ProjectedRuntimeSubscription {
+    pub fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
+    }
+
+    pub async fn recv(&mut self) -> Result<ProjectedEvent> {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) => return Ok(RuntimeEventProjection::project(&event)),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => bail!("runtime event bus closed"),
+            }
+        }
+    }
+}
+
+pub struct RuntimeEventProjection;
+
+impl RuntimeEventProjection {
+    pub fn project(event: &RuntimeEvent) -> ProjectedEvent {
+        let kind = match event.kind {
+            RuntimeEventKind::AgentStarted
+            | RuntimeEventKind::AgentCompleted
+            | RuntimeEventKind::AgentFailed
+            | RuntimeEventKind::AgentCancelled
+            | RuntimeEventKind::AgentClosed => ProjectedEventKind::ThreadStatusChanged,
+            RuntimeEventKind::AgentTurnStarted => ProjectedEventKind::TurnStarted,
+            RuntimeEventKind::AgentTurnCompleted | RuntimeEventKind::AgentTurnAborted => {
+                ProjectedEventKind::TurnCompleted
+            }
+            RuntimeEventKind::ExecCommandBegin
+            | RuntimeEventKind::BrowserScriptStarted
+            | RuntimeEventKind::PythonStarted
+            | RuntimeEventKind::McpToolStarted => ProjectedEventKind::ItemStarted,
+            RuntimeEventKind::ExecCommandEnd
+            | RuntimeEventKind::BrowserScriptCompleted
+            | RuntimeEventKind::BrowserScriptCancelled
+            | RuntimeEventKind::PythonCompleted
+            | RuntimeEventKind::McpToolCompleted
+            | RuntimeEventKind::ToolCompleted
+            | RuntimeEventKind::ToolFailed => ProjectedEventKind::ItemCompleted,
+            RuntimeEventKind::ExecCommandOutputDelta
+            | RuntimeEventKind::BrowserScriptOutputDelta
+            | RuntimeEventKind::PythonOutputDelta => ProjectedEventKind::CommandOutputDelta,
+            RuntimeEventKind::ToolOutputDelta => ProjectedEventKind::AgentMessageDelta,
+            _ => ProjectedEventKind::ToolUpdated,
+        };
+        ProjectedEvent {
+            source_event_id: event.id.clone(),
+            kind,
+            session_id: event.session_id.clone(),
+            payload: event.payload.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeEventBus {
+    tx: broadcast::Sender<RuntimeEvent>,
+}
+
+impl RuntimeEventBus {
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn publish(&self, event: RuntimeEvent) {
+        let _ = self.tx.send(event);
+    }
+}
+
+impl Default for RuntimeEventBus {
+    fn default() -> Self {
+        Self::new(1024)
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    inner: Arc<BrowserUseRuntime>,
+}
+
+impl RuntimeHandle {
+    pub fn new(runtime: BrowserUseRuntime) -> Self {
+        Self {
+            inner: Arc::new(runtime),
+        }
+    }
+
+    pub fn events(&self) -> &RuntimeEventBus {
+        &self.inner.events
+    }
+
+    pub fn journal(&self) -> &dyn JournalSink {
+        self.inner.persistence.as_ref()
+    }
+
+    pub fn append_observed_session_event(
+        &self,
+        session_id: SessionId,
+        event_type: &str,
+        payload: Value,
+        durability: Durability,
+    ) -> Result<JournalAppend> {
+        let append = self.inner.persistence.append_session_event(
+            &session_id,
+            event_type,
+            payload.clone(),
+            durability,
+        )?;
+        let agent_id = AgentId::from_string(session_id.as_str().to_string())?;
+        let mut event = RuntimeEvent::new(
+            RuntimeEventKind::from_observed_event_type(event_type),
+            durability,
+        )
+        .with_session_id(session_id.clone())
+        .with_agent_id(agent_id.clone())
+        .with_payload(json!({
+            "event_type": event_type,
+            "seq": append.seq,
+            "payload": payload,
+        }));
+        if let Ok(thread) = self.inner.agents.thread(&agent_id) {
+            event.root_id = Some(thread.root_id.clone());
+        }
+        self.inner.events.publish(event);
+        Ok(append)
+    }
+
+    pub fn agents(&self) -> &AgentManager {
+        &self.inner.agents
+    }
+
+    pub fn browsers(&self) -> &BrowserManager {
+        &self.inner.browsers
+    }
+
+    pub fn register_run(&self, session_id: SessionId) -> CancellationToken {
+        self.inner.active_runs.register(session_id)
+    }
+
+    pub fn register_run_with_token(
+        &self,
+        session_id: SessionId,
+        token: CancellationToken,
+    ) -> CancellationToken {
+        self.inner
+            .active_runs
+            .register_with_token(session_id, token)
+    }
+
+    pub fn unregister_run(&self, session_id: &SessionId) {
+        self.inner.active_runs.unregister(session_id);
+    }
+
+    pub fn cancel_run(&self, session_id: &SessionId) -> bool {
+        self.inner.active_runs.cancel(session_id)
+    }
+
+    pub fn get_or_insert_session_resource<T, F, C>(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        init: F,
+        cleanup: C,
+    ) -> Result<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+        F: FnOnce() -> T,
+        C: Fn(Arc<T>) -> usize + Send + Sync + 'static,
+    {
+        self.inner
+            .agents
+            .thread_for_session(session_id)?
+            .resources()
+            .get_or_insert_with(key, init, cleanup)
+    }
+
+    pub fn try_get_or_insert_session_resource<T, F, C>(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+        init: F,
+        cleanup: C,
+    ) -> Result<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+        F: FnOnce() -> Result<T>,
+        C: Fn(Arc<T>) -> usize + Send + Sync + 'static,
+    {
+        self.inner
+            .agents
+            .thread_for_session(session_id)?
+            .resources()
+            .try_get_or_insert_with(key, init, cleanup)
+    }
+
+    pub fn cleanup_session_resources(&self, session_id: &SessionId) -> Result<usize> {
+        Ok(self
+            .inner
+            .agents
+            .thread_for_session(session_id)?
+            .resources()
+            .cleanup_all())
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.inner.snapshot()
+    }
+
+    pub fn subscribe_projected(&self) -> ProjectedRuntimeSubscription {
+        self.inner.subscribe_projected()
+    }
+
+    pub fn create_root_agent(&self, request: CreateRootAgentRequest) -> Result<Arc<AgentThread>> {
+        self.inner.create_root_agent(request)
+    }
+
+    pub fn attach_root_agent(&self, request: AttachRootAgentRequest) -> Result<Arc<AgentThread>> {
+        self.inner.attach_root_agent(request)
+    }
+
+    pub fn attach_child_agent(&self, request: AttachChildAgentRequest) -> Result<Arc<AgentThread>> {
+        self.inner.attach_child_agent(request)
+    }
+
+    pub fn spawn_child(&self, request: SpawnChildRequest) -> Result<Arc<AgentThread>> {
+        self.inner.spawn_child(request)
+    }
+
+    pub fn complete_agent(&self, request: CompleteAgentRequest) -> Result<()> {
+        self.inner.complete_agent(request)
+    }
+
+    pub fn fail_agent(&self, request: FailAgentRequest) -> Result<()> {
+        self.inner.fail_agent(request)
+    }
+
+    pub fn close_agent(&self, request: CloseAgentRequest) -> Result<()> {
+        self.inner.close_agent(request)
+    }
+
+    pub fn send_agent_message(
+        &self,
+        request: SendAgentMessageRequest,
+    ) -> Result<SendAgentMessageResponse> {
+        self.inner.send_agent_message(request)
+    }
+
+    pub fn has_pending_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+        delivery_phase: MailboxDeliveryPhase,
+    ) -> Result<bool> {
+        self.inner
+            .has_pending_agent_mail_for_session(session_id, delivery_phase)
+    }
+
+    pub fn pending_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<MailboxItem>> {
+        self.inner.pending_agent_mail_for_session(session_id)
+    }
+
+    pub fn has_pending_trigger_turn_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+        delivery_phase: MailboxDeliveryPhase,
+    ) -> Result<bool> {
+        self.inner
+            .has_pending_trigger_turn_agent_mail_for_session(session_id, delivery_phase)
+    }
+
+    pub fn drain_agent_mailbox(
+        &self,
+        request: DrainAgentMailboxRequest,
+    ) -> Result<DrainAgentMailboxResponse> {
+        self.inner.drain_agent_mailbox(request)
+    }
+
+    pub async fn wait_agent(
+        &self,
+        parent_agent_id: &AgentId,
+        target: AgentTarget,
+        timeout: Duration,
+    ) -> Result<WaitAgentOutcome> {
+        self.inner
+            .wait_agent(parent_agent_id, target, timeout)
+            .await
+    }
+}
+
+pub struct BrowserUseRuntime {
+    events: RuntimeEventBus,
+    persistence: Arc<dyn LiveThreadPersistence>,
+    state_index: Arc<dyn StateIndex>,
+    agents: AgentManager,
+    browsers: BrowserManager,
+    active_runs: ActiveRunRegistry,
+}
+
+impl BrowserUseRuntime {
+    pub fn new(
+        persistence: Arc<dyn LiveThreadPersistence>,
+        state_index: Arc<dyn StateIndex>,
+    ) -> Self {
+        Self {
+            events: RuntimeEventBus::default(),
+            persistence,
+            state_index,
+            agents: AgentManager::new(),
+            browsers: BrowserManager::new(),
+            active_runs: ActiveRunRegistry::new(),
+        }
+    }
+
+    pub fn memory() -> (Self, Arc<MemoryJournal>) {
+        let memory = Arc::new(MemoryJournal::new());
+        let persistence: Arc<dyn LiveThreadPersistence> = memory.clone();
+        let state_index: Arc<dyn StateIndex> = memory.clone();
+        (Self::new(persistence, state_index), memory)
+    }
+
+    pub fn handle(self) -> RuntimeHandle {
+        RuntimeHandle::new(self)
+    }
+
+    pub fn events(&self) -> &RuntimeEventBus {
+        &self.events
+    }
+
+    pub fn agents(&self) -> &AgentManager {
+        &self.agents
+    }
+
+    pub fn browsers(&self) -> &BrowserManager {
+        &self.browsers
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            agents: self.agents.snapshots(),
+            agent_controls: self.agents.control_snapshots(),
+            browsers: self.browsers.snapshots(),
+        }
+    }
+
+    pub fn subscribe_projected(&self) -> ProjectedRuntimeSubscription {
+        let rx = self.events.subscribe();
+        let snapshot = self.snapshot();
+        ProjectedRuntimeSubscription { snapshot, rx }
+    }
+
+    pub fn publish_after_barrier(&self, event: RuntimeEvent) -> Result<JournalAppend> {
+        let append = self.persistence.append_runtime_event(&event)?;
+        self.events.publish(event);
+        Ok(append)
+    }
+
+    fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<JournalAppend> {
+        self.persistence.append_runtime_event(event)
+    }
+
+    pub fn create_root_agent(&self, request: CreateRootAgentRequest) -> Result<Arc<AgentThread>> {
+        let cwd = request.cwd;
+        let session = self.persistence.create_thread(CreateThreadRequest {
+            session_id: None,
+            parent_session_id: None,
+            cwd: cwd.clone(),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        self.insert_root_agent(
+            session_id,
+            cwd,
+            request.task,
+            request.max_concurrent_threads_per_session,
+            Some(RuntimeEventKind::AgentCreated),
+        )
+    }
+
+    pub fn attach_root_agent(&self, request: AttachRootAgentRequest) -> Result<Arc<AgentThread>> {
+        self.persistence
+            .load_session(&request.session_id)?
+            .with_context(|| format!("unknown root session id: {}", request.session_id))?;
+        let thread = self.insert_root_agent(
+            request.session_id,
+            request.cwd,
+            request.task,
+            request.max_concurrent_threads_per_session,
+            Some(RuntimeEventKind::AgentResumed),
+        )?;
+        self.record_lost_resources_after_resume(&thread)?;
+        Ok(thread)
+    }
+
+    pub fn attach_child_agent(&self, request: AttachChildAgentRequest) -> Result<Arc<AgentThread>> {
+        self.persistence
+            .load_session(&request.child_session_id)?
+            .with_context(|| format!("unknown child session id: {}", request.child_session_id))?;
+        let parent = self.agents.thread(&request.parent_agent_id)?;
+        let control = self.agents.control_for_thread(&parent)?;
+        match control
+            .scheduler
+            .admit_spawn(request.child_agent_id.clone(), request.agent_path.clone())
+        {
+            Ok(SpawnAdmission::Reserved(_)) => {}
+            Ok(SpawnAdmission::Queued(_)) => {
+                bail!("queued subagent mode is not enabled for BrowserUseRuntime AgentControl");
+            }
+            Err(err) => return Err(err),
+        }
+        let child = Arc::new(AgentThread::new(
+            request.child_agent_id.clone(),
+            request.child_session_id.clone(),
+            parent.root_id.clone(),
+            request.cwd,
+            Some(parent.agent_id.clone()),
+            Some(parent.session_id.clone()),
+            request.agent_path.clone(),
+            request.nickname.clone(),
+            request.role.clone(),
+        ));
+        self.agents.insert_thread(child.clone());
+        let mut event = RuntimeEvent::new(RuntimeEventKind::AgentResumed, Durability::Barrier)
+            .with_session_id(request.child_session_id)
+            .with_agent_id(request.child_agent_id)
+            .with_payload(json!({
+                "agent_path": request.agent_path,
+                "nickname": request.nickname,
+                "role": request.role,
+            }));
+        event.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(event)?;
+        self.record_lost_resources_after_resume(&child)?;
+        Ok(child)
+    }
+
+    fn insert_root_agent(
+        &self,
+        session_id: SessionId,
+        cwd: PathBuf,
+        task: String,
+        max_concurrent_threads_per_session: usize,
+        event_kind: Option<RuntimeEventKind>,
+    ) -> Result<Arc<AgentThread>> {
+        let root_id = RootId::from_string(session_id.as_str())?;
+        let agent_id = AgentId::from_string(session_id.as_str())?;
+        let thread = Arc::new(AgentThread::new(
+            agent_id.clone(),
+            session_id.clone(),
+            root_id.clone(),
+            cwd,
+            None,
+            None,
+            "/root".to_string(),
+            None,
+            Some("default".to_string()),
+        ));
+        self.agents.insert_thread(thread.clone());
+        self.agents.insert_control(Arc::new(AgentControl::new(
+            root_id.clone(),
+            agent_id.clone(),
+            session_id.clone(),
+            max_concurrent_threads_per_session,
+        )));
+        let mut event = RuntimeEvent::new(
+            event_kind.unwrap_or(RuntimeEventKind::AgentCreated),
+            Durability::Barrier,
+        )
+        .with_session_id(session_id)
+        .with_agent_id(agent_id)
+        .with_payload(json!({
+            "agent_path": "/root",
+            "task": task,
+            "role": "default",
+        }));
+        event.root_id = Some(root_id);
+        self.publish_after_barrier(event)?;
+        Ok(thread)
+    }
+
+    pub fn spawn_child(&self, request: SpawnChildRequest) -> Result<Arc<AgentThread>> {
+        let parent = self.agents.thread(&request.parent_agent_id)?;
+        let control = self.agents.control_for_thread(&parent)?;
+        let child_agent_id = request.child_agent_id.clone().unwrap_or_default();
+        let child_path = child_agent_path(&parent.agent_path, &request.task_name);
+        match control
+            .scheduler
+            .admit_spawn(child_agent_id.clone(), request.task_name.clone())
+        {
+            Ok(SpawnAdmission::Reserved(_)) => {}
+            Ok(SpawnAdmission::Queued(queued)) => {
+                let mut event =
+                    RuntimeEvent::new(RuntimeEventKind::SubagentSpawnQueued, Durability::Barrier)
+                        .with_session_id(parent.session_id.clone())
+                        .with_agent_id(parent.agent_id.clone())
+                        .with_payload(json!({
+                            "child_agent_id": queued.child_agent_id.as_str(),
+                            "task_name": queued.task_name,
+                        }));
+                event.root_id = Some(parent.root_id.clone());
+                self.publish_after_barrier(event)?;
+                bail!("queued subagent mode is not enabled for BrowserUseRuntime AgentControl");
+            }
+            Err(err) => {
+                let mut event =
+                    RuntimeEvent::new(RuntimeEventKind::SubagentSpawnRejected, Durability::Barrier)
+                        .with_session_id(parent.session_id.clone())
+                        .with_agent_id(parent.agent_id.clone())
+                        .with_payload(json!({
+                            "task_name": request.task_name,
+                            "reason": err.to_string(),
+                        }));
+                event.root_id = Some(parent.root_id.clone());
+                self.publish_after_barrier(event)?;
+                return Err(err);
+            }
+        }
+
+        let child_session = self.persistence.create_thread(CreateThreadRequest {
+            session_id: request.child_session_id.clone(),
+            parent_session_id: Some(parent.session_id.clone()),
+            cwd: parent.cwd.clone(),
+            artifact_root: None,
+            agent_path: Some(child_path.clone()),
+            nickname: request.nickname.clone(),
+            role: request.role.clone(),
+        })?;
+        let child_session_id = SessionId::from_string(child_session.id)?;
+        let child = Arc::new(AgentThread::new(
+            child_agent_id.clone(),
+            child_session_id.clone(),
+            parent.root_id.clone(),
+            parent.cwd.clone(),
+            Some(parent.agent_id.clone()),
+            Some(parent.session_id.clone()),
+            child_path.clone(),
+            request.nickname.clone(),
+            request.role.clone(),
+        ));
+        let mut spawn_event =
+            RuntimeEvent::new(RuntimeEventKind::SubagentSpawnStarted, Durability::Barrier)
+                .with_session_id(parent.session_id.clone())
+                .with_agent_id(parent.agent_id.clone())
+                .with_payload(json!({
+                    "child_agent_id": child_agent_id.as_str(),
+                    "child_session_id": child_session_id.as_str(),
+                    "agent_path": child_path,
+                    "task_name": request.task_name,
+                    "message": request.message,
+                    "nickname": request.nickname,
+                    "role": request.role,
+                }));
+        spawn_event.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(spawn_event)?;
+        self.agents.insert_thread(child.clone());
+        Ok(child)
+    }
+
+    pub fn complete_agent(&self, request: CompleteAgentRequest) -> Result<()> {
+        self.finish_child_agent(request.child_agent_id, request.result, true)
+    }
+
+    pub fn fail_agent(&self, request: FailAgentRequest) -> Result<()> {
+        self.finish_child_agent(request.child_agent_id, request.error, false)
+    }
+
+    fn finish_child_agent(
+        &self,
+        child_agent_id: AgentId,
+        terminal_text: String,
+        success: bool,
+    ) -> Result<()> {
+        let child = self.agents.thread(&child_agent_id)?;
+        let parent_agent_id = child
+            .parent_agent_id
+            .clone()
+            .ok_or_else(|| RuntimeError::MissingParentAgent(child.agent_id.as_str().to_string()))?;
+        let parent = self.agents.thread(&parent_agent_id)?;
+        child.set_status(if success {
+            AgentThreadStatus::Completed
+        } else {
+            AgentThreadStatus::Failed
+        });
+        self.state_index.finish_spawn_edge(
+            &child.session_id,
+            if success {
+                SpawnEdgeStatus::Done
+            } else {
+                SpawnEdgeStatus::Failed
+            },
+        )?;
+
+        let terminal_event_kind = if success {
+            RuntimeEventKind::AgentCompleted
+        } else {
+            RuntimeEventKind::AgentFailed
+        };
+        let status = if success { "done" } else { "failed" };
+        let result = success.then(|| terminal_text.clone());
+        let failure = (!success).then(|| terminal_text.clone());
+        let parent_payload = json!({
+            "child_session_id": child.session_id.as_str(),
+            "status": status,
+            "runtime_owned": true,
+            "payload": {
+                "child_session_id": child.session_id.as_str(),
+                "status": status,
+                "result": result,
+                "failure": failure,
+                "runtime_owned": true,
+            },
+        });
+        let mut completed = RuntimeEvent::new(terminal_event_kind.clone(), Durability::Barrier)
+            .with_session_id(child.session_id.clone())
+            .with_agent_id(child.agent_id.clone())
+            .with_payload(json!({
+                "success": success,
+                "result": terminal_text.clone(),
+                "agent_path": child.agent_path.as_str(),
+                "runtime_owned": true,
+            }));
+        completed.root_id = Some(child.root_id.clone());
+        self.publish_after_barrier(completed)?;
+
+        let mut parent_terminal = RuntimeEvent::new(terminal_event_kind, Durability::Barrier)
+            .with_session_id(parent.session_id.clone())
+            .with_agent_id(parent.agent_id.clone())
+            .with_payload(parent_payload.clone());
+        parent_terminal.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(parent_terminal)?;
+
+        let notification_status = if success {
+            json!({ "completed": terminal_text.clone() })
+        } else {
+            json!({ "errored": terminal_text.clone() })
+        };
+        let notification = format!(
+            "<subagent_notification>\n{}\n</subagent_notification>",
+            json!({
+                "agent_path": child.agent_path.as_str(),
+                "status": notification_status,
+            })
+        );
+        let mailbox_item = MailboxItem {
+            seq: 0,
+            id: Uuid::new_v4().simple().to_string(),
+            kind: MailboxItemKind::Completion,
+            author_agent_id: child.agent_id.clone(),
+            target_agent_id: parent.agent_id.clone(),
+            target_path: Some(child.agent_path.clone()),
+            content: notification,
+            trigger_turn: false,
+            delivery_phase: MailboxDeliveryPhase::NextTurn,
+            payload: json!({
+                "success": success,
+                "author_session_id": child.session_id.as_str(),
+                "target_session_id": parent.session_id.as_str(),
+                "child_session_id": child.session_id.as_str(),
+                "agent_path": child.agent_path.as_str(),
+                "result": terminal_text,
+                "runtime_owned": true,
+            }),
+        };
+        let mut mailbox_event =
+            RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
+                .with_session_id(parent.session_id.clone())
+                .with_agent_id(parent.agent_id.clone())
+                .with_payload(json!({
+                    "mailbox_item": mailbox_item,
+                    "trigger_turn": false,
+                }));
+        mailbox_event.root_id = Some(parent.root_id.clone());
+        self.append_runtime_event(&mailbox_event)?;
+        parent.mailbox.enqueue(mailbox_item);
+        self.events.publish(mailbox_event);
+        Ok(())
+    }
+
+    pub fn close_agent(&self, request: CloseAgentRequest) -> Result<()> {
+        let thread = self.agents.thread(&request.agent_id)?;
+        let reason = request.reason.clone();
+        let mut threads = vec![thread.clone()];
+        if thread.parent_agent_id.is_some() {
+            for edge in self.state_index.list_descendants(&thread.session_id)? {
+                self.state_index.close_spawn_edge(&edge.child_session_id)?;
+                if let Ok(descendant) = self.agents.thread_for_session(&edge.child_session_id) {
+                    threads.push(descendant);
+                }
+            }
+        }
+        for closing in threads.iter().rev() {
+            let _ = self.active_runs.cancel(&closing.session_id);
+            let cleaned_resources = closing.resources.cleanup_all();
+            closing.set_status(AgentThreadStatus::Closed);
+            if closing.parent_agent_id.is_some() {
+                let control = self.agents.control_for_thread(closing)?;
+                control.scheduler.close_spawned_agent(&closing.agent_id);
+                self.state_index.close_spawn_edge(&closing.session_id)?;
+            }
+            let mut event = RuntimeEvent::new(RuntimeEventKind::AgentClosed, Durability::Barrier)
+                .with_session_id(closing.session_id.clone())
+                .with_agent_id(closing.agent_id.clone())
+                .with_payload(json!({
+                    "reason": reason.clone(),
+                    "agent_path": closing.agent_path.as_str(),
+                    "cleaned_resources": cleaned_resources,
+                }));
+            event.root_id = Some(closing.root_id.clone());
+            self.publish_after_barrier(event)?;
+        }
+        if let Some(parent_agent_id) = thread.parent_agent_id.as_ref() {
+            let parent = self.agents.thread(parent_agent_id)?;
+            let payload = json!({
+                "child_session_id": thread.session_id.as_str(),
+                "status": "cancelled",
+                "payload": { "reason": reason.clone() },
+                "agent_path": thread.agent_path.as_str(),
+            });
+            self.persistence.append_session_event(
+                &parent.session_id,
+                RuntimeEventKind::AgentCancelled.as_str(),
+                payload.clone(),
+                Durability::Barrier,
+            )?;
+            let mut parent_event =
+                RuntimeEvent::new(RuntimeEventKind::AgentCancelled, Durability::Barrier)
+                    .with_session_id(parent.session_id.clone())
+                    .with_agent_id(parent.agent_id.clone())
+                    .with_payload(payload);
+            parent_event.root_id = Some(parent.root_id.clone());
+            self.events.publish(parent_event);
+        }
+        Ok(())
+    }
+
+    pub fn send_agent_message(
+        &self,
+        request: SendAgentMessageRequest,
+    ) -> Result<SendAgentMessageResponse> {
+        let content = request.content.trim();
+        if content.is_empty() {
+            bail!("Empty message can't be sent to an agent");
+        }
+        let author = self.agents.thread(&request.author_agent_id)?;
+        let target = self.agents.thread(&request.target_agent_id)?;
+        let is_user_followup_to_self = request.kind == MailboxItemKind::Followup
+            && request.author_agent_id == request.target_agent_id;
+        if request.trigger_turn && target.parent_agent_id.is_none() && !is_user_followup_to_self {
+            bail!("Tasks can't be assigned to the root agent");
+        }
+        let payload = enrich_mailbox_payload(
+            request.payload,
+            &author.session_id,
+            &target.session_id,
+            &author.agent_path,
+            &target.agent_path,
+        );
+        let mailbox_item = MailboxItem {
+            seq: 0,
+            id: Uuid::new_v4().simple().to_string(),
+            kind: request.kind,
+            author_agent_id: author.agent_id.clone(),
+            target_agent_id: target.agent_id.clone(),
+            target_path: Some(target.agent_path.clone()),
+            content: content.to_string(),
+            trigger_turn: request.trigger_turn,
+            delivery_phase: request.delivery_phase,
+            payload,
+        };
+        let mut mailbox_event =
+            RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
+                .with_session_id(target.session_id.clone())
+                .with_agent_id(target.agent_id.clone())
+                .with_payload(json!({
+                    "mailbox_item": mailbox_item,
+                    "trigger_turn": request.trigger_turn,
+                    "author_agent_id": author.agent_id.as_str(),
+                    "target_agent_id": target.agent_id.as_str(),
+                }));
+        mailbox_event.root_id = Some(target.root_id.clone());
+        self.append_runtime_event(&mailbox_event)?;
+        let seq = target.mailbox.enqueue(mailbox_item.clone());
+        let mut mailbox_item = mailbox_item;
+        mailbox_item.seq = seq;
+        self.events.publish(mailbox_event);
+        Ok(SendAgentMessageResponse { mailbox_item })
+    }
+
+    pub fn has_pending_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+        delivery_phase: MailboxDeliveryPhase,
+    ) -> Result<bool> {
+        Ok(self
+            .agents
+            .thread_for_session(session_id)?
+            .mailbox
+            .has_pending_phase(delivery_phase))
+    }
+
+    pub fn pending_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<MailboxItem>> {
+        Ok(self
+            .agents
+            .thread_for_session(session_id)?
+            .mailbox
+            .pending_items())
+    }
+
+    pub fn has_pending_trigger_turn_agent_mail_for_session(
+        &self,
+        session_id: &SessionId,
+        delivery_phase: MailboxDeliveryPhase,
+    ) -> Result<bool> {
+        Ok(self
+            .agents
+            .thread_for_session(session_id)?
+            .mailbox
+            .has_pending_trigger_turn_phase(delivery_phase))
+    }
+
+    pub fn drain_agent_mailbox(
+        &self,
+        request: DrainAgentMailboxRequest,
+    ) -> Result<DrainAgentMailboxResponse> {
+        let thread = self.agents.thread_for_session(&request.session_id)?;
+        let items = thread.mailbox.drain_phase(request.delivery_phase);
+        if !items.is_empty() {
+            let mut event =
+                RuntimeEvent::new(RuntimeEventKind::MailboxConsumed, Durability::Barrier)
+                    .with_session_id(thread.session_id.clone())
+                    .with_agent_id(thread.agent_id.clone())
+                    .with_payload(json!({
+                        "delivery_phase": request.delivery_phase,
+                        "count": items.len(),
+                        "mailbox_seqs": items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+                        "mailbox_items": items.clone(),
+                    }));
+            event.root_id = Some(thread.root_id.clone());
+            self.publish_after_barrier(event)?;
+        }
+        Ok(DrainAgentMailboxResponse {
+            mailbox_items: items,
+        })
+    }
+
+    pub async fn wait_agent(
+        &self,
+        parent_agent_id: &AgentId,
+        target: AgentTarget,
+        timeout: Duration,
+    ) -> Result<WaitAgentOutcome> {
+        let parent = self.agents.thread(parent_agent_id)?;
+        let mut started =
+            RuntimeEvent::new(RuntimeEventKind::WaitAgentStarted, Durability::BestEffort)
+                .with_session_id(parent.session_id.clone())
+                .with_agent_id(parent.agent_id.clone())
+                .with_payload(json!({ "timeout_ms": timeout.as_millis() as u64 }));
+        started.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(started)?;
+
+        let outcome = parent.mailbox.wait_for_item(target, timeout).await?;
+        let (kind, payload) = match &outcome {
+            WaitAgentOutcome::Completed(item) => (
+                RuntimeEventKind::WaitAgentCompleted,
+                json!({
+                    "timed_out": false,
+                    "mailbox_seq": item.seq,
+                    "author_agent_id": item.author_agent_id.as_str(),
+                }),
+            ),
+            WaitAgentOutcome::TimedOut => (
+                RuntimeEventKind::WaitAgentTimedOut,
+                json!({ "timed_out": true }),
+            ),
+        };
+        let mut finished = RuntimeEvent::new(kind, Durability::Barrier)
+            .with_session_id(parent.session_id.clone())
+            .with_agent_id(parent.agent_id.clone())
+            .with_payload(payload);
+        finished.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(finished)?;
+        Ok(outcome)
+    }
+
+    fn record_lost_resources_after_resume(&self, thread: &AgentThread) -> Result<()> {
+        let events = self.persistence.events_for_session(&thread.session_id)?;
+        let lost = lost_live_resources_from_events(&events);
+        for resource in lost {
+            let mut event = RuntimeEvent::new(RuntimeEventKind::ResourceLost, Durability::Barrier)
+                .with_session_id(thread.session_id.clone())
+                .with_agent_id(thread.agent_id.clone())
+                .with_payload(json!({
+                    "resource": {
+                        "kind": resource.kind,
+                        "id": resource.id,
+                    },
+                    "reason": "resume_without_live_handle",
+                }));
+            event.root_id = Some(thread.root_id.clone());
+            self.publish_after_barrier(event)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn local_runtime_socket_path(state_dir: &Path) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in state_dir.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    std::env::temp_dir().join(format!("browser-use-runtime-{hash:016x}.sock"))
+}
+
+pub fn handle_local_runtime_request(
+    runtime: &RuntimeHandle,
+    request: LocalRuntimeRequest,
+) -> Result<Value> {
+    match request {
+        LocalRuntimeRequest::Ping => Ok(json!({ "ok": true })),
+        LocalRuntimeRequest::PendingAgentMail { session_id } => {
+            let session_id = SessionId::from_string(session_id)?;
+            let items = runtime.pending_agent_mail_for_session(&session_id)?;
+            Ok(json!({
+                "count": items.len(),
+                "items": items,
+            }))
+        }
+        LocalRuntimeRequest::SendAgentMessage {
+            author_agent_id,
+            target_agent_id,
+            content,
+            trigger_turn,
+            kind,
+            delivery_phase,
+            payload,
+        } => {
+            let response = runtime.send_agent_message(SendAgentMessageRequest {
+                author_agent_id: AgentId::from_string(author_agent_id)?,
+                target_agent_id: AgentId::from_string(target_agent_id)?,
+                content,
+                trigger_turn,
+                kind,
+                delivery_phase,
+                payload,
+            })?;
+            Ok(json!({
+                "mailbox_item": response.mailbox_item,
+            }))
+        }
+        LocalRuntimeRequest::SubmitUserInput {
+            session_id,
+            content,
+            trigger_turn,
+            delivery_phase,
+            input_items,
+            mut payload,
+        } => {
+            let agent_id = AgentId::from_string(session_id.clone())?;
+            if !payload.is_object() {
+                payload = json!({});
+            }
+            if let Some(obj) = payload.as_object_mut() {
+                obj.entry("source".to_string())
+                    .or_insert_with(|| json!("user_input"));
+                obj.insert("target_session_id".to_string(), json!(session_id));
+                if let Some(input_items) = input_items {
+                    obj.insert("input_items".to_string(), input_items);
+                }
+            }
+            let response = runtime.send_agent_message(SendAgentMessageRequest {
+                author_agent_id: agent_id.clone(),
+                target_agent_id: agent_id,
+                content,
+                trigger_turn,
+                kind: MailboxItemKind::Followup,
+                delivery_phase,
+                payload,
+            })?;
+            Ok(json!({
+                "mailbox_item": response.mailbox_item,
+            }))
+        }
+        LocalRuntimeRequest::WaitAgent {
+            parent_agent_id,
+            target,
+            timeout_ms,
+        } => {
+            let parent_agent_id = AgentId::from_string(parent_agent_id)?;
+            let target = match target.unwrap_or(LocalRuntimeWaitTarget::Any) {
+                LocalRuntimeWaitTarget::Any => AgentTarget::Any,
+                LocalRuntimeWaitTarget::AgentId(agent_id) => {
+                    AgentTarget::AgentId(AgentId::from_string(agent_id)?)
+                }
+                LocalRuntimeWaitTarget::Path(path) => AgentTarget::Path(path),
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .context("build local runtime wait loop")?;
+            let outcome = rt.block_on(runtime.wait_agent(
+                &parent_agent_id,
+                target,
+                Duration::from_millis(timeout_ms),
+            ))?;
+            match outcome {
+                WaitAgentOutcome::Completed(item) => Ok(json!({
+                    "timed_out": false,
+                    "mailbox_item": item,
+                })),
+                WaitAgentOutcome::TimedOut => Ok(json!({
+                    "timed_out": true,
+                })),
+            }
+        }
+        LocalRuntimeRequest::CancelRun { session_id } => {
+            let cancelled = runtime.cancel_run(&SessionId::from_string(session_id)?);
+            Ok(json!({ "cancelled": cancelled }))
+        }
+        LocalRuntimeRequest::CloseAgent { agent_id, reason } => {
+            runtime.close_agent(CloseAgentRequest {
+                agent_id: AgentId::from_string(agent_id)?,
+                reason,
+            })?;
+            Ok(json!({ "closed": true }))
+        }
+    }
+}
+
+pub fn local_runtime_response(result: Result<Value>) -> LocalRuntimeResponse {
+    match result {
+        Ok(result) => LocalRuntimeResponse {
+            ok: true,
+            result,
+            error: None,
+        },
+        Err(error) => LocalRuntimeResponse {
+            ok: false,
+            result: Value::Null,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+#[cfg(unix)]
+pub fn send_local_runtime_request(
+    state_dir: &Path,
+    request: &LocalRuntimeRequest,
+    timeout: Duration,
+) -> Result<Option<LocalRuntimeResponse>> {
+    let socket_path = local_runtime_socket_path(state_dir);
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("connect local runtime socket"),
+    };
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set local runtime read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("set local runtime write timeout")?;
+    writeln!(stream, "{}", serde_json::to_string(request)?)
+        .context("write local runtime request")?;
+    stream.flush().context("flush local runtime request")?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .context("read local runtime response")?;
+    if response.trim().is_empty() {
+        bail!("local runtime socket closed without a response");
+    }
+    serde_json::from_str(response.trim()).context("parse local runtime response")
+}
+
+#[cfg(not(unix))]
+pub fn send_local_runtime_request(
+    _state_dir: &Path,
+    _request: &LocalRuntimeRequest,
+    _timeout: Duration,
+) -> Result<Option<LocalRuntimeResponse>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+pub fn spawn_local_runtime_server(state_dir: &Path, runtime: RuntimeHandle) -> Result<PathBuf> {
+    let socket_path = local_runtime_socket_path(state_dir);
+    if socket_path.exists() {
+        if send_local_runtime_request(
+            state_dir,
+            &LocalRuntimeRequest::Ping,
+            Duration::from_millis(100),
+        )?
+        .is_some_and(|response| response.ok)
+        {
+            return Ok(socket_path);
+        }
+        let _ = std::fs::remove_file(&socket_path);
+    }
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind local runtime socket {}", socket_path.display()))?;
+    let server_path = socket_path.clone();
+    thread::Builder::new()
+        .name("browser-use-local-runtime-rpc".to_string())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let runtime = runtime.clone();
+                let _ = thread::Builder::new()
+                    .name("browser-use-local-runtime-rpc-request".to_string())
+                    .spawn(move || {
+                        let _ = handle_local_runtime_stream(stream, runtime);
+                    });
+            }
+            let _ = std::fs::remove_file(server_path);
+        })
+        .context("spawn local runtime socket server")?;
+    Ok(socket_path)
+}
+
+#[cfg(not(unix))]
+pub fn spawn_local_runtime_server(_state_dir: &Path, _runtime: RuntimeHandle) -> Result<PathBuf> {
+    bail!("local runtime server is only supported on Unix platforms")
+}
+
+#[cfg(unix)]
+fn handle_local_runtime_stream(mut stream: UnixStream, runtime: RuntimeHandle) -> Result<()> {
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        reader
+            .read_line(&mut line)
+            .context("read local runtime request")?;
+    }
+    let response = match serde_json::from_str::<LocalRuntimeRequest>(line.trim()) {
+        Ok(request) => local_runtime_response(handle_local_runtime_request(&runtime, request)),
+        Err(error) => LocalRuntimeResponse {
+            ok: false,
+            result: Value::Null,
+            error: Some(format!("parse local runtime request failed: {error}")),
+        },
+    };
+    writeln!(stream, "{}", serde_json::to_string(&response)?)
+        .context("write local runtime response")?;
+    stream.flush().context("flush local runtime response")
+}
+
+fn enrich_mailbox_payload(
+    payload: Value,
+    author_session_id: &SessionId,
+    target_session_id: &SessionId,
+    author_path: &str,
+    target_path: &str,
+) -> Value {
+    let mut map = match payload {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            if !other.is_null() {
+                map.insert("value".to_string(), other);
+            }
+            map
+        }
+    };
+    map.entry("author_session_id".to_string())
+        .or_insert_with(|| json!(author_session_id.as_str()));
+    map.entry("target_session_id".to_string())
+        .or_insert_with(|| json!(target_session_id.as_str()));
+    map.entry("author_path".to_string())
+        .or_insert_with(|| json!(author_path));
+    map.entry("target_path".to_string())
+        .or_insert_with(|| json!(target_path));
+    Value::Object(map)
+}
+
+fn child_agent_path(parent_path: &str, task_name: &str) -> String {
+    let task_name = task_name.trim_matches('/');
+    if parent_path == "/root" {
+        format!("/root/{task_name}")
+    } else {
+        format!("{parent_path}/{task_name}")
+    }
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LiveResourceKey {
+    kind: &'static str,
+    id: String,
+}
+
+fn lost_live_resources_from_events(events: &[EventRecord]) -> Vec<LiveResourceKey> {
+    let mut open = HashSet::new();
+    let mut terminal = HashSet::new();
+    for event in events {
+        if let Some(key) = live_resource_start_key(event.event_type.as_str(), &event.payload) {
+            open.insert(key);
+            continue;
+        }
+        if let Some(key) = live_resource_terminal_key(event.event_type.as_str(), &event.payload) {
+            terminal.insert(key);
+        }
+    }
+    open.into_iter()
+        .filter(|key| !terminal.contains(key))
+        .collect()
+}
+
+fn live_resource_start_key(event_type: &str, payload: &Value) -> Option<LiveResourceKey> {
+    match event_type {
+        "exec_command.begin" => {
+            payload_resource_id(payload, &["process_id", "session_id"]).map(|id| LiveResourceKey {
+                kind: "exec_command",
+                id,
+            })
+        }
+        "browser_script.started" => payload_resource_id(
+            payload,
+            &[
+                "run_id",
+                "browser_script_run_id",
+                "script_run_id",
+                "tool_call_id",
+            ],
+        )
+        .map(|id| LiveResourceKey {
+            kind: "browser_script",
+            id,
+        }),
+        "python.started" => {
+            payload_resource_id(payload, &["tool_call_id", "call_id", "session_id"])
+                .map(|id| LiveResourceKey { kind: "python", id })
+        }
+        "mcp.tool.started" => payload_resource_id(payload, &["tool_call_id", "call_id"])
+            .map(|id| LiveResourceKey { kind: "mcp", id }),
+        _ => None,
+    }
+}
+
+fn live_resource_terminal_key(event_type: &str, payload: &Value) -> Option<LiveResourceKey> {
+    match event_type {
+        "exec_command.end" => {
+            payload_resource_id(payload, &["process_id", "session_id"]).map(|id| LiveResourceKey {
+                kind: "exec_command",
+                id,
+            })
+        }
+        "browser_script.completed" | "browser_script.cancelled" | "browser_script.failed" => {
+            payload_resource_id(
+                payload,
+                &[
+                    "run_id",
+                    "browser_script_run_id",
+                    "script_run_id",
+                    "tool_call_id",
+                ],
+            )
+            .map(|id| LiveResourceKey {
+                kind: "browser_script",
+                id,
+            })
+        }
+        "python.completed" | "python.failed" => {
+            payload_resource_id(payload, &["tool_call_id", "call_id", "session_id"])
+                .map(|id| LiveResourceKey { kind: "python", id })
+        }
+        "mcp.tool.completed" | "mcp.tool.failed" => {
+            payload_resource_id(payload, &["tool_call_id", "call_id"])
+                .map(|id| LiveResourceKey { kind: "mcp", id })
+        }
+        "resource.lost" => payload
+            .get("payload")
+            .unwrap_or(payload)
+            .get("resource")
+            .and_then(|resource| {
+                Some(LiveResourceKey {
+                    kind: match resource.get("kind").and_then(Value::as_str)? {
+                        "exec_command" => "exec_command",
+                        "browser_script" => "browser_script",
+                        "python" => "python",
+                        "mcp" => "mcp",
+                        _ => return None,
+                    },
+                    id: resource.get("id").and_then(value_to_resource_id)?,
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn payload_resource_id(payload: &Value, keys: &[&str]) -> Option<String> {
+    let payload = payload.get("payload").unwrap_or(payload);
+    keys.iter()
+        .filter_map(|key| payload.get(*key))
+        .find_map(value_to_resource_id)
+}
+
+fn value_to_resource_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox_item(author: &AgentId, target: &AgentId, kind: MailboxItemKind) -> MailboxItem {
+        MailboxItem {
+            seq: 0,
+            id: Uuid::new_v4().simple().to_string(),
+            kind,
+            author_agent_id: author.clone(),
+            target_agent_id: target.clone(),
+            target_path: Some("/root/research".to_string()),
+            content: "done".to_string(),
+            trigger_turn: false,
+            delivery_phase: MailboxDeliveryPhase::NextTurn,
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn memory_journal_barrier_appends_ordered_events() -> Result<()> {
+        let journal = MemoryJournal::new();
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        let first = journal.append_session_event(
+            &session_id,
+            "session.input",
+            json!({"text": "hello"}),
+            Durability::Barrier,
+        )?;
+        let second = journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::AgentStarted, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_payload(json!({"status": "running"})),
+        )?;
+        assert_eq!(first.seq, Some(2));
+        assert_eq!(second.seq, Some(3));
+        let events = journal.events_for_session(&session_id)?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "session.created");
+        assert_eq!(events[2].event_type, "agent.started");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mailbox_wait_is_target_specific_and_non_draining() -> Result<()> {
+        let mailbox = AgentMailbox::new();
+        let parent = AgentId::from_string("parent")?;
+        let child_a = AgentId::from_string("child-a")?;
+        let child_b = AgentId::from_string("child-b")?;
+
+        mailbox.enqueue(mailbox_item(&child_a, &parent, MailboxItemKind::Completion));
+
+        let wrong = mailbox
+            .wait_for_completion(
+                AgentTarget::AgentId(child_b.clone()),
+                Duration::from_millis(10),
+            )
+            .await?;
+        assert_eq!(wrong, WaitAgentOutcome::TimedOut);
+
+        let right = mailbox
+            .wait_for_completion(
+                AgentTarget::AgentId(child_a.clone()),
+                Duration::from_millis(10),
+            )
+            .await?;
+        let WaitAgentOutcome::Completed(item) = right else {
+            panic!("expected completion");
+        };
+        assert_eq!(item.author_agent_id, child_a);
+        assert_eq!(
+            mailbox.pending_items().len(),
+            1,
+            "wait_agent must not drain mail"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_agent_wakes_for_any_mailbox_item_kind() -> Result<()> {
+        let mailbox = AgentMailbox::new();
+        let parent = AgentId::from_string("parent")?;
+        let child = AgentId::from_string("child")?;
+
+        mailbox.enqueue(mailbox_item(&child, &parent, MailboxItemKind::Input));
+
+        let outcome = mailbox
+            .wait_for_item(
+                AgentTarget::AgentId(child.clone()),
+                Duration::from_millis(10),
+            )
+            .await?;
+        let WaitAgentOutcome::Completed(item) = outcome else {
+            panic!("expected mailbox item");
+        };
+        assert_eq!(item.kind, MailboxItemKind::Input);
+        assert_eq!(item.author_agent_id, child);
+        assert_eq!(
+            mailbox.pending_items().len(),
+            1,
+            "wait_agent must not drain non-completion mail either"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_index_lists_descendants() -> Result<()> {
+        let journal = MemoryJournal::new();
+        let root = SessionId::from_string("root")?;
+        let child = SessionId::from_string("child")?;
+        let grandchild = SessionId::from_string("grandchild")?;
+        journal.open_spawn_edge(SpawnEdge {
+            parent_session_id: root.clone(),
+            child_session_id: child.clone(),
+            status: SpawnEdgeStatus::Closed,
+            path: Some("/root/child".to_string()),
+            nickname: Some("child".to_string()),
+            role: None,
+        })?;
+        journal.open_spawn_edge(SpawnEdge {
+            parent_session_id: child,
+            child_session_id: grandchild,
+            status: SpawnEdgeStatus::Closed,
+            path: Some("/root/child/grandchild".to_string()),
+            nickname: None,
+            role: None,
+        })?;
+        let descendants = journal.list_descendants(&root)?;
+        assert_eq!(descendants.len(), 2);
+        assert!(descendants
+            .iter()
+            .all(|edge| edge.status == SpawnEdgeStatus::Open));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_scheduler_counts_open_spawned_agents_until_close() -> Result<()> {
+        let scheduler = SubagentScheduler::new(3, CapacityMode::StrictReject);
+        let child_a = AgentId::from_string("child-a")?;
+        let child_b = AgentId::from_string("child-b")?;
+        let child_c = AgentId::from_string("child-c")?;
+
+        assert!(matches!(
+            scheduler.admit_spawn(child_a.clone(), "a")?,
+            SpawnAdmission::Reserved(_)
+        ));
+        assert!(matches!(
+            scheduler.admit_spawn(child_b.clone(), "b")?,
+            SpawnAdmission::Reserved(_)
+        ));
+        let err = scheduler
+            .admit_spawn(child_c.clone(), "c")
+            .expect_err("third spawned child should exceed cap because root consumes one slot");
+        assert!(err.to_string().contains("agent limit reached"));
+        assert_eq!(scheduler.open_count(), 2);
+
+        assert!(
+            scheduler.close_spawned_agent(&child_a).is_none(),
+            "strict mode releases a slot but does not auto-start queued work"
+        );
+        assert!(matches!(
+            scheduler.admit_spawn(child_c, "c")?,
+            SpawnAdmission::Reserved(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn queue_scheduler_is_explicit_non_default_behavior() -> Result<()> {
+        let scheduler = SubagentScheduler::new(2, CapacityMode::Queue);
+        let child_a = AgentId::from_string("child-a")?;
+        let child_b = AgentId::from_string("child-b")?;
+
+        assert!(matches!(
+            scheduler.admit_spawn(child_a.clone(), "a")?,
+            SpawnAdmission::Reserved(_)
+        ));
+        assert!(matches!(
+            scheduler.admit_spawn(child_b.clone(), "b")?,
+            SpawnAdmission::Queued(_)
+        ));
+        assert_eq!(scheduler.open_count(), 1);
+        assert_eq!(scheduler.queued_count(), 1);
+
+        let reservation = scheduler
+            .close_spawned_agent(&child_a)
+            .expect("queue mode should reserve next child when a slot closes");
+        assert_eq!(reservation.child_agent_id, child_b);
+        assert_eq!(scheduler.open_count(), 1);
+        assert_eq!(scheduler.queued_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_manager_allows_one_active_agent_per_browser() -> Result<()> {
+        let manager = BrowserManager::new();
+        let browser_id = manager.create_browser(BrowserConfig {
+            keep_alive: true,
+            headless: Some(true),
+            profile_id: Some("default".to_string()),
+        });
+        let agent_a = AgentId::from_string("agent-a")?;
+        let agent_b = AgentId::from_string("agent-b")?;
+
+        let lease = manager.claim_browser(&browser_id, agent_a.clone())?;
+        let snapshot = manager.snapshot(&browser_id)?;
+        assert_eq!(snapshot.status, BrowserStatus::Claimed);
+        assert_eq!(snapshot.active_agent_id, Some(agent_a.clone()));
+
+        let err = manager
+            .claim_browser(&browser_id, agent_b.clone())
+            .expect_err("same browser cannot be claimed by another running agent");
+        assert!(err.to_string().contains("browser already in use"));
+
+        manager.release_browser(&lease)?;
+        let lease_b = manager.claim_browser(&browser_id, agent_b.clone())?;
+        assert_eq!(lease_b.agent_id, agent_b);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_release_requires_matching_lease_owner() -> Result<()> {
+        let manager = BrowserManager::new();
+        let browser_id = manager.create_browser(BrowserConfig::default());
+        let agent_a = AgentId::from_string("agent-a")?;
+        let agent_b = AgentId::from_string("agent-b")?;
+        let lease = manager.claim_browser(&browser_id, agent_a)?;
+
+        let wrong_lease = BrowserLease {
+            browser_id: lease.browser_id.clone(),
+            agent_id: agent_b,
+        };
+        let err = manager
+            .release_browser(&wrong_lease)
+            .expect_err("wrong agent must not release another agent's browser");
+        assert!(err.to_string().contains("browser lease mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_run_registry_cancels_registered_tokens() -> Result<()> {
+        let registry = ActiveRunRegistry::new();
+        let session_id = SessionId::from_string("session-1")?;
+        let token = registry.register(session_id.clone());
+        assert!(!token.is_cancelled());
+        assert!(registry.cancel(&session_id));
+        assert!(token.is_cancelled());
+        registry.unregister(&session_id);
+        assert!(!registry.cancel(&session_id));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_session_resources_are_owned_by_agent_thread() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let cleaned = Arc::new(Mutex::new(0usize));
+        let cleaned_for_callback = Arc::clone(&cleaned);
+        let first = handle.get_or_insert_session_resource(
+            root.session_id(),
+            "test.counter",
+            || Mutex::new(41usize),
+            move |counter: Arc<Mutex<usize>>| {
+                let value = *counter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *cleaned_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+                1
+            },
+        )?;
+        let second = handle.get_or_insert_session_resource(
+            root.session_id(),
+            "test.counter",
+            || Mutex::new(999usize),
+            |_counter: Arc<Mutex<usize>>| 1,
+        )?;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        *first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = 42;
+        assert_eq!(handle.cleanup_session_resources(root.session_id())?, 1);
+        assert_eq!(
+            *cleaned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            42
+        );
+        assert_eq!(handle.cleanup_session_resources(root.session_id())?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn close_agent_cleans_runtime_owned_resources() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let cleaned = Arc::new(Mutex::new(false));
+        let cleaned_for_callback = Arc::clone(&cleaned);
+        handle.get_or_insert_session_resource(
+            root.session_id(),
+            "test.close_cleanup",
+            || "resource".to_string(),
+            move |_resource: Arc<String>| {
+                *cleaned_for_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                1
+            },
+        )?;
+
+        handle.close_agent(CloseAgentRequest {
+            agent_id: root.agent_id().clone(),
+            reason: "test close".to_string(),
+        })?;
+
+        assert!(*cleaned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_marks_unclosed_exec_resources_lost_once() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(root.id)?;
+        journal.append_session_event(
+            &session_id,
+            "exec_command.begin",
+            json!({ "process_id": "123", "session_id": 123 }),
+            Durability::Barrier,
+        )?;
+
+        for _ in 0..2 {
+            handle.attach_root_agent(AttachRootAgentRequest {
+                session_id: session_id.clone(),
+                cwd: PathBuf::from("/tmp"),
+                task: "resume".to_string(),
+                max_concurrent_threads_per_session: 4,
+            })?;
+        }
+
+        let lost = journal
+            .events_for_session(&session_id)?
+            .into_iter()
+            .filter(|event| event.event_type == "resource.lost")
+            .collect::<Vec<_>>();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(
+            lost[0].payload["payload"]["resource"]["kind"],
+            "exec_command"
+        );
+        assert_eq!(lost[0].payload["payload"]["resource"]["id"], "123");
+        Ok(())
+    }
+
+    #[test]
+    fn resume_does_not_mark_completed_exec_resources_lost() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(root.id)?;
+        journal.append_session_event(
+            &session_id,
+            "exec_command.begin",
+            json!({ "process_id": "123", "session_id": 123 }),
+            Durability::Barrier,
+        )?;
+        journal.append_session_event(
+            &session_id,
+            "exec_command.end",
+            json!({ "process_id": "123", "session_id": 123, "exit_code": 0 }),
+            Durability::Barrier,
+        )?;
+
+        handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 4,
+        })?;
+
+        let lost = journal
+            .events_for_session(&session_id)?
+            .into_iter()
+            .filter(|event| event.event_type == "resource.lost")
+            .count();
+        assert_eq!(lost, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_journal_uses_store_event_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let journal = SqliteJournal::open(dir.path())?;
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: None,
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_payload(json!({"target": "parent"})),
+        )?;
+        let events = journal.events_for_session(&session_id)?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "mailbox.enqueued");
+        assert_eq!(events[1].payload["durability"], "barrier");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_journal_persists_child_thread_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let journal = Arc::new(SqliteJournal::open(dir.path())?);
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: Some("Curie".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+
+        let children = journal.list_children(root.session_id())?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_session_id, child.session_id().clone());
+        assert_eq!(children[0].path.as_deref(), Some("/root/research"));
+        assert_eq!(children[0].nickname.as_deref(), Some("Curie"));
+        assert_eq!(children[0].role.as_deref(), Some("explorer"));
+
+        handle.close_agent(CloseAgentRequest {
+            agent_id: child.agent_id().clone(),
+            reason: "done inspecting".to_string(),
+        })?;
+        let children = journal.list_children(root.session_id())?;
+        assert_eq!(children[0].status, SpawnEdgeStatus::Closed);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_appends_observed_protocol_events_without_wrapping_payload() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+
+        handle.append_observed_session_event(
+            root.session_id().clone(),
+            "exec_command.begin",
+            json!({"command": ["pwd"]}),
+            Durability::Barrier,
+        )?;
+
+        let events = journal.events_for_session(root.session_id())?;
+        let observed = events
+            .iter()
+            .find(|event| event.event_type == "exec_command.begin")
+            .context("observed event")?;
+        assert_eq!(observed.payload, json!({"command": ["pwd"]}));
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let projected = rt.block_on(subscription.recv())?;
+        assert_eq!(projected.kind, ProjectedEventKind::ItemStarted);
+        assert_eq!(projected.payload["event_type"], "exec_command.begin");
+        assert_eq!(projected.payload["payload"], json!({"command": ["pwd"]}));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_attaches_existing_sqlite_root_and_uses_caller_child_id() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let journal = Arc::new(SqliteJournal::open(dir.path())?);
+        let root_session = journal.create_thread(CreateThreadRequest {
+            session_id: None,
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let root_session_id = SessionId::from_string(root_session.id)?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: root_session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "attached root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        assert_eq!(root.session_id(), &root_session_id);
+        assert_eq!(root.agent_id().as_str(), root_session_id.as_str());
+
+        let child_agent_id = AgentId::from_string("child-agent-1")?;
+        let child_session_id = SessionId::from_string("child-session-1")?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: Some(child_agent_id.clone()),
+            child_session_id: Some(child_session_id.clone()),
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        assert_eq!(child.agent_id(), &child_agent_id);
+        assert_eq!(child.session_id(), &child_session_id);
+
+        let children = journal.list_children(&root_session_id)?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_session_id, child_session_id);
+        assert_eq!(children[0].path.as_deref(), Some("/root/research"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_spawn_completion_and_wait_are_mailbox_first() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: Some("Curie".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+
+        let edges = journal.list_children(root.session_id())?;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].child_session_id, child.session_id().clone());
+        assert_eq!(edges[0].path.as_deref(), Some("/root/research"));
+
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: child.agent_id().clone(),
+            result: "findings ready".to_string(),
+        })?;
+        let edges = journal.list_children(root.session_id())?;
+        assert_eq!(edges[0].status, SpawnEdgeStatus::Done);
+
+        let pending = root.mailbox().pending_items();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].author_agent_id, child.agent_id().clone());
+        assert!(
+            !pending[0].trigger_turn,
+            "child completion must not auto-trigger parent"
+        );
+
+        let outcome = handle
+            .wait_agent(
+                root.agent_id(),
+                AgentTarget::AgentId(child.agent_id().clone()),
+                Duration::from_millis(20),
+            )
+            .await?;
+        let WaitAgentOutcome::Completed(item) = outcome else {
+            panic!("expected wait completion");
+        };
+        assert!(item.content.contains("<subagent_notification>"));
+        assert!(item.content.contains("findings ready"));
+        assert_eq!(
+            root.mailbox().pending_items().len(),
+            1,
+            "wait_agent observes mail but does not drain it"
+        );
+
+        let root_events = journal.events_for_session(root.session_id())?;
+        let root_event_types = root_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(root_event_types.contains(&"subagent.spawn_started"));
+        assert!(root_events.iter().any(|event| {
+            event.event_type == "agent.completed"
+                && event.payload["payload"]["child_session_id"] == child.session_id().as_str()
+                && event.payload["payload"]["runtime_owned"] == true
+        }));
+        assert!(root_event_types.contains(&"mailbox.enqueued"));
+        assert!(root_event_types.contains(&"wait_agent.completed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_send_agent_message_journals_then_wakes_mailbox() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+
+        let sent = handle.send_agent_message(SendAgentMessageRequest {
+            author_agent_id: child.agent_id().clone(),
+            target_agent_id: root.agent_id().clone(),
+            content: "status update".to_string(),
+            trigger_turn: false,
+            kind: MailboxItemKind::Input,
+            delivery_phase: MailboxDeliveryPhase::NextTurn,
+            payload: json!({"source": "test"}),
+        })?;
+        assert_eq!(sent.mailbox_item.content, "status update");
+
+        let outcome = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(20))
+            .await?;
+        let WaitAgentOutcome::Completed(item) = outcome else {
+            panic!("expected runtime wait to wake from sent message");
+        };
+        assert_eq!(item.kind, MailboxItemKind::Input);
+        assert_eq!(item.content, "status update");
+        assert_eq!(root.mailbox().pending_items().len(), 1);
+
+        let root_events = journal.events_for_session(root.session_id())?;
+        let mailbox_event = root_events
+            .iter()
+            .find(|event| event.event_type == "mailbox.enqueued")
+            .context("mailbox.enqueued event")?;
+        assert_eq!(mailbox_event.payload["payload"]["trigger_turn"], false);
+
+        let err = handle
+            .send_agent_message(SendAgentMessageRequest {
+                author_agent_id: child.agent_id().clone(),
+                target_agent_id: root.agent_id().clone(),
+                content: "new root task".to_string(),
+                trigger_turn: true,
+                kind: MailboxItemKind::Followup,
+                delivery_phase: MailboxDeliveryPhase::NextTurn,
+                payload: json!({}),
+            })
+            .expect_err("trigger_turn messages to root must be rejected");
+        assert!(err.to_string().contains("root agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_runtime_socket_routes_mailbox_requests() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+
+        let socket_path = spawn_local_runtime_server(dir.path(), handle.clone())?;
+        let response = send_local_runtime_request(
+            dir.path(),
+            &LocalRuntimeRequest::SendAgentMessage {
+                author_agent_id: child.agent_id().as_str().to_string(),
+                target_agent_id: root.agent_id().as_str().to_string(),
+                content: "status update".to_string(),
+                trigger_turn: false,
+                kind: MailboxItemKind::Input,
+                delivery_phase: MailboxDeliveryPhase::NextTurn,
+                payload: json!({"source": "test"}),
+            },
+            Duration::from_secs(1),
+        )?
+        .context("local runtime send response")?;
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(
+            response.result["mailbox_item"]["content"].as_str(),
+            Some("status update")
+        );
+
+        let pending = send_local_runtime_request(
+            dir.path(),
+            &LocalRuntimeRequest::PendingAgentMail {
+                session_id: root.session_id().as_str().to_string(),
+            },
+            Duration::from_secs(1),
+        )?
+        .context("local runtime pending response")?;
+        assert!(pending.ok, "{:?}", pending.error);
+        assert_eq!(pending.result["count"].as_u64(), Some(1));
+
+        let waited = send_local_runtime_request(
+            dir.path(),
+            &LocalRuntimeRequest::WaitAgent {
+                parent_agent_id: root.agent_id().as_str().to_string(),
+                target: Some(LocalRuntimeWaitTarget::Any),
+                timeout_ms: 50,
+            },
+            Duration::from_secs(1),
+        )?
+        .context("local runtime wait response")?;
+        assert!(waited.ok, "{:?}", waited.error);
+        assert_eq!(waited.result["timed_out"].as_bool(), Some(false));
+        assert_eq!(
+            waited.result["mailbox_item"]["content"].as_str(),
+            Some("status update")
+        );
+        assert_eq!(
+            root.mailbox().pending_items().len(),
+            1,
+            "wait_agent must observe but not drain mailbox items"
+        );
+        let submitted = send_local_runtime_request(
+            dir.path(),
+            &LocalRuntimeRequest::SubmitUserInput {
+                session_id: root.session_id().as_str().to_string(),
+                content: "continue with the follow-up".to_string(),
+                trigger_turn: true,
+                delivery_phase: MailboxDeliveryPhase::CurrentTurn,
+                input_items: None,
+                payload: json!({"pending_from_seq": 123}),
+            },
+            Duration::from_secs(1),
+        )?
+        .context("local runtime submit user input response")?;
+        assert!(submitted.ok, "{:?}", submitted.error);
+        assert_eq!(
+            submitted.result["mailbox_item"]["kind"].as_str(),
+            Some("followup")
+        );
+        assert_eq!(
+            root.mailbox().pending_items().len(),
+            2,
+            "submit user input should enqueue into the same live mailbox"
+        );
+        let closed = send_local_runtime_request(
+            dir.path(),
+            &LocalRuntimeRequest::CloseAgent {
+                agent_id: child.agent_id().as_str().to_string(),
+                reason: "done with child".to_string(),
+            },
+            Duration::from_secs(1),
+        )?
+        .context("local runtime close response")?;
+        assert!(closed.ok, "{:?}", closed.error);
+        assert_eq!(closed.result["closed"].as_bool(), Some(true));
+        let child_events = journal.events_for_session(child.session_id())?;
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "agent.closed"));
+        let parent_events = journal.events_for_session(root.session_id())?;
+        let cancelled = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.cancelled")
+            .context("agent.cancelled")?;
+        assert_eq!(
+            cancelled.payload["payload"]["reason"].as_str(),
+            Some("done with child")
+        );
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_strict_spawn_rejection_is_journaled() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 1,
+        })?;
+
+        let err = match handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "blocked".to_string(),
+            message: "no capacity".to_string(),
+            nickname: None,
+            role: None,
+        }) {
+            Ok(_) => panic!("cap 1 means root consumes the only slot"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("agent limit reached"));
+
+        let root_events = journal.events_for_session(root.session_id())?;
+        assert!(root_events
+            .iter()
+            .any(|event| event.event_type == "subagent.spawn_rejected"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_wait_timeout_is_journaled_without_hiding_children() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 2,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "slow".to_string(),
+            message: "take your time".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+
+        let outcome = handle
+            .wait_agent(
+                root.agent_id(),
+                AgentTarget::AgentId(child.agent_id().clone()),
+                Duration::from_millis(1),
+            )
+            .await?;
+        assert_eq!(outcome, WaitAgentOutcome::TimedOut);
+        assert_eq!(
+            handle.agents().thread(child.agent_id())?.snapshot().status,
+            AgentThreadStatus::Created,
+            "wait timeout must not close or hide the child"
+        );
+        let root_events = journal.events_for_session(root.session_id())?;
+        assert!(root_events
+            .iter()
+            .any(|event| event.event_type == "wait_agent.timed_out"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_completed_child_holds_capacity_until_close() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 2,
+        })?;
+        let first = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "first".to_string(),
+            message: "one".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: first.agent_id().clone(),
+            result: "done".to_string(),
+        })?;
+
+        let err = match handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "second".to_string(),
+            message: "two".to_string(),
+            nickname: None,
+            role: None,
+        }) {
+            Ok(_) => panic!("completed-but-open child must still hold capacity"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("agent limit reached"));
+
+        handle.close_agent(CloseAgentRequest {
+            agent_id: first.agent_id().clone(),
+            reason: "done inspecting".to_string(),
+        })?;
+        let second = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "second".to_string(),
+            message: "two".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        assert_eq!(second.snapshot().agent_path, "/root/second");
+
+        let edges = journal.list_children(root.session_id())?;
+        assert!(edges.iter().any(|edge| {
+            edge.child_session_id == first.session_id().clone()
+                && edge.status == SpawnEdgeStatus::Closed
+        }));
+        let first_events = journal.events_for_session(first.session_id())?;
+        assert!(first_events
+            .iter()
+            .any(|event| event.event_type == "agent.closed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projected_subscription_returns_snapshot_before_live_events() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+        assert_eq!(subscription.snapshot().agents.len(), 1);
+        assert_eq!(
+            subscription.snapshot().agents[0].agent_id,
+            root.agent_id().clone()
+        );
+
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        let event = subscription.recv().await?;
+        assert_eq!(event.session_id, Some(root.session_id().clone()));
+        assert_eq!(event.kind, ProjectedEventKind::ToolUpdated);
+        assert_eq!(event.payload["child_agent_id"], child.agent_id().as_str());
+
+        let fresh_snapshot = handle.snapshot();
+        assert_eq!(fresh_snapshot.agents.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projected_subscription_maps_terminal_agent_events() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "research".to_string(),
+            message: "inspect".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        let mut subscription = handle.subscribe_projected();
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: child.agent_id().clone(),
+            result: "done".to_string(),
+        })?;
+
+        let completed = subscription.recv().await?;
+        assert_eq!(completed.kind, ProjectedEventKind::ThreadStatusChanged);
+        assert_eq!(completed.session_id, Some(child.session_id().clone()));
+        assert_eq!(completed.payload["result"], "done");
+
+        let parent_terminal = subscription.recv().await?;
+        assert_eq!(
+            parent_terminal.kind,
+            ProjectedEventKind::ThreadStatusChanged
+        );
+        assert_eq!(parent_terminal.session_id, Some(root.session_id().clone()));
+        assert_eq!(parent_terminal.payload["runtime_owned"], true);
+        assert_eq!(
+            parent_terminal.payload["child_session_id"],
+            child.session_id().as_str()
+        );
+
+        let mailbox = subscription.recv().await?;
+        assert_eq!(mailbox.kind, ProjectedEventKind::ToolUpdated);
+        assert_eq!(mailbox.session_id, Some(root.session_id().clone()));
+        assert_eq!(mailbox.payload["trigger_turn"], false);
+        Ok(())
+    }
+}

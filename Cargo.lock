@@ -228,6 +228,7 @@ dependencies = [
  "browser-use-protocol",
  "browser-use-providers",
  "browser-use-python-worker",
+ "browser-use-runtime",
  "browser-use-store",
  "futures-util",
  "portable-pty",
@@ -270,6 +271,7 @@ dependencies = [
  "browser-use-protocol",
  "browser-use-providers",
  "browser-use-python-worker",
+ "browser-use-runtime",
  "browser-use-store",
  "clap",
  "open",
@@ -277,6 +279,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "toml",
 ]
 
@@ -332,6 +335,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-use-runtime"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "browser-use-protocol",
+ "browser-use-store",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "browser-use-store"
 version = "0.1.2"
 dependencies = [
@@ -354,6 +375,7 @@ dependencies = [
  "browser-use-browser",
  "browser-use-protocol",
  "browser-use-providers",
+ "browser-use-runtime",
  "browser-use-store",
  "clap",
  "crossterm",
