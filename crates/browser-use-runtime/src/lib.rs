@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -287,6 +288,16 @@ impl RuntimeEvent {
 
     pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
         self.agent_id = Some(agent_id);
+        self
+    }
+
+    pub fn with_root_id(mut self, root_id: RootId) -> Self {
+        self.root_id = Some(root_id);
+        self
+    }
+
+    pub fn with_run_id(mut self, run_id: RunId) -> Self {
+        self.run_id = Some(run_id);
         self
     }
 
@@ -1834,6 +1845,17 @@ impl ActiveRunRegistry {
     }
 }
 
+struct ActiveRuntimeRunGuard {
+    runtime: Arc<BrowserUseRuntime>,
+    session_id: SessionId,
+}
+
+impl Drop for ActiveRuntimeRunGuard {
+    fn drop(&mut self) {
+        self.runtime.active_runs.unregister(&self.session_id);
+    }
+}
+
 impl AgentManager {
     pub fn new() -> Self {
         Self::default()
@@ -2026,6 +2048,36 @@ pub struct RuntimeHandle {
     inner: Arc<BrowserUseRuntime>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunAgentRequest {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub cancellation_token: CancellationToken,
+}
+
+impl RunAgentRequest {
+    pub fn new(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            run_id: RunId::new(),
+            cancellation_token: CancellationToken::new(),
+        }
+    }
+
+    pub fn with_cancellation_token(mut self, cancellation_token: CancellationToken) -> Self {
+        self.cancellation_token = cancellation_token;
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RunAgentResponse<T> {
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub output: T,
+}
+
 impl RuntimeHandle {
     pub fn new(runtime: BrowserUseRuntime) -> Self {
         Self {
@@ -2101,6 +2153,97 @@ impl RuntimeHandle {
 
     pub fn cancel_run(&self, session_id: &SessionId) -> bool {
         self.inner.active_runs.cancel(session_id)
+    }
+
+    pub async fn run_agent<T, Fut>(
+        &self,
+        request: RunAgentRequest,
+        run: Fut,
+    ) -> Result<RunAgentResponse<T>>
+    where
+        Fut: Future<Output = Result<T>> + Send,
+        T: Send,
+    {
+        let thread = self.inner.agents.thread_for_session(&request.session_id)?;
+        let agent_id = thread.agent_id().clone();
+        thread.set_status(AgentThreadStatus::Running);
+
+        self.inner.publish_after_barrier(
+            RuntimeEvent::new(RuntimeEventKind::AgentStarted, Durability::Barrier)
+                .with_agent_id(agent_id.clone())
+                .with_session_id(request.session_id.clone())
+                .with_root_id(thread.root_id.clone())
+                .with_run_id(request.run_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "run_id": request.run_id.as_str(),
+                })),
+        )?;
+        self.inner.publish_after_barrier(
+            RuntimeEvent::new(RuntimeEventKind::AgentTurnStarted, Durability::Barrier)
+                .with_agent_id(agent_id.clone())
+                .with_session_id(request.session_id.clone())
+                .with_root_id(thread.root_id.clone())
+                .with_run_id(request.run_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "run_id": request.run_id.as_str(),
+                })),
+        )?;
+
+        self.inner.active_runs.register_with_token(
+            request.session_id.clone(),
+            request.cancellation_token.clone(),
+        );
+        let _active_run = ActiveRuntimeRunGuard {
+            runtime: self.inner.clone(),
+            session_id: request.session_id.clone(),
+        };
+
+        let output = match run.await {
+            Ok(output) => output,
+            Err(error) => {
+                thread.set_status(if request.cancellation_token.is_cancelled() {
+                    AgentThreadStatus::Cancelled
+                } else {
+                    AgentThreadStatus::Failed
+                });
+                self.inner.publish_after_barrier(
+                    RuntimeEvent::new(RuntimeEventKind::AgentTurnAborted, Durability::Barrier)
+                        .with_agent_id(agent_id.clone())
+                        .with_session_id(request.session_id.clone())
+                        .with_root_id(thread.root_id.clone())
+                        .with_run_id(request.run_id.clone())
+                        .with_payload(json!({
+                            "runtime_owned": true,
+                            "run_id": request.run_id.as_str(),
+                            "error": format!("{error:#}"),
+                            "cancelled": request.cancellation_token.is_cancelled(),
+                        })),
+                )?;
+                return Err(error);
+            }
+        };
+
+        thread.set_status(AgentThreadStatus::Completed);
+        self.inner.publish_after_barrier(
+            RuntimeEvent::new(RuntimeEventKind::AgentTurnCompleted, Durability::Barrier)
+                .with_agent_id(agent_id.clone())
+                .with_session_id(request.session_id.clone())
+                .with_root_id(thread.root_id.clone())
+                .with_run_id(request.run_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "run_id": request.run_id.as_str(),
+                })),
+        )?;
+
+        Ok(RunAgentResponse {
+            agent_id,
+            session_id: request.session_id,
+            run_id: request.run_id,
+            output,
+        })
     }
 
     pub fn get_or_insert_session_resource<T, F, C>(
@@ -3534,6 +3677,49 @@ mod tests {
         assert!(token.is_cancelled());
         registry.unregister(&session_id);
         assert!(!registry.cancel(&session_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_run_agent_owns_active_run_lifecycle_and_events() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let session_id = root.session_id().clone();
+        let session_id_for_run = session_id.clone();
+        let handle_for_run = handle.clone();
+
+        let response = handle
+            .run_agent(RunAgentRequest::new(session_id.clone()), async move {
+                assert!(handle_for_run
+                    .inner
+                    .active_runs
+                    .tokens
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&session_id_for_run));
+                Ok::<_, anyhow::Error>("done".to_string())
+            })
+            .await?;
+
+        assert_eq!(response.agent_id, *root.agent_id());
+        assert_eq!(response.session_id, session_id);
+        assert_eq!(response.output, "done");
+        assert!(!handle.cancel_run(root.session_id()));
+        assert_eq!(root.snapshot().status, AgentThreadStatus::Completed);
+
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.started".to_string()));
+        assert!(event_types.contains(&"agent.turn.completed".to_string()));
         Ok(())
     }
 

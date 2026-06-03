@@ -6,7 +6,7 @@ use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use browser_use_runtime::{
-    AgentId, AttachChildAgentRequest, AttachRootAgentRequest, RuntimeHandle,
+    AgentId, AttachChildAgentRequest, AttachRootAgentRequest, RunAgentRequest, RuntimeHandle,
     SessionId as RuntimeSessionId,
 };
 use browser_use_store::{Store, StoreNotifier};
@@ -157,31 +157,36 @@ impl LiveAgentExecutor {
         let cancel = request
             .cancellation_token
             .unwrap_or_else(CancellationToken::new);
-        self.inner
-            .runtime
-            .register_run_with_token(runtime_session_id.clone(), cancel.clone());
-        let _active_run = ActiveRunGuard {
-            runtime: self.inner.runtime.clone(),
-            session_id: runtime_session_id.clone(),
-        };
-        let result = self
-            .inner
-            .tokio
-            .block_on(run_session_with_config_with_cancel_and_runtime(
-                Arc::clone(&shared_store),
-                &request.session_id,
-                request.config,
-                cancel,
-                Some(self.inner.runtime.clone()),
-            ));
+        let runtime_request =
+            RunAgentRequest::new(runtime_session_id).with_cancellation_token(cancel.clone());
+        let runtime = self.inner.runtime.clone();
+        let runner_runtime = self.inner.runtime.clone();
+        let request_session_id = request.session_id.clone();
+        let request_session_id_for_run = request_session_id.clone();
+        let shared_store_for_run = Arc::clone(&shared_store);
+        let config = request.config;
+        let result = self.inner.tokio.block_on(async move {
+            runtime
+                .run_agent(runtime_request, async move {
+                    run_session_with_config_with_cancel_and_runtime(
+                        shared_store_for_run,
+                        &request_session_id_for_run,
+                        config,
+                        cancel,
+                        Some(runner_runtime),
+                    )
+                    .await
+                })
+                .await
+        });
         match result {
-            Ok(session_id) => Ok(LiveAgentRunResult {
-                session_id: session_id.0,
+            Ok(response) => Ok(LiveAgentRunResult {
+                session_id: response.output.0,
             }),
             Err(error) => {
                 append_session_failed_if_missing(
                     &shared_store,
-                    &request.session_id,
+                    &request_session_id,
                     &format!("{error:#}"),
                 );
                 Err(error)
@@ -219,17 +224,6 @@ impl LiveAgentExecutor {
             })
             .context("spawn live agent executor thread")?;
         Ok(())
-    }
-}
-
-struct ActiveRunGuard {
-    runtime: RuntimeHandle,
-    session_id: RuntimeSessionId,
-}
-
-impl Drop for ActiveRunGuard {
-    fn drop(&mut self) {
-        self.runtime.unregister_run(&self.session_id);
     }
 }
 
