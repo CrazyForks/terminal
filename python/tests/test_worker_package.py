@@ -596,6 +596,36 @@ def test_managed_browser_profile_env_uses_configured_user_data_dir(
     assert worker._managed_chrome_profile_is_temporary is False
 
 
+def test_managed_browser_viewport_env_controls_worker_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "BU_BROWSER_VIEWPORT",
+        '{"width":1024,"height":768,"deviceScaleFactor":2,"screenWidth":1440,"screenHeight":900}',
+    )
+    monkeypatch.setenv("BU_BROWSER_NO_VIEWPORT", "false")
+
+    headless = worker._managed_chrome_args("/chrome", 9338, tmp_path / "profile", False)
+
+    assert "--headless=new" in headless
+    assert "--window-size=1024,768" in headless
+    assert "--force-device-scale-factor=2" in headless
+
+    headed = worker._managed_chrome_args("/chrome", 9339, tmp_path / "profile", True)
+
+    assert "--new-window" in headed
+    assert "--window-size=1024,768" in headed
+    assert "--window-size=1512,900" not in headed
+
+    monkeypatch.setenv("BU_BROWSER_NO_VIEWPORT", "true")
+
+    no_viewport = worker._managed_chrome_args("/chrome", 9340, tmp_path / "profile", True)
+
+    assert "--window-size=1024,768" not in no_viewport
+    assert "--force-device-scale-factor=2" not in no_viewport
+    assert "--window-size=1512,900" in no_viewport
+
+
 def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:
     visible = worker._managed_chrome_args("/chrome", 9333, tmp_path / "profile", True)
     headless = worker._managed_chrome_args("/chrome", 9334, tmp_path / "profile", False)

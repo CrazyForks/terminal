@@ -385,7 +385,43 @@ def _managed_chrome_profile_dir() -> tuple[Path, bool]:
     return Path(tempfile.mkdtemp(prefix="but-managed-chrome.")), True
 
 
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _managed_chrome_viewport_args() -> list[str]:
+    if _env_bool("BU_BROWSER_NO_VIEWPORT") is True:
+        return []
+    raw = os.environ.get("BU_BROWSER_VIEWPORT")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    width = parsed.get("width")
+    height = parsed.get("height")
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return []
+    args = [f"--window-size={width},{height}"]
+    device_scale_factor = parsed.get("deviceScaleFactor")
+    if isinstance(device_scale_factor, (int, float)) and device_scale_factor > 0:
+        args.append(f"--force-device-scale-factor={device_scale_factor:g}")
+    return args
+
+
 def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -> list[str]:
+    viewport_args = _managed_chrome_viewport_args()
     args = [
         chrome,
         "--remote-debugging-address=127.0.0.1",
@@ -395,9 +431,12 @@ def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -
         "--no-default-browser-check",
     ]
     if visible:
-        args.extend(["--new-window", "--window-size=1512,900"])
+        args.append("--new-window")
+        if not viewport_args:
+            args.append("--window-size=1512,900")
     else:
         args.append("--headless=new")
+    args.extend(viewport_args)
     args.extend(_managed_chrome_extra_args())
     args.append("about:blank")
     return args
