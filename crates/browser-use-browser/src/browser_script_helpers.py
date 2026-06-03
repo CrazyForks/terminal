@@ -7,6 +7,7 @@ browser-harness semantics so the model sees one coherent browser API.
 
 import base64
 import concurrent.futures
+import csv
 import fnmatch
 import gzip
 import html
@@ -1353,6 +1354,137 @@ def json_api_records(urls, records_path=None, limit=200, max_urls=8, use_browser
         "source_count": len(sources),
         "sources": sources,
         "records_path": records_path,
+        "used_browser_fetch": bool(use_browser_fetch),
+    }
+
+
+def tabular_data_records(source, delimiter=None, limit=500, use_browser_fetch=False, table_index=0, timeout=20.0):
+    """Fetch/read CSV, TSV, or simple HTML table data and return normalized records."""
+    try:
+        limit_int = max(1, min(int(limit or 500), 5000))
+    except Exception:
+        limit_int = 500
+
+    def clean(value, max_chars=2000):
+        return re.sub(r"\s+", " ", html.unescape(str(value or ""))).strip()[:max_chars]
+
+    def unique_headers(headers):
+        out = []
+        seen = {}
+        for index, header in enumerate(headers):
+            base = clean(header, 120) or f"column_{index + 1}"
+            count = seen.get(base, 0) + 1
+            seen[base] = count
+            out.append(base if count == 1 else f"{base}_{count}")
+        return out
+
+    def response_text(payload):
+        if isinstance(payload, dict):
+            if payload.get("text") is not None:
+                return str(payload.get("text") or "")
+            if payload.get("json") is not None:
+                return json.dumps(payload.get("json"), ensure_ascii=False)
+        if hasattr(payload, "text"):
+            return str(payload.text)
+        return str(payload)
+
+    def read_source(value):
+        text = str(value or "")
+        if not text:
+            return "", "empty", ""
+        if len(text) < 1000 and "\n" not in text and "\r" not in text:
+            try:
+                path = pathlib.Path(text).expanduser()
+                if path.exists():
+                    return path.read_text(encoding="utf-8", errors="replace"), "file", str(path)
+            except OSError:
+                pass
+        if re.match(r"^https?://", text) or text.startswith("/"):
+            payload = browser_fetch(text, timeout=timeout) if use_browser_fetch else http_get(text, timeout=timeout)
+            return response_text(payload), "browser_fetch" if use_browser_fetch else "http_get", text
+        return text, "literal", ""
+
+    def parse_csv_text(text):
+        sample = text[:4096]
+        delimiter_char = None
+        dialect = None
+        if delimiter:
+            delimiter_char = str(delimiter)[0]
+        else:
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+            except Exception:
+                dialect = csv.excel_tab if "\t" in sample and "," not in sample else csv.excel
+        rows = (
+            list(csv.reader(io.StringIO(text), delimiter=delimiter_char))
+            if delimiter_char
+            else list(csv.reader(io.StringIO(text), dialect))
+        )
+        rows = [[clean(cell) for cell in row] for row in rows if any(clean(cell) for cell in row)]
+        if not rows:
+            return [], [], dialect.delimiter if dialect else delimiter_char, "empty_csv"
+        headers = unique_headers(rows[0])
+        records = []
+        for row in rows[1 : limit_int + 1]:
+            padded = row + [""] * max(0, len(headers) - len(row))
+            record = {headers[index]: padded[index] if index < len(padded) else "" for index in range(len(headers))}
+            if any(str(value).strip() for value in record.values()):
+                records.append(record)
+        return headers, records, delimiter_char or dialect.delimiter, ""
+
+    def strip_tags(value):
+        value = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
+        value = re.sub(r"<[^>]+>", " ", value)
+        return clean(value)
+
+    def parse_html_tables(text):
+        tables = re.findall(r"<table\b[^>]*>.*?</table>", text, flags=re.I | re.S)
+        if not tables:
+            return [], [], "no_html_table"
+        try:
+            table_i = max(0, min(int(table_index or 0), len(tables) - 1))
+        except Exception:
+            table_i = 0
+        table = tables[table_i]
+        row_blocks = re.findall(r"<tr\b[^>]*>.*?</tr>", table, flags=re.I | re.S)
+        parsed_rows = []
+        header_row_index = 0
+        for row_index, row_html in enumerate(row_blocks):
+            cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html, flags=re.I | re.S)
+            if cells:
+                parsed_rows.append([strip_tags(cell) for cell in cells])
+                if re.search(r"<th\b", row_html, flags=re.I):
+                    header_row_index = row_index
+        if not parsed_rows:
+            return [], [], "empty_html_table"
+        headers = unique_headers(parsed_rows[header_row_index])
+        data_rows = parsed_rows[header_row_index + 1 :] if header_row_index == 0 else parsed_rows[:header_row_index] + parsed_rows[header_row_index + 1 :]
+        records = []
+        for row in data_rows[:limit_int]:
+            padded = row + [""] * max(0, len(headers) - len(row))
+            record = {headers[index]: padded[index] if index < len(padded) else "" for index in range(len(headers))}
+            if any(str(value).strip() for value in record.values()):
+                records.append(record)
+        return headers, records, f"html_table_{table_i}", ""
+
+    text, source_kind, resolved_source = read_source(source)
+    lower = str(source or "").lower()
+    if "<table" in text[:20000].lower() or lower.endswith((".html", ".htm")):
+        fields, records, parsed_as, diagnosis = parse_html_tables(text)
+        kind = "html_table"
+    else:
+        fields, records, parsed_as, diagnosis = parse_csv_text(text)
+        kind = "csv" if parsed_as != "\t" else "tsv"
+    return {
+        "source": source,
+        "resolved_source": resolved_source,
+        "source_kind": source_kind,
+        "kind": kind,
+        "parsed_as": parsed_as,
+        "count": len(records),
+        "fields": fields,
+        "records": records,
+        "diagnosis": diagnosis,
         "used_browser_fetch": bool(use_browser_fetch),
     }
 
