@@ -1999,7 +1999,9 @@ impl App {
         let session_changed = self.last_followup_check_session != self.selected_session_id;
         if drained_any || session_changed {
             self.last_followup_check_session = self.selected_session_id.clone();
-            if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
+            if self.flush_ready_pending_active_followups()?
+                || self.flush_ready_queued_followups()?
+            {
                 changed = true;
                 self.state_cache.refresh_all(&self.store)?;
                 self.refresh_cached_projection();
@@ -5761,6 +5763,7 @@ impl App {
         let choice = BROWSER_CHOICES
             .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
             .unwrap_or(&BROWSER_CHOICES[0]);
+        let previous_browser = self.browser.clone();
         self.browser = (*choice).to_string();
         self.track_browser_selected();
         self.persist_runtime_settings()?;
@@ -5771,6 +5774,7 @@ impl App {
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
         }
+        self.append_browser_backend_change_if_needed(&previous_browser)?;
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
@@ -5780,6 +5784,24 @@ impl App {
         } else {
             self.close_surface();
         }
+        Ok(())
+    }
+
+    fn append_browser_backend_change_if_needed(&mut self, previous_browser: &str) -> Result<()> {
+        if previous_browser == self.browser {
+            return Ok(());
+        }
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        self.store.append_event(
+            session_id,
+            "browser.backend_changed",
+            serde_json::json!({
+                "previous_browser": previous_browser,
+                "browser": self.browser,
+            }),
+        )?;
         Ok(())
     }
 
@@ -8893,7 +8915,9 @@ mod redesign_tests {
             black_box(app.drain_store_notifications()?);
         }
         let drain_us = t.elapsed().as_micros() as f64 / reps as f64;
-        eprintln!("TIMING3 events=3000 steady_drain_per_call={drain_us:.1}us (~2-3 calls per keystroke)");
+        eprintln!(
+            "TIMING3 events=3000 steady_drain_per_call={drain_us:.1}us (~2-3 calls per keystroke)"
+        );
         Ok(())
     }
 
@@ -11945,6 +11969,8 @@ wire_api = "responses"
     fn browser_live_url_is_visible_in_browser_panel() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
@@ -11962,6 +11988,49 @@ wire_api = "responses"
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live view"));
         assert!(screen.contains("https://live.browser-use.com/?wss=example"));
+        Ok(())
+    }
+
+    #[test]
+    fn switching_from_cloud_to_local_clears_live_url_source() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Done"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let local_index = BROWSER_CHOICES
+            .iter()
+            .position(|choice| *choice == BROWSER_LOCAL_CHROME)
+            .context("local browser choice")?;
+        app.save_browser(local_index)?;
+        let state = app.workbench_state()?;
+        assert_eq!(state.browser.backend, BROWSER_LOCAL_CHROME);
+        assert_eq!(state.browser.live_url, None);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "browser.backend_changed"));
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("live https://live.browser-use.com"));
+        assert!(!screen.contains("source https://live.browser-use.com"));
         Ok(())
     }
 

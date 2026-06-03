@@ -660,8 +660,9 @@ pub fn browser_summary_from_events(
     events: &[EventRecord],
     backend: impl Into<String>,
 ) -> BrowserSummary {
+    let backend = backend.into();
     let mut summary = BrowserSummary {
-        backend: backend.into(),
+        backend,
         status: "not connected".to_string(),
         title: None,
         url: None,
@@ -682,6 +683,14 @@ pub fn browser_summary_from_events(
             }
             "browser.disconnected" => {
                 summary.status = "disconnected".to_string();
+            }
+            "browser.backend_changed" => {
+                summary.status = "not connected".to_string();
+                summary.title = None;
+                summary.url = None;
+                summary.live_url = None;
+                summary.tabs = None;
+                summary.viewport = None;
             }
             "browser.live_url" => {
                 summary.status = "connected".to_string();
@@ -718,7 +727,14 @@ pub fn browser_summary_from_events(
             _ => {}
         }
     }
+    if !browser_backend_supports_live_url(&summary.backend) {
+        summary.live_url = None;
+    }
     summary
+}
+
+fn browser_backend_supports_live_url(backend: &str) -> bool {
+    backend.to_ascii_lowercase().contains("cloud")
 }
 
 pub fn telemetry_summary_from_events(events: &[EventRecord]) -> TelemetrySummary {
@@ -1562,6 +1578,26 @@ mod tests {
             browser.live_url.as_deref(),
             Some("https://live.browser-use.com/legacy")
         );
+    }
+
+    #[test]
+    fn browser_backend_change_clears_stale_cloud_live_url() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({"live_url": "https://live.browser-use.com/watch"}),
+            ),
+            event(
+                2,
+                "browser.backend_changed",
+                json!({"previous_browser": "Browser Use cloud", "browser": "Local Chrome"}),
+            ),
+        ];
+        let browser = browser_summary_from_events(&events, "Local Chrome");
+        assert_eq!(browser.status, "not connected");
+        assert_eq!(browser.live_url, None);
+        assert_eq!(browser.url, None);
     }
 
     #[test]

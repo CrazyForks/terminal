@@ -21,7 +21,7 @@ use browser_use_store::Store;
 use serde_json::json;
 
 use super::browser::{
-    BrowserAction, BrowserBackend, BrowserRequest, BrowserTool,
+    desired_browser_connect_command, BrowserAction, BrowserBackend, BrowserRequest, BrowserTool,
     BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
 };
 use crate::session::SharedStore;
@@ -377,6 +377,41 @@ async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
     assert_eq!(
         backend.last(),
         LastCall::Command("browser remote start --profile-id 'profile with space'".to_string())
+    );
+}
+
+#[tokio::test]
+async fn dynamic_browser_mode_uses_latest_store_browser_setting_mid_run() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store, session)
+        .with_dynamic_browser_mode_from_store(true);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser connect local".to_string())
+    );
+}
+
+#[test]
+fn selected_local_mode_reconnects_when_cloud_is_currently_attached() {
+    assert_eq!(
+        desired_browser_connect_command("local", true, Some("remote-cloud")),
+        Some("browser connect local")
+    );
+    assert_eq!(
+        desired_browser_connect_command("local", true, Some("local")),
+        None
     );
 }
 

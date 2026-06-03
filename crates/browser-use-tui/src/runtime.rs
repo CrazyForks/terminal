@@ -537,12 +537,14 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
+            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
+                .with_dynamic_browser_mode_from_store(true)
                 .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
@@ -558,6 +560,7 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
+            .with_dynamic_browser_mode_from_store(true)
             .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
@@ -635,6 +638,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -651,6 +655,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
@@ -683,6 +688,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
+        assert!(options.dynamic_browser_mode_from_store);
         assert!(options.python_env.is_empty());
     }
 
