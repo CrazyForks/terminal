@@ -247,6 +247,37 @@ def _apply_browser_user_agent_override(cdp: Any, session_id: Any = None) -> None
         cdp("Network.setUserAgentOverride", session_id=session_id, userAgent=user_agent)
 
 
+def _browser_permissions() -> list[str]:
+    raw = os.environ.get("BU_BROWSER_PERMISSIONS")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    permissions: list[str] = []
+    seen: set[str] = set()
+    for permission in parsed:
+        if not isinstance(permission, str):
+            continue
+        permission = permission.strip()
+        if not permission or permission in seen:
+            continue
+        permissions.append(permission)
+        seen.add(permission)
+    return permissions
+
+
+def _apply_browser_permissions(cdp: Any) -> None:
+    permissions = _browser_permissions()
+    if not permissions:
+        return
+    with contextlib.suppress(Exception):
+        cdp("Browser.grantPermissions", permissions=permissions)
+
+
 def _annotate_error(msg: str) -> str:
     for pattern, hint in _HINT_PATTERNS:
         if pattern.search(msg):
@@ -647,6 +678,8 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
             _ensure_cloud_browser(admin)
         else:
             admin.ensure_daemon()
+        if method != "Browser.grantPermissions":
+            _apply_browser_permissions(original_cdp)
         if method != "Network.setUserAgentOverride":
             _apply_browser_user_agent_override(original_cdp, session_id=session_id)
         return original_cdp(method, session_id=session_id, **params)
