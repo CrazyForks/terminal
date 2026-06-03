@@ -570,6 +570,32 @@ def test_managed_browser_profile_env_controls_worker_launch(
     assert "--proxy-server=http://proxy.example:8080" in headless
 
 
+def test_managed_browser_profile_env_uses_configured_user_data_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    configured_profile = tmp_path / "configured-profile"
+    monkeypatch.setenv("BU_MANAGED_BROWSER_PROFILE", str(configured_profile))
+
+    profile, is_temporary = worker._managed_chrome_profile_dir()
+
+    assert profile == configured_profile
+    assert is_temporary is False
+    assert configured_profile.exists()
+
+    args = worker._managed_chrome_args("/chrome", 9337, profile, False)
+    assert f"--user-data-dir={configured_profile}" in args
+
+    monkeypatch.setattr(worker, "_managed_chrome", None)
+    monkeypatch.setattr(worker, "_managed_chrome_profile", configured_profile)
+    monkeypatch.setattr(worker, "_managed_chrome_profile_is_temporary", False)
+
+    worker._cleanup_managed_chrome()
+
+    assert configured_profile.exists()
+    assert worker._managed_chrome_profile is None
+    assert worker._managed_chrome_profile_is_temporary is False
+
+
 def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:
     visible = worker._managed_chrome_args("/chrome", 9333, tmp_path / "profile", True)
     headless = worker._managed_chrome_args("/chrome", 9334, tmp_path / "profile", False)
