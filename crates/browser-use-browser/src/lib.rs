@@ -8935,6 +8935,73 @@ print("autocomplete_helpers ok")
     }
 
     #[test]
+    fn browser_script_action_helpers_click_named_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-action-control-helpers",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+clicked_points = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "button,input[type=\"button\"]" in expression
+    assert "[role=\"button\"]" in expression
+    assert "CSS.escape" in expression
+    if "__CLICK_BUTTON__" in expression:
+        assert "matched_text" in expression
+        assert 'const needle = "apply filters"' in expression
+        return {
+            "selector": "button[name=\"apply\"]",
+            "score": 145,
+            "matched_text": "apply filters",
+            "tag": "button",
+            "type": "submit",
+            "x": 88,
+            "y": 144,
+            "rect": {"x": 40, "y": 128, "width": 96, "height": 32},
+        }
+    assert "__ACTION_CONTROLS_SNAPSHOT__" in expression
+    return [
+        {
+            "index": 0,
+            "selector": "button[name=\"apply\"]",
+            "tag": "button",
+            "type": "submit",
+            "text": "Apply filters",
+            "href": "",
+            "name": "apply",
+            "aria_label": "",
+            "rect": {"x": 40, "y": 128, "width": 96, "height": 32, "in_viewport": True},
+        }
+    ]
+
+def click_at_xy(x, y, button="left", clicks=1):
+    clicked_points.append({"x": x, "y": y, "button": button, "clicks": clicks})
+    return True
+
+snapshot = action_controls_snapshot()
+assert snapshot["count"] == 1, snapshot
+assert snapshot["actions"][0]["text"] == "Apply filters", snapshot
+result = click_button("apply filters", timeout=0)
+assert result["clicked"] is True, result
+assert result["selector"] == "button[name=\"apply\"]", result
+assert result["matched_text"] == "apply filters", result
+assert clicked_points == [{"x": 88, "y": 144, "button": "left", "clicks": 1}], clicked_points
+assert len(calls) == 2, calls
+print("action_helpers ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("action_helpers ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

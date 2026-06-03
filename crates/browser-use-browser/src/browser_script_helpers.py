@@ -4080,6 +4080,136 @@ def select_autocomplete(label_or_placeholder, query, match_text=None, timeout=3.
     }
 
 
+def action_controls_snapshot(limit=30):
+    """Return compact rendered buttons, links, and action controls with text/selectors/rects."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 30
+    limit_int = max(1, min(limit_int, 200))
+    expression = f"""
+(() => {{
+  // __ACTION_CONTROLS_SNAPSHOT__
+  const clean = (text, max = 180) => (text || '').replace(/\\s+/g, ' ').trim().slice(0, max);
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'value', 'title', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return el.tagName.toLowerCase();
+  }};
+  const textFor = el => clean([
+    el.innerText || '',
+    el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('name') || '',
+    el.id || '',
+  ].filter(Boolean).join(' '));
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  return Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"],input[type="reset"],a[href],[role="button"],[role="link"],[onclick]'))
+    .filter(el => !el.disabled && visible(el))
+    .slice(0, {limit_int})
+    .map((el, index) => {{
+      const r = el.getBoundingClientRect();
+      return {{
+        index,
+        selector: selectorFor(el),
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || '',
+        text: textFor(el),
+        href: el.href || '',
+        name: clean(el.getAttribute('name')),
+        aria_label: clean(el.getAttribute('aria-label')),
+        rect: {{
+          x: Math.round(r.x), y: Math.round(r.y),
+          width: Math.round(r.width), height: Math.round(r.height),
+          in_viewport: r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth,
+        }},
+      }};
+    }});
+}})()
+"""
+    actions = js(expression) or []
+    return {"count": len(actions), "actions": actions}
+
+
+def click_button(label_or_text, timeout=3.0):
+    """Click a rendered button/link/action by visible text, aria-label, name, or selector."""
+    needle = str(label_or_text or "").strip().lower()
+    if not needle:
+        raise RuntimeError("click_button requires a label_or_text")
+    expression = f"""
+(() => {{
+  // __CLICK_BUTTON__
+  const needle = {json.dumps(needle)};
+  const clean = text => (text || '').replace(/\\s+/g, ' ').trim();
+  const selectorFor = el => {{
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['name', 'aria-label', 'value', 'title', 'data-testid', 'data-test']) {{
+      const value = el.getAttribute(attr);
+      if (value) return `${{el.tagName.toLowerCase()}}[${{attr}}="${{CSS.escape(value)}}"]`;
+    }}
+    return '';
+  }};
+  const textFor = el => clean([
+    el.innerText || '',
+    el.value || '',
+    el.getAttribute('aria-label') || '',
+    el.getAttribute('title') || '',
+    el.getAttribute('name') || '',
+    el.id || '',
+  ].filter(Boolean).join(' ')).toLowerCase();
+  const visible = el => {{
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  }};
+  let best = null, bestScore = -1, bestText = '';
+  for (const el of document.querySelectorAll('button,input[type="button"],input[type="submit"],input[type="reset"],a[href],[role="button"],[role="link"],[onclick]')) {{
+    if (el.disabled || !visible(el)) continue;
+    const selector = selectorFor(el);
+    const hay = textFor(el);
+    let score = hay === needle ? 140 : hay.startsWith(needle) ? 100 : hay.includes(needle) ? 70 : needle.includes(hay) && hay.length > 2 ? 30 : 0;
+    if (selector && selector.toLowerCase() === needle) score = 160;
+    const r = el.getBoundingClientRect();
+    if (score > 0 && r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth) score += 5;
+    if (score > bestScore) {{ best = el; bestScore = score; bestText = hay; }}
+  }}
+  if (!best || bestScore <= 0) return null;
+  const r = best.getBoundingClientRect();
+  return {{
+    selector: selectorFor(best),
+    score: bestScore,
+    matched_text: bestText,
+    tag: best.tagName.toLowerCase(),
+    type: best.getAttribute('type') || '',
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2),
+    rect: {{x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}},
+  }};
+}})()
+"""
+    match = js(expression)
+    if not match:
+        actions = action_controls_snapshot(limit=20)
+        raise RuntimeError(f"click_button: no rendered action matched {label_or_text!r}; actions={actions}")
+    click_at_xy(match["x"], match["y"])
+    if timeout:
+        _time.sleep(min(max(float(timeout), 0.0), 3.0))
+    return {
+        "clicked": True,
+        "selector": match.get("selector", ""),
+        "matched_text": match.get("matched_text", ""),
+        "score": match.get("score"),
+        "x": match.get("x"),
+        "y": match.get("y"),
+    }
+
+
 def upload_file(selector, path):
     doc = cdp("DOM.getDocument", depth=-1)
     node_id = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
