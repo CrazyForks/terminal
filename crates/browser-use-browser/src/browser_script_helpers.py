@@ -2139,6 +2139,159 @@ def result_count_snapshot(limit=12):
     }
 
 
+def contact_details_snapshot(limit=50):
+    """Return visible and structured contact details: emails, phones, links, addresses."""
+    try:
+        limit_int = int(limit)
+    except Exception:
+        limit_int = 50
+    limit_int = max(1, min(limit_int, 200))
+    expression = r"""
+(() => {
+  // __CONTACT_DETAILS_SNAPSHOT__
+  const limit = __LIMIT__;
+  const clean = (text, max = 500) => (text || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+  };
+  const normEmail = value => clean(String(value || '')
+    .replace(/^mailto:/i, '')
+    .replace(/\?.*$/, '')
+    .replace(/\s*\[at\]\s*/ig, '@').replace(/\s*\(at\)\s*/ig, '@').replace(/\s+at\s+/ig, '@')
+    .replace(/\s*\[dot\]\s*/ig, '.').replace(/\s*\(dot\)\s*/ig, '.').replace(/\s+dot\s+/ig, '.')
+  ).toLowerCase();
+  const normPhone = value => clean(String(value || '').replace(/^tel:/i, '').replace(/[^\d+().\-\s extx]/ig, ' ').replace(/\s+/g, ' '), 80);
+  const selectorFor = el => {
+    if (el.id) return '#' + CSS.escape(el.id);
+    for (const attr of ['aria-label', 'title', 'data-testid', 'data-test', 'href']) {
+      const value = el.getAttribute(attr);
+      if (value) return `${el.tagName.toLowerCase()}[${attr}="${CSS.escape(value)}"]`;
+    }
+    return el.tagName.toLowerCase();
+  };
+  const emails = [], phones = [], contactLinks = [], socialLinks = [], addresses = [], sections = [], jsonldContacts = [];
+  const seen = {emails: new Set(), phones: new Set(), links: new Set(), social: new Set(), addresses: new Set(), sections: new Set()};
+  const addEmail = (email, source, context = '') => {
+    email = normEmail(email);
+    if (!email || !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>.]+$/.test(email) || seen.emails.has(email)) return;
+    seen.emails.add(email);
+    emails.push({email, source, context: clean(context, 260)});
+  };
+  const addPhone = (phone, source, context = '') => {
+    phone = normPhone(phone);
+    const digits = (phone.match(/\d/g) || []).length;
+    if (!phone || digits < 7 || seen.phones.has(phone)) return;
+    seen.phones.add(phone);
+    phones.push({phone, source, context: clean(context, 260)});
+  };
+  const addAddress = (address, source, context = '') => {
+    address = clean(address, 260);
+    if (!address || address.length < 8 || seen.addresses.has(address)) return;
+    seen.addresses.add(address);
+    addresses.push({address, source, context: clean(context, 220)});
+  };
+  const addLink = (arr, seenSet, link, source) => {
+    const href = link.href || link.getAttribute('href') || '';
+    const text = clean(link.innerText || link.getAttribute('aria-label') || link.getAttribute('title') || href, 220);
+    const key = href + '|' + text;
+    if (!href || seenSet.has(key)) return;
+    seenSet.add(key);
+    const r = link.getBoundingClientRect();
+    arr.push({
+      text, href, source, selector: selectorFor(link),
+      rect: {
+        x: Math.round(r.x), y: Math.round(r.y),
+        width: Math.round(r.width), height: Math.round(r.height),
+        in_viewport: r.bottom >= 0 && r.top <= innerHeight && r.right >= 0 && r.left <= innerWidth,
+      },
+    });
+  };
+  const text = clean(document.body && document.body.innerText || '', 50000);
+  const emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig;
+  let match;
+  while ((match = emailRe.exec(text))) addEmail(match[0], 'visible_text');
+  const obfuscatedRe = /[A-Z0-9._%+-]+\s*(?:\[at\]|\(at\)|\sat\s)\s*[A-Z0-9.-]+\s*(?:\[dot\]|\(dot\)|\sdot\s)\s*[A-Z]{2,}/ig;
+  while ((match = obfuscatedRe.exec(text))) addEmail(match[0], 'visible_text_obfuscated');
+  const phoneRe = /(?:\+?\d[\d().\-\s]{6,}\d)(?:\s*(?:ext|x)\s*\d{1,6})?/ig;
+  while ((match = phoneRe.exec(text))) addPhone(match[0], 'visible_text');
+  for (const link of document.querySelectorAll('a[href]')) {
+    const href = link.getAttribute('href') || '', lower = href.toLowerCase();
+    const label = clean(link.innerText || link.getAttribute('aria-label') || link.getAttribute('title') || href, 240);
+    if (lower.startsWith('mailto:')) addEmail(href, 'mailto', label);
+    if (lower.startsWith('tel:')) addPhone(href, 'tel', label);
+    if (/contact|support|help|customer|service|about|team|staff|location|store|directory|provider/i.test(label + ' ' + href)) addLink(contactLinks, seen.links, link, 'contact_candidate');
+    if (/linkedin|facebook|twitter|x\.com|instagram|youtube|github|tiktok|pinterest/i.test(href)) addLink(socialLinks, seen.social, link, 'social');
+  }
+  const flatten = value => Array.isArray(value) ? value.flatMap(flatten) : (value && typeof value === 'object' ? [value, ...Object.values(value).flatMap(flatten)] : []);
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+    try {
+      for (const item of flatten(JSON.parse(script.textContent || '{}'))) {
+        if (!item || typeof item !== 'object') continue;
+        const name = clean(item.name || item.legalName || (item.givenName && item.familyName && `${item.givenName} ${item.familyName}`) || '', 180);
+        if (item.email) addEmail(item.email, 'json_ld', name);
+        if (item.telephone) addPhone(item.telephone, 'json_ld', name);
+        const address = item.address;
+        if (address && typeof address === 'object') addAddress([address.streetAddress, address.addressLocality, address.addressRegion, address.postalCode, address.addressCountry].filter(Boolean).join(', '), 'json_ld', name);
+        if (item.url || item.email || item.telephone || address) {
+          jsonldContacts.push({type: item['@type'] || '', name, email: item.email || '', telephone: item.telephone || '', url: item.url || '', address: address || null});
+        }
+      }
+    } catch (e) {}
+  }
+  for (const el of document.querySelectorAll('address,[itemtype*="PostalAddress"],[class*="contact" i],[id*="contact" i],[class*="location" i],[id*="location" i],[class*="address" i],[id*="address" i],footer')) {
+    if (!visible(el)) continue;
+    const sectionText = clean(el.innerText || el.textContent || '', 900);
+    if (!sectionText) continue;
+    if (/@|phone|tel|email|contact|support|address|location|hours|\d{3,}[\s\w,.-]+(?:st|street|ave|avenue|rd|road|blvd|drive|dr|lane|ln|way|suite|ste)\b/i.test(sectionText)) {
+      const key = sectionText.slice(0, 260);
+      if (!seen.sections.has(key)) {
+        seen.sections.add(key);
+        sections.push({text: sectionText, selector: selectorFor(el)});
+      }
+      if (/(?:st|street|ave|avenue|rd|road|blvd|drive|dr|lane|ln|way|suite|ste)\b/i.test(sectionText)) addAddress(sectionText, 'visible_section');
+    }
+  }
+  return {
+    emails: emails.slice(0, limit),
+    phones: phones.slice(0, limit),
+    contact_links: contactLinks.slice(0, limit),
+    social_links: socialLinks.slice(0, limit),
+    addresses: addresses.slice(0, limit),
+    jsonld_contacts: jsonldContacts.slice(0, limit),
+    sections: sections.slice(0, Math.min(limit, 20)),
+    counts: {
+      emails: emails.length,
+      phones: phones.length,
+      contact_links: contactLinks.length,
+      social_links: socialLinks.length,
+      addresses: addresses.length,
+      jsonld_contacts: jsonldContacts.length,
+      sections: sections.length,
+    },
+  };
+})()
+""".replace("__LIMIT__", str(limit_int))
+    data = js(expression) or {}
+    if not isinstance(data, dict):
+        return {
+            "emails": [],
+            "phones": [],
+            "contact_links": [],
+            "social_links": [],
+            "addresses": [],
+            "jsonld_contacts": [],
+            "sections": [],
+            "counts": {},
+            "raw": data,
+        }
+    keys = ["emails", "phones", "contact_links", "social_links", "addresses", "jsonld_contacts", "sections"]
+    for key in keys:
+        data.setdefault(key, [])
+    data.setdefault("counts", {key: len(data.get(key) or []) for key in keys})
+    return data
+
+
 def investor_documents_snapshot(limit=80, keywords=None, latest_only=False):
     """Return classified investor/report/earnings document candidates from visible links."""
     raw_keywords = [keywords] if isinstance(keywords, str) else (keywords or [])

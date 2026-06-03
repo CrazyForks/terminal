@@ -8538,6 +8538,56 @@ print("result_count_snapshot ok")
     }
 
     #[test]
+    fn browser_script_contact_details_snapshot_normalizes_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-contact-details-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+calls = []
+
+def js(expression, *args, **kwargs):
+    calls.append(expression)
+    assert "__CONTACT_DETAILS_SNAPSHOT__" in expression
+    assert "mailto:" in expression
+    assert "tel:" in expression
+    assert "application/ld+json" in expression
+    assert "contact_links" in expression
+    assert "social_links" in expression
+    assert "visible_text_obfuscated" in expression
+    return {
+        "emails": [{"email": "support@example.test", "source": "mailto", "context": "Support"}],
+        "phones": [{"phone": "+1 415 555 0101", "source": "tel", "context": "Call us"}],
+        "contact_links": [{"text": "Contact support", "href": "https://example.test/contact", "source": "contact_candidate"}],
+        "social_links": [{"text": "LinkedIn", "href": "https://linkedin.com/company/example", "source": "social"}],
+        "addresses": [{"address": "123 Market St, San Francisco, CA 94103", "source": "json_ld", "context": "Example Inc"}],
+        "jsonld_contacts": [{"type": "Organization", "name": "Example Inc", "email": "support@example.test", "telephone": "+1 415 555 0101", "url": "https://example.test", "address": {"streetAddress": "123 Market St"}}],
+        "sections": [{"text": "Contact us at support@example.test or +1 415 555 0101", "selector": "footer"}],
+        "counts": {"emails": 1, "phones": 1, "contact_links": 1, "social_links": 1, "addresses": 1, "jsonld_contacts": 1, "sections": 1},
+    }
+
+snapshot = contact_details_snapshot(limit=12)
+assert snapshot["counts"]["emails"] == 1, snapshot
+assert snapshot["emails"][0]["email"] == "support@example.test", snapshot
+assert snapshot["phones"][0]["phone"].endswith("0101"), snapshot
+assert snapshot["contact_links"][0]["href"].endswith("/contact"), snapshot
+assert "linkedin.com" in snapshot["social_links"][0]["href"], snapshot
+assert snapshot["addresses"][0]["address"].startswith("123 Market"), snapshot
+assert snapshot["jsonld_contacts"][0]["name"] == "Example Inc", snapshot
+assert snapshot["sections"][0]["selector"] == "footer", snapshot
+assert len(calls) == 1, calls
+print("contact_details_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("contact_details_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_embedded_data_snapshot_extracts_hydration_records() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
