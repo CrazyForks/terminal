@@ -8400,6 +8400,71 @@ print("investor_documents_snapshot ok")
     }
 
     #[test]
+    fn browser_script_document_links_snapshot_classifies_filing_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-document-links-snapshot",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+def js(expression, returnByValue=True):
+    for needle in [
+        "__DOCUMENT_LINKS_SNAPSHOT__",
+        "docketRe",
+        "accessionRe",
+        "transmittal",
+        "visible_dom",
+        "nearestContext",
+    ]:
+        assert needle in expression, needle
+    assert "filing/document link" not in expression
+    documents = []
+    for index in range(3):
+        documents.append({
+            "title": f"CP23-29 Transmittal Letter {index + 1}",
+            "url": f"https://ferc.example.test/elibrary/file-{index + 1}.pdf",
+            "type": "transmittal",
+            "extension": "pdf",
+            "published_on": "2026-02-03",
+            "docket_tokens": ["CP23-29"],
+            "accession": f"20260203{index + 1:03d}",
+            "context": f"CP23-29 Accession 20260203{index + 1:03d} Transmittal Letter filing.pdf",
+            "source": "visible_dom",
+            "score": 80 - index,
+        })
+    return {
+        "url": "https://ferc.example.test/elibrary/search",
+        "title": "FERC eLibrary Search Results",
+        "keywords": ["ferc", "docket"],
+        "count": len(documents),
+        "documents": documents,
+    }
+
+snapshot = document_links_snapshot(limit=20, keywords=["FERC", "docket"])
+assert snapshot["url"].endswith("/elibrary/search"), snapshot
+assert snapshot["keywords"] == ["ferc", "docket"], snapshot
+assert snapshot["count"] == 3, snapshot
+doc = snapshot["documents"][0]
+assert doc["type"] == "transmittal", snapshot
+assert doc["docket_tokens"] == ["CP23-29"], snapshot
+assert doc["accession"] == "20260203001", snapshot
+assert doc["published_on"] == "2026-02-03", snapshot
+assert doc["extension"] == "pdf", snapshot
+assert doc["source"] == "visible_dom", snapshot
+assert snapshot["document_action_count"] == 3, snapshot
+assert "fanout_tasks" not in snapshot, snapshot
+assert "fanout_recommended" not in snapshot, snapshot
+print("document_links_snapshot ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("document_links_snapshot ok"));
+    }
+
+    #[test]
     fn browser_script_read_document_text_extracts_common_document_formats() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

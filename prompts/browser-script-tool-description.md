@@ -43,6 +43,7 @@ extract_repeated_items(selector, limit=50, include_html=False)
 rows_snapshot(limit=8)
 extract_grid_rows(selector=None, limit=50, include_html=False)
 investor_documents_snapshot(limit=80, keywords=None, latest_only=False)
+document_links_snapshot(limit=100, keywords=None)
 read_document_text(source, headers=None, timeout=30.0, max_chars=120000, binary=None)
 arxiv_query(search_query="cat:cs.AI", start=0, max_results=20, sort_by="submittedDate", sort_order="descending", timeout=20.0)
 
@@ -97,6 +98,7 @@ Usage guidance:
 - Use `repeated_items_snapshot()` on repeated product/listing/package/ticket cards or non-table lists; if it recommends `extract_repeated_items`, use that selector. Records include stable attributes, cells with headers, headings, labels, prices, links/buttons, and image metadata.
 - Use `rows_snapshot()` and then `extract_grid_rows(selector=...)` for search-result tables, docket grids, comparison tables, and SPA row lists where links/buttons/files must stay associated with the correct row.
 - Use `investor_documents_snapshot(keywords=[...], latest_only=...)` after reaching investor/results/document pages; it classifies earnings releases, supplements, presentations, transcripts, reports, and data annexes with dates, period tokens, extensions, and direct URLs.
+- Use `document_links_snapshot(keywords=[...])` on FERC, docket, regulatory, government, report, and generic filing/search-result pages; it preserves nearby row/card context, docket/accession/date tokens, document type, extension, and direct URL.
 - Use `read_document_text(...)` for PDFs, DOCX files, downloaded filings, investor reports, and earnings documents after discovering a direct file URL or local path; it returns bounded extracted text plus source/kind/extractor metadata.
 - Use `arxiv_query(...)` for arXiv recent-list or paper-search tasks instead of browsing list/abstract pages one by one; it returns normalized title, authors, abstract, abs/pdf URLs, categories, DOI/journal/comment metadata, and submission timestamps.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
