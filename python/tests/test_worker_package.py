@@ -456,6 +456,63 @@ def test_worker_cdp_applies_browser_storage_state_env(monkeypatch) -> None:
     assert calls == [("Storage.setCookies", "target-1", {"cookies": []})]
 
 
+def test_worker_cdp_enforces_browser_domain_constraints_env(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setenv("LLM_BROWSER_BROWSER_MODE", "remote-cdp")
+    monkeypatch.setenv("BU_BROWSER_ALLOWED_DOMAINS", '["example.com","*.browser-use.com"]')
+
+    class Helpers:
+        __all__ = ["cdp"]
+
+        def cdp(self, method, session_id=None, **params):
+            calls.append((method, session_id, params))
+            return {"method": method}
+
+    class Admin:
+        def __init__(self) -> None:
+            self.ensure_calls = 0
+
+        def ensure_daemon(self):
+            self.ensure_calls += 1
+
+    def expect_blocked(url: str) -> None:
+        try:
+            helpers.cdp("Page.navigate", session_id="target-1", url=url)
+        except RuntimeError as exc:
+            assert "BrowserProfile domain constraints blocked navigation" in str(exc)
+            assert url in str(exc)
+        else:
+            raise AssertionError(f"navigation should be blocked: {url}")
+
+    helpers = Helpers()
+    admin = Admin()
+    worker._patch_browser_harness_cdp(helpers, admin)
+
+    result = helpers.cdp("Page.navigate", session_id="target-1", url="https://www.example.com/path")
+
+    assert result == {"method": "Page.navigate"}
+    assert calls == [("Page.navigate", "target-1", {"url": "https://www.example.com/path"})]
+
+    expect_blocked("https://iana.org/")
+
+    assert len(calls) == 1
+
+    monkeypatch.delenv("BU_BROWSER_ALLOWED_DOMAINS", raising=False)
+    monkeypatch.setenv("BU_BROWSER_PROHIBITED_DOMAINS", '["*.tracking.example"]')
+
+    expect_blocked("https://ads.tracking.example/")
+
+    assert len(calls) == 1
+
+    monkeypatch.delenv("BU_BROWSER_PROHIBITED_DOMAINS", raising=False)
+    monkeypatch.setenv("BU_BROWSER_BLOCK_IP_ADDRESSES", "true")
+
+    expect_blocked("http://127.0.0.1/")
+
+    assert len(calls) == 1
+    assert admin.ensure_calls == 4
+
+
 def test_worker_page_info_fallback_reads_target_url_and_title(
     tmp_path: Path, monkeypatch
 ) -> None:
