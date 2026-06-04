@@ -110,6 +110,7 @@ fn system_prompt_bounds_multi_item_collection_loops() {
 fn system_prompt_commits_single_site_collection_to_one_domain() {
     assert!(BASE_SYSTEM_PROMPT.contains("Single-site collection rule"));
     assert!(BASE_SYSTEM_PROMPT.contains("choose one viable domain early"));
+    assert!(BASE_SYSTEM_PROMPT.contains("do not keep searching for a perfect domain"));
     assert!(BASE_SYSTEM_PROMPT.contains("Do not stitch rows from multiple domains"));
     assert!(BASE_SYSTEM_PROMPT.contains("mark it unavailable for that domain"));
 }
