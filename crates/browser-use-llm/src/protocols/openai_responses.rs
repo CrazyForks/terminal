@@ -432,6 +432,9 @@ struct ResponsesDecoder {
     /// `response.output_text.*` events. Codex uses this to preempt mailbox mail
     /// only for commentary text; missing phase defaults to final-answer semantics.
     text_phases: HashMap<String, TextPhase>,
+    /// Accumulated reasoning text per output item so finalized `.done` events can
+    /// fill in summaries when a backend sends the full text without deltas.
+    reasoning_texts: HashMap<String, String>,
 }
 
 impl ResponsesDecoder {
@@ -445,6 +448,7 @@ impl ResponsesDecoder {
             open: OpenBlock::None,
             item_to_call: HashMap::new(),
             text_phases: HashMap::new(),
+            reasoning_texts: HashMap::new(),
         }
     }
 
@@ -513,11 +517,43 @@ impl ResponsesDecoder {
 
     /// Append a reasoning delta for `id`, closing any other open block first.
     fn push_reasoning(&mut self, id: &str, delta: &str, out: &mut Vec<LlmEvent>) {
+        if delta.is_empty() {
+            return;
+        }
         if !matches!(&self.open, OpenBlock::Reasoning(open) if open == id) {
             self.close_open(out);
             self.open = OpenBlock::Reasoning(id.to_string());
         }
+        self.reasoning_texts
+            .entry(id.to_string())
+            .or_default()
+            .push_str(delta);
         out.extend(self.lifecycle.reasoning_delta(id, delta));
+    }
+
+    fn push_final_reasoning_text(&mut self, id: &str, text: &str, out: &mut Vec<LlmEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        let existing = self
+            .reasoning_texts
+            .get(id)
+            .map(String::as_str)
+            .unwrap_or("");
+        if existing == text || existing.trim() == text.trim() {
+            return;
+        }
+        if existing.is_empty() {
+            self.push_reasoning(id, text, out);
+            return;
+        }
+        if let Some(suffix) = text.strip_prefix(existing) {
+            self.push_reasoning(id, suffix, out);
+            return;
+        }
+        if !existing.contains(text) && !text.contains(existing) {
+            self.push_reasoning(id, text, out);
+        }
     }
 }
 
@@ -528,6 +564,35 @@ fn parse_text_phase(value: Option<&Value>) -> Option<TextPhase> {
         "final" | "final_answer" | "final-answer" => Some(TextPhase::FinalAnswer),
         _ => None,
     }
+}
+
+fn finalized_reasoning_text_from_event(value: &Value) -> Option<&str> {
+    value
+        .get("text")
+        .or_else(|| value.get("part").and_then(|part| part.get("text")))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn reasoning_texts_from_item(item: &Value) -> Vec<&str> {
+    let mut texts = Vec::new();
+    for key in ["summary", "content"] {
+        for part in item
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                texts.push(text);
+            }
+        }
+    }
+    texts
 }
 
 impl ProtocolStream for ResponsesDecoder {
@@ -615,7 +680,26 @@ impl ProtocolStream for ResponsesDecoder {
                     self.push_reasoning(&id, delta, &mut out);
                 }
             }
-            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {}
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                let id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("reasoning")
+                    .to_string();
+                if let Some(text) = finalized_reasoning_text_from_event(&value) {
+                    self.push_final_reasoning_text(&id, text, &mut out);
+                }
+            }
+            "response.reasoning_summary_part.done" => {
+                let id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("reasoning")
+                    .to_string();
+                if let Some(text) = finalized_reasoning_text_from_event(&value) {
+                    self.push_final_reasoning_text(&id, text, &mut out);
+                }
+            }
 
             "response.function_call_arguments.delta" => {
                 let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or("");
@@ -635,6 +719,17 @@ impl ProtocolStream for ResponsesDecoder {
                 // Function-call items are finalised by
                 // `response.function_call_arguments.done`; nothing extra here.
                 if let Some(item) = value.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        let id = item
+                            .get("id")
+                            .or_else(|| value.get("item_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("reasoning")
+                            .to_string();
+                        for text in reasoning_texts_from_item(item) {
+                            self.push_final_reasoning_text(&id, text, &mut out);
+                        }
+                    }
                     self.record_text_phase_from_message_item(item);
                 }
             }
@@ -1103,6 +1198,107 @@ mod tests {
                         total_tokens: 2,
                     },
                     finish_reason: Some(FinishReason::Stop),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_reasoning_done_text_backfills_missing_delta() {
+        let proto = OpenAiResponsesProtocol::new();
+        let mut dec = proto.decoder();
+        let frames = vec![
+            frame(
+                "response.reasoning_summary_text.done",
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"r1","text":"Looking up the browser state."}"#,
+            ),
+            frame(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"t1","delta":"done"}"#,
+            ),
+            frame(
+                "response.completed",
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+            ),
+        ];
+        let mut events = Vec::new();
+        for f in &frames {
+            events.extend(dec.on_frame(f).unwrap());
+        }
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::StepStart,
+                LlmEvent::ReasoningStart { id: "r1".into() },
+                LlmEvent::ReasoningDelta {
+                    id: "r1".into(),
+                    delta: "Looking up the browser state.".into()
+                },
+                LlmEvent::ReasoningEnd { id: "r1".into() },
+                LlmEvent::TextStart { id: "t1".into() },
+                LlmEvent::TextDelta {
+                    id: "t1".into(),
+                    delta: "done".into()
+                },
+                LlmEvent::TextEnd {
+                    id: "t1".into(),
+                    phase: None,
+                },
+                LlmEvent::StepFinish {
+                    usage: Usage {
+                        input_tokens: 1,
+                        cached_input_tokens: 0,
+                        output_tokens: 1,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 2,
+                    },
+                    finish_reason: Some(FinishReason::Stop),
+                },
+                LlmEvent::Finish {
+                    usage: Usage {
+                        input_tokens: 1,
+                        cached_input_tokens: 0,
+                        output_tokens: 1,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 2,
+                    },
+                    finish_reason: Some(FinishReason::Stop),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_reasoning_output_item_done_emits_summary() {
+        let proto = OpenAiResponsesProtocol::new();
+        let mut dec = proto.decoder();
+        let frames = vec![
+            frame(
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"Checking the current tab."}]}}"#,
+            ),
+            frame(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"browser_script"}}"#,
+            ),
+        ];
+        let mut events = Vec::new();
+        for f in &frames {
+            events.extend(dec.on_frame(f).unwrap());
+        }
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::StepStart,
+                LlmEvent::ReasoningStart { id: "r1".into() },
+                LlmEvent::ReasoningDelta {
+                    id: "r1".into(),
+                    delta: "Checking the current tab.".into()
+                },
+                LlmEvent::ReasoningEnd { id: "r1".into() },
+                LlmEvent::ToolInputStart {
+                    id: "call_1".into(),
+                    name: "browser_script".into(),
                 },
             ]
         );
