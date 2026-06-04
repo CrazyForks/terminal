@@ -15,10 +15,11 @@ use serde_json::{json, Value};
 /// Map a single `LlmEvent` to zero or more `PendingEvent`s.
 ///
 /// Only events that carry UI-facing data map to anything. The streaming
-/// lifecycle markers (`StepStart`, `Text{Start,End}`, `Reasoning{Start,End}`,
+/// lifecycle markers (`StepStart`, `Text{Start,End}`,
 /// `ToolInput{Start,Delta,End}`, `StepFinish`) carry no UI payload of their own
 /// and map to nothing — codex/core records no per-marker UI event for them, so
-/// they return an empty `Vec`.
+/// they return an empty `Vec`. Reasoning lifecycle markers are preserved because
+/// providers can expose structured, visible reasoning streams.
 ///
 /// `task_complete` / `turn_aborted` (and `task_started`) are NOT mapped here:
 /// they are turn-lifecycle events synthesized by the turn layer, not carried by
@@ -33,11 +34,30 @@ pub fn map_llm_event(ctx: &TurnCtx, ev: &LlmEvent) -> Vec<PendingEvent> {
             names::MODEL_STREAM_DELTA,
             json!({ "text": delta, "delta": delta }),
         )],
-        // Reasoning/thinking streaming -> `model.thinking_delta { text }`.
-        LlmEvent::ReasoningDelta { delta, .. } => vec![PendingEvent::new(
+        // Reasoning/thinking streaming. Keep the structured shape first so
+        // reducers can preserve provider reasoning ids/boundaries, then emit the
+        // legacy flattened event for older consumers.
+        LlmEvent::ReasoningStart { id } => vec![PendingEvent::new(
             session_id,
-            names::MODEL_THINKING_DELTA,
-            json!({ "text": delta, "delta": delta }),
+            names::MODEL_REASONING_START,
+            json!({ "reasoning_id": id }),
+        )],
+        LlmEvent::ReasoningDelta { id, delta } => vec![
+            PendingEvent::new(
+                session_id,
+                names::MODEL_REASONING_DELTA,
+                json!({ "reasoning_id": id, "text": delta, "delta": delta }),
+            ),
+            PendingEvent::new(
+                session_id,
+                names::MODEL_THINKING_DELTA,
+                json!({ "text": delta, "delta": delta }),
+            ),
+        ],
+        LlmEvent::ReasoningEnd { id } => vec![PendingEvent::new(
+            session_id,
+            names::MODEL_REASONING_END,
+            json!({ "reasoning_id": id }),
         )],
         // Fully-assembled tool call -> `tool.started { name, arguments }`.
         // `arguments` is the parsed JSON input the model produced; core forwards
@@ -70,8 +90,6 @@ pub fn map_llm_event(ctx: &TurnCtx, ev: &LlmEvent) -> Vec<PendingEvent> {
         LlmEvent::StepStart
         | LlmEvent::TextStart { .. }
         | LlmEvent::TextEnd { .. }
-        | LlmEvent::ReasoningStart { .. }
-        | LlmEvent::ReasoningEnd { .. }
         | LlmEvent::ToolInputStart { .. }
         | LlmEvent::ToolInputDelta { .. }
         | LlmEvent::ToolInputEnd { .. }

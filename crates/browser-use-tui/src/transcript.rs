@@ -1677,6 +1677,9 @@ fn committed_node_for_event(
             NodeStyle::Failed,
         )),
         "model.turn.request"
+        | "model.reasoning.start"
+        | "model.reasoning.delta"
+        | "model.reasoning.end"
         | "model.thinking_delta"
         | "model.turn.retry"
         | "model.stream_delta"
@@ -2037,7 +2040,7 @@ fn live_status_for_session(
 fn live_thinking_status_detail(live_events: &[EventRecord], thinking_text: &str) -> String {
     let first_ts = live_events
         .iter()
-        .find(|event| event.event_type == "model.thinking_delta")
+        .find(|event| is_reasoning_event(event))
         .map(|event| event.ts_ms);
     let elapsed_s = first_ts
         .map(|start| now_ms().saturating_sub(start).max(0) / 1000)
@@ -2080,6 +2083,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
     let mut last_ts: i64 = 0;
     let mut reported_tokens: Option<i64> = None;
     let mut turn_start_ts: Option<i64> = None;
+    let mut saw_structured_reasoning_delta = false;
 
     fn flush(
         blocks: &mut Vec<ThinkingBlock>,
@@ -2087,6 +2091,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
         first_ts: &mut Option<i64>,
         last_ts: i64,
         reported_tokens: &mut Option<i64>,
+        saw_structured_reasoning_delta: &mut bool,
     ) {
         let trimmed = text.trim();
         let reported = *reported_tokens;
@@ -2117,21 +2122,39 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
         text.clear();
         *first_ts = None;
         *reported_tokens = None;
+        *saw_structured_reasoning_delta = false;
     }
 
     for event in events {
         match event.event_type.as_str() {
-            "model.thinking_delta" => {
-                if let Some(delta) = event
-                    .payload
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                {
+            "model.reasoning.start" => {
+                if first_ts.is_none() {
+                    first_ts = Some(event.ts_ms);
+                }
+                last_ts = event.ts_ms;
+            }
+            "model.reasoning.delta" => {
+                saw_structured_reasoning_delta = true;
+                if let Some(delta) = reasoning_delta_text(event) {
                     append_thinking_delta(&mut text, delta);
                     if first_ts.is_none() {
                         first_ts = Some(event.ts_ms);
                     }
                     last_ts = event.ts_ms;
+                }
+            }
+            "model.reasoning.end" => {
+                last_ts = event.ts_ms;
+            }
+            "model.thinking_delta" => {
+                if !saw_structured_reasoning_delta {
+                    if let Some(delta) = reasoning_delta_text(event) {
+                        append_thinking_delta(&mut text, delta);
+                        if first_ts.is_none() {
+                            first_ts = Some(event.ts_ms);
+                        }
+                        last_ts = event.ts_ms;
+                    }
                 }
             }
             // Usage closes out the turn's reasoning with the exact token count.
@@ -2150,6 +2173,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                         &mut first_ts,
                         last_ts,
                         &mut reported_tokens,
+                        &mut saw_structured_reasoning_delta,
                     );
                     turn_start_ts = None;
                 }
@@ -2162,6 +2186,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                     &mut first_ts,
                     last_ts,
                     &mut reported_tokens,
+                    &mut saw_structured_reasoning_delta,
                 );
                 turn_start_ts = Some(event.ts_ms);
                 last_ts = event.ts_ms;
@@ -2173,6 +2198,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                     &mut first_ts,
                     last_ts,
                     &mut reported_tokens,
+                    &mut saw_structured_reasoning_delta,
                 );
                 turn_start_ts = None;
             }
@@ -2185,8 +2211,30 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
         &mut first_ts,
         last_ts,
         &mut reported_tokens,
+        &mut saw_structured_reasoning_delta,
     );
     blocks
+}
+
+fn is_reasoning_event(event: &EventRecord) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "model.reasoning.start"
+            | "model.reasoning.delta"
+            | "model.reasoning.end"
+            | "model.thinking_delta"
+    )
+}
+
+fn reasoning_delta_text(event: &EventRecord) -> Option<&str> {
+    match event.event_type.as_str() {
+        "model.reasoning.delta" | "model.thinking_delta" => event
+            .payload
+            .get("text")
+            .or_else(|| event.payload.get("delta"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    }
 }
 
 fn reasoning_tokens_for_usage_event(event: &EventRecord) -> Option<i64> {
@@ -2513,11 +2561,14 @@ fn latest_nonempty_stream_event(live_events: &[EventRecord]) -> Option<&EventRec
 
 fn is_live_output_event(event: &EventRecord) -> bool {
     match event.event_type.as_str() {
-        "model.stream_delta" | "model.thinking_delta" => event
+        "model.stream_delta" => event
             .payload
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
+        "model.reasoning.delta" | "model.thinking_delta" => {
+            reasoning_delta_text(event).is_some_and(|text| !text.trim().is_empty())
+        }
         "command.waiting" | "tool.output_delta" | "tool.started" | "browser.page"
         | "browser.state" | "plan.updated" => true,
         _ => false,

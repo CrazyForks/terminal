@@ -2,7 +2,8 @@
 //! reconstructed `Vec<Value>` provider messages match codex/core parity.
 
 use super::reconstruct::{
-    is_real_user_event, provider_history_has_open_turn, provider_messages_from_events,
+    is_persistable_event, is_real_user_event, provider_history_has_open_turn,
+    provider_messages_from_events,
 };
 use browser_use_protocol::EventRecord;
 use serde_json::{json, Value};
@@ -262,6 +263,66 @@ fn codex_shaped_stream_and_tool_events_replay() {
         messages[2].get("content").and_then(Value::as_str),
         Some("tool result")
     );
+}
+
+#[test]
+fn structured_reasoning_replays_once_with_legacy_compat_delta() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "click the button" })),
+        event(2, "model.reasoning.start", json!({ "reasoning_id": "r0" })),
+        event(
+            3,
+            "model.reasoning.delta",
+            json!({ "reasoning_id": "r0", "text": "Need " }),
+        ),
+        event(4, "model.thinking_delta", json!({ "text": "Need " })),
+        event(
+            5,
+            "model.reasoning.delta",
+            json!({ "reasoning_id": "r0", "text": "to click." }),
+        ),
+        event(6, "model.thinking_delta", json!({ "text": "to click." })),
+        event(7, "model.reasoning.end", json!({ "reasoning_id": "r0" })),
+        event(
+            8,
+            "tool.started",
+            json!({
+                "tool_call_id": "call_1",
+                "name": "click",
+                "arguments": { "index": 1 },
+            }),
+        ),
+        event(9, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    let assistant = messages
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .expect("assistant message");
+    assert_eq!(
+        assistant.get("reasoning_content").and_then(Value::as_str),
+        Some("Need to click.")
+    );
+    assert!(!assistant
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .contains("Need Need"));
+}
+
+#[test]
+fn structured_reasoning_events_are_persistable() {
+    for ty in [
+        "model.reasoning.start",
+        "model.reasoning.delta",
+        "model.reasoning.end",
+    ] {
+        assert!(
+            is_persistable_event(ty, &json!({})),
+            "{ty} should survive store replay"
+        );
+    }
 }
 
 #[test]

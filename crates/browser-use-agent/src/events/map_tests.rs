@@ -45,7 +45,21 @@ fn text_delta_maps_to_stream_delta() {
 }
 
 #[test]
-fn reasoning_delta_maps_to_thinking_delta() {
+fn reasoning_lifecycle_maps_to_structured_events() {
+    assert_eq!(
+        map_llm_event(
+            &ctx(),
+            &LlmEvent::ReasoningStart {
+                id: "r0".to_string(),
+            },
+        ),
+        vec![PendingEvent::new(
+            "sess-1",
+            names::MODEL_REASONING_START,
+            json!({ "reasoning_id": "r0" }),
+        )]
+    );
+
     let got = map_llm_event(
         &ctx(),
         &LlmEvent::ReasoningDelta {
@@ -55,10 +69,31 @@ fn reasoning_delta_maps_to_thinking_delta() {
     );
     assert_eq!(
         got,
+        vec![
+            PendingEvent::new(
+                "sess-1",
+                names::MODEL_REASONING_DELTA,
+                json!({ "reasoning_id": "r0", "text": "thinking", "delta": "thinking" }),
+            ),
+            PendingEvent::new(
+                "sess-1",
+                names::MODEL_THINKING_DELTA,
+                json!({ "text": "thinking", "delta": "thinking" }),
+            ),
+        ]
+    );
+
+    assert_eq!(
+        map_llm_event(
+            &ctx(),
+            &LlmEvent::ReasoningEnd {
+                id: "r0".to_string(),
+            },
+        ),
         vec![PendingEvent::new(
             "sess-1",
-            names::MODEL_THINKING_DELTA,
-            json!({ "text": "thinking", "delta": "thinking" }),
+            names::MODEL_REASONING_END,
+            json!({ "reasoning_id": "r0" }),
         )]
     );
 }
@@ -167,8 +202,6 @@ fn lifecycle_markers_map_to_nothing() {
             id: "t".into(),
             phase: None,
         },
-        LlmEvent::ReasoningStart { id: "r".into() },
-        LlmEvent::ReasoningEnd { id: "r".into() },
         LlmEvent::ToolInputStart {
             id: "c".into(),
             name: "click".into(),

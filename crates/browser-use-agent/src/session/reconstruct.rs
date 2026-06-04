@@ -76,6 +76,9 @@ pub(crate) const STORE_EVENT_TYPES: &[&str] = &[
     "model.tool_call",
     "model.delta",
     "model.stream_delta",
+    "model.reasoning.start",
+    "model.reasoning.delta",
+    "model.reasoning.end",
     "model.thinking_delta",
     "tool.started",
     "tool.output",
@@ -225,6 +228,7 @@ pub fn provider_messages_from_event_slice(
     let mut assistant_text = String::new();
     let mut assistant_phase = None::<String>;
     let mut assistant_reasoning_content = String::new();
+    let mut saw_structured_reasoning = false;
     let mut assistant_tool_calls = Vec::<Value>::new();
     let mut tool_names = HashMap::<String, String>::new();
     let mut emitted_tool_messages = HashSet::<String>::new();
@@ -419,6 +423,7 @@ pub fn provider_messages_from_event_slice(
                     &mut assistant_tool_calls,
                 );
                 messages.extend(session_event_user_messages(&event.payload));
+                saw_structured_reasoning = false;
                 turn_open = true;
             }
             MODEL_SWITCH_CONTEXT_EVENT
@@ -545,9 +550,31 @@ pub fn provider_messages_from_event_slice(
                     }
                 }
             }
-            "model.thinking_delta" => {
-                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+            "model.reasoning.start" => {
+                saw_structured_reasoning = true;
+            }
+            "model.reasoning.delta" => {
+                saw_structured_reasoning = true;
+                if let Some(text) = event
+                    .payload
+                    .get("text")
+                    .or_else(|| event.payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
                     assistant_reasoning_content.push_str(text);
+                }
+            }
+            "model.reasoning.end" => {}
+            "model.thinking_delta" => {
+                if !saw_structured_reasoning {
+                    if let Some(text) = event
+                        .payload
+                        .get("text")
+                        .or_else(|| event.payload.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        assistant_reasoning_content.push_str(text);
+                    }
                 }
             }
             "model.tool_call" => {
@@ -701,6 +728,7 @@ pub fn provider_messages_from_event_slice(
                 if should_insert_marker {
                     messages.push(turn_aborted_user_message());
                 }
+                saw_structured_reasoning = false;
                 turn_open = false;
                 suppress_terminal_tail = true;
             }
@@ -720,6 +748,7 @@ pub fn provider_messages_from_event_slice(
                     &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
+                saw_structured_reasoning = false;
                 turn_open = false;
                 suppress_terminal_tail = true;
             }
@@ -731,6 +760,7 @@ pub fn provider_messages_from_event_slice(
                     &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
+                saw_structured_reasoning = false;
                 turn_open = false;
                 suppress_terminal_tail = true;
             }

@@ -763,6 +763,9 @@ pub(crate) fn event_payload_text(event: &EventRecord) -> Option<String> {
 fn event_is_pre_output_after_submission(event: &EventRecord, target_seq: i64) -> bool {
     match event.event_type.as_str() {
         "model.turn.request"
+        | "model.reasoning.start"
+        | "model.reasoning.delta"
+        | "model.reasoning.end"
         | "model.thinking_delta"
         | "session.status"
         | "agent.created"
@@ -14578,6 +14581,83 @@ wire_api = "responses"
         assert!(screen.contains("Checking the repository structure."));
         // The de-dup worked: no doubled "Checking Checking".
         assert!(!screen.contains("Checking Checking"));
+        Ok(())
+    }
+
+    #[test]
+    fn structured_reasoning_collapses_without_legacy_duplication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "investigate"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.reasoning.start",
+            serde_json::json!({"reasoning_id": "r0"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.reasoning.delta",
+            serde_json::json!({"reasoning_id": "r0", "text": "Checking "}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking "}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.reasoning.delta",
+            serde_json::json!({"reasoning_id": "r0", "text": "Checking the repository structure."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking the repository structure."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.reasoning.end",
+            serde_json::json!({"reasoning_id": "r0"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 2000
+                    }
+                }
+            }),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let scrollback = lines_plain_text(&transcript::all_scrollback_lines(&model, 100));
+        assert!(scrollback.contains("Thought for"), "{scrollback}");
+        assert!(scrollback.contains("2k tokens"), "{scrollback}");
+        assert!(
+            !scrollback.contains("Checking the repository structure."),
+            "{scrollback}"
+        );
+
+        app.open_surface(Surface::Thinking);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Checking the repository structure."));
+        assert!(!screen.contains("Checking Checking"), "{screen}");
         Ok(())
     }
 

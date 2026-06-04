@@ -599,11 +599,27 @@ pub fn turn_streaming_text_from_events(events: &[EventRecord]) -> Option<String>
 }
 
 pub fn turn_thinking_text_from_events(events: &[EventRecord]) -> Option<String> {
-    let mut text = String::new();
+    let mut structured_text = String::new();
+    let mut legacy_text = String::new();
+    let mut saw_structured_delta = false;
     for event in events {
         match event.event_type.as_str() {
             "model.turn.request" | "model.turn.retry" | "model.turn.error" => {
-                text.clear();
+                structured_text.clear();
+                legacy_text.clear();
+                saw_structured_delta = false;
+            }
+            "model.reasoning.start" | "model.reasoning.end" => {}
+            "model.reasoning.delta" => {
+                saw_structured_delta = true;
+                if let Some(incoming) = event
+                    .payload
+                    .get("text")
+                    .or_else(|| event.payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
+                    append_streaming_text_delta(&mut structured_text, incoming);
+                }
             }
             "model.thinking_delta" => {
                 if let Some(incoming) = event
@@ -612,13 +628,19 @@ pub fn turn_thinking_text_from_events(events: &[EventRecord]) -> Option<String> 
                     .or_else(|| event.payload.get("delta"))
                     .and_then(Value::as_str)
                 {
-                    append_streaming_text_delta(&mut text, incoming);
+                    if !saw_structured_delta {
+                        append_streaming_text_delta(&mut legacy_text, incoming);
+                    }
                 }
             }
             _ => {}
         }
     }
-    (!text.trim().is_empty()).then_some(text)
+    if !structured_text.trim().is_empty() {
+        Some(structured_text)
+    } else {
+        (!legacy_text.trim().is_empty()).then_some(legacy_text)
+    }
 }
 
 fn append_streaming_text_delta(current: &mut String, incoming: &str) {
@@ -2022,6 +2044,39 @@ mod tests {
         assert_eq!(
             transcript[0].streaming_text.as_deref(),
             Some("fresh answer")
+        );
+    }
+
+    #[test]
+    fn structured_reasoning_text_wins_over_legacy_compat_deltas() {
+        let events = vec![
+            event(1, "session.input", json!({"text": "reason visibly"})),
+            event(2, "model.turn.request", json!({"model": "GPT-5.5"})),
+            event(3, "model.reasoning.start", json!({"reasoning_id": "r0"})),
+            event(
+                4,
+                "model.reasoning.delta",
+                json!({"reasoning_id": "r0", "text": "checking "}),
+            ),
+            event(5, "model.thinking_delta", json!({"text": "checking "})),
+            event(
+                6,
+                "model.reasoning.delta",
+                json!({"reasoning_id": "r0", "text": "checking context"}),
+            ),
+            event(
+                7,
+                "model.thinking_delta",
+                json!({"text": "checking context"}),
+            ),
+            event(8, "model.reasoning.end", json!({"reasoning_id": "r0"})),
+        ];
+
+        let transcript = transcript_from_events(&events);
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0].thinking_text.as_deref(),
+            Some("checking context")
         );
     }
 
