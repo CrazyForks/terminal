@@ -2645,11 +2645,22 @@ impl BrowserSession {
             .ok_or_else(|| anyhow!("no previous target_id to reattach"))?;
         let targets = self.targets()?;
         if !targets.iter().any(|target| target["targetId"] == target_id) {
+            let debug = target_gone_debug(&target_id, &targets);
+            self.log(format!(
+                "browser target gone while reattaching {}; debug: {}",
+                target_id,
+                json!({
+                    "target_id": target_id,
+                    "available_target_count": targets.len(),
+                    "available_targets": targets,
+                })
+            ));
             return Ok(json!({
                 "status": "target-gone",
                 "target_id": target_id,
-                "available_targets": targets,
-                "next_step": "Use browser_script list_tabs()/switch_tab(...) or browser_script new_tab(...).",
+                "reason": "Previous browser tab target is gone.",
+                "next_step": "Select an existing tab or create a new tab, then continue from the last checkpoint.",
+                "debug": debug,
             }));
         }
         let session_id = self.attach_target(&target_id)?;
@@ -2864,11 +2875,29 @@ impl BrowserSession {
                             }
                         }
                         Ok(recovery) => {
-                            let failure = format!(
-                                "CDP {method} failed because the current session is stale and reattach did not recover it: {message}; reattach result: {recovery}"
-                            );
+                            self.log(format!(
+                                "CDP {method} stale-session recovery did not reattach; original_error: {message}; recovery: {recovery}"
+                            ));
+                            let failure = if recovery.get("status").and_then(Value::as_str)
+                                == Some("target-gone")
+                            {
+                                format!(
+                                    "CDP {method} failed because the previous browser tab target is gone."
+                                )
+                            } else {
+                                format!(
+                                    "CDP {method} failed because the current session is stale and reattach did not recover it."
+                                )
+                            };
                             self.last_error = Some(failure.clone());
-                            self.last_error_kind = Some("target-gone".to_string());
+                            self.last_error_kind = Some(
+                                recovery
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .filter(|status| *status == "target-gone")
+                                    .unwrap_or("session-gone")
+                                    .to_string(),
+                            );
                             bail!(failure);
                         }
                         Err(recovery_error) => {
@@ -7097,6 +7126,34 @@ fn is_internal_browser_url(url: &str) -> bool {
         || url.starts_with("vivaldi:")
 }
 
+fn target_gone_debug(target_id: &str, targets: &[Value]) -> Value {
+    let page_targets: Vec<Value> = targets
+        .iter()
+        .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+        .take(8)
+        .map(cdp_target_summary)
+        .collect();
+    json!({
+        "target_id": target_id,
+        "available_target_count": targets.len(),
+        "available_page_targets": page_targets,
+        "available_page_target_count": targets
+            .iter()
+            .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+            .count(),
+        "note": "Full raw target list is available in `browser runtime logs`.",
+    })
+}
+
+fn cdp_target_summary(target: &Value) -> Value {
+    json!({
+        "target_id": target.get("targetId").and_then(Value::as_str),
+        "type": target.get("type").and_then(Value::as_str),
+        "title": target.get("title").and_then(Value::as_str),
+        "url": target.get("url").and_then(Value::as_str),
+    })
+}
+
 fn browser_help() -> &'static str {
     include_str!("../../../prompts/browser-tool-description.md").trim()
 }
@@ -7590,6 +7647,37 @@ mod tests {
             "url": "https://dashboard.brex.com/account-management/home",
             "title": "Brex",
         })));
+    }
+
+    #[test]
+    fn target_gone_debug_is_capped_and_omits_raw_targets() {
+        let targets: Vec<Value> = (0..12)
+            .map(|idx| {
+                json!({
+                    "type": "page",
+                    "targetId": format!("page-{idx}"),
+                    "title": format!("Page {idx}"),
+                    "url": format!("https://example.test/{idx}"),
+                    "large_debug_blob": "x".repeat(1024),
+                })
+            })
+            .chain((0..3).map(|idx| {
+                json!({
+                    "type": "service_worker",
+                    "targetId": format!("worker-{idx}"),
+                    "title": format!("Worker {idx}"),
+                    "url": format!("chrome-extension://example/{idx}"),
+                    "large_debug_blob": "x".repeat(1024),
+                })
+            }))
+            .collect();
+        let debug = target_gone_debug("missing-target", &targets);
+
+        assert_eq!(debug["available_target_count"], 15);
+        assert_eq!(debug["available_page_target_count"], 12);
+        assert_eq!(debug["available_page_targets"].as_array().unwrap().len(), 8);
+        assert!(debug.get("available_targets").is_none(), "{debug}");
+        assert!(!debug.to_string().contains("large_debug_blob"), "{debug}");
     }
 
     #[test]
