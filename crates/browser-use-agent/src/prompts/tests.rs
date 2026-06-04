@@ -130,6 +130,16 @@ fn prompts_avoid_screenshots_for_text_heavy_extraction() {
     assert!(script.contains("screenshots add latency"));
 }
 
+#[test]
+fn dataset_prompt_enforces_timeboxed_finalization() {
+    let prompt = include_str!("../../../../prompts/dataset-case-user.md");
+
+    assert!(prompt.contains("Timebox contract"));
+    assert!(prompt.contains("soft deadline"));
+    assert!(prompt.contains("hard deadline"));
+    assert!(prompt.contains("Never keep running until the external runner timeout"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]

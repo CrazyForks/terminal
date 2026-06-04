@@ -18,6 +18,8 @@ Remote browser contract: browser automation may run on a different machine from 
 
 Long extraction contract: if the task needs many pages, rows, files, or detail records, work in bounded chunks. Discover the endpoint or pagination pattern first, then fetch in batches with explicit timeouts, checkpoint partial results in the current working directory, and print compact progress counts. A timed-out all-in-one crawl with no saved artifact is not progress; resume from checkpoints when a chunk fails.
 
+Timebox contract: dataset runs have a short wall-clock budget. For long research, document, or extraction tasks, set a soft deadline before starting broad collection, about 7 minutes from now, and a hard deadline about 8.5 minutes from now. Check the deadline before each new page, document, query, or file. After the soft deadline, stop broad research and fill remaining fields from the strongest verified evidence or mark them unknown/unavailable. Before the hard deadline, call `done(...)` with the completed or partial result. Never keep running until the external runner timeout with no saved result.
+
 Completion contract: the final answer must contain the requested answer or a clear pointer to the artifact that contains it. For artifact-heavy results, include the artifact path, record count, schema/columns, and one sample row. A bare acknowledgement such as `Done.` is not useful unless the task explicitly asked for no visible answer.
 
 Before finalizing extraction results, briefly check that the returned items are the same kind of thing the task asked for and that hard filters were not softened to satisfy quantity. If an item is only adjacent, similar, or uncertain, exclude it or mark it uncertain rather than silently treating it as a match.
