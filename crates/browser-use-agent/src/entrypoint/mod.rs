@@ -1868,6 +1868,10 @@ impl TurnState for LiveTurnState {
     }
 
     async fn defer_mailbox_delivery_to_next_turn(&self) {
+        if self.runtime_handle.is_some() {
+            *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::NextTurn;
+            return;
+        }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
         let followup_pending =
@@ -3461,6 +3465,69 @@ mod tests {
                     .and_then(Value::as_array)
                     .is_some_and(|seqs| seqs.iter().any(|seq| seq.as_i64() == Some(pending_seq)))
         }));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_deferral_ignores_store_active_followup_marker() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    serde_json::json!({
+                        "text": "store marker should not control runtime",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                    }),
+                )
+                .expect("pending followup");
+        }
+
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                target_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                content: "runtime current-turn steer".to_string(),
+                trigger_turn: true,
+                kind: RuntimeMailboxItemKind::Followup,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: serde_json::json!({ "source": "test" }),
+            })
+            .expect("enqueue runtime followup");
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        assert!(state.has_pending_input().await);
+        state.defer_mailbox_delivery_to_next_turn().await;
+        assert!(
+            !state.has_pending_input().await,
+            "runtime deferral should not let store follow-up markers keep current-turn delivery open"
+        );
+        assert!(
+            state.take_pending_input().await.is_empty(),
+            "deferred runtime mail should wait for the outer runtime driver restart"
+        );
     }
 
     #[tokio::test]
