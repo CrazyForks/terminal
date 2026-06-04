@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
+use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
-    AgentId, AttachChildAgentRequest, AttachRootAgentRequest,
+    AcceptPromptInputRequest, AgentId, AttachChildAgentRequest, AttachRootAgentRequest,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RunAgentRequest, RuntimeHandle,
     SessionId as RuntimeSessionId,
 };
@@ -155,6 +156,7 @@ impl RuntimeAgentExecutor {
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
+        accept_latest_durable_prompt_input(&self.inner.runtime, &store, &request.session_id)?;
         let session_meta = store
             .load_session(&request.session_id)?
             .with_context(|| format!("unknown session id: {}", request.session_id))?;
@@ -264,6 +266,42 @@ impl RuntimeAgentExecutor {
             .context("spawn live agent executor thread")?;
         Ok(())
     }
+}
+
+fn accept_latest_durable_prompt_input(
+    runtime: &RuntimeHandle,
+    store: &Store,
+    session_id: &str,
+) -> Result<()> {
+    let Some(event) = latest_durable_prompt_input_event(store, session_id)? else {
+        return Ok(());
+    };
+    let payload = json!({
+        "source": "durable_prompt_input",
+        "event_type": event.event_type,
+    });
+    let _ = runtime.accept_prompt_input(AcceptPromptInputRequest {
+        target_agent_id: AgentId::from_string(session_id.to_string())?,
+        source_event_seq: Some(event.seq),
+        payload,
+    })?;
+    Ok(())
+}
+
+fn latest_durable_prompt_input_event(
+    store: &Store,
+    session_id: &str,
+) -> Result<Option<EventRecord>> {
+    Ok(store
+        .events_for_session(session_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup" | "agent.mailbox_input"
+            )
+        }))
 }
 
 fn runtime_has_trigger_turn_mail(runtime: &RuntimeHandle, session_id: &RuntimeSessionId) -> bool {
@@ -385,5 +423,79 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use browser_use_runtime::{
+        BrowserUseRuntime, LiveThreadPersistence, SqliteJournal, StateIndex,
+    };
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn sqlite_runtime(state_dir: &Path) -> Result<RuntimeHandle> {
+        let journal = Arc::new(SqliteJournal::open(state_dir)?);
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        Ok(BrowserUseRuntime::new(persistence, state_index).handle())
+    }
+
+    #[test]
+    fn durable_prompt_input_is_accepted_once_without_mailbox() -> Result<()> {
+        let dir = TempDir::new()?;
+        let store = Store::open(dir.path())?;
+        let session = store.create_session(None, Path::new("/work"))?;
+        let input = store.append_event(
+            &session.id,
+            "session.input",
+            json!({ "text": "inspect the repo" }),
+        )?;
+        let runtime = sqlite_runtime(dir.path())?;
+        ensure_agent_attached(&runtime, &store, &session.id, 3)?;
+
+        accept_latest_durable_prompt_input(&runtime, &store, &session.id)?;
+        let agent_id = AgentId::from_string(session.id.clone())?;
+        let thread = runtime.agents().thread(&agent_id)?;
+        assert!(thread.mailbox().pending_items().is_empty());
+        let live = thread.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 1);
+        assert_eq!(live.pending_prompt_input_count, 1);
+        assert_eq!(live.last_accepted_prompt_input_seq, input.seq);
+
+        let consumed = runtime.consume_prompt_input_for_session(&RuntimeSessionId::from_string(
+            session.id.clone(),
+        )?)?;
+        assert!(consumed.consumed);
+        accept_latest_durable_prompt_input(&runtime, &store, &session.id)?;
+        let live = thread.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 1);
+        assert_eq!(live.pending_prompt_input_count, 0);
+        assert_eq!(live.last_consumed_prompt_input_seq, input.seq);
+
+        let event_types = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "agent.input.accepted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "agent.input.consumed")
+                .count(),
+            1
+        );
+        assert!(event_types
+            .iter()
+            .all(|event_type| event_type != "mailbox.enqueued"));
+        Ok(())
     }
 }

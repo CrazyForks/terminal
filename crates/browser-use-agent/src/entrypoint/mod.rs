@@ -992,17 +992,6 @@ fn has_pending_runtime_trigger_turn_agent_mail(
         .unwrap_or(false)
 }
 
-fn has_pending_runtime_agent_mail_any_phase(
-    runtime_handle: &RuntimeHandle,
-    session_id: &str,
-) -> bool {
-    has_pending_runtime_agent_mail(
-        runtime_handle,
-        session_id,
-        MailboxDeliveryPhase::CurrentTurn,
-    ) || has_pending_runtime_agent_mail(runtime_handle, session_id, MailboxDeliveryPhase::NextTurn)
-}
-
 fn has_pending_runtime_trigger_turn_agent_mail_any_phase(
     runtime_handle: &RuntimeHandle,
     session_id: &str,
@@ -1016,6 +1005,16 @@ fn has_pending_runtime_trigger_turn_agent_mail_any_phase(
         session_id,
         MailboxDeliveryPhase::NextTurn,
     )
+}
+
+fn consume_runtime_prompt_input(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    Ok(runtime_handle
+        .consume_prompt_input_for_session(&runtime_session_id)?
+        .consumed)
 }
 
 fn initial_runtime_mailbox_delivery_phase(
@@ -2684,15 +2683,15 @@ async fn run_session_once_with_config_with_cancel(
     }
 
     // The run drives over the session's existing durable history (the prompt the
-    // caller already seeded). Fresh user input is sampled before queued steer
-    // unless the reason this run exists is already-buffered mailbox mail; that
-    // case matches Codex's "next turn" delivery and must drain immediately.
-    let pending_mail_at_start = runtime_handle
-        .as_ref()
-        .map(|runtime| has_pending_runtime_agent_mail_any_phase(runtime, session_id.as_str()))
-        .unwrap_or(false);
-    let turn_has_fresh_input =
-        log_has_user_input(&store, session_id.as_str()) && !pending_mail_at_start;
+    // caller already seeded). Runtime-backed callers own the live "fresh input"
+    // fact explicitly (`agent.input.accepted` -> `agent.input.consumed`), while
+    // SQLite remains the transcript/replay source. Legacy no-runtime callers keep
+    // the old store-derived gate.
+    let turn_has_fresh_input = if let Some(runtime) = runtime_handle.as_ref() {
+        consume_runtime_prompt_input(runtime, session_id.as_str())?
+    } else {
+        log_has_user_input(&store, session_id.as_str())
+    };
 
     // (3) drive the loop to quiescence with the resolved driver. The SAME
     //     `recorded` buffer the recorder writes is handed to the state, so the

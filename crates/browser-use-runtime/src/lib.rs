@@ -110,6 +110,8 @@ pub enum RuntimeEventKind {
     RuntimeStarted,
     RuntimeShutdown,
     AgentCreated,
+    AgentInputAccepted,
+    AgentInputConsumed,
     AgentStarted,
     AgentQueued,
     AgentResumed,
@@ -166,6 +168,8 @@ impl RuntimeEventKind {
             Self::RuntimeStarted => "runtime.started",
             Self::RuntimeShutdown => "runtime.shutdown",
             Self::AgentCreated => "agent.created",
+            Self::AgentInputAccepted => "agent.input.accepted",
+            Self::AgentInputConsumed => "agent.input.consumed",
             Self::AgentStarted => "agent.started",
             Self::AgentQueued => "agent.queued",
             Self::AgentResumed => "agent.resumed",
@@ -1486,6 +1490,9 @@ pub enum AgentThreadStatus {
 pub struct AgentLiveStateSnapshot {
     pub accepted_input_count: usize,
     pub accepted_followup_count: usize,
+    pub pending_prompt_input_count: usize,
+    pub last_accepted_prompt_input_seq: i64,
+    pub last_consumed_prompt_input_seq: i64,
     pub pending_mailbox_count: usize,
     pub pending_trigger_turn_count: usize,
     pub last_enqueued_mailbox_seq: u64,
@@ -1658,6 +1665,53 @@ impl AgentLiveState {
             }
             MailboxItemKind::Completion | MailboxItemKind::Notification => {}
         }
+    }
+
+    fn has_accepted_prompt_input_seq(&self, source_event_seq: Option<i64>) -> bool {
+        let Some(source_event_seq) = source_event_seq else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_accepted_prompt_input_seq
+            >= source_event_seq
+    }
+
+    fn record_prompt_input_accepted(&self, source_event_seq: Option<i64>) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepted_input_count = state.accepted_input_count.saturating_add(1);
+        state.pending_prompt_input_count = state.pending_prompt_input_count.saturating_add(1);
+        if let Some(source_event_seq) = source_event_seq {
+            state.last_accepted_prompt_input_seq =
+                state.last_accepted_prompt_input_seq.max(source_event_seq);
+        }
+    }
+
+    fn has_pending_prompt_input(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_prompt_input_count
+            > 0
+    }
+
+    fn record_prompt_input_consumed(&self) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending_prompt_input_count == 0 {
+            return false;
+        }
+        state.pending_prompt_input_count = state.pending_prompt_input_count.saturating_sub(1);
+        state.last_consumed_prompt_input_seq = state
+            .last_consumed_prompt_input_seq
+            .max(state.last_accepted_prompt_input_seq);
+        true
     }
 
     fn record_mailbox_enqueued(&self, item: &MailboxItem) {
@@ -1852,6 +1906,23 @@ pub struct SendAgentMessageRequest {
 #[derive(Clone, Debug)]
 pub struct SendAgentMessageResponse {
     pub mailbox_item: MailboxItem,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptPromptInputRequest {
+    pub target_agent_id: AgentId,
+    pub source_event_seq: Option<i64>,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptPromptInputResponse {
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConsumePromptInputResponse {
+    pub consumed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2755,6 +2826,20 @@ impl RuntimeHandle {
         self.inner.send_agent_message(request)
     }
 
+    pub fn accept_prompt_input(
+        &self,
+        request: AcceptPromptInputRequest,
+    ) -> Result<AcceptPromptInputResponse> {
+        self.inner.accept_prompt_input(request)
+    }
+
+    pub fn consume_prompt_input_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ConsumePromptInputResponse> {
+        self.inner.consume_prompt_input_for_session(session_id)
+    }
+
     pub fn submit_input(&self, request: SubmitInputRequest) -> Result<SubmitInputResponse> {
         self.inner.submit_input(request)
     }
@@ -3352,6 +3437,73 @@ impl BrowserUseRuntime {
         target.live_state.record_mailbox_enqueued(&mailbox_item);
         self.events.publish(mailbox_event);
         Ok(SendAgentMessageResponse { mailbox_item })
+    }
+
+    pub fn accept_prompt_input(
+        &self,
+        mut request: AcceptPromptInputRequest,
+    ) -> Result<AcceptPromptInputResponse> {
+        let target = self.agents.thread(&request.target_agent_id)?;
+        if target
+            .live_state
+            .has_accepted_prompt_input_seq(request.source_event_seq)
+        {
+            return Ok(AcceptPromptInputResponse { accepted: false });
+        }
+        if !request.payload.is_object() {
+            request.payload = json!({});
+        }
+        if let Some(obj) = request.payload.as_object_mut() {
+            obj.insert(
+                "target_session_id".to_string(),
+                json!(target.session_id.as_str()),
+            );
+            if let Some(source_event_seq) = request.source_event_seq {
+                obj.insert("source_event_seq".to_string(), json!(source_event_seq));
+            }
+        }
+        let mut event =
+            RuntimeEvent::new(RuntimeEventKind::AgentInputAccepted, Durability::Barrier)
+                .with_session_id(target.session_id.clone())
+                .with_agent_id(target.agent_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "source_event_seq": request.source_event_seq,
+                    "payload": request.payload,
+                }));
+        event.root_id = Some(target.root_id.clone());
+        self.append_runtime_event(&event)?;
+        target
+            .live_state
+            .record_prompt_input_accepted(request.source_event_seq);
+        self.events.publish(event);
+        Ok(AcceptPromptInputResponse { accepted: true })
+    }
+
+    pub fn consume_prompt_input_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ConsumePromptInputResponse> {
+        let thread = self.agents.thread_for_session(session_id)?;
+        if !thread.live_state.has_pending_prompt_input() {
+            return Ok(ConsumePromptInputResponse { consumed: false });
+        }
+        let live = thread.live_state.snapshot();
+        let mut event =
+            RuntimeEvent::new(RuntimeEventKind::AgentInputConsumed, Durability::Barrier)
+                .with_session_id(thread.session_id.clone())
+                .with_agent_id(thread.agent_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "source_event_seq": live.last_accepted_prompt_input_seq,
+                }));
+        event.root_id = Some(thread.root_id.clone());
+        self.append_runtime_event(&event)?;
+        let consumed = thread.live_state.record_prompt_input_consumed();
+        if consumed {
+            self.events.publish(event);
+        }
+        Ok(ConsumePromptInputResponse { consumed })
     }
 
     pub fn submit_input(&self, mut request: SubmitInputRequest) -> Result<SubmitInputResponse> {
@@ -5160,6 +5312,100 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(event_types.contains(&"mailbox.delivered".to_string()));
         assert!(event_types.contains(&"mailbox.consumed".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_prompt_input_is_barrier_backed_and_one_shot() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let accepted = handle.accept_prompt_input(AcceptPromptInputRequest {
+            target_agent_id: root.agent_id().clone(),
+            source_event_seq: Some(42),
+            payload: json!({ "source": "test" }),
+        })?;
+        assert!(accepted.accepted);
+        let duplicate = handle.accept_prompt_input(AcceptPromptInputRequest {
+            target_agent_id: root.agent_id().clone(),
+            source_event_seq: Some(42),
+            payload: json!({ "source": "test" }),
+        })?;
+        assert!(!duplicate.accepted);
+
+        let live = root.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 1);
+        assert_eq!(live.pending_prompt_input_count, 1);
+        assert_eq!(live.last_accepted_prompt_input_seq, 42);
+        assert!(root.mailbox().pending_items().is_empty());
+
+        let consumed = handle.consume_prompt_input_for_session(root.session_id())?;
+        assert!(consumed.consumed);
+        let consumed_again = handle.consume_prompt_input_for_session(root.session_id())?;
+        assert!(!consumed_again.consumed);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.pending_prompt_input_count, 0);
+        assert_eq!(live.last_consumed_prompt_input_seq, 42);
+
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "agent.input.accepted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "agent.input.consumed")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_input_barrier_failure_does_not_mark_fresh_input() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let mut rx = handle.events().subscribe();
+        journal.fail_event_type("agent.input.accepted");
+
+        let err = handle
+            .accept_prompt_input(AcceptPromptInputRequest {
+                target_agent_id: root.agent_id().clone(),
+                source_event_seq: Some(7),
+                payload: json!({ "source": "test" }),
+            })
+            .expect_err("prompt input accept must fail before live mutation");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        let live = root.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 0);
+        assert_eq!(live.pending_prompt_input_count, 0);
+        assert_eq!(live.last_accepted_prompt_input_seq, 0);
+        assert!(journal
+            .events_for_session(root.session_id())?
+            .iter()
+            .all(|event| event.event_type != "agent.input.accepted"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         Ok(())
     }
 
