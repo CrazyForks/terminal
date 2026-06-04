@@ -575,7 +575,7 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
 }
 
 #[tokio::test]
-async fn turn_request_event_carries_sanitized_llm_input_messages() {
+async fn turn_request_event_carries_full_llm_input_messages() {
     let (transport, _opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
     let sink = Arc::new(RecordingSink::default());
@@ -627,16 +627,64 @@ async fn turn_request_event_carries_sanitized_llm_input_messages() {
     );
     assert_eq!(
         llm_input["messages"][0]["content"][1]["data"],
-        serde_json::json!("[redacted inline data]")
+        serde_json::json!("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")
     );
     assert_eq!(
         llm_input["messages"][1]["content"][0]["input"]["api_key"],
         serde_json::json!("[redacted]")
     );
+    assert_eq!(llm_input["truncated"], serde_json::json!(false));
     assert!(!llm_input["system"][0]["text"]
         .as_str()
         .unwrap_or_default()
         .is_empty());
+}
+
+#[tokio::test]
+async fn turn_request_event_carries_all_observability_messages_without_text_budget() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let long_text = "observe-this-text".repeat(6_000);
+    let mut input: Vec<Message> = (0..85)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("msg-{index}"))],
+            )
+        })
+        .collect();
+    input.push(Message::new(
+        MessageRole::User,
+        vec![ContentPart::text(long_text.clone())],
+    ));
+
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    let messages = llm_input["messages"].as_array().expect("messages array");
+    assert_eq!(llm_input["message_count"], serde_json::json!(86));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(0));
+    assert_eq!(messages.len(), 86);
+    assert_eq!(
+        messages[85]["content"][0]["text"],
+        serde_json::json!(long_text)
+    );
+    assert_eq!(llm_input["truncated"], serde_json::json!(false));
+
+    let serialized = serde_json::to_string(llm_input).expect("llm_input serializes");
+    assert!(!serialized.contains("request observability text budget exhausted"));
+    assert!(!serialized.contains("...[truncated]"));
 }
 
 #[tokio::test]
