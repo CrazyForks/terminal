@@ -10,10 +10,11 @@ use browser_use_runtime::{
     SessionId as RuntimeSessionId,
 };
 use browser_use_store::{Store, StoreNotifier};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::config_overrides::ProviderRunConfig;
-use crate::entrypoint::run_session_with_config_with_cancel_and_runtime;
+use crate::entrypoint::RuntimeTurnDriver;
 use crate::session::SharedStore;
 
 #[derive(Clone)]
@@ -153,12 +154,25 @@ impl RuntimeAgentExecutor {
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
+        let session_meta = store
+            .load_session(&request.session_id)?
+            .with_context(|| format!("unknown session id: {}", request.session_id))?;
+        let run_cwd = PathBuf::from(&session_meta.cwd);
         let shared_store: SharedStore = Arc::new(Mutex::new(store));
         let cancel = request
             .cancellation_token
             .unwrap_or_else(CancellationToken::new);
-        let runtime_request =
-            RunAgentRequest::new(runtime_session_id).with_cancellation_token(cancel.clone());
+        let provider_config = json!({
+            "backend": format!("{:?}", request.config.backend),
+            "model": request.config.model,
+            "runtime_agent_executor": true,
+        });
+        let runtime_request = RunAgentRequest::new(runtime_session_id)
+            .with_agent_id(AgentId::from_string(request.session_id.clone())?)
+            .with_provider_config(provider_config)
+            .with_cwd(run_cwd)
+            .with_input_source("runtime_agent_executor")
+            .with_cancellation_token(cancel.clone());
         let runtime = self.inner.runtime.clone();
         let runner_runtime = self.inner.runtime.clone();
         let request_session_id = request.session_id.clone();
@@ -168,13 +182,14 @@ impl RuntimeAgentExecutor {
         let result = self.inner.tokio.block_on(async move {
             runtime
                 .run_agent(runtime_request, async move {
-                    run_session_with_config_with_cancel_and_runtime(
+                    RuntimeTurnDriver::new(
                         shared_store_for_run,
-                        &request_session_id_for_run,
+                        request_session_id_for_run,
                         config,
                         cancel,
-                        Some(runner_runtime),
                     )
+                    .with_runtime_handle(Some(runner_runtime))
+                    .run()
                     .await
                 })
                 .await

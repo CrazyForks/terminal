@@ -2252,7 +2252,7 @@ impl EventSink for DiscardSink {
 /// SAME `Arc` the driver's [`FusionRecorder`] writes (so dispatched tool outputs
 /// re-enter the next prompt). The state is built over it AFTER the driver so the
 /// driver/recorder and the loop read/write the one buffer.
-struct RuntimeTurnDriver<Sd> {
+struct RuntimeTurnLoopDriver<Sd> {
     store: SharedStore,
     session_id: SessionId,
     ctx: TurnCtx,
@@ -2274,7 +2274,7 @@ struct RuntimeTurnDriver<Sd> {
     cancel: CancellationToken,
 }
 
-impl<Sd: SamplingDriver> RuntimeTurnDriver<Sd> {
+impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
     async fn run(self) -> Result<Option<String>, AgentError> {
         let Self {
             store,
@@ -2372,7 +2372,7 @@ async fn drive_run<Sd: SamplingDriver>(
     runtime_handle: Option<RuntimeHandle>,
     cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
-    RuntimeTurnDriver {
+    RuntimeTurnLoopDriver {
         store,
         session_id,
         ctx,
@@ -2557,29 +2557,77 @@ pub async fn run_session_with_config_with_cancel_and_runtime(
     cancel: CancellationToken,
     runtime_handle: Option<RuntimeHandle>,
 ) -> anyhow::Result<SessionId> {
-    let session_id = SessionId(session_id.to_string());
-    loop {
-        run_session_once_with_config_with_cancel(
-            Arc::clone(&store),
-            session_id.clone(),
-            config.clone(),
-            cancel.clone(),
-            runtime_handle.clone(),
-        )
-        .await?;
+    RuntimeTurnDriver::new(store, session_id, config, cancel)
+        .with_runtime_handle(runtime_handle)
+        .run()
+        .await
+}
 
-        let has_pending_trigger_turn_mail = runtime_handle
-            .as_ref()
-            .map(|runtime_handle| {
-                has_pending_runtime_trigger_turn_agent_mail_any_phase(
-                    runtime_handle,
-                    session_id.as_str(),
-                )
-            })
-            .unwrap_or(false);
-        if cancel.is_cancelled() || !has_pending_trigger_turn_mail {
-            return Ok(session_id);
+/// Runtime-owned turn driver boundary.
+///
+/// The driver still uses the existing model/tool loop implementation, but live
+/// callers should enter through this object rather than the old
+/// `run_session_with_config*` compatibility functions. This makes the remaining
+/// inversion explicit: move prompt state, resources, and scheduling decisions
+/// from the store-backed implementation below into this runtime driver.
+pub struct RuntimeTurnDriver {
+    store: SharedStore,
+    session_id: SessionId,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
+    runtime_handle: Option<RuntimeHandle>,
+}
+
+impl RuntimeTurnDriver {
+    pub fn new(
+        store: SharedStore,
+        session_id: impl Into<String>,
+        config: ProviderRunConfig,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            store,
+            session_id: SessionId(session_id.into()),
+            config,
+            cancel,
+            runtime_handle: None,
         }
+    }
+
+    pub fn with_runtime_handle(mut self, runtime_handle: Option<RuntimeHandle>) -> Self {
+        self.runtime_handle = runtime_handle;
+        self
+    }
+
+    pub async fn run(self) -> anyhow::Result<SessionId> {
+        loop {
+            self.run_once().await?;
+
+            let has_pending_trigger_turn_mail = self
+                .runtime_handle
+                .as_ref()
+                .map(|runtime_handle| {
+                    has_pending_runtime_trigger_turn_agent_mail_any_phase(
+                        runtime_handle,
+                        self.session_id.as_str(),
+                    )
+                })
+                .unwrap_or(false);
+            if self.cancel.is_cancelled() || !has_pending_trigger_turn_mail {
+                return Ok(self.session_id);
+            }
+        }
+    }
+
+    async fn run_once(&self) -> anyhow::Result<()> {
+        run_session_once_with_config_with_cancel(
+            Arc::clone(&self.store),
+            self.session_id.clone(),
+            self.config.clone(),
+            self.cancel.clone(),
+            self.runtime_handle.clone(),
+        )
+        .await
     }
 }
 
