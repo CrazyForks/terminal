@@ -54,6 +54,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -334,6 +335,7 @@ pub struct ModelSamplingDriver<
     transport: T,
     sink: Arc<dyn EventSink>,
     ctx: TurnCtx,
+    next_turn_idx: AtomicUsize,
     /// Retry budget (codex `provider.stream_max_retries()`).
     max_retries: u32,
     /// Whether to apply I/O-layer jitter to the post-decision backoff sleep.
@@ -369,6 +371,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
         Self {
             transport,
             sink,
+            next_turn_idx: AtomicUsize::new(ctx.turn_idx),
             ctx,
             max_retries,
             jitter: true,
@@ -397,6 +400,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
         ModelSamplingDriver {
             transport: self.transport,
             sink: self.sink,
+            next_turn_idx: self.next_turn_idx,
             ctx: self.ctx,
             max_retries: self.max_retries,
             jitter: self.jitter,
@@ -433,20 +437,33 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     }
 
     /// Map an [`LlmEvent`] to UI events and emit them through the sink.
-    fn emit_event(&self, ev: &LlmEvent) {
-        for pending in events::map_llm_event(&self.ctx, ev) {
+    fn ctx_for_turn(&self, turn_idx: usize) -> TurnCtx {
+        let mut ctx = self.ctx.clone();
+        ctx.turn_idx = turn_idx;
+        ctx
+    }
+
+    fn emit_event(&self, ev: &LlmEvent, turn_idx: usize) {
+        let ctx = self.ctx_for_turn(turn_idx);
+        for pending in events::map_llm_event(&ctx, ev) {
             self.sink.emit(pending);
         }
     }
 
-    fn emit_turn_request(&self, attempt: u32, composition: &Value, llm_input: &Value) {
+    fn emit_turn_request(
+        &self,
+        turn_idx: usize,
+        attempt: u32,
+        composition: &Value,
+        llm_input: &Value,
+    ) {
         self.sink.emit(PendingEvent::new(
             self.ctx.session_id.clone(),
             names::MODEL_TURN_REQUEST,
             serde_json::json!({
                 "model": &self.ctx.model,
                 "provider": &self.ctx.provider,
-                "turn_idx": self.ctx.turn_idx,
+                "turn_idx": turn_idx,
                 "attempt": attempt,
                 "composition": composition,
                 "llm_input": llm_input,
@@ -544,9 +561,10 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         acc: &mut TurnAccumulator,
         ev: LlmEvent,
         started_at: Instant,
+        turn_idx: usize,
     ) -> StreamProgress {
         // Emit UI events first (map is pure; emit is the only side effect).
-        self.emit_event(&ev);
+        self.emit_event(&ev, turn_idx);
         match ev {
             LlmEvent::TextDelta { id, delta } => {
                 let has_content = !delta.trim().is_empty();
@@ -864,6 +882,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // the populated conversation, not an empty body.
         let input = self.input_with_goal_context(input);
         let mut req = build_request(&self.ctx, input);
+        let turn_idx = self.next_turn_idx.fetch_add(1, Ordering::Relaxed);
         // Advertise the tool catalog. When a dispatcher is attached (the fused
         // path), it carries the registry's model-visible definitions; we copy them
         // verbatim (order-stable) into `req.tools` so the model can actually emit
@@ -881,7 +900,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         let llm_input = request_observability_input(&req);
         let mut attempt: u32 = 0;
         loop {
-            self.emit_turn_request(attempt, &composition, &llm_input);
+            self.emit_turn_request(turn_idx, attempt, &composition, &llm_input);
             // ---- open the stream (codex: `client.stream(&prompt).await`) ----
             let mut stream = match self.transport.open_stream(&req) {
                 Ok(s) => s,
@@ -913,7 +932,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match maybe_event {
                     Some(Ok(ev)) => {
                         let check_mailbox_preemption = checks_mailbox_preemption_after_event(&ev);
-                        match self.consume_event(&mut acc, ev, started_at) {
+                        match self.consume_event(&mut acc, ev, started_at, turn_idx) {
                             StreamProgress::Continue => {
                                 if check_mailbox_preemption && self.has_mailbox_preemption().await {
                                     preempted_for_mailbox = true;
@@ -1128,10 +1147,13 @@ fn request_observability_input(req: &LlmRequest) -> Value {
     let message_count = req.messages.len();
     let messages: Vec<Value> = req.messages.iter().map(observability_json_value).collect();
     let system: Vec<Value> = req.system.iter().map(observability_json_value).collect();
+    let tools: Vec<Value> = req.tools.iter().map(observability_json_value).collect();
 
     serde_json::json!({
         "system": system,
         "messages": messages,
+        "tools": tools,
+        "tools_count": tools.len(),
         "message_count": message_count,
         "omitted_earlier_messages": 0,
         "truncated": false,
