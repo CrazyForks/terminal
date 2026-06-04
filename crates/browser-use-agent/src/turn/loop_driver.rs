@@ -79,7 +79,10 @@ use super::{CompactionMode, SamplingDriver, TurnObserver, TurnState};
 use crate::decision::{self, LoopStep};
 use crate::events::TurnCtx;
 use crate::task::{TurnAbortReason, TurnLifecycleEvent};
+use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
+
+const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
 /// traits so production wires real impls (`ContextManager`+`Session`,
@@ -175,6 +178,12 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             // `ContextManager` history; the loop simply threads it through.
             let mut request = self.state.clone_history_for_prompt().await;
             request.extend(input);
+            if max_turns.is_some_and(|limit| turns_run + 1 == limit) {
+                request.push(Message::new(
+                    MessageRole::Developer,
+                    vec![ContentPart::text(FINAL_MAX_TURNS_NUDGE)],
+                ));
+            }
 
             // ---- 2. run one sampling round-trip ----
             let outcome = match self

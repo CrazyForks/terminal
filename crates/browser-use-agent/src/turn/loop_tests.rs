@@ -722,6 +722,7 @@ async fn bounded_loop_aborts_after_max_turns() {
         SamplingScript::Ok(complete("should not run")),
     ]);
     let requests = sampler.requests_handle();
+    let inputs = sampler.inputs_handle();
     let state = InMemoryTurnState::new(Vec::new(), token_status(false));
     let observer = RecordingObserver::new();
 
@@ -733,6 +734,18 @@ async fn bounded_loop_aborts_after_max_turns() {
 
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert_eq!(out.as_deref(), Some("step 1"));
+    let recorded_inputs = inputs.lock().unwrap();
+    let Some(Message {
+        role: MessageRole::Developer,
+        content,
+    }) = recorded_inputs[1].last()
+    else {
+        panic!("last bounded request should include final-step developer nudge");
+    };
+    assert!(
+        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("final allowed step")),
+        "final nudge should tell the agent to finish"
+    );
     assert_eq!(observer.kinds(), vec!["started", "aborted"]);
     let events = observer.events.lock().unwrap();
     assert!(matches!(
