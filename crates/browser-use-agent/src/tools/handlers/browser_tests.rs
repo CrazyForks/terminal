@@ -432,10 +432,18 @@ fn passive_browser_commands_do_not_preflight_connect() {
     for words in [
         ["browser", "status", "--json"].as_slice(),
         ["status", "--json"].as_slice(),
+        ["browser", "connect", "local"].as_slice(),
+        ["connect", "local"].as_slice(),
         ["browser", "runtime", "logs"].as_slice(),
         ["runtime", "logs"].as_slice(),
         ["browser", "runtime", "ownership", "--json"].as_slice(),
         ["runtime", "ownership", "--json"].as_slice(),
+        ["browser", "local", "list", "--json"].as_slice(),
+        ["local", "list", "--json"].as_slice(),
+        ["browser", "local", "profiles", "--json"].as_slice(),
+        ["local", "profiles", "--json"].as_slice(),
+        ["browser", "local", "setup"].as_slice(),
+        ["local", "setup"].as_slice(),
     ] {
         assert!(browser_command_is_passive(words), "{words:?}");
     }
@@ -444,7 +452,7 @@ fn passive_browser_commands_do_not_preflight_connect() {
         "runtime",
         "cleanup-stale"
     ]));
-    assert!(!browser_command_is_passive(&["browser", "connect"]));
+    assert!(!browser_command_is_passive(&["go", "https://example.com"]));
 }
 
 // (2) Script start routes to start_script, matching main's browser_script tool.
