@@ -368,14 +368,11 @@ impl LiveTurnState {
     }
 
     fn durable_events_blocking(&self) -> Vec<EventRecord> {
-        if let (Some(runtime_handle), Some(runtime_session_id)) =
-            (self.runtime_handle.as_ref(), self.runtime_session_id())
-        {
-            if let Ok(events) = runtime_handle.events_for_session(&runtime_session_id) {
-                return events;
-            }
-        }
-        events_from_store(&self.store, self.session_id.as_str())
+        runtime_or_store_events(
+            self.runtime_handle.as_ref(),
+            &self.store,
+            self.session_id.as_str(),
+        )
     }
 
     fn durable_history_blocking(&self) -> Vec<Message> {
@@ -1338,14 +1335,15 @@ fn runtime_or_store_events(
     store: &SharedStore,
     session_id: &str,
 ) -> Vec<EventRecord> {
-    if let Some(runtime_handle) = runtime_handle {
-        if let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) {
-            if let Ok(events) = runtime_handle.events_for_session(&runtime_session_id) {
-                return events;
-            }
-        }
-    }
-    events_from_store(store, session_id)
+    let Some(runtime_handle) = runtime_handle else {
+        return events_from_store(store, session_id);
+    };
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return events_from_store(store, session_id);
+    };
+    runtime_handle
+        .events_for_session(&runtime_session_id)
+        .unwrap_or_default()
 }
 
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
@@ -1952,14 +1950,16 @@ impl TurnState for LiveTurnState {
         let session_id = self.session_id.as_str().to_string();
         // The durable read is synchronous (rusqlite); run it off the async runtime.
         let mut msgs = tokio::task::spawn_blocking(move || {
-            if let (Some(runtime_handle), Some(runtime_session_id)) =
-                (runtime_handle.as_ref(), runtime_session_id.as_ref())
-            {
-                if let Ok(events) = runtime_handle.events_for_session(runtime_session_id) {
-                    return history_from_events(&events);
+            let events = match (runtime_handle.as_ref(), runtime_session_id.as_ref()) {
+                (Some(runtime_handle), Some(runtime_session_id)) => {
+                    match runtime_handle.events_for_session(runtime_session_id) {
+                        Ok(events) => events,
+                        Err(_) => Vec::new(),
+                    }
                 }
-            }
-            history_from_store(&store, &session_id)
+                _ => return history_from_store(&store, &session_id),
+            };
+            history_from_events(&events)
         })
         .await
         .unwrap_or_default();
@@ -3159,12 +3159,14 @@ mod tests {
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_runtime::{
         AgentId as RuntimeAgentId, AttachRootAgentRequest, BrowserUseRuntime, CreateThreadRequest,
+        Durability as RuntimeDurability, JournalAppend, JournalReader, JournalSink,
         LiveThreadPersistence, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
-        MailboxItemKind as RuntimeMailboxItemKind,
+        MailboxItemKind as RuntimeMailboxItemKind, MemoryJournal, RuntimeEvent,
         SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
-        SpawnChildRequest, SqliteJournal, StateIndex,
+        SpawnChildRequest, SpawnEdge, SpawnEdgeStatus, SqliteJournal, StateIndex,
     };
     use browser_use_store::Store;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -3179,6 +3181,112 @@ mod tests {
             .expect("create session")
             .id;
         (dir, Arc::new(Mutex::new(store)), session_id)
+    }
+
+    #[derive(Clone, Default)]
+    struct ReadFailingJournal {
+        inner: MemoryJournal,
+    }
+
+    impl JournalSink for ReadFailingJournal {
+        fn append_runtime_event(&self, event: &RuntimeEvent) -> anyhow::Result<JournalAppend> {
+            self.inner.append_runtime_event(event)
+        }
+
+        fn append_session_event(
+            &self,
+            session_id: &RuntimeSessionId,
+            event_type: &str,
+            payload: Value,
+            durability: RuntimeDurability,
+        ) -> anyhow::Result<JournalAppend> {
+            self.inner
+                .append_session_event(session_id, event_type, payload, durability)
+        }
+
+        fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl JournalReader for ReadFailingJournal {
+        fn load_session(
+            &self,
+            session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Option<browser_use_protocol::SessionMeta>> {
+            self.inner.load_session(session_id)
+        }
+
+        fn list_sessions(&self) -> anyhow::Result<Vec<browser_use_protocol::SessionMeta>> {
+            self.inner.list_sessions()
+        }
+
+        fn events_for_session(
+            &self,
+            _session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<EventRecord>> {
+            Err(anyhow::anyhow!("forced runtime read failure"))
+        }
+
+        fn events_after_seq(
+            &self,
+            _session_id: &RuntimeSessionId,
+            _after_seq: i64,
+        ) -> anyhow::Result<Vec<EventRecord>> {
+            Err(anyhow::anyhow!("forced runtime read failure"))
+        }
+    }
+
+    impl LiveThreadPersistence for ReadFailingJournal {
+        fn create_thread(
+            &self,
+            request: CreateThreadRequest,
+        ) -> anyhow::Result<browser_use_protocol::SessionMeta> {
+            self.inner.create_thread(request)
+        }
+    }
+
+    impl StateIndex for ReadFailingJournal {
+        fn open_spawn_edge(&self, edge: SpawnEdge) -> anyhow::Result<()> {
+            self.inner.open_spawn_edge(edge)
+        }
+
+        fn finish_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            status: SpawnEdgeStatus,
+        ) -> anyhow::Result<()> {
+            self.inner.finish_spawn_edge(child_session_id, status)
+        }
+
+        fn close_spawn_edge(
+            &self,
+            child_session_id: &RuntimeSessionId,
+            reason: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.close_spawn_edge(child_session_id, reason)
+        }
+
+        fn list_children(
+            &self,
+            parent_session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<SpawnEdge>> {
+            self.inner.list_children(parent_session_id)
+        }
+
+        fn list_descendants(
+            &self,
+            root_session_id: &RuntimeSessionId,
+        ) -> anyhow::Result<Vec<SpawnEdge>> {
+            self.inner.list_descendants(root_session_id)
+        }
+    }
+
+    fn runtime_with_read_failing_journal() -> RuntimeHandle {
+        let journal = Arc::new(ReadFailingJournal::default());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        BrowserUseRuntime::new(persistence, state_index).handle()
     }
 
     fn events(store: &SharedStore, session_id: &str) -> Vec<browser_use_protocol::EventRecord> {
@@ -3728,6 +3836,45 @@ mod tests {
         assert!(
             !prompt_text.contains("store only text"),
             "runtime-backed prompt history should come from RuntimeHandle::events_for_session first"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_turn_state_read_failure_does_not_fall_back_to_store_history() {
+        let (_dir, store, session_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    names::SESSION_INPUT,
+                    serde_json::json!({ "text": "store text must not leak" }),
+                )
+                .expect("append store input");
+        }
+
+        let state = LiveTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_with_read_failing_journal()));
+
+        let prompt_text = state
+            .clone_history_for_prompt()
+            .await
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !prompt_text.contains("store text must not leak"),
+            "runtime-backed prompt history must not fall back to Store when runtime journal reads fail"
         );
     }
 
