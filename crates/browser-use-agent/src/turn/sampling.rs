@@ -1041,6 +1041,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     base_system.cache = Some(CacheHint::Ephemeral);
     req.system.push(base_system);
     req.messages = input;
+    mark_last_message_cacheable(&mut req.messages);
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
             0,
@@ -1051,6 +1052,16 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
         );
     }
     req
+}
+
+fn mark_last_message_cacheable(messages: &mut [Message]) {
+    if let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| !matches!(message.role, MessageRole::System | MessageRole::Developer))
+    {
+        message.cache = Some(CacheHint::Ephemeral);
+    }
 }
 
 /// Token attribution for the per-turn request, computed from the REAL assembled
