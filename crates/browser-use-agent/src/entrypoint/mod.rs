@@ -995,16 +995,26 @@ fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -
 }
 
 const DISABLE_FALLBACK_CAPTURE_GIF_ENV: &str = "BU_DISABLE_FALLBACK_CAPTURE_GIF";
+const ENABLE_FALLBACK_CAPTURE_GIF_ENV: &str = "BU_ENABLE_FALLBACK_CAPTURE_GIF";
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
 
 fn fallback_capture_recording_enabled() -> bool {
-    std::env::var(DISABLE_FALLBACK_CAPTURE_GIF_ENV)
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
+    if matches!(env_bool(DISABLE_FALLBACK_CAPTURE_GIF_ENV), Some(true)) {
+        return false;
+    }
+    if let Some(enabled) = env_bool(ENABLE_FALLBACK_CAPTURE_GIF_ENV) {
+        return enabled;
+    }
+    matches!(env_bool(DISABLE_FALLBACK_CAPTURE_GIF_ENV), Some(false))
 }
 
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
@@ -2578,13 +2588,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_capture_recording_can_be_disabled_for_eval_runs() {
+    fn fallback_capture_recording_is_opt_in_for_eval_speed() {
         {
-            let _env = EnvRestore::unset(&[DISABLE_FALLBACK_CAPTURE_GIF_ENV]);
+            let _env = EnvRestore::unset(&[
+                DISABLE_FALLBACK_CAPTURE_GIF_ENV,
+                ENABLE_FALLBACK_CAPTURE_GIF_ENV,
+            ]);
+            assert!(!fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[(ENABLE_FALLBACK_CAPTURE_GIF_ENV, "1")]);
             assert!(fallback_capture_recording_enabled());
         }
         {
-            let _env = EnvRestore::set(&[(DISABLE_FALLBACK_CAPTURE_GIF_ENV, "1")]);
+            let _env = EnvRestore::set(&[
+                (ENABLE_FALLBACK_CAPTURE_GIF_ENV, "1"),
+                (DISABLE_FALLBACK_CAPTURE_GIF_ENV, "1"),
+            ]);
             assert!(!fallback_capture_recording_enabled());
         }
         {
