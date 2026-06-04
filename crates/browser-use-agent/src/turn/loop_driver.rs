@@ -83,6 +83,7 @@ use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
 
 const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
+const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
 /// traits so production wires real impls (`ContextManager`+`Session`,
@@ -178,10 +179,16 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             // `ContextManager` history; the loop simply threads it through.
             let mut request = self.state.clone_history_for_prompt().await;
             request.extend(input);
-            if max_turns.is_some_and(|limit| turns_run + 1 == limit) {
+            let next_turn = turns_run + 1;
+            if max_turns.is_some_and(|limit| next_turn == limit) {
                 request.push(Message::new(
                     MessageRole::Developer,
                     vec![ContentPart::text(FINAL_MAX_TURNS_NUDGE)],
+                ));
+            } else if max_turns.is_some_and(|limit| should_emit_progress_nudge(limit, next_turn)) {
+                request.push(Message::new(
+                    MessageRole::Developer,
+                    vec![ContentPart::text(PROGRESS_MAX_TURNS_NUDGE)],
                 ));
             }
 
@@ -255,4 +262,11 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             }
         }
     }
+}
+
+fn should_emit_progress_nudge(max_turns: usize, next_turn: usize) -> bool {
+    if max_turns < 40 || next_turn >= max_turns {
+        return false;
+    }
+    next_turn >= max_turns / 2 && next_turn % 10 == 0
 }
