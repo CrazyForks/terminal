@@ -994,7 +994,23 @@ fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -
         .collect()
 }
 
+const DISABLE_FALLBACK_CAPTURE_GIF_ENV: &str = "BU_DISABLE_FALLBACK_CAPTURE_GIF";
+
+fn fallback_capture_recording_enabled() -> bool {
+    std::env::var(DISABLE_FALLBACK_CAPTURE_GIF_ENV)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
+    if !fallback_capture_recording_enabled() {
+        return;
+    }
     let Ok(store) = store.lock() else {
         return;
     };
@@ -2476,7 +2492,65 @@ mod tests {
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_store::Store;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock as StdOnceLock};
     use tempfile::TempDir;
+
+    static ENTRYPOINT_ENV_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    struct EnvRestore {
+        _guard: StdMutexGuard<'static, ()>,
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let guard = ENTRYPOINT_ENV_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
+
+        fn unset(keys: &[&'static str]) -> Self {
+            let guard = ENTRYPOINT_ENV_LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
 
     /// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
     /// has a FK on `sessions(id)`, so the session must exist before we append).
@@ -2501,6 +2575,22 @@ mod tests {
 
     fn fake_config() -> ProviderRunConfig {
         ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_fake_result("hi from fake")
+    }
+
+    #[test]
+    fn fallback_capture_recording_can_be_disabled_for_eval_runs() {
+        {
+            let _env = EnvRestore::unset(&[DISABLE_FALLBACK_CAPTURE_GIF_ENV]);
+            assert!(fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[(DISABLE_FALLBACK_CAPTURE_GIF_ENV, "1")]);
+            assert!(!fallback_capture_recording_enabled());
+        }
+        {
+            let _env = EnvRestore::set(&[(DISABLE_FALLBACK_CAPTURE_GIF_ENV, "false")]);
+            assert!(fallback_capture_recording_enabled());
+        }
     }
 
     /// Seed a real user turn into the durable log before driving.
