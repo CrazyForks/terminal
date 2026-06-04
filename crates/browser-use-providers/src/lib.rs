@@ -7051,10 +7051,33 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
         .or_else(|| usage.get("total_cost"))
         .or_else(|| usage.get("cost_usd"))
         .and_then(value_f64);
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
         .and_then(Value::as_i64);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_i64);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .or_else(|| usage.get("prompt_cache_creation_tokens"))
+        .and_then(Value::as_i64);
+    let input_tokens = raw_input_tokens.map(|tokens| {
+        if usage.get("cache_read_input_tokens").is_some()
+            || usage.get("cache_creation_input_tokens").is_some()
+        {
+            tokens + cached_input_tokens.unwrap_or(0)
+        } else {
+            tokens
+        }
+    });
     let output_tokens = usage
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
@@ -7068,26 +7091,21 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
                 .and_then(|details| details.get("reasoning_tokens"))
         })
         .and_then(Value::as_i64);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| Some(input_tokens? + output_tokens?));
+    let has_anthropic_cache_fields = usage.get("cache_read_input_tokens").is_some()
+        || usage.get("cache_creation_input_tokens").is_some();
+    let computed_total_tokens = input_tokens? + cache_creation_tokens.unwrap_or(0) + output_tokens?;
+    let total_tokens = if has_anthropic_cache_fields {
+        Some(computed_total_tokens)
+    } else {
+        usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .or(Some(computed_total_tokens))
+    };
     let usage = ModelUsage {
         input_tokens,
-        input_cached_tokens: usage
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_i64),
-        input_cache_creation_tokens: usage
-            .get("cache_creation_input_tokens")
-            .or_else(|| usage.get("prompt_cache_creation_tokens"))
-            .and_then(Value::as_i64),
+        input_cached_tokens: cached_input_tokens,
+        input_cache_creation_tokens: cache_creation_tokens,
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
