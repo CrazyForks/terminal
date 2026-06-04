@@ -3346,7 +3346,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_backed_child_runner_completion_writes_durable_parent_mail_once() {
+    async fn store_backed_child_runner_completion_writes_durable_parent_mail_once_but_wait_requires_runtime(
+    ) {
         use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
         use crate::tools::orchestrator::ToolOrchestrator;
         use crate::tools::registry::ToolRegistry;
@@ -3457,7 +3458,7 @@ mod tests {
             cwd: temp.path().to_path_buf(),
             artifact_root: temp.path().join("artifacts"),
         };
-        let wait_out = reg
+        let wait_err = reg
             .dispatch(
                 "wait_agent",
                 &serde_json::json!({ "timeout_ms": 1 }),
@@ -3467,10 +3468,11 @@ mod tests {
                 &orch,
             )
             .await
-            .expect("wait_agent should read durable parent mail");
-        let wait_body: serde_json::Value = serde_json::from_str(&wait_out.stdout).unwrap();
-        assert_eq!(wait_body["message"], "Wait completed.");
-        assert_eq!(wait_body["timed_out"], false);
+            .expect_err("wait_agent requires a live runtime mailbox");
+        assert!(
+            format!("{wait_err:?}").contains("wait_agent requires a live runtime mailbox"),
+            "{wait_err:?}"
+        );
 
         let store = shared_store.lock().unwrap();
         let parent_events = store.events_for_session(&root_id).unwrap();

@@ -3188,7 +3188,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_facade_drains_trigger_turn_mail_at_run_start() {
+    async fn config_facade_does_not_drain_store_trigger_turn_mail_without_runtime() {
         let (_dir, store, root_id) = store_with_session();
         {
             let store = store.lock().expect("store mutex poisoned");
@@ -3208,13 +3208,16 @@ mod tests {
 
         run_session_with_config(Arc::clone(&store), &root_id, fake_config())
             .await
-            .expect("facade must run with queued trigger-turn mail");
+            .expect("facade must ignore Store-only queued trigger-turn mail");
 
-        assert!(!has_pending_agent_mail(&store, &root_id));
+        assert!(
+            has_pending_agent_mail(&store, &root_id),
+            "Store trigger-turn mail is replay/debug state unless the runtime mailbox delivers it"
+        );
         let log = events(&store, &root_id);
         assert!(log
             .iter()
-            .any(|event| event.event_type == "agent.mailbox_input"));
+            .all(|event| event.event_type != "agent.mailbox_input"));
     }
 
     /// The codex backend is a REAL provider again: with codex OAuth creds in the
