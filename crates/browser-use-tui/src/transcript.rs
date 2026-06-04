@@ -1096,24 +1096,13 @@ fn committed_node_for_event(
                 ))
             }
         }
-        "agent.completed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "finished",
-            NodeStyle::Normal,
-        )),
-        "agent.failed" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "failed",
-            NodeStyle::Failed,
-        )),
-        "agent.cancelled" => Some(subagent_lifecycle_node(
-            app,
-            event,
-            "stopped",
-            NodeStyle::Muted,
-        )),
+        "agent.completed" => {
+            subagent_terminal_lifecycle_node(app, event, "finished", NodeStyle::Normal)
+        }
+        "agent.failed" => subagent_terminal_lifecycle_node(app, event, "failed", NodeStyle::Failed),
+        "agent.cancelled" => {
+            subagent_terminal_lifecycle_node(app, event, "stopped", NodeStyle::Muted)
+        }
         "model.tool_call" | "tool.started" | "tool.finished" => None,
         "tool.batch_started" | "tool.batch_result" | "tool.batch_finished" => None,
         "tool.output" => tool_output_node(event),
@@ -3452,11 +3441,34 @@ fn subagent_lifecycle_node(
     timeline_node(event, &group, Vec::new(), style)
 }
 
-fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
-    if let Some(child_id) = event
+fn subagent_terminal_lifecycle_node(
+    app: &App,
+    event: &EventRecord,
+    status: &str,
+    style: NodeStyle,
+) -> Option<TranscriptNode> {
+    if event_child_session_id(event).is_none() {
+        return None;
+    }
+    Some(subagent_lifecycle_node(app, event, status, style))
+}
+
+fn event_child_session_id(event: &EventRecord) -> Option<&str> {
+    event
         .payload
         .get("child_session_id")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("child_session_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
+    if let Some(child_id) = event_child_session_id(event)
         .or_else(|| {
             event
                 .payload
@@ -3467,13 +3479,6 @@ fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
             event
                 .payload
                 .get("receiver_thread_id")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| {
-            event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("child_session_id"))
                 .and_then(serde_json::Value::as_str)
         })
     {

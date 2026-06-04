@@ -10284,6 +10284,104 @@ mod redesign_tests {
     }
 
     #[test]
+    fn root_runtime_agent_completion_does_not_render_as_subagent_lifecycle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let session_id = session.id.clone();
+        app.store.append_event(
+            &session_id,
+            "session.input",
+            serde_json::json!({"text": "answer directly"}),
+        )?;
+        app.store.append_event(
+            &session_id,
+            "session.done",
+            serde_json::json!({"result": "Final answer from the main task."}),
+        )?;
+        app.store.append_event(
+            &session_id,
+            "agent.completed",
+            serde_json::json!({
+                "runtime_event_id": "runtime-main-completed",
+                "root_id": session_id.clone(),
+                "agent_id": session_id.clone(),
+                "payload": {
+                    "runtime_owned": true,
+                    "result": "Final answer from the main task.",
+                    "terminal_event_type": "session.done",
+                    "terminal_event_seq": 2,
+                },
+            }),
+        )?;
+
+        app.selected_session_id = Some(session_id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Final answer from the main task."));
+        assert!(!screen.contains("subagent finished"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_child_completion_payload_still_renders_as_subagent_lifecycle() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "inspect repository"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.completed",
+            serde_json::json!({
+                "runtime_event_id": "runtime-child-completed",
+                "root_id": parent.id.clone(),
+                "agent_id": parent.id.clone(),
+                "payload": {
+                    "child_session_id": child.id.clone(),
+                    "status": "done",
+                    "runtime_owned": true,
+                    "payload": {
+                        "child_session_id": child.id,
+                        "status": "done",
+                        "result": "Nested helper summary must stay hidden.",
+                        "runtime_owned": true,
+                    },
+                },
+            }),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Parent final answer."}),
+        )?;
+
+        app.selected_session_id = Some(parent.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer finished"));
+        assert!(screen.contains("Parent final answer."));
+        assert!(!screen.contains("Nested helper summary must stay hidden."));
+        Ok(())
+    }
+
+    #[test]
     fn command_palette_filters_and_exposes_only_product_actions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
