@@ -3,6 +3,7 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    GoToProduction,
     Context,
     Goal,
     ChooseModel,
@@ -21,7 +22,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 8] = [
+const VISIBLE_ITEMS: [PaletteItem; 9] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -51,6 +52,11 @@ const VISIBLE_ITEMS: [PaletteItem; 8] = [
         command: "/goal",
         description: "set or view the goal for a long-running task",
         action: PaletteAction::Goal,
+    },
+    PaletteItem {
+        command: "/go-to-production",
+        description: "prepare an API v2 production script",
+        action: PaletteAction::GoToProduction,
     },
     PaletteItem {
         command: "/sync-cookies",
@@ -135,5 +141,13 @@ mod tests {
     #[test]
     fn context_is_available_from_palette() {
         assert_eq!(selected_action("/context", 0), Some(PaletteAction::Context));
+    }
+
+    #[test]
+    fn go_to_production_is_available_from_palette() {
+        assert_eq!(
+            selected_action("/production", 0),
+            Some(PaletteAction::GoToProduction)
+        );
     }
 }

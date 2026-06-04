@@ -32,7 +32,7 @@ use super::{
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
     CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ModelSearchEntry,
-    ProductState, SetupResultKind, Surface,
+    ProductState, ProductionTaskScale, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -1380,6 +1380,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Cookie Sync",
             "Import local browser cookies to Browser Use Cloud",
         ),
+        Surface::GoToProduction => ("Go to Production", "Choose monthly task volume"),
         Surface::Context => ("Context", "Inspect current context window usage"),
         Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
@@ -1427,6 +1428,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
+        Surface::GoToProduction => "Enter:send | Esc:close",
         Surface::Context => "Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
@@ -1487,6 +1489,7 @@ fn surface_lines(
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::CookieSync => cookie_sync_lines(app, width),
+        Surface::GoToProduction => go_to_production_lines(app),
         Surface::Context => context_lines(app, state, width),
         Surface::Goal => goal_lines(app),
         Surface::History => history_lines(app, state, width),
@@ -2019,7 +2022,7 @@ fn render_footer(
     } else if app.surface == Surface::Feedback {
         feedback_footer(app)
     } else if app.surface.is_bottom_pane() {
-        surface_footer(app.surface)
+        surface_footer_for_app(app.surface, app)
     } else {
         let _ = (state, product_state);
         ""
@@ -4072,6 +4075,37 @@ fn truncate(value: &str, max: usize) -> String {
     let mut out = value.chars().take(max - 3).collect::<String>();
     out.push_str("...");
     out
+}
+
+fn go_to_production_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  Browser Use will send a production advisor prompt after this.",
+        text_style(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Expected tasks per month",
+        muted(),
+    )));
+    for (idx, scale) in ProductionTaskScale::ALL.iter().enumerate() {
+        lines.push(selectable_row(
+            &format!("{}. {}", idx + 1, scale.label()),
+            idx,
+            app.selected_row,
+            *scale == app.production.tasks_per_month,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Use arrows or press 1-5 to choose a monthly task range.",
+        dim(),
+    )));
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(format!("  {notice}"), failed())));
+    }
+    lines
 }
 
 fn feedback_lines(app: &App) -> Vec<Line<'static>> {

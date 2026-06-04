@@ -232,6 +232,7 @@ enum Surface {
     Browser,
     BrowserSelect,
     CookieSync,
+    GoToProduction,
     Context,
     Goal,
     History,
@@ -256,6 +257,7 @@ impl Surface {
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::CookieSync
+                | Self::GoToProduction
                 | Self::Context
                 | Self::Goal
                 | Self::History
@@ -460,6 +462,171 @@ impl Default for CookieSyncState {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Go to Production questionnaire state
+
+const PRODUCTION_TASKS_PER_MONTH_SETTING: &str = "production.tasks_per_month";
+const PRODUCTION_INTENT_SEEN_SETTING: &str = "production.intent_seen";
+const PRODUCTION_LAST_REQUESTED_MS_SETTING: &str = "production.last_requested_ms";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductionTaskScale {
+    UnderTen,
+    TenToHundred,
+    HundredToThousand,
+    ThousandToTenThousand,
+    TenThousandPlus,
+}
+
+impl ProductionTaskScale {
+    const ALL: [Self; 5] = [
+        Self::UnderTen,
+        Self::TenToHundred,
+        Self::HundredToThousand,
+        Self::ThousandToTenThousand,
+        Self::TenThousandPlus,
+    ];
+
+    fn from_setting(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        match trimmed {
+            "< 10" | "<10" => Some(Self::UnderTen),
+            "10-100" | "10 - 100" => Some(Self::TenToHundred),
+            "100-1,000" | "100-1000" | "100 - 1000" | "100 - 1,000" => {
+                Some(Self::HundredToThousand)
+            }
+            "1,000-10,000" | "1000-10000" | "1,000 - 10,000" | "1000 - 10000" => {
+                Some(Self::ThousandToTenThousand)
+            }
+            "10,000+" | "10000+" => Some(Self::TenThousandPlus),
+            _ => trimmed
+                .parse::<u64>()
+                .ok()
+                .map(Self::from_numeric_tasks_per_month),
+        }
+    }
+
+    fn from_numeric_tasks_per_month(value: u64) -> Self {
+        match value {
+            0..=9 => Self::UnderTen,
+            10..=100 => Self::TenToHundred,
+            101..=1_000 => Self::HundredToThousand,
+            1_001..=10_000 => Self::ThousandToTenThousand,
+            _ => Self::TenThousandPlus,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnderTen => "< 10",
+            Self::TenToHundred => "10-100",
+            Self::HundredToThousand => "100-1,000",
+            Self::ThousandToTenThousand => "1,000-10,000",
+            Self::TenThousandPlus => "10,000+",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|scale| *scale == self)
+            .unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Self::UnderTen)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductionState {
+    tasks_per_month: ProductionTaskScale,
+}
+
+impl Default for ProductionState {
+    fn default() -> Self {
+        Self {
+            tasks_per_month: ProductionTaskScale::UnderTen,
+        }
+    }
+}
+
+fn load_production_state(store: &Store) -> Result<ProductionState> {
+    let tasks_per_month = store
+        .get_setting(PRODUCTION_TASKS_PER_MONTH_SETTING)?
+        .as_deref()
+        .and_then(ProductionTaskScale::from_setting)
+        .unwrap_or(ProductionTaskScale::UnderTen);
+    Ok(ProductionState { tasks_per_month })
+}
+
+fn go_to_production_prompt(tasks_per_month: &str) -> String {
+    format!(
+        r###"You are Browser Use Terminal's Go to Production advisor.
+
+The user wants to turn their current browser task into a production API call. Read the current session/conversation as evidence and infer the task prompt they want to run in production. The task prompt may have been refined across multiple follow-ups. If there are multiple plausible task prompts, ask the user which one they want to use.
+
+Use Browser Use Cloud API v2 only.
+
+Reference docs:
+- Cloud quickstart: https://docs.browser-use.com/cloud/quickstart
+- API v2 overview: https://docs.browser-use.com/cloud/api-v2-overview
+- Pricing: https://docs.browser-use.com/cloud/pricing
+- API v2 base URL: https://api.browser-use.com/api/v2
+- API key settings: https://cloud.browser-use.com/settings
+
+Production profile captured by Browser Use Terminal:
+- Expected scale: {tasks_per_month} tasks per month
+
+Hard requirements:
+- Use Browser Use Cloud API v2.
+- Use base URL: https://api.browser-use.com/api/v2
+- Use auth from BROWSER_USE_API_KEY.
+- Use model: bu-2-0.
+- Treat scale as expected tasks per month.
+
+Do not ask the user for expected tasks per month. That value was already captured by the app.
+
+Terminal answer contract:
+- The user's terminal is the output surface. Keep prose concise.
+- The primary output must be a runnable single-file script.
+- Start with exactly: "## Runnable script".
+- Put the complete script in one fenced code block immediately after that heading.
+- Embed the production task prompt inside the script; do not output a separate long task-prompt section before the script.
+- After the script, output only these short sections: "## Run", "## Cost estimate", and "## Notes".
+- Keep all prose after the script under 20 lines total.
+- Do not add extra handoff, follow-up-work, long task-prompt, broad recommendation, or setup-manual sections.
+- Do not include horizontal rules.
+
+Script requirements:
+- Be complete, runnable locally, and minimal.
+- Prefer Python standard library unless the docs require an SDK.
+- Read BROWSER_USE_API_KEY from the environment.
+- Call Browser Use Cloud API v2.
+- Use base URL: https://api.browser-use.com/api/v2
+- Use model: bu-2-0.
+- Send the inferred production task prompt.
+- Poll with GET /tasks/{{task_id}}/status.
+- Treat status, output, isSuccess, and cost as documented response keys from the polling endpoint.
+- In the terminal-status branch, access final output, cost, and success directly with task["output"], task["cost"], and task["isSuccess"].
+- Do not guard final output or cost with `if output`, `if cost is not None`, or similar availability checks.
+- Print only the task id, status changes, final output, and reported cost.
+- Fail with clear, short errors if configuration is missing or the task fails.
+- Do not include POLL_SECONDS, TIMEOUT_SECONDS, deadline variables, retry frameworks, metadata blocks, scheduling code, cron examples, or broad monitoring scaffolding.
+- Do not suggest changing the model string.
+- If polling is needed, use a literal `time.sleep(3)` in the loop.
+- Keep the script under 90 lines unless the task genuinely requires more.
+
+Cost estimate requirements:
+- Use the pricing docs if available: https://docs.browser-use.com/cloud/pricing
+- Estimate cost from the captured tasks-per-month range.
+- If the current session shows a representative step count, use it. Otherwise assume 10 steps per task and state that assumption in one short line.
+- Show the formula and one concise monthly estimate/range.
+- If live pricing cannot be checked, say so and provide the formula only."###,
+        tasks_per_month = tasks_per_month.trim()
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Feedback questionnaire state
 
 const FEEDBACK_INGEST_URL: &str = "https://feedback-ingest-production.up.railway.app";
@@ -584,6 +751,7 @@ enum AppCommand {
     ConfigureTelemetry,
     ChangeBrowser,
     SyncCookies,
+    OpenGoToProduction,
     Reload,
     Update,
     SaveAccount(String),
@@ -1084,6 +1252,7 @@ struct App {
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
     codex_login: Option<CodexLoginFlow>,
     cookie_sync: CookieSyncState,
+    production: ProductionState,
     pending_cookie_sync_after_auth: bool,
     browser_notice: Option<String>,
     status_notice: Option<String>,
@@ -1977,6 +2146,7 @@ impl App {
         let browser = store
             .get_setting("browser")?
             .unwrap_or_else(|| args.browser.clone());
+        let production = load_production_state(&store)?;
         let selected_row = 0;
         let _ = had_stored_model;
         let mut app = Self {
@@ -2016,6 +2186,7 @@ impl App {
             claude_code_oauth: None,
             codex_login: None,
             cookie_sync: CookieSyncState::default(),
+            production,
             pending_cookie_sync_after_auth: false,
             browser_notice: None,
             status_notice: None,
@@ -3855,6 +4026,7 @@ impl App {
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
             AppCommand::SyncCookies => self.open_cookie_sync()?,
+            AppCommand::OpenGoToProduction => self.open_go_to_production()?,
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
@@ -4411,6 +4583,9 @@ impl App {
         if self.surface == Surface::Feedback {
             return self.handle_feedback_key(key);
         }
+        if self.surface == Surface::GoToProduction {
+            return self.handle_go_to_production_key(key);
+        }
         if self.surface == Surface::Main && !self.is_slash_palette_active() {
             match key {
                 KeyEvent {
@@ -4830,6 +5005,18 @@ impl App {
                 self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
+            Surface::GoToProduction => {
+                if let Some(index) = text
+                    .chars()
+                    .find_map(|ch| ch.to_digit(10).and_then(|digit| digit.checked_sub(1)))
+                    .filter(|index| (*index as usize) < ProductionTaskScale::ALL.len())
+                {
+                    self.production.tasks_per_month =
+                        ProductionTaskScale::from_index(index as usize);
+                    self.selected_row = index as usize;
+                    self.status_notice = None;
+                }
+            }
             _ => {}
         }
     }
@@ -5085,6 +5272,11 @@ impl App {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
+            Surface::GoToProduction => {
+                self.production.tasks_per_month =
+                    ProductionTaskScale::from_index(self.selected_row);
+                self.submit_go_to_production()?;
+            }
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
@@ -5342,6 +5534,7 @@ impl App {
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::SyncCookies => self.dispatch(AppCommand::SyncCookies)?,
+            PaletteAction::GoToProduction => self.dispatch(AppCommand::OpenGoToProduction)?,
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
@@ -5375,6 +5568,72 @@ impl App {
                 );
             }
         }
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Go to Production
+
+    fn open_go_to_production(&mut self) -> Result<()> {
+        self.close_slash_palette();
+        if self.selected_session_id.is_none() {
+            self.status_notice = Some("Open a task before using /go-to-production.".to_string());
+            return Ok(());
+        }
+        self.production = load_production_state(&self.store)?;
+        self.selected_row = self.production.tasks_per_month.index();
+        self.status_notice = None;
+        self.open_surface(Surface::GoToProduction);
+        Ok(())
+    }
+
+    fn handle_go_to_production_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.escape_stop_until = None;
+                self.close_surface();
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                let delta = match key.code {
+                    KeyCode::Up | KeyCode::Left => -1,
+                    _ => 1,
+                };
+                self.move_selection(delta)?;
+                self.production.tasks_per_month =
+                    ProductionTaskScale::from_index(self.selected_row);
+            }
+            KeyCode::Char(ch) if matches!(ch, '1'..='5') => {
+                let index = ch as usize - '1' as usize;
+                self.production.tasks_per_month = ProductionTaskScale::from_index(index);
+                self.selected_row = index;
+                self.status_notice = None;
+            }
+            KeyCode::Enter => self.submit_go_to_production()?,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn submit_go_to_production(&mut self) -> Result<()> {
+        let tasks_per_month = self.production.tasks_per_month.label();
+        self.store
+            .set_setting(PRODUCTION_TASKS_PER_MONTH_SETTING, tasks_per_month)?;
+        self.store
+            .set_setting(PRODUCTION_INTENT_SEEN_SETTING, "1")?;
+        self.store.set_setting(
+            PRODUCTION_LAST_REQUESTED_MS_SETTING,
+            &browser_use_store::now_ms().to_string(),
+        )?;
+
+        let Some(session_id) = self.selected_session_id.clone() else {
+            self.close_surface();
+            self.status_notice = Some("Open a task before using /go-to-production.".to_string());
+            return Ok(());
+        };
+        let prompt = go_to_production_prompt(tasks_per_month);
+        self.close_surface();
+        self.status_notice = Some("Starting Go to Production advisor...".to_string());
+        self.send_followup_submission(session_id, UserSubmission::text(prompt))?;
         Ok(())
     }
 
@@ -6705,6 +6964,7 @@ impl App {
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::CookieSync => self.cookie_sync_row_count(),
+            Surface::GoToProduction => ProductionTaskScale::ALL.len(),
             Surface::Context | Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
@@ -6767,6 +7027,18 @@ impl App {
         }
     }
 
+    fn is_go_to_production_slash_filter(filter: &str) -> bool {
+        let normalized = filter
+            .chars()
+            .filter(|ch| !matches!(ch, '-' | '_' | ' '))
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        matches!(
+            normalized.as_str(),
+            "production" | "prod" | "gotoproduction" | "gotoprod"
+        )
+    }
+
     fn execute_slash_palette_selection(&mut self) -> Result<bool> {
         let filter = self.palette_filter.trim().trim_start_matches('/');
         if let Some(goal_text) = filter
@@ -6777,6 +7049,11 @@ impl App {
         {
             self.close_slash_palette();
             self.execute_goal_slash_command(&goal_text)?;
+            return Ok(false);
+        }
+        if Self::is_go_to_production_slash_filter(filter) {
+            self.close_slash_palette();
+            self.dispatch(AppCommand::OpenGoToProduction)?;
             return Ok(false);
         }
         let action = palette::selected_action(&self.palette_filter, self.selected_row);
@@ -10234,6 +10511,7 @@ mod redesign_tests {
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
+            Surface::GoToProduction => "Go to Production",
             Surface::Context => "Context",
             Surface::Goal => "Goal",
             Surface::History => "History",
@@ -11620,6 +11898,7 @@ mod redesign_tests {
             .any(|item| item.command == "/mode"));
         assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
+        assert!(screen.contains("/goal"));
         assert!(!screen.contains("/auth"));
         assert!(!screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
@@ -11661,6 +11940,18 @@ mod redesign_tests {
         assert!(screen.contains("sign in to a provider"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
         assert_eq!(app.palette_filter(), "");
+        for ch in "production".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> production");
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx > input_row && line.contains("/go-to-production")));
+        assert!(screen.contains("prepare an API v2 production script"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.palette_filter(), "");
         for ch in "bro".chars() {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
@@ -11687,6 +11978,119 @@ mod redesign_tests {
             .iter()
             .any(|item| item.command == "/plan"));
         assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        Ok(())
+    }
+
+    #[test]
+    fn go_to_production_requires_selected_task() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.open_go_to_production()?;
+
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(
+            app.status_notice.as_deref(),
+            Some("Open a task before using /go-to-production.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn go_to_production_modal_persists_profile_and_submits_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "Find this month's invoices in the vendor portal"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Downloaded invoice summary."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        app.open_go_to_production()?;
+        assert_eq!(app.surface, Surface::GoToProduction);
+        assert_eq!(
+            app.production.tasks_per_month,
+            ProductionTaskScale::UnderTen
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Expected tasks per month"));
+        assert!(screen.contains("< 10"));
+        assert!(screen.contains("10-100"));
+        assert!(screen.contains("100-1,000"));
+        assert!(screen.contains("1,000-10,000"));
+        assert!(screen.contains("10,000+"));
+        assert!(!screen.contains("Use type"));
+        assert!(!screen.contains("Personal"));
+        assert!(!screen.contains("Business"));
+        assert!(!screen.contains("Continue"));
+        assert!(!screen.contains("Cancel"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 3);
+        assert_eq!(
+            app.production.tasks_per_month,
+            ProductionTaskScale::ThousandToTenThousand
+        );
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(
+            app.store
+                .get_setting(PRODUCTION_TASKS_PER_MONTH_SETTING)?
+                .as_deref(),
+            Some("1,000-10,000")
+        );
+        assert_eq!(
+            app.store
+                .get_setting(PRODUCTION_INTENT_SEEN_SETTING)?
+                .as_deref(),
+            Some("1")
+        );
+
+        let events = app.store.events_for_session(&session.id)?;
+        let prompt = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "session.followup")
+            .and_then(|event| {
+                event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .context("production prompt followup")?;
+        assert!(prompt.contains("Use Browser Use Cloud API v2 only."));
+        assert!(prompt.contains("https://docs.browser-use.com/cloud/quickstart"));
+        assert!(prompt.contains("https://docs.browser-use.com/cloud/pricing"));
+        assert!(prompt.contains("https://api.browser-use.com/api/v2"));
+        assert!(prompt.contains("BROWSER_USE_API_KEY"));
+        assert!(prompt.contains("bu-2-0"));
+        assert!(prompt.contains("Expected scale: 1,000-10,000 tasks per month"));
+        assert!(prompt.contains("Start with exactly: \"## Runnable script\""));
+        assert!(prompt.contains("Keep all prose after the script under 20 lines total."));
+        assert!(prompt.contains("Embed the production task prompt inside the script"));
+        assert!(prompt.contains("Use the pricing docs if available"));
+        assert!(prompt.contains("Poll with GET /tasks/{task_id}/status."));
+        assert!(prompt.contains("task[\"output\"], task[\"cost\"], and task[\"isSuccess\"]"));
+        assert!(prompt.contains("Do not guard final output or cost"));
+        assert!(prompt.contains("Do not include POLL_SECONDS, TIMEOUT_SECONDS, deadline variables"));
+        assert!(prompt.contains("Do not suggest changing the model string."));
+        assert!(prompt.contains("use a literal `time.sleep(3)`"));
+        assert!(prompt.contains("Keep the script under 90 lines"));
+        assert!(!prompt.contains("1. Production task prompt"));
+        assert!(!prompt.contains("2. API recommendation"));
+        assert!(!prompt.contains("3. Runnable starter script"));
+        assert!(!prompt.contains("4. Setup guide"));
+        assert!(!prompt.contains("User type:"));
+        assert!(!prompt.contains("personal or business"));
+        assert!(!prompt.contains("Coding-agent handoff prompt"));
+        assert!(!prompt.contains("Remaining implementation work"));
         Ok(())
     }
 
