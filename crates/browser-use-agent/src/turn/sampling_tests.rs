@@ -575,6 +575,44 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
 }
 
 #[tokio::test]
+async fn open_stream_marks_an_earlier_cache_breakpoint_for_long_histories() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let input: Vec<Message> = (0..25)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("browser state {index}"))],
+            )
+        })
+        .collect();
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    let cache_indices: Vec<usize> = req
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.cache == Some(CacheHint::Ephemeral)).then_some(index)
+        })
+        .collect();
+
+    assert_eq!(
+        cache_indices,
+        vec![8, 24],
+        "long browser histories should keep the latest message cacheable and add one earlier breakpoint inside Anthropic's lookback window"
+    );
+}
+
+#[tokio::test]
 async fn turn_request_event_carries_full_llm_input_messages() {
     let (transport, _opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
