@@ -209,15 +209,42 @@ def _has_return_statement(expression):
     return False
 
 
-def js(expression, target_id=None, returnByValue=True):
-    """Run JS in the attached tab, or in an iframe target via target_id.
+def js(expression, *args, target_id=None, returnByValue=True):
+    """Run JS in the attached tab, or call a JS function with JSON args.
 
     Expressions with top-level `return` are wrapped in an IIFE, so both
     `document.title` and `const x = 1; return x` are valid.
+    If positional args are provided, `expression` must evaluate to a function;
+    args must be JSON-serializable and are passed to that function.
     """
-    session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
-    if _has_return_statement(expression) and not expression.strip().startswith("("):
+    if not isinstance(expression, str):
+        raise TypeError("js(expression, ...): expression must be a string")
+    if target_id is not None and not isinstance(target_id, str):
+        raise TypeError("js(..., target_id=None): target_id must be a string when provided")
+    if not isinstance(returnByValue, bool):
+        raise TypeError("js(..., returnByValue=True): returnByValue must be a boolean")
+    if args:
+        try:
+            args_json = json.dumps(args, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "js(..., *args) arguments must be JSON-serializable. "
+                "For DOM nodes or remote objects, use raw CDP Runtime.callFunctionOn."
+            ) from exc
+        source = expression.strip().rstrip(";")
+        expression = f"""
+(async () => {{
+  const fn = ({source});
+  if (typeof fn !== "function") {{
+    throw new TypeError("js(expression, *args): expression must evaluate to a function when args are provided");
+  }}
+  const args = {args_json};
+  return await fn(...args);
+}})()
+"""
+    elif _has_return_statement(expression) and not expression.strip().startswith("("):
         expression = f"(function(){{{expression}}})()"
+    session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     return _runtime_evaluate(
         expression,
         session_id=session_id,
@@ -428,7 +455,31 @@ def switch_tab(target):
     return session_id
 
 
+def _current_target_url():
+    """URL of the current controlled tab, or None if it can't be resolved.
+
+    Any CDP failure resolves to None so new_tab() falls back to creating a
+    fresh tab rather than erroring out before it ever opens one.
+    """
+    try:
+        target_id = current_tab().get("targetId")
+        if not target_id:
+            return None
+        for target in cdp("Target.getTargets").get("targetInfos", []):
+            if target.get("targetId") == target_id:
+                return target.get("url", "")
+    except Exception:
+        return None
+    return None
+
+
 def new_tab(url="about:blank"):
+    # Reuse the current controlled tab when it's blank page
+    if url != "about:blank":
+        current_url = _current_target_url()
+        if current_url in ("", "about:blank"):
+            goto_url(url)
+            return current_tab().get("targetId")
     # Match browser-harness: create blank first, attach, then navigate. Passing
     # the final URL to createTarget can race with attach/load polling.
     target_id = cdp("Target.createTarget", url="about:blank")["targetId"]

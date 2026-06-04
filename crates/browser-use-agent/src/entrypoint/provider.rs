@@ -838,10 +838,15 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     );
     let browser_tool = match &user_input {
         Some((store, session_id)) => {
-            BrowserTool::with_browser_mode(config.options.browser_mode.clone())
+            let tool = BrowserTool::with_browser_mode(config.options.browser_mode.clone())
                 .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds)
                 .with_session_id(session_id.as_str().to_string())
-                .with_persistence(store.clone(), session_id.as_str().to_string())
+                .with_persistence(store.clone(), session_id.as_str().to_string());
+            if config.options.dynamic_browser_mode_from_store {
+                tool.with_dynamic_browser_mode_from_store(true)
+            } else {
+                tool
+            }
         }
         None => BrowserTool::with_browser_mode(config.options.browser_mode.clone())
             .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds),

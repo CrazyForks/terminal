@@ -2958,11 +2958,19 @@ fn payload_string(event: &EventRecord, key: &str) -> Option<String> {
 }
 
 fn source_for_state(state: &WorkbenchState) -> Option<String> {
-    state
+    if let Some(source) = state
         .browser
         .url
         .as_deref()
-        .or(state.browser.live_url.as_deref())
+        .filter(|source| is_useful_source_for_backend(source, &state.browser.backend))
+    {
+        return Some(source.to_string());
+    }
+    state
+        .browser
+        .live_url
+        .as_deref()
+        .filter(|_| browser_backend_supports_live_url(&state.browser.backend))
         .filter(|source| is_useful_source(source))
         .map(ToOwned::to_owned)
 }
@@ -2970,6 +2978,22 @@ fn source_for_state(state: &WorkbenchState) -> Option<String> {
 fn is_useful_source(source: &str) -> bool {
     let source = source.trim();
     !source.is_empty() && source != "about:blank"
+}
+
+fn is_useful_source_for_backend(source: &str, backend: &str) -> bool {
+    is_useful_source(source)
+        && (browser_backend_supports_live_url(backend) || !is_cloud_live_url(source))
+}
+
+fn browser_backend_supports_live_url(backend: &str) -> bool {
+    backend.to_ascii_lowercase().contains("cloud")
+}
+
+fn is_cloud_live_url(source: &str) -> bool {
+    source
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("https://live.browser-use.com/")
 }
 
 fn tool_failed_lines(event: &EventRecord) -> Vec<String> {
@@ -3607,7 +3631,11 @@ mod tests {
         cache.with_filtered("s", &raw, |events| black_box(events.len()));
         let t = Instant::now();
         for i in 0..reps {
-            raw.push(ev(raw.last().unwrap().seq + 1, "model.turn.response", &body));
+            raw.push(ev(
+                raw.last().unwrap().seq + 1,
+                "model.turn.response",
+                &body,
+            ));
             cache.with_filtered("s", &raw, |events| black_box(events.len()));
             black_box(i);
         }
