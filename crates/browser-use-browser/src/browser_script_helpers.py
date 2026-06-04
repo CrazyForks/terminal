@@ -15,6 +15,7 @@ import sys
 import time as _time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 
@@ -1016,3 +1017,233 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
         raise RuntimeError(
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
         ) from exc
+
+
+def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, return_errors=True):
+    """Fetch many independent URLs with http_get while preserving input order.
+
+    By default one failed URL becomes {"ok": False, "url": ..., "error": ...}
+    instead of failing the whole batch. Set return_errors=False when every URL is
+    required and the caller should abort on the first failure.
+    """
+    items = list(urls)
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items)))
+    results = [None] * len(items)
+
+    def fetch_one(index, item):
+        if isinstance(item, dict):
+            request_url = item["url"]
+            request_headers = dict(headers or {})
+            request_headers.update(item.get("headers") or {})
+            request_timeout = item.get("timeout", timeout)
+            request_binary = item.get("binary", binary)
+        else:
+            request_url = str(item)
+            request_headers = headers
+            request_timeout = timeout
+            request_binary = binary
+        return index, request_url, http_get(
+            request_url,
+            headers=request_headers,
+            timeout=request_timeout,
+            binary=request_binary,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_one, index, item) for index, item in enumerate(items)]
+        for future in as_completed(futures):
+            try:
+                index, _url, response = future.result()
+                results[index] = response
+            except Exception as exc:
+                index = futures.index(future)
+                item = items[index]
+                request_url = item.get("url") if isinstance(item, dict) else str(item)
+                if not return_errors:
+                    raise
+                results[index] = {"ok": False, "url": request_url, "error": str(exc)}
+    return results
+
+
+def _normalize_browser_fetch_request(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    timeout=20.0,
+    binary=None,
+):
+    request_headers = dict(headers or {})
+    request_body = body
+    if json_body is not None:
+        request_body = json.dumps(json_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, (dict, list)):
+        request_body = json.dumps(request_body)
+        if not any(k.lower() == "content-type" for k in request_headers):
+            request_headers["Content-Type"] = "application/json"
+    if isinstance(request_body, bytes):
+        request_body = request_body.decode("latin1")
+    return {
+        "url": str(url),
+        "method": str(method or "GET").upper(),
+        "headers": request_headers,
+        "body": request_body,
+        "timeout_ms": int(float(timeout) * 1000),
+        "binary": bool(binary),
+    }
+
+
+def _browser_fetch_response(result, return_error=False):
+    if not isinstance(result, dict):
+        if return_error:
+            return {"ok": False, "url": None, "error": f"invalid browser_fetch result: {result!r}"}
+        raise RuntimeError(f"invalid browser_fetch result: {result!r}")
+    if not result.get("ok"):
+        if return_error:
+            return {
+                "ok": False,
+                "url": result.get("url"),
+                "error": result.get("error", "browser_fetch failed"),
+            }
+        raise RuntimeError(f"browser_fetch failed for {result.get('url')}: {result.get('error')}")
+    headers = result.get("headers") or {}
+    status = result.get("status")
+    url = result.get("url")
+    if result.get("binary"):
+        body = base64.b64decode(result.get("body_b64") or "")
+        return _HttpGetBytes(body, status, headers, url)
+    return _HttpGetText(result.get("body") or "", status, headers, url)
+
+
+def browser_fetch(
+    url,
+    method="GET",
+    headers=None,
+    body=None,
+    json_body=None,
+    timeout=20.0,
+    binary=None,
+):
+    """Fetch from the current page context with browser cookies/session state."""
+    request = _normalize_browser_fetch_request(
+        url,
+        method=method,
+        headers=headers,
+        body=body,
+        json_body=json_body,
+        timeout=timeout,
+        binary=binary,
+    )
+    return browser_fetch_many([request], timeout=timeout, return_errors=False)[0]
+
+
+def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True):
+    """Fetch many URLs from the current page context, preserving order.
+
+    Each item may be a URL string or a dict with url/method/headers/body/json_body/
+    timeout/binary. This is useful after the page reveals stable endpoints but
+    direct http_get lacks cookies, auth headers, or browser-only access.
+    """
+    normalized = []
+    for item in list(requests):
+        if isinstance(item, dict):
+            normalized.append(
+                _normalize_browser_fetch_request(
+                    item["url"],
+                    method=item.get("method", "GET"),
+                    headers=item.get("headers"),
+                    body=item.get("body"),
+                    json_body=item.get("json_body"),
+                    timeout=item.get("timeout", timeout),
+                    binary=item.get("binary"),
+                )
+            )
+        else:
+            normalized.append(_normalize_browser_fetch_request(item, timeout=timeout))
+    if not normalized:
+        return []
+
+    expression = f"""
+(async () => {{
+  const requests = {json.dumps(normalized)};
+  const maxConcurrency = Math.max(1, Math.min({int(max_concurrency or 1)}, requests.length));
+  function arrayBufferToBase64(buffer) {{
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {{
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode.apply(null, chunk);
+    }}
+    return btoa(binary);
+  }}
+  async function fetchOne(request) {{
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1, Number(request.timeout_ms || 20000));
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {{
+      const options = {{
+        method: request.method || "GET",
+        headers: request.headers || {{}},
+        credentials: "include",
+        signal: controller.signal
+      }};
+      if (request.body !== null && request.body !== undefined) {{
+        options.body = request.body;
+      }}
+      const response = await fetch(request.url, options);
+      const headers = {{}};
+      response.headers.forEach((value, key) => {{ headers[key] = value; }});
+      if (request.binary) {{
+        const buffer = await response.arrayBuffer();
+        return {{
+          ok: true,
+          response_ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+          url: response.url,
+          headers,
+          binary: true,
+          body_b64: arrayBufferToBase64(buffer)
+        }};
+      }}
+      const body = await response.text();
+      return {{
+        ok: true,
+        response_ok: response.ok,
+        status: response.status,
+        statusText: response.statusText,
+        url: response.url,
+        headers,
+        binary: false,
+        body
+      }};
+    }} catch (error) {{
+      return {{
+        ok: false,
+        url: request.url,
+        error: String(error && (error.message || error))
+      }};
+    }} finally {{
+      clearTimeout(timer);
+    }}
+  }}
+  const results = new Array(requests.length);
+  let next = 0;
+  async function worker() {{
+    while (next < requests.length) {{
+      const index = next++;
+      results[index] = await fetchOne(requests[index]);
+    }}
+  }}
+  await Promise.all(Array.from({{length: maxConcurrency}}, worker));
+  return results;
+}})()
+"""
+    raw_results = _runtime_evaluate(expression, await_promise=True, return_by_value=True)
+    return [_browser_fetch_response(result, return_error=return_errors) for result in raw_results]
