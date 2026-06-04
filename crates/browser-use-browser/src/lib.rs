@@ -587,6 +587,16 @@ fn spawn_browser_script(
         code,
     )?;
     let mut command = browser_script_python_command();
+    if browser_script_session_outputs_enabled() {
+        let outputs_dir = artifact_dir.as_ref().join("outputs");
+        fs::create_dir_all(&outputs_dir).with_context(|| {
+            format!(
+                "create browser_script outputs dir {}",
+                outputs_dir.display()
+            )
+        })?;
+        command.env("BH_OUTPUTS_DIR", outputs_dir);
+    }
     let mut child = command
         .arg("-c")
         .arg(prelude)
@@ -985,6 +995,10 @@ fn browser_script_python_command() -> Command {
 
 fn nonempty_os_var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn browser_script_session_outputs_enabled() -> bool {
+    env_bool("BU_BROWSER_SCRIPT_SESSION_OUTPUTS").unwrap_or(false)
 }
 
 fn venv_python_path(venv: &Path) -> PathBuf {
@@ -5636,7 +5650,7 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
-OUTPUTS_DIR = CWD
+OUTPUTS_DIR = pathlib.Path(os.environ.get("BH_OUTPUTS_DIR") or {cwd:?}).expanduser().resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
 
@@ -7677,6 +7691,48 @@ print(session_metadata()["outputs_dir"])
                 "artifact path should be absolute: {artifact}"
             );
         }
+    }
+
+    #[test]
+    fn browser_script_session_outputs_dir_isolates_parallel_cwd_files() {
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_SESSION_OUTPUTS", "1")]);
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let output = run_browser_script(
+            "script-session-outputs",
+            temp.path(),
+            &artifacts,
+            r#"
+shared = pathlib.Path.cwd() / 'parallel-task-leak.txt'
+shared.write_text('from another parallel task', encoding='utf-8')
+answer = pathlib.Path(outputs_dir()) / 'answer.json'
+answer.write_text(json.dumps({'ok': True}), encoding='utf-8')
+print(session_metadata()["outputs_dir"])
+"#,
+            10,
+        )
+        .unwrap();
+        assert!(output.ok, "{:?}", output.error);
+        let artifact_paths = output
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            artifact_paths
+                .iter()
+                .any(|path| path.ends_with("/outputs/answer.json")),
+            "expected outputs artifact, got {artifact_paths:?}"
+        );
+        assert!(
+            artifact_paths
+                .iter()
+                .all(|path| !path.ends_with("parallel-task-leak.txt")),
+            "cwd file leaked into artifacts: {artifact_paths:?}"
+        );
+        assert!(output
+            .text
+            .contains(artifacts.join("outputs").to_str().unwrap()));
     }
 
     #[test]
