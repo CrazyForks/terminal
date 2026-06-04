@@ -1531,8 +1531,15 @@ fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<
             bold(),
         )));
         lines.push(Line::from(""));
-        for text_line in block.text.lines() {
-            lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
+        if block.summary_unavailable {
+            lines.push(Line::from(Span::styled(
+                "Reasoning summary unavailable from provider.".to_string(),
+                dim(),
+            )));
+        } else {
+            for text_line in block.text.lines() {
+                lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
+            }
         }
     }
     lines

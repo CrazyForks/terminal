@@ -1297,7 +1297,7 @@ fn committed_node_for_event(
         // Once the turn reports usage, its reasoning has settled — commit the
         // collapsed "Thought for Xs · Nk tokens" summary so it persists in
         // scrollback. The full text stays available in the Ctrl+O view.
-        "model.usage" => thinking_summary_node_before_event(root, events, event),
+        "model.usage" | "token_count" => thinking_summary_node_before_event(root, events, event),
         // `plan.proposed` is legacy: planning mode was removed, so nothing
         // emits these anymore. Old persisted sessions can still contain them,
         // though — render the text as a plain assistant turn so historical
@@ -2065,6 +2065,9 @@ pub(crate) struct ThinkingBlock {
     pub(crate) tokens: i64,
     /// True when `tokens` is the estimate rather than reported usage.
     pub(crate) tokens_estimated: bool,
+    /// True when the provider reported reasoning tokens but returned no textual
+    /// reasoning summary for the turn.
+    pub(crate) summary_unavailable: bool,
 }
 
 /// Walk events and split the agent's reasoning into per-turn blocks. Thinking
@@ -2076,6 +2079,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
     let mut first_ts: Option<i64> = None;
     let mut last_ts: i64 = 0;
     let mut reported_tokens: Option<i64> = None;
+    let mut turn_start_ts: Option<i64> = None;
 
     fn flush(
         blocks: &mut Vec<ThinkingBlock>,
@@ -2085,11 +2089,14 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
         reported_tokens: &mut Option<i64>,
     ) {
         let trimmed = text.trim();
-        if !trimmed.is_empty() {
+        let reported = *reported_tokens;
+        let has_summary = !trimmed.is_empty();
+        let has_reported_reasoning = reported.is_some_and(|tokens| tokens > 0);
+        if has_summary || has_reported_reasoning {
             let duration_s = first_ts
                 .map(|start| (last_ts - start).max(0) / 1000)
                 .unwrap_or(0);
-            let (tokens, tokens_estimated) = match *reported_tokens {
+            let (tokens, tokens_estimated) = match reported {
                 Some(reported) => (reported, false),
                 None => {
                     let chars = trimmed.chars().count() as i64;
@@ -2104,6 +2111,7 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                 duration_s,
                 tokens,
                 tokens_estimated,
+                summary_unavailable: !has_summary && has_reported_reasoning,
             });
         }
         text.clear();
@@ -2127,13 +2135,27 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                 }
             }
             // Usage closes out the turn's reasoning with the exact token count.
-            "model.usage" if first_ts.is_some() => {
-                reported_tokens = event
-                    .payload
-                    .get("reasoning_output_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                    .filter(|tokens| *tokens > 0)
-                    .or(reported_tokens);
+            "model.usage" | "token_count" => {
+                if let Some(tokens) = reasoning_tokens_for_usage_event(event) {
+                    reported_tokens = Some(tokens);
+                    if first_ts.is_none() {
+                        first_ts = turn_start_ts.or(Some(event.ts_ms));
+                    }
+                    last_ts = event.ts_ms;
+                }
+                if first_ts.is_some() || reported_tokens.is_some() {
+                    flush(
+                        &mut blocks,
+                        &mut text,
+                        &mut first_ts,
+                        last_ts,
+                        &mut reported_tokens,
+                    );
+                    turn_start_ts = None;
+                }
+            }
+            // Any new turn or task boundary ends the current reasoning block.
+            "model.turn.request" => {
                 flush(
                     &mut blocks,
                     &mut text,
@@ -2141,15 +2163,19 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
                     last_ts,
                     &mut reported_tokens,
                 );
+                turn_start_ts = Some(event.ts_ms);
+                last_ts = event.ts_ms;
             }
-            // Any new turn or task boundary ends the current reasoning block.
-            "model.turn.request" | "session.input" | "session.followup" | "session.done" => flush(
-                &mut blocks,
-                &mut text,
-                &mut first_ts,
-                last_ts,
-                &mut reported_tokens,
-            ),
+            "session.input" | "session.followup" | "session.done" => {
+                flush(
+                    &mut blocks,
+                    &mut text,
+                    &mut first_ts,
+                    last_ts,
+                    &mut reported_tokens,
+                );
+                turn_start_ts = None;
+            }
             _ => {}
         }
     }
@@ -2161,6 +2187,23 @@ pub(crate) fn thinking_blocks_for_session(events: &[EventRecord]) -> Vec<Thinkin
         &mut reported_tokens,
     );
     blocks
+}
+
+fn reasoning_tokens_for_usage_event(event: &EventRecord) -> Option<i64> {
+    let tokens = match event.event_type.as_str() {
+        "model.usage" => event
+            .payload
+            .get("reasoning_output_tokens")
+            .and_then(serde_json::Value::as_i64),
+        "token_count" => event
+            .payload
+            .get("info")
+            .and_then(|info| info.get("last_token_usage"))
+            .and_then(|usage| usage.get("reasoning_output_tokens"))
+            .and_then(serde_json::Value::as_i64),
+        _ => None,
+    }?;
+    (tokens > 0).then_some(tokens)
 }
 
 /// Append a thinking delta, tolerating providers that resend growing snapshots
@@ -2193,11 +2236,15 @@ pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
     } else {
         crate::render::format_token_count(block.tokens)
     };
-    format!(
+    let mut summary = format!(
         "Thought for {}s · {} tokens",
         block.duration_s.max(0),
         tokens
-    )
+    );
+    if block.summary_unavailable {
+        summary.push_str(" · summary unavailable");
+    }
+    summary
 }
 
 /// Build the collapsed reasoning summary for the turn that ends at `event`.
@@ -2480,7 +2527,7 @@ fn pending_followup_status(events: &[EventRecord], after_seq: i64) -> String {
         .filter(|event| event.seq > after_seq)
         .rev()
         .find_map(|event| match event.event_type.as_str() {
-            "model.turn.request" => Some("thinking".to_string()),
+            "model.turn.request" => Some("waiting for model".to_string()),
             "model.turn.retry" => Some("retrying model request".to_string()),
             "command.waiting" => Some("running command".to_string()),
             "tool.started" => payload_string(event, "name")

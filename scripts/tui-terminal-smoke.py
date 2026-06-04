@@ -1523,7 +1523,7 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "model.turn.request",
             {"model": "GPT-5.5", "provider": "codex", "turn_idx": 1},
         )
-        wait_for(session, "thinking", "prompt-only-followup-live-thinking")
+        wait_for(session, "waiting for model", "prompt-only-followup-live-waiting")
         live_frames = []
         for idx in range(40):
             live_visible = capture_after_idle(
@@ -1551,15 +1551,15 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             )
             assert_contains(
                 live_visible,
-                "thinking",
-                "follow-up live activity should keep the thinking indicator visible",
+                "waiting for model",
+                "follow-up live activity should show the model-wait indicator",
             )
             assert_row_gap_at_most(
                 live_visible,
                 "> yo",
-                "thinking",
+                "waiting for model",
                 2,
-                "follow-up thinking indicator should sit near submitted text",
+                "follow-up model-wait indicator should sit near submitted text",
             )
             assert_not_contains(
                 live_visible,

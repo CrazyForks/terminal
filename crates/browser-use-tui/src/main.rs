@@ -14495,11 +14495,18 @@ wire_api = "responses"
             "model.thinking_delta",
             serde_json::json!({"text": "Checking the schema in lib.rs."}),
         )?;
-        // Usage settles the turn — the reasoning collapses into a summary.
+        // `token_count` settles the turn — the reasoning collapses into a summary.
         app.store.append_event(
             &session.id,
-            "model.usage",
-            serde_json::json!({"output_tokens": 40, "reasoning_output_tokens": 2000}),
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 2000
+                    }
+                }
+            }),
         )?;
         app.selected_session_id = Some(session.id.clone());
         app.drain_store_notifications()?;
@@ -14550,8 +14557,15 @@ wire_api = "responses"
         )?;
         app.store.append_event(
             &session.id,
-            "model.usage",
-            serde_json::json!({"output_tokens": 40, "reasoning_output_tokens": 2000}),
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 2000
+                    }
+                }
+            }),
         )?;
         app.selected_session_id = Some(session.id);
 
@@ -14564,6 +14578,48 @@ wire_api = "responses"
         assert!(screen.contains("Checking the repository structure."));
         // The de-dup worked: no doubled "Checking Checking".
         assert!(!screen.contains("Checking Checking"));
+        Ok(())
+    }
+
+    #[test]
+    fn thinking_view_explains_missing_provider_summary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "research"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 35
+                    }
+                }
+            }),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("summary unavailable"), "{screen}");
+
+        app.open_surface(Surface::Thinking);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("summary unavailable"), "{screen}");
+        assert!(
+            screen.contains("Reasoning summary unavailable from provider."),
+            "{screen}"
+        );
         Ok(())
     }
 
@@ -16360,8 +16416,8 @@ wire_api = "responses"
         let waiting = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
         assert_eq!(waiting, prompt_only);
         let waiting_screen = render_dump(&mut app)?;
-        assert!(waiting_screen.contains("thinking"));
-        assert!(!waiting_screen.contains("> yo  - thinking"));
+        assert!(waiting_screen.contains("waiting for model"));
+        assert!(!waiting_screen.contains("> yo  - waiting for model"));
 
         app.store.append_event(
             &session.id,
@@ -16560,7 +16616,7 @@ wire_api = "responses"
         assert!(native_prompt.contains("> mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"));
         assert!(native_prompt.contains("yell me about this repo"));
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("thinking"));
+        assert!(screen.contains("waiting for model"));
         Ok(())
     }
 
