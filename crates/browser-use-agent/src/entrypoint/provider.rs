@@ -4112,6 +4112,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_backed_unified_exec_manager_is_isolated_between_agents() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let first = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "first task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("first root agent");
+        let second = handle
+            .create_root_agent(browser_use_runtime::CreateRootAgentRequest {
+                cwd: tempdir.path().to_path_buf(),
+                task: "second task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("second root agent");
+        let first_session_id = SessionId(first.session_id().as_str().to_string());
+        let second_session_id = SessionId(second.session_id().as_str().to_string());
+
+        let first_manager =
+            unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&first_session_id))
+                .expect("first runtime exec manager resource");
+        let second_manager =
+            unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&second_session_id))
+                .expect("second runtime exec manager resource");
+        let started = first_manager
+            .spawn_process(crate::tools::unified_exec::SpawnProcessRequest {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
+                cwd: tempdir.path().to_path_buf(),
+                env: std::collections::HashMap::new(),
+                tty: false,
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                timeout_ms: Some(5_000),
+                kill_on_cancel: true,
+                call_id: "call-start".to_string(),
+                tool_name: "exec_command".to_string(),
+                emitter: None,
+                cancel: None,
+            })
+            .await
+            .expect("spawn process");
+        assert!(started.running);
+
+        let cross_agent = second_manager
+            .write_stdin(crate::tools::unified_exec::WriteStdinRequest {
+                session_id: started.session_id,
+                chars: String::new(),
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                call_id: "call-cross-agent".to_string(),
+                tool_name: "write_stdin".to_string(),
+                emitter: None,
+            })
+            .await
+            .expect_err("second agent must not access first agent process id");
+        let cross_agent_debug = format!("{cross_agent:?}");
+        assert!(
+            cross_agent_debug.contains("unknown session"),
+            "unexpected cross-agent write_stdin error: {cross_agent_debug}"
+        );
+        assert_eq!(
+            first_manager.terminate_all().await,
+            1,
+            "first manager should still own the original process"
+        );
+        assert_eq!(
+            second_manager.terminate_all().await,
+            0,
+            "second manager should not own first manager's process"
+        );
+    }
+
     #[test]
     fn runtime_unattached_unified_exec_does_not_use_global_fallback() {
         let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
