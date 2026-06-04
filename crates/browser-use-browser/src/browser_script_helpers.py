@@ -1128,8 +1128,15 @@ def browser_fetch(
     json_body=None,
     timeout=20.0,
     binary=None,
+    return_error=True,
 ):
-    """Fetch from the current page context with browser cookies/session state."""
+    """Fetch from the current page context with browser cookies/session state.
+
+    By default a failed page-context fetch returns
+    {"ok": False, "url": ..., "error": ...} instead of failing the entire
+    browser_script call. Pass return_error=False when the caller wants a hard
+    exception for required URLs.
+    """
     request = _normalize_browser_fetch_request(
         url,
         method=method,
@@ -1139,7 +1146,7 @@ def browser_fetch(
         timeout=timeout,
         binary=binary,
     )
-    return browser_fetch_many([request], timeout=timeout, return_errors=False)[0]
+    return browser_fetch_many([request], timeout=timeout, return_errors=return_error)[0]
 
 
 def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True):
