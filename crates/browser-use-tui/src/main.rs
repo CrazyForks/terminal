@@ -106,7 +106,7 @@ use render::{
 };
 use runtime::{cancel_agent_run, run_agent_thread};
 use settings::{
-    browser_use_cloud_env_key_present, bundled_openrouter_model_ids,
+    browser_use_cloud_env_key_present, bundled_openai_model_ids, bundled_openrouter_model_ids,
     display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
     is_claude_code_account, model_choices_for_config, provider_model_choices,
     provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
@@ -3406,9 +3406,21 @@ impl App {
         self.open_provider_model_search(account)
     }
 
-    /// Seed the typeahead from the per-source disk cache (and the bundled
-    /// OpenRouter ids as an offline fallback) so it shows instantly.
+    /// Seed the typeahead from curated provider ids or the per-source disk cache
+    /// so it shows instantly.
     fn seed_provider_models(&mut self, account: &str) {
+        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+            self.provider_models = bundled_openai_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+            return;
+        }
         let Some(source) = model_source_for_account(account) else {
             return;
         };
@@ -3420,8 +3432,13 @@ impl App {
                 }
             }
         }
-        if account == ACCOUNT_OPENROUTER {
-            self.provider_models = bundled_openrouter_model_ids()
+        let fallback_ids = if account == ACCOUNT_OPENROUTER {
+            bundled_openrouter_model_ids()
+        } else {
+            Vec::new()
+        };
+        if !fallback_ids.is_empty() {
+            self.provider_models = fallback_ids
                 .into_iter()
                 .map(|id| ProviderModel {
                     id,
@@ -3435,6 +3452,9 @@ impl App {
 
     fn start_provider_fetch(&mut self, account: &str) {
         if self.provider_fetch.is_some() {
+            return;
+        }
+        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
             return;
         }
         let Some(source) = model_source_for_account(account) else {
@@ -3580,15 +3600,26 @@ impl App {
             .any(|model| model.id == id && model.vision)
     }
 
+    fn model_search_has_filter_input(&self) -> bool {
+        !matches!(
+            self.selected_provider,
+            Some(ACCOUNT_CODEX) | Some(ACCOUNT_OPENAI)
+        )
+    }
+
     fn model_search_entries(&self) -> Vec<ModelSearchEntry> {
-        let typed = self.composer.input().trim().to_string();
+        let typed = if self.model_search_has_filter_input() {
+            self.composer.input().trim().to_string()
+        } else {
+            String::new()
+        };
         let query = typed.to_ascii_lowercase();
         let usable = self.usable_provider_models();
 
         if !query.is_empty() {
             let mut entries = Vec::new();
             let exact = usable.iter().any(|model| model.id == typed);
-            if !exact {
+            if !exact && self.model_search_has_filter_input() {
                 // Offer the raw typed id so any valid model can be submitted.
                 entries.push(ModelSearchEntry::Item(typed.clone()));
             }
@@ -3609,7 +3640,7 @@ impl App {
             }
         }
         // Group the remaining models by provider prefix, alphabetically; ids
-        // within a group inherit the fetch's alphabetical order.
+        // within a group keep the provider/fallback order.
         let mut groups: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         for model in &usable {
@@ -3623,8 +3654,7 @@ impl App {
                 .unwrap_or_else(|| "models".to_string());
             groups.entry(group).or_default().push(model.id.clone());
         }
-        for (group, mut ids) in groups {
-            ids.sort();
+        for (group, ids) in groups {
             entries.push(ModelSearchEntry::Header(group));
             for id in ids {
                 entries.push(ModelSearchEntry::Item(id));
@@ -4795,10 +4825,10 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if matches!(
-                self.surface,
-                Surface::ApiKey | Surface::Telemetry | Surface::ModelSearch
-            ) && self.handle_api_key_key(key) => {}
+            _ if (matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
+                || (self.surface == Surface::ModelSearch
+                    && self.model_search_has_filter_input()))
+                && self.handle_api_key_key(key) => {}
             // A leading `/` opens the slash palette popup. Once the composer
             // has text, slash is regular prompt input.
             KeyEvent {
@@ -5204,10 +5234,14 @@ impl App {
     }
 
     fn execute_first_run_setup_selection(&mut self) -> Result<()> {
-        let idx = self
-            .selected_row
-            .min(ACCOUNT_CHOICES.len().saturating_sub(1));
-        let account = ACCOUNT_CHOICES[idx].to_string();
+        let choices = self.setup_account_choices()?;
+        let Some(account) = choices
+            .get(self.selected_row.min(choices.len().saturating_sub(1)))
+            .copied()
+        else {
+            return Ok(());
+        };
+        let account = account.to_string();
         self.setup_pending_account = Some(account);
         self.setup_result = None;
         self.open_surface(Surface::SetupConfirm);
@@ -5331,6 +5365,10 @@ impl App {
         self.account = account;
         if let Some(choice) = self.pending_model_after_auth.take() {
             return self.save_model_with_choice(choice);
+        }
+        if !self.setup_complete {
+            let account = self.account.clone();
+            return self.open_provider_model_search(&account);
         }
         self.advance_after_auth()
     }
@@ -6489,6 +6527,20 @@ impl App {
         load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
     }
 
+    fn setup_account_choices(&self) -> Result<Vec<&'static str>> {
+        let mut choices = Vec::new();
+        if self.account_ready(ACCOUNT_CODEX)? {
+            choices.push(ACCOUNT_CODEX);
+        }
+        choices.extend([
+            ACCOUNT_OPENAI,
+            ACCOUNT_ANTHROPIC,
+            ACCOUNT_OPENROUTER,
+            ACCOUNT_DEEPSEEK,
+        ]);
+        Ok(choices)
+    }
+
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
@@ -6533,7 +6585,9 @@ impl App {
     }
 
     fn setup_row_count(&self) -> usize {
-        ACCOUNT_CHOICES.len()
+        self.setup_account_choices()
+            .map(|choices| choices.len())
+            .unwrap_or_else(|_| ACCOUNT_CHOICES.len().saturating_sub(1))
     }
 
     fn cookie_sync_row_count(&self) -> usize {
@@ -10731,7 +10785,14 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        assert!(screen.contains("Codex login"));
+        if app
+            .setup_account_choices()?
+            .contains(&settings::ACCOUNT_CODEX)
+        {
+            assert!(screen.contains("Continue with Codex login"));
+        } else {
+            assert!(!screen.contains("Codex login"));
+        }
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
@@ -10755,16 +10816,17 @@ mod redesign_tests {
             .set_setting("auth.codex.account_id", "codex-test-account")?;
 
         // Up/Down navigate the provider rows and wrap around the edges.
+        let setup_count = app.setup_row_count();
         assert_eq!(app.selected_row, 0);
-        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
+        for _ in 0..setup_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, setup_count - 1);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
-        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
+        assert_eq!(app.selected_row, setup_count - 1);
+        for _ in 0..setup_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, 0);
@@ -10774,7 +10836,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use Codex login?"));
+        assert!(screen.contains("Continue with Codex login?"));
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -10784,10 +10846,16 @@ mod redesign_tests {
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, "Codex login");
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert!(app.status_notice.is_none());
         let screen = render_dump(&mut app)?;
@@ -12469,7 +12537,11 @@ wire_api = "responses"
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.open_surface(Surface::Setup);
-        app.selected_row = 1;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENAI)
+            .context("OpenAI setup row")?;
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("Claude Code subscription"));
@@ -12491,7 +12563,11 @@ wire_api = "responses"
         );
 
         app.open_surface(Surface::Setup);
-        app.selected_row = 3;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENROUTER)
+            .context("OpenRouter setup row")?;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         assert_eq!(
@@ -12600,13 +12676,33 @@ wire_api = "responses"
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("A default model will be selected automatically."));
+        assert!(screen.contains("Continue to choose a model."));
+        assert!(screen.contains("> Choose model"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_CODEX);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+        assert_eq!(
+            app.model_search_rows(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+            ]
+        );
+        assert!(!app.model_search_has_filter_input());
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_CODEX);
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         Ok(())
     }
 
@@ -12807,6 +12903,73 @@ wire_api = "responses"
     }
 
     #[test]
+    fn openai_provider_search_uses_curated_model_set() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+
+        app.select_provider(settings::ACCOUNT_OPENAI)?;
+
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+        assert!(!app.model_search_has_filter_input());
+        assert_eq!(
+            app.model_search_rows(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+            ]
+        );
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))?);
+        assert!(app.composer.input().is_empty());
+        assert!(!app
+            .model_search_rows()
+            .iter()
+            .any(|id| id == "not-a-real-openai-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_openai_searchable_providers_allow_typed_model_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+        app.composer.set_input("claude-custom-local".to_string());
+
+        assert!(app.model_search_has_filter_input());
+        assert_eq!(
+            app.model_search_rows().first().map(String::as_str),
+            Some("claude-custom-local")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_curated_model_list_scrolls_without_phantom_search_header() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.select_provider(settings::ACCOUNT_OPENAI)?;
+        app.args.height = 10;
+        app.selected_row = app.model_search_row_count().saturating_sub(1);
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("gpt-5.3-codex"));
+        assert!(
+            !screen.contains("gpt-5.5\n"),
+            "top OpenAI row should scroll away instead of being pinned as a hidden search header:\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn model_search_is_uncapped_recommended_then_grouped_by_provider() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -12882,7 +13045,11 @@ wire_api = "responses"
     fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
-        app.selected_row = 1;
+        app.selected_row = app
+            .setup_account_choices()?
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENAI)
+            .context("OpenAI setup row")?;
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
@@ -12909,21 +13076,22 @@ wire_api = "responses"
         );
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
-        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         Ok(())
     }
 
     #[test]
     fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
-        fn assert_nav(app: &mut App) -> Result<()> {
-            let expected_count = if app.is_slash_palette_active() {
-                app.slash_palette_items().len()
-            } else {
-                app.selectable_row_count()?
-            };
+        fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
             assert!(expected_count > 0, "surface {:?}", app.surface);
             app.selected_row = 0;
             for _ in 0..expected_count - 1 {
@@ -12937,10 +13105,19 @@ wire_api = "responses"
             assert_eq!(app.selected_row, expected_count - 1);
             Ok(())
         }
+        fn assert_nav_current(app: &mut App) -> Result<()> {
+            let expected_count = if app.is_slash_palette_active() {
+                app.slash_palette_items().len()
+            } else {
+                app.selectable_row_count()?
+            };
+            assert_nav(app, expected_count)
+        }
 
         let first_run_temp = tempfile::tempdir()?;
         let mut first_run_app = App::new(args(&first_run_temp))?;
-        assert_nav(&mut first_run_app)?;
+        let first_run_setup_count = first_run_app.setup_row_count();
+        assert_nav(&mut first_run_app, first_run_setup_count)?;
 
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -12972,14 +13149,24 @@ wire_api = "responses"
                     },
                 ];
             }
-            assert_nav(&mut app)?;
+            let count = match surface {
+                Surface::Setup => app.setup_row_count(),
+                Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Model => app.model_choices.len(),
+                Surface::Mode => 2,
+                Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::DefaultProfile => app.default_profile_row_count(),
+                Surface::CookieSync => app.cookie_sync_row_count(),
+                _ => unreachable!(),
+            };
+            assert_nav(&mut app, count)?;
         }
 
         app.start_auth_entry(settings::ACCOUNT_OPENROUTER.to_string());
-        assert_nav(&mut app)?;
+        assert_nav(&mut app, 2)?;
         app.cancel_auth_entry();
         app.start_telemetry_entry();
-        assert_nav(&mut app)?;
+        assert_nav(&mut app, 2)?;
         app.cancel_secret_entry();
 
         for idx in 0..3 {
@@ -12992,11 +13179,11 @@ wire_api = "responses"
         }
         app.refresh_state_cache_from_store()?;
         app.open_surface(Surface::History);
-        assert_nav(&mut app)?;
+        assert_nav_current(&mut app)?;
         app.close_surface();
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        assert_nav(&mut app)?;
+        assert_nav_current(&mut app)?;
         app.close_slash_palette();
 
         let failed = app.store.create_session(None, std::env::current_dir()?)?;
@@ -13012,7 +13199,7 @@ wire_api = "responses"
         )?;
         app.selected_session_id = Some(failed.id);
         app.refresh_state_cache_from_store()?;
-        assert_nav(&mut app)?;
+        assert_nav_current(&mut app)?;
 
         let cancelled = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -13023,7 +13210,7 @@ wire_api = "responses"
         app.store.request_cancel(&cancelled.id, "test cancel")?;
         app.selected_session_id = Some(cancelled.id);
         app.refresh_state_cache_from_store()?;
-        assert_nav(&mut app)?;
+        assert_nav_current(&mut app)?;
         Ok(())
     }
 
@@ -16805,6 +16992,7 @@ wire_api = "responses"
         }));
         assert_eq!(app.surface, Surface::Main);
         let screen = render_dump(&mut app)?;
+        assert_eq!(app.surface, Surface::Main);
         assert!(screen.contains("stopped"));
         assert_eq!(app.surface, Surface::Main);
         Ok(())

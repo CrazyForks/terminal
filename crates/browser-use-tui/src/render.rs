@@ -946,7 +946,9 @@ fn render_surface_popup_box(
     }
     // For text-input popups, position the terminal cursor at the end of the
     // masked secret line so the user sees a blinking caret in the input field.
-    let cursor_pos: Option<Position> = if surface.is_text_input_popup() {
+    let cursor_pos: Option<Position> = if surface.is_text_input_popup()
+        && (surface != Surface::ModelSearch || app.model_search_has_filter_input())
+    {
         let masked = match surface {
             Surface::Telemetry => masked_secret(app.composer.input()),
             Surface::ApiKey => {
@@ -2194,8 +2196,20 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled("PROVIDERS", muted())));
     lines.push(Line::from(""));
 
-    for (idx, label) in ACCOUNT_CHOICES.iter().enumerate() {
-        lines.push(setup_account_row(label, idx, app.selected_row));
+    for (idx, account) in app
+        .setup_account_choices()
+        .unwrap_or_else(|_| {
+            vec![
+                ACCOUNT_OPENAI,
+                ACCOUNT_ANTHROPIC,
+                ACCOUNT_OPENROUTER,
+                ACCOUNT_DEEPSEEK,
+            ]
+        })
+        .iter()
+        .enumerate()
+    {
+        lines.push(setup_account_row(account, idx, app.selected_row));
     }
     lines.extend([
         Line::from(""),
@@ -2206,14 +2220,26 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
 
 fn setup_account_row(label: &str, idx: usize, selected_row: usize) -> Line<'static> {
     let is_selected = idx == selected_row;
+    let detected_codex = label == ACCOUNT_CODEX;
+    let display = if detected_codex {
+        "Continue with Codex login"
+    } else {
+        label
+    };
     Line::from(vec![
         Span::styled(
             if is_selected { "> " } else { "  " },
             if is_selected { accent() } else { dim() },
         ),
         Span::styled(
-            label.to_string(),
-            if is_selected { bold() } else { text_style() },
+            display.to_string(),
+            if detected_codex {
+                done()
+            } else if is_selected {
+                bold()
+            } else {
+                text_style()
+            },
         ),
     ])
 }
@@ -2223,14 +2249,16 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         .setup_pending_account
         .as_deref()
         .unwrap_or(ACCOUNT_CODEX);
-    let mut lines = vec![
-        Line::from(Span::styled(format!("Use {account}?"), bold())),
-        Line::from(""),
-    ];
+    let title = if account == ACCOUNT_CODEX {
+        "Continue with Codex login?".to_string()
+    } else {
+        format!("Use {account}?")
+    };
+    let mut lines = vec![Line::from(Span::styled(title, bold())), Line::from("")];
     if account == ACCOUNT_CODEX {
         lines.extend([
-            Line::from("  Imports your local Codex auth."),
-            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
+            Line::from("  A local Codex login is already available."),
+            Line::from("  Continue to choose a model for this login."),
             Line::from("  No API key is required."),
         ]);
     } else if is_claude_code_account(account) {
@@ -2253,7 +2281,7 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
             "Open sign-in"
         } else if account == ACCOUNT_CODEX {
-            "Use Codex auth"
+            "Continue"
         } else {
             "Continue"
         };
@@ -2292,13 +2320,23 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     if is_success {
         let next_message = if app.pending_model_after_auth.is_some() {
             "  Continue applies the selected model."
+        } else if app.setup_complete {
+            "  Continue keeps your current model."
         } else {
-            "  A default model will be selected automatically."
+            "  Continue to choose a model."
         };
         lines.extend([
             Line::from(Span::styled(next_message, muted())),
             Line::from(""),
-            selected("Continue", 0, app.selected_row),
+            selected(
+                if app.setup_complete {
+                    "Continue"
+                } else {
+                    "Choose model"
+                },
+                0,
+                app.selected_row,
+            ),
         ]);
     } else if is_pending {
         if result.account == ACCOUNT_CODEX {
@@ -2639,21 +2677,27 @@ fn model_custom_row(is_selected: bool) -> Line<'static> {
 /// suggestions (and the raw typed id as the first row when not an exact match).
 fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
-    // Query input line; the popup cursor logic positions the caret at its end.
-    lines.push((None, Line::from(format!("  {}", app.composer.input()))));
-    lines.push((None, Line::from("")));
+    if app.model_search_has_filter_input() {
+        // Query input line; the popup cursor logic positions the caret at its end.
+        lines.push((None, Line::from(format!("  {}", app.composer.input()))));
+        lines.push((None, Line::from("")));
+    }
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
         lines.push((None, Line::from("")));
     }
     let entries = app.model_search_entries();
     if entries.is_empty() {
+        let empty_message = if !app.model_search_has_filter_input() {
+            "  No models available"
+        } else if app.selected_provider == Some(ACCOUNT_OPENROUTER) {
+            "  Type a model id, e.g. moonshotai/kimi-k2.5"
+        } else {
+            "  No matching models"
+        };
         lines.push((
             None,
-            Line::from(Span::styled(
-                "  Type a model id, e.g. moonshotai/kimi-k2.5".to_string(),
-                muted(),
-            )),
+            Line::from(Span::styled(empty_message.to_string(), muted())),
         ));
     }
     // Items carry a running selectable index (matching `model_search_rows`);
@@ -2687,8 +2731,10 @@ fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    // Pin the query-input line (index 0) so the caret stays visible.
-    crop_model_lines(lines, app.selected_row, height, 1)
+    // Pin the query-input line (index 0) only when the provider has one, so
+    // plain curated lists scroll every row normally.
+    let pinned_head = usize::from(app.model_search_has_filter_input());
+    crop_model_lines(lines, app.selected_row, height, pinned_head)
 }
 
 /// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
