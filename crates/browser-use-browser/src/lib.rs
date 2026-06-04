@@ -5800,7 +5800,7 @@ __USER_CODE = base64.b64decode({encoded_code:?}).decode()
 # are written as JPEGs plus a sidecar manifest, kept OUT of STREAM_PATH so the
 # event drain never sees partial/interleaved lines.
 try:
-    CAPTURE_FPS = float(os.environ.get("LLM_BROWSER_CAPTURE_FPS", "2") or "2")
+    CAPTURE_FPS = float(os.environ.get("LLM_BROWSER_CAPTURE_FPS", "0") or "0")
 except (TypeError, ValueError):
     CAPTURE_FPS = 2.0
 try:
@@ -6870,7 +6870,7 @@ fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(2.0)
+        .unwrap_or(0.0)
 }
 fn session_capture_quality() -> i64 {
     std::env::var("LLM_BROWSER_CAPTURE_QUALITY")
@@ -8830,6 +8830,18 @@ print("http_get parity ok")
         {
             let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "45000")]);
             assert_eq!(browser_script_initial_wait_ms(), 30_000);
+        }
+    }
+
+    #[test]
+    fn session_capture_is_opt_in_for_eval_speed() {
+        {
+            let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
+            assert_eq!(session_capture_fps(), 0.0);
+        }
+        {
+            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "2")]);
+            assert_eq!(session_capture_fps(), 2.0);
         }
     }
 
