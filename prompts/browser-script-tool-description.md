@@ -51,6 +51,9 @@ ensure_real_tab()
 upload_file(...)
 drain_events()
 http_get(url, **kwargs)
+http_get_many(urls, **kwargs)
+browser_fetch(url, **kwargs)
+browser_fetch_many(requests, **kwargs)
 
 copy_artifact(path, kind="file")
 emit_output(value, label=None)
@@ -109,7 +112,7 @@ emit_output(rows, label="employee_rows")
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - Use `js(function_source, *args)` when passing JSON-serializable Python values into JavaScript; use `target_id=` as a keyword for iframe targets.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.
-- Use `http_get(...)` for static pages and APIs after the browser reveals stable endpoints. It returns the response body as a string by default, or bytes with `binary=True`; the returned body also exposes `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. If direct HTTP hits bot or login protection, retry with site-specific headers/cookies, `js(fetch(...))` in the browser, or the configured Browser Use fetch proxy.
+- Use `http_get(...)` for one static page/API URL after the browser reveals a stable endpoint, and `http_get_many(...)` for several independent public URLs. Use `browser_fetch(...)` or `browser_fetch_many(...)` when the page's cookies, auth headers, or browser session are needed. Returned bodies are strings by default, bytes with `binary=True`, and expose `.status_code`, `.headers`, `.url`, `.text`, `.content`, and `.json()` for convenience. Batch helpers preserve input order and return per-URL error records by default so one bad link does not waste the whole extraction chunk. If direct HTTP hits bot or login protection, retry with `browser_fetch(...)`, site-specific headers/cookies, or the configured Browser Use fetch proxy.
 - Extract only fields needed for the task. Do not emit full profile text, full DOM text, cookies, localStorage, or entire app caches unless you are debugging and the smaller field-level extraction failed.
 - Save complete generated result files under `outputs_dir()` or relative paths in the current working directory. Files written there are collected as artifacts automatically; `copy_artifact(...)` is for files created elsewhere.
 - For large structured results, write the full JSON/CSV/text to a file. If the task asks for an exact inline final format, return that content with `done(result=...)` and optionally include `result_file=path`; otherwise finish with `done(result_file=path)`.

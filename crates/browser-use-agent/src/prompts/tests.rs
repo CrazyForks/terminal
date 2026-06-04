@@ -164,13 +164,20 @@ fn browser_tool_descriptions_preserve_interaction_skills() {
         script.contains("js(function_source, *args)"),
         "browser_script description lost js argument helper guidance"
     );
+    assert!(
+        script.contains("http_get_many(urls, **kwargs)")
+            && script.contains("browser_fetch_many(requests, **kwargs)"),
+        "browser_script description lost batch/direct fetch helper guidance"
+    );
 
     // The base system prompt enumerates the page-interaction helpers, including
     // the screenshot/image helpers used for visual inspection.
     assert!(
         BASE_SYSTEM_PROMPT.contains("capture_screenshot")
             && BASE_SYSTEM_PROMPT.contains("emit_image")
-            && BASE_SYSTEM_PROMPT.contains("js(function_source, *args)"),
+            && BASE_SYSTEM_PROMPT.contains("js(function_source, *args)")
+            && BASE_SYSTEM_PROMPT.contains("http_get_many")
+            && BASE_SYSTEM_PROMPT.contains("browser_fetch_many"),
         "base system prompt lost its screenshot/image interaction helpers"
     );
 }

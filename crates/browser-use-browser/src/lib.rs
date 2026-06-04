@@ -8773,6 +8773,76 @@ print("http_get parity ok")
     }
 
     #[test]
+    fn browser_script_http_get_many_preserves_order_and_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-http-get-many",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+import http.server
+import socketserver
+import threading
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path in ("/one", "/two"):
+            assert self.headers.get("X-Shared") == "yes", dict(self.headers)
+            if self.path == "/one":
+                assert self.headers.get("X-Item") == "one", dict(self.headers)
+            body = self.path.strip("/").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+try:
+    results = http_get_many(
+        [base + "/two", {"url": base + "/one", "headers": {"X-Item": "one"}}, base + "/missing"],
+        headers={"X-Shared": "yes"},
+        max_workers=3,
+    )
+    assert len(results) == 3, results
+    assert results[0] == "two", results
+    assert results[0].status_code == 200
+    assert results[1] == "one", results
+    assert results[1].url.endswith("/one")
+    assert results[2]["ok"] is False, results[2]
+    assert results[2]["url"].endswith("/missing"), results[2]
+    try:
+        http_get_many([base + "/missing"], return_errors=False)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("return_errors=False should raise")
+finally:
+    server.shutdown()
+    server.server_close()
+
+assert callable(browser_fetch)
+assert callable(browser_fetch_many)
+print("http_get_many parity ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("http_get_many parity ok"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
