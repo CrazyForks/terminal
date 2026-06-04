@@ -2583,15 +2583,12 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
 fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let tool_call_id = format!("browser_script-cli-{task_id}");
-    if let Some(cdp_url) = std::env::var("BU_CDP_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-    {
+    if let Some(connect_command) = remote_cdp_connect_command_from_env() {
         let connect = browser_use_browser::run_browser_command(
             task_id,
             &task.cwd,
             &task.artifact_root,
-            &format!("browser connect remote-cdp --url {}", cdp_url.trim()),
+            &connect_command,
         )?;
         if connect.content.get("status").and_then(Value::as_str) != Some("connected") {
             bail!("browser connect remote-cdp failed: {}", connect.content);
@@ -2638,6 +2635,30 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             .error
             .unwrap_or_else(|| "browser_script failed".to_string())
     )
+}
+
+fn remote_cdp_connect_command_from_env() -> Option<String> {
+    std::env::var("BU_CDP_WS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("BU_CDP_URL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .map(|endpoint| {
+            let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                "--ws"
+            } else {
+                "--url"
+            };
+            format!(
+                "browser connect remote-cdp {flag} {}",
+                shell_quote_arg(&endpoint)
+            )
+        })
 }
 
 #[derive(Clone, Debug)]
