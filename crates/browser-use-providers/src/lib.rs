@@ -5928,7 +5928,19 @@ fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<
             })),
         }
     }
+    drop_trailing_anthropic_assistant_prefill(&mut out);
     Ok(out)
+}
+
+fn drop_trailing_anthropic_assistant_prefill(messages: &mut Vec<Value>) {
+    while messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        messages.pop();
+    }
 }
 
 fn should_skip_raw_response_item_for_fallback_provider(message: &Value) -> bool {
@@ -8190,6 +8202,27 @@ mod tests {
         assert_eq!(anthropic.len(), 1);
         assert_eq!(anthropic[0]["role"], "user");
         assert_eq!(anthropic[0]["content"][0]["text"], "next prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_drop_trailing_assistant_prefill() -> Result<()> {
+        let messages = [
+            json!({
+                "role": "user",
+                "content": "do the browser task"
+            }),
+            json!({
+                "role": "assistant",
+                "content": "premature final answer"
+            }),
+        ];
+
+        let anthropic = messages_to_anthropic_messages(&messages, false)?;
+
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        assert_eq!(anthropic[0]["content"][0]["text"], "do the browser task");
         Ok(())
     }
 
@@ -12301,14 +12334,23 @@ mod tests {
     fn read_request_headers(stream: &mut TcpStream) {
         let mut request = Vec::new();
         let mut buf = [0_u8; 1024];
+        let start = Instant::now();
         loop {
-            let read = stream.read(&mut buf).expect("read request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&buf[..read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > Duration::from_secs(2) {
+                        panic!("read request timed out");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("read request: {error}"),
             }
         }
         let request_text = String::from_utf8_lossy(&request);

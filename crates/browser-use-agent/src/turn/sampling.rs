@@ -206,6 +206,15 @@ fn llm_error_to_agent(e: &LlmError) -> AgentError {
     }
 }
 
+fn provider_error_event_to_agent(message: String) -> AgentError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("context") && lower.contains("window") {
+        AgentError::ContextWindowExceeded
+    } else {
+        AgentError::Provider(message)
+    }
+}
+
 /// Server-requested retry delay, if any.
 ///
 /// The structured `Retry-After` hint is carried by `browser-use-llm`'s retry
@@ -562,7 +571,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         ev: LlmEvent,
         started_at: Instant,
         turn_idx: usize,
-    ) -> StreamProgress {
+    ) -> Result<StreamProgress, AgentError> {
         // Emit UI events first (map is pure; emit is the only side effect).
         self.emit_event(&ev, turn_idx);
         match ev {
@@ -572,7 +581,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 if has_content {
                     acc.text_items_with_content.insert(id, true);
                 }
-                StreamProgress::Continue
+                Ok(StreamProgress::Continue)
             }
             LlmEvent::TextEnd { id, phase } => {
                 let text_item_has_content = acc.text_items_with_content.remove(&id).unwrap_or(
@@ -584,7 +593,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 if text_item_has_content && !matches!(phase, Some(TextPhase::Commentary)) {
                     acc.defers_mailbox_delivery_to_next_turn = true;
                 }
-                StreamProgress::Continue
+                Ok(StreamProgress::Continue)
             }
             LlmEvent::ToolCall {
                 id,
@@ -601,7 +610,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                     provider_metadata: namespace
                         .map(|namespace| serde_json::json!({ "namespace": namespace })),
                 });
-                StreamProgress::Continue
+                Ok(StreamProgress::Continue)
             }
             LlmEvent::Finish {
                 usage,
@@ -610,11 +619,12 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 self.emit_goal_accounting(&usage, started_at.elapsed().as_secs() as i64);
                 acc.usage = Some(usage);
                 acc.finish_reason = finish_reason;
-                StreamProgress::Done
+                Ok(StreamProgress::Done)
             }
-            // Reasoning, lifecycle markers, provider-side notices, step finishes:
+            LlmEvent::ProviderError { message, .. } => Err(provider_error_event_to_agent(message)),
+            // Reasoning, lifecycle markers, and step finishes:
             // no accumulation; their UI mapping (if any) already happened above.
-            _ => StreamProgress::Continue,
+            _ => Ok(StreamProgress::Continue),
         }
     }
 }
@@ -932,7 +942,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match maybe_event {
                     Some(Ok(ev)) => {
                         let check_mailbox_preemption = checks_mailbox_preemption_after_event(&ev);
-                        match self.consume_event(&mut acc, ev, started_at, turn_idx) {
+                        match self.consume_event(&mut acc, ev, started_at, turn_idx)? {
                             StreamProgress::Continue => {
                                 if check_mailbox_preemption && self.has_mailbox_preemption().await {
                                     preempted_for_mailbox = true;
