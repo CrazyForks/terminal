@@ -61,6 +61,10 @@ BrowserUseRuntime
 - Child completion mail is non-triggering and delivered through the runtime
   mailbox. `wait_agent` observes mailbox sequence changes and records
   `after_seq`, `mailbox_seq`, and `timed_out`.
+- Runtime mailbox drain now journals prompt-projection rows such as
+  `agent.mailbox_input`, `session.followup`, and `agent.turn_queue_drained`
+  through `RuntimeHandle::append_observed_session_event`, so live mailbox
+  delivery no longer writes those rows directly through `Store`.
 - Subagent lifecycle UI events use the runtime-backed event sink when a runtime
   handle exists.
 - `session.done` emitted by the turn observer is routed through the runtime

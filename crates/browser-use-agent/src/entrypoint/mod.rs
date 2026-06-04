@@ -1082,6 +1082,7 @@ fn drain_runtime_agent_mailbox_as_pending_input(
     }
     let store_guard = store.lock().ok();
     runtime_mailbox_items_as_pending_input(
+        runtime_handle,
         store_guard.as_deref(),
         session_id,
         response.mailbox_items,
@@ -1089,6 +1090,7 @@ fn drain_runtime_agent_mailbox_as_pending_input(
 }
 
 fn runtime_mailbox_items_as_pending_input(
+    runtime_handle: &RuntimeHandle,
     store: Option<&Store>,
     session_id: &str,
     items: Vec<RuntimeMailboxItem>,
@@ -1155,50 +1157,52 @@ fn runtime_mailbox_items_as_pending_input(
                             );
                         }
                     }
-                    if let Some(store) = store {
-                        if let Ok(committed) =
-                            store.append_event(session_id, names::SESSION_FOLLOWUP, payload.clone())
-                        {
-                            if let Some(pending_from_seq) = pending_from_seq {
-                                let _ = store.append_event(
-                                    session_id,
-                                    AGENT_TURN_QUEUE_DRAINED_EVENT,
-                                    serde_json::json!({
-                                        "phase": "runtime_mailbox",
-                                        "session_messages": 1,
-                                        "mailbox_messages": 1,
-                                        "last_seq": committed.seq,
-                                        "followup_seqs": [pending_from_seq],
-                                        "runtime_mailbox_id": item.id,
-                                        "runtime_mailbox_seq": item.seq,
-                                    }),
-                                );
-                            }
-                        }
+                    let committed_seq = append_runtime_prompt_projection_event(
+                        runtime_handle,
+                        session_id,
+                        names::SESSION_FOLLOWUP,
+                        payload.clone(),
+                    );
+                    if let (Some(pending_from_seq), Some(committed_seq)) =
+                        (pending_from_seq, committed_seq)
+                    {
+                        let _ = append_runtime_prompt_projection_event(
+                            runtime_handle,
+                            session_id,
+                            AGENT_TURN_QUEUE_DRAINED_EVENT,
+                            serde_json::json!({
+                                "phase": "runtime_mailbox",
+                                "session_messages": 1,
+                                "mailbox_messages": 1,
+                                "last_seq": committed_seq,
+                                "followup_seqs": [pending_from_seq],
+                                "runtime_mailbox_id": item.id,
+                                "runtime_mailbox_seq": item.seq,
+                            }),
+                        );
                     }
                     return user_input_payload_to_messages(&payload);
                 }
             }
 
-            if let Some(store) = store {
-                let _ = store.append_event(
-                    session_id,
-                    "agent.mailbox_input",
-                    serde_json::json!({
-                        "id": item.id,
-                        "runtime_mailbox_seq": item.seq,
-                        "author_session_id": author_session_id.clone(),
-                        "target_session_id": target_session_id.clone(),
-                        "author_path": author_path.clone(),
-                        "recipient_path": recipient_path.clone(),
-                        "content": content.clone(),
-                        "trigger_turn": trigger_turn,
-                        "delivery_phase": item.delivery_phase,
-                        "kind": item_kind.clone(),
-                        "source": "runtime",
-                    }),
-                );
-            }
+            let _ = append_runtime_prompt_projection_event(
+                runtime_handle,
+                session_id,
+                "agent.mailbox_input",
+                serde_json::json!({
+                    "id": item.id,
+                    "runtime_mailbox_seq": item.seq,
+                    "author_session_id": author_session_id.clone(),
+                    "target_session_id": target_session_id.clone(),
+                    "author_path": author_path.clone(),
+                    "recipient_path": recipient_path.clone(),
+                    "content": content.clone(),
+                    "trigger_turn": trigger_turn,
+                    "delivery_phase": item.delivery_phase,
+                    "kind": item_kind.clone(),
+                    "source": "runtime",
+                }),
+            );
             let label = match item_kind {
                 RuntimeMailboxItemKind::Completion => "Subagent completion",
                 RuntimeMailboxItemKind::Notification => "Inter-agent notification",
@@ -1215,6 +1219,24 @@ fn runtime_mailbox_items_as_pending_input(
             )]
         })
         .collect()
+}
+
+fn append_runtime_prompt_projection_event(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+    event_type: &str,
+    payload: Value,
+) -> Option<i64> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string()).ok()?;
+    runtime_handle
+        .append_observed_session_event(
+            runtime_session_id,
+            event_type,
+            payload,
+            RuntimeDurability::Barrier,
+        )
+        .ok()
+        .and_then(|append| append.seq)
 }
 
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
