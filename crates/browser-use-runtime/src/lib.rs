@@ -1338,6 +1338,18 @@ impl AgentMailbox {
         seq
     }
 
+    fn materialize_pending(&self, items: Vec<MailboxItem>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_seq = state
+            .next_seq
+            .max(items.iter().map(|item| item.seq).max().unwrap_or_default());
+        state.queue = items.into();
+        let _ = self.seq_tx.send(state.next_seq);
+    }
+
     pub fn pending_items(&self) -> Vec<MailboxItem> {
         self.state
             .lock()
@@ -1747,6 +1759,26 @@ impl AgentLiveState {
             .pending_trigger_turn_count
             .saturating_sub(trigger_count);
         state.last_consumed_mailbox_seq = state.last_consumed_mailbox_seq.max(max_seq);
+    }
+
+    fn materialize_from_replay(&self, replay: &MaterializedLiveState) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepted_input_count = replay.accepted_prompt_input_count;
+        state.pending_prompt_input_count = replay.pending_prompt_input_count;
+        state.last_accepted_prompt_input_seq = replay.last_accepted_prompt_input_seq;
+        state.last_consumed_prompt_input_seq = replay.last_consumed_prompt_input_seq;
+        state.pending_mailbox_count = replay.pending_mailbox_items.len();
+        state.pending_trigger_turn_count = replay
+            .pending_mailbox_items
+            .iter()
+            .filter(|item| item.trigger_turn)
+            .count();
+        state.last_enqueued_mailbox_seq = replay.last_enqueued_mailbox_seq;
+        state.last_delivered_mailbox_seq = replay.last_delivered_mailbox_seq;
+        state.last_consumed_mailbox_seq = replay.last_consumed_mailbox_seq;
     }
 }
 
@@ -3007,6 +3039,7 @@ impl BrowserUseRuntime {
             request.max_concurrent_threads_per_session,
             Some(RuntimeEventKind::AgentResumed),
         )?;
+        self.materialize_live_state_after_resume(&thread)?;
         self.record_lost_resources_after_resume(&thread)?;
         Ok(thread)
     }
@@ -3049,6 +3082,7 @@ impl BrowserUseRuntime {
             }));
         event.root_id = Some(parent.root_id.clone());
         self.publish_after_barrier(event)?;
+        self.materialize_live_state_after_resume(&child)?;
         self.record_lost_resources_after_resume(&child)?;
         Ok(child)
     }
@@ -3678,6 +3712,16 @@ impl BrowserUseRuntime {
         }
         Ok(())
     }
+
+    fn materialize_live_state_after_resume(&self, thread: &AgentThread) -> Result<()> {
+        let events = self.persistence.events_for_session(&thread.session_id)?;
+        let replay = materialized_live_state_from_events(&events);
+        thread
+            .mailbox
+            .materialize_pending(replay.pending_mailbox_items.clone());
+        thread.live_state.materialize_from_replay(&replay);
+        Ok(())
+    }
 }
 
 pub fn local_runtime_socket_path(state_dir: &Path) -> PathBuf {
@@ -3987,6 +4031,123 @@ fn lost_live_resources_from_events(events: &[EventRecord]) -> Vec<LiveResourceKe
     open.into_iter()
         .filter(|key| !terminal.contains(key))
         .collect()
+}
+
+#[derive(Default)]
+struct MaterializedLiveState {
+    pending_mailbox_items: Vec<MailboxItem>,
+    last_enqueued_mailbox_seq: u64,
+    last_delivered_mailbox_seq: u64,
+    last_consumed_mailbox_seq: u64,
+    accepted_prompt_input_count: usize,
+    pending_prompt_input_count: usize,
+    last_accepted_prompt_input_seq: i64,
+    last_consumed_prompt_input_seq: i64,
+}
+
+fn materialized_live_state_from_events(events: &[EventRecord]) -> MaterializedLiveState {
+    let mut replay = MaterializedLiveState::default();
+    let mut enqueued = Vec::new();
+    let mut consumed_mailbox_seqs = HashSet::new();
+    let mut prompt_accepted_seqs = Vec::new();
+    let mut prompt_consumed_count = 0usize;
+
+    for event in events {
+        match event.event_type.as_str() {
+            "mailbox.enqueued" => {
+                if let Some(item) = mailbox_item_from_event(event) {
+                    replay.last_enqueued_mailbox_seq =
+                        replay.last_enqueued_mailbox_seq.max(item.seq);
+                    enqueued.push(item);
+                }
+            }
+            "mailbox.delivered" => {
+                for seq in mailbox_seqs_from_event(event) {
+                    replay.last_delivered_mailbox_seq = replay.last_delivered_mailbox_seq.max(seq);
+                }
+            }
+            "mailbox.consumed" => {
+                for seq in mailbox_seqs_from_event(event) {
+                    replay.last_consumed_mailbox_seq = replay.last_consumed_mailbox_seq.max(seq);
+                    consumed_mailbox_seqs.insert(seq);
+                }
+            }
+            "agent.input.accepted" => {
+                replay.accepted_prompt_input_count =
+                    replay.accepted_prompt_input_count.saturating_add(1);
+                let source_event_seq = prompt_source_event_seq(event);
+                replay.last_accepted_prompt_input_seq = replay
+                    .last_accepted_prompt_input_seq
+                    .max(source_event_seq.unwrap_or_default());
+                prompt_accepted_seqs.push(source_event_seq);
+            }
+            "agent.input.consumed" => {
+                prompt_consumed_count = prompt_consumed_count.saturating_add(1);
+                replay.last_consumed_prompt_input_seq = replay
+                    .last_consumed_prompt_input_seq
+                    .max(prompt_source_event_seq(event).unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
+    replay.pending_mailbox_items = enqueued
+        .into_iter()
+        .filter(|item| !consumed_mailbox_seqs.contains(&item.seq))
+        .collect();
+
+    replay.pending_prompt_input_count =
+        if replay.last_accepted_prompt_input_seq > replay.last_consumed_prompt_input_seq {
+            prompt_accepted_seqs
+                .into_iter()
+                .filter(|source_event_seq| {
+                    source_event_seq
+                        .map(|seq| seq > replay.last_consumed_prompt_input_seq)
+                        .unwrap_or(true)
+                })
+                .count()
+        } else {
+            replay
+                .accepted_prompt_input_count
+                .saturating_sub(prompt_consumed_count)
+        };
+
+    replay
+}
+
+fn runtime_payload(payload: &Value) -> &Value {
+    payload.get("payload").unwrap_or(payload)
+}
+
+fn mailbox_item_from_event(event: &EventRecord) -> Option<MailboxItem> {
+    runtime_payload(&event.payload)
+        .get("mailbox_item")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn mailbox_seqs_from_event(event: &EventRecord) -> Vec<u64> {
+    let payload = runtime_payload(&event.payload);
+    if let Some(values) = payload.get("mailbox_seqs").and_then(Value::as_array) {
+        return values.iter().filter_map(Value::as_u64).collect();
+    }
+    if let Some(values) = payload.get("mailbox_items").and_then(Value::as_array) {
+        return values
+            .iter()
+            .filter_map(|item| item.get("seq").and_then(Value::as_u64))
+            .collect();
+    }
+    payload
+        .get("mailbox_item")
+        .and_then(|item| item.get("seq"))
+        .and_then(Value::as_u64)
+        .into_iter()
+        .collect()
+}
+
+fn prompt_source_event_seq(event: &EventRecord) -> Option<i64> {
+    runtime_payload(&event.payload)
+        .get("source_event_seq")
+        .and_then(Value::as_i64)
 }
 
 fn live_resource_start_key(event_type: &str, payload: &Value) -> Option<LiveResourceKey> {
@@ -5371,6 +5532,237 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_root_materializes_pending_mailbox_from_journal() -> Result<()> {
+        let journal = Arc::new(MemoryJournal::new());
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        let root_agent_id = AgentId::from_string(session_id.as_str())?;
+        let child_agent_id = AgentId::from_string("child")?;
+        let item = MailboxItem {
+            seq: 7,
+            id: "mail-7".to_string(),
+            kind: MailboxItemKind::Completion,
+            author_agent_id: child_agent_id.clone(),
+            target_agent_id: root_agent_id.clone(),
+            target_path: Some("/root/research".to_string()),
+            content: "<subagent_notification>done</subagent_notification>".to_string(),
+            trigger_turn: false,
+            delivery_phase: MailboxDeliveryPhase::NextTurn,
+            payload: json!({"source": "test"}),
+        };
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id.clone())
+                .with_payload(json!({
+                    "mailbox_item": item,
+                    "trigger_turn": false,
+                })),
+        )?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let pending = handle.pending_agent_mail_for_session(&session_id)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, 7);
+        assert_eq!(pending[0].author_agent_id, child_agent_id);
+        let live = root.live_state_snapshot();
+        assert_eq!(live.pending_mailbox_count, 1);
+        assert_eq!(live.last_enqueued_mailbox_seq, 7);
+
+        let outcome = handle
+            .wait_agent(root.agent_id(), AgentTarget::Any, Duration::from_millis(20))
+            .await?;
+        let WaitAgentOutcome::Completed(item) = outcome else {
+            panic!("materialized mail should wake wait_agent immediately");
+        };
+        assert_eq!(item.seq, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn attach_root_does_not_materialize_consumed_mailbox_from_journal() -> Result<()> {
+        let journal = Arc::new(MemoryJournal::new());
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        let root_agent_id = AgentId::from_string(session_id.as_str())?;
+        let item = MailboxItem {
+            seq: 3,
+            id: "mail-3".to_string(),
+            kind: MailboxItemKind::Followup,
+            author_agent_id: root_agent_id.clone(),
+            target_agent_id: root_agent_id.clone(),
+            target_path: Some("/root".to_string()),
+            content: "continue".to_string(),
+            trigger_turn: true,
+            delivery_phase: MailboxDeliveryPhase::CurrentTurn,
+            payload: json!({"source": "test"}),
+        };
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::MailboxEnqueued, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id.clone())
+                .with_payload(json!({
+                    "mailbox_item": item,
+                    "trigger_turn": true,
+                })),
+        )?;
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::MailboxConsumed, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id)
+                .with_payload(json!({
+                    "delivery_phase": MailboxDeliveryPhase::CurrentTurn,
+                    "mailbox_seqs": [3],
+                })),
+        )?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        assert!(handle
+            .pending_agent_mail_for_session(&session_id)?
+            .is_empty());
+        let live = root.live_state_snapshot();
+        assert_eq!(live.pending_mailbox_count, 0);
+        assert_eq!(live.pending_trigger_turn_count, 0);
+        assert_eq!(live.last_enqueued_mailbox_seq, 3);
+        assert_eq!(live.last_consumed_mailbox_seq, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn attach_root_materializes_prompt_input_from_journal() -> Result<()> {
+        let journal = Arc::new(MemoryJournal::new());
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        let root_agent_id = AgentId::from_string(session_id.as_str())?;
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::AgentInputAccepted, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id)
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "source_event_seq": 11,
+                })),
+        )?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let live = root.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 1);
+        assert_eq!(live.pending_prompt_input_count, 1);
+        assert_eq!(live.last_accepted_prompt_input_seq, 11);
+        let consumed = handle.consume_prompt_input_for_session(&session_id)?;
+        assert!(consumed.consumed);
+        assert_eq!(
+            root.live_state_snapshot().last_consumed_prompt_input_seq,
+            11
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attach_root_does_not_rematerialize_consumed_prompt_input() -> Result<()> {
+        let journal = Arc::new(MemoryJournal::new());
+        let session = journal.create_thread(CreateThreadRequest {
+            session_id: Some(SessionId::from_string("root")?),
+            parent_session_id: None,
+            cwd: PathBuf::from("/tmp"),
+            artifact_root: None,
+            agent_path: None,
+            nickname: None,
+            role: None,
+        })?;
+        let session_id = SessionId::from_string(session.id)?;
+        let root_agent_id = AgentId::from_string(session_id.as_str())?;
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::AgentInputAccepted, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "source_event_seq": 11,
+                })),
+        )?;
+        journal.append_runtime_event(
+            &RuntimeEvent::new(RuntimeEventKind::AgentInputConsumed, Durability::Barrier)
+                .with_session_id(session_id.clone())
+                .with_agent_id(root_agent_id)
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "source_event_seq": 11,
+                })),
+        )?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root = handle.attach_root_agent(AttachRootAgentRequest {
+            session_id: session_id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let live = root.live_state_snapshot();
+        assert_eq!(live.accepted_input_count, 1);
+        assert_eq!(live.pending_prompt_input_count, 0);
+        assert_eq!(live.last_accepted_prompt_input_seq, 11);
+        assert_eq!(live.last_consumed_prompt_input_seq, 11);
+        let consumed = handle.consume_prompt_input_for_session(&session_id)?;
+        assert!(!consumed.consumed);
         Ok(())
     }
 
