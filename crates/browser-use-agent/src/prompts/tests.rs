@@ -169,6 +169,12 @@ fn browser_tool_descriptions_preserve_interaction_skills() {
             && script.contains("browser_fetch_many(requests, **kwargs)"),
         "browser_script description lost batch/direct fetch helper guidance"
     );
+    assert!(
+        script.contains("Batch recipe after discovering stable links or endpoints")
+            && script.contains("responses = http_get_many(urls, timeout=12, max_workers=8)")
+            && script.contains("Fetched ${$.ok_count}/${$.total} independent URLs"),
+        "browser_script description lost its concrete batch-fetch adoption recipe"
+    );
 
     // The base system prompt enumerates the page-interaction helpers, including
     // the screenshot/image helpers used for visual inspection.
