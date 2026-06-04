@@ -2509,6 +2509,24 @@ impl RuntimeHandle {
         self.inner.persistence.as_ref()
     }
 
+    pub fn load_session(&self, session_id: &SessionId) -> Result<Option<SessionMeta>> {
+        self.inner.persistence.load_session(session_id)
+    }
+
+    pub fn events_for_session(&self, session_id: &SessionId) -> Result<Vec<EventRecord>> {
+        self.inner.persistence.events_for_session(session_id)
+    }
+
+    pub fn events_after_seq(
+        &self,
+        session_id: &SessionId,
+        after_seq: i64,
+    ) -> Result<Vec<EventRecord>> {
+        self.inner
+            .persistence
+            .events_after_seq(session_id, after_seq)
+    }
+
     pub fn append_observed_session_event(
         &self,
         session_id: SessionId,

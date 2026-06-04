@@ -357,17 +357,33 @@ impl LiveTurnState {
     fn assemble_prompt_blocking(&self) -> Vec<Message> {
         let mut msgs = match self.compacted.lock().unwrap().as_ref() {
             Some(compacted) => compacted.clone(),
-            None => {
-                let session_id = self.session_id.as_str().to_string();
-                history_from_store(&self.store, &session_id)
-            }
+            None => self.durable_history_blocking(),
         };
         msgs.extend(self.recorded.lock().unwrap().iter().cloned());
         msgs
     }
 
+    fn runtime_session_id(&self) -> Option<RuntimeSessionId> {
+        RuntimeSessionId::from_string(self.session_id.as_str().to_string()).ok()
+    }
+
+    fn durable_events_blocking(&self) -> Vec<EventRecord> {
+        if let (Some(runtime_handle), Some(runtime_session_id)) =
+            (self.runtime_handle.as_ref(), self.runtime_session_id())
+        {
+            if let Ok(events) = runtime_handle.events_for_session(&runtime_session_id) {
+                return events;
+            }
+        }
+        events_from_store(&self.store, self.session_id.as_str())
+    }
+
+    fn durable_history_blocking(&self) -> Vec<Message> {
+        history_from_events(&self.durable_events_blocking())
+    }
+
     fn current_prompt_items_for_compaction(&self, mode: CompactionMode) -> Vec<Item> {
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         match mode {
             CompactionMode::PreTurn => {
                 let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
@@ -408,7 +424,7 @@ impl LiveTurnState {
     ///   the latest compaction checkpoint;
     /// - otherwise the whole-prompt local byte/token estimate.
     fn active_prompt_tokens_for_status(&self) -> ActivePromptTokens {
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
         let events = events_through_seq(&events, replay_from);
         self.active_prompt_tokens_from_events(&events)
@@ -777,8 +793,12 @@ fn history_from_store(store: &SharedStore, session_id: &str) -> Vec<Message> {
         let store = store.lock().expect("store mutex poisoned");
         store.events_for_session(session_id).unwrap_or_default()
     };
+    history_from_events(&events)
+}
+
+fn history_from_events(events: &[EventRecord]) -> Vec<Message> {
     // Pure reduce: durable events -> provider messages (the legacy currency).
-    let items = provider_messages_from_events(&events);
+    let items = provider_messages_from_events(events);
     // Pure lower: provider-message Values -> typed Messages for the request.
     ContextManager::new().lower_to_messages(&items)
 }
@@ -1763,11 +1783,22 @@ impl TurnState for LiveTurnState {
             return self.assemble_prompt_blocking();
         }
         let store = Arc::clone(&self.store);
+        let runtime_handle = self.runtime_handle.clone();
+        let runtime_session_id = self.runtime_session_id();
         let session_id = self.session_id.as_str().to_string();
         // The durable read is synchronous (rusqlite); run it off the async runtime.
-        let mut msgs = tokio::task::spawn_blocking(move || history_from_store(&store, &session_id))
-            .await
-            .unwrap_or_default();
+        let mut msgs = tokio::task::spawn_blocking(move || {
+            if let (Some(runtime_handle), Some(runtime_session_id)) =
+                (runtime_handle.as_ref(), runtime_session_id.as_ref())
+            {
+                if let Ok(events) = runtime_handle.events_for_session(runtime_session_id) {
+                    return history_from_events(&events);
+                }
+            }
+            history_from_store(&store, &session_id)
+        })
+        .await
+        .unwrap_or_default();
         // The recorded buffer carries this run's assistant turns AND the fused
         // driver's dispatched tool outputs (both append through the same `Arc`), so
         // the next prompt sees everything produced so far.
@@ -1923,7 +1954,7 @@ impl LiveTurnState {
             }
         };
 
-        let events = events_from_store(&self.store, self.session_id.as_str());
+        let events = self.durable_events_blocking();
         let initial_context = initial_context_messages_from_events(&events, None, true, true);
         let initial_context_already_in_history = matches!(mode, CompactionMode::MidTurn);
         let replay_from_seq = match mode {
@@ -1956,7 +1987,7 @@ impl LiveTurnState {
         }
 
         let active_after_compact = {
-            let lowered = history_from_store(&self.store, self.session_id.as_str());
+            let lowered = self.durable_history_blocking();
             let items = lowered
                 .iter()
                 .map(message_to_provider_item)
@@ -1967,13 +1998,9 @@ impl LiveTurnState {
             mgr.estimate_total_tokens()
                 .saturating_add(crate::compact::approx_token_count(&self.base_instructions) as i64)
         };
+        let previous_total = latest_total_token_usage_value(&self.durable_events_blocking());
         {
             let store = self.store.lock().expect("store mutex poisoned");
-            let previous_total = latest_total_token_usage_value(
-                &store
-                    .events_for_session(self.session_id.as_str())
-                    .unwrap_or_default(),
-            );
             store
                 .append_event(
                     self.session_id.as_str(),
