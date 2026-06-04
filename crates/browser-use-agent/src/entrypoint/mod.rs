@@ -2034,6 +2034,7 @@ async fn drive_run<Sd: SamplingDriver>(
     developer_instructions: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
     cancel: CancellationToken,
+    max_turns: Option<usize>,
 ) -> Result<Option<String>, AgentError> {
     let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
     // Enable REAL token accounting + model-based compaction when a sampler is
@@ -2078,9 +2079,18 @@ async fn drive_run<Sd: SamplingDriver>(
     let turn_loop = TurnLoop::new(state, driver, observer);
     let cancel_monitor =
         spawn_store_cancel_monitor(Arc::clone(&store), session_id.clone(), cancel.clone());
-    let result = turn_loop
-        .run(ctx, turn_has_fresh_input, cancel.clone())
-        .await;
+    let result = match max_turns {
+        Some(max_turns) => {
+            turn_loop
+                .run_with_max_turns(ctx, turn_has_fresh_input, cancel.clone(), max_turns)
+                .await
+        }
+        None => {
+            turn_loop
+                .run(ctx, turn_has_fresh_input, cancel.clone())
+                .await
+        }
+    };
     cancel_monitor.abort();
     if result.is_ok() {
         ensure_fallback_capture_recording(&store, session_id.as_str());
@@ -2340,6 +2350,7 @@ async fn run_session_once_with_config_with_cancel(
                 config.options.developer_instructions.clone(),
                 previous_model_compaction,
                 cancel.clone(),
+                Some(config.options.max_turns),
             )
             .await?;
         }
@@ -2364,6 +2375,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 None,
                 cancel.clone(),
+                Some(config.options.max_turns),
             )
             .await?;
         }
@@ -3911,6 +3923,7 @@ mod tests {
                 None,
                 None,
                 CancellationToken::new(),
+                None,
             ),
         )
         .await
