@@ -414,13 +414,18 @@ impl RealBackend {
     }
 
     fn should_ensure_before_command(&self, command: &str) -> bool {
-        if self.normalized_browser_mode().is_none() {
+        let Some(mode) = self.normalized_browser_mode() else {
             return false;
-        }
+        };
         let Ok(words) = browser_command_words(command) else {
             return false;
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+        if mode == "remote-cdp"
+            && matches!(words.as_slice(), ["browser", "status", ..] | ["status", ..])
+        {
+            return true;
+        }
         if browser_command_is_passive(words.as_slice()) {
             return false;
         }
@@ -842,9 +847,39 @@ fn resolve_browser_command_for_selected_mode(
         };
         browser_connect_command_for_mode(effective_mode, profile_id.as_deref())
     } else {
+        if let Some(command) =
+            remote_cdp_compatibility_connect_command(&args, selected_browser_mode)?
+        {
+            return Ok(command);
+        }
         enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
         Ok(cmd.to_string())
     }
+}
+
+fn remote_cdp_compatibility_connect_command(
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if normalize_browser_preference_mode(selected_mode)? != "remote-cdp" {
+        return Ok(None);
+    }
+    let requests_different_browser_setup = match args {
+        [command, mode, ..] if command == "connect" => mode != "remote-cdp",
+        [command, ..] if command == "local" => true,
+        [command, action, ..] if command == "remote" && action == "start" => true,
+        _ => false,
+    };
+    if requests_different_browser_setup {
+        return Ok(Some(remote_cdp_connect_command()?));
+    }
+    Ok(None)
 }
 
 fn local_connect_profile_preflight(
