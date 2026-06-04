@@ -322,6 +322,40 @@ async fn finish_accounts_usage_only_when_goal_is_active() {
 }
 
 #[tokio::test]
+async fn repeated_sampling_requests_emit_monotonic_turn_indices() {
+    let (transport, _opens) = ScriptedTransport::new(vec![
+        OpenScript::Stream(vec![finish(FinishReason::Stop)]),
+        OpenScript::Stream(vec![finish(FinishReason::Stop)]),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("first sampling request should succeed");
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("second sampling request should succeed");
+
+    let events = sink.drain();
+    let turn_request_indices: Vec<i64> = events
+        .iter()
+        .filter(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .map(|event| event.payload["turn_idx"].as_i64().expect("turn_idx"))
+        .collect();
+    let token_count_indices: Vec<i64> = events
+        .iter()
+        .filter(|event| event.event_type == names::TOKEN_COUNT)
+        .map(|event| event.payload["turn_idx"].as_i64().expect("turn_idx"))
+        .collect();
+
+    assert_eq!(turn_request_indices, vec![0, 1]);
+    assert_eq!(token_count_indices, vec![0, 1]);
+}
+
+#[tokio::test]
 async fn active_goal_context_is_injected_with_codex_envelope() {
     let (transport, seen) =
         RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
@@ -873,7 +907,7 @@ impl crate::turn::sampling::FusionRecorder for NoopRecorder {
 fn tool_def(name: &str) -> browser_use_llm::schema::ToolDefinition {
     browser_use_llm::schema::ToolDefinition {
         name: name.to_string(),
-        description: String::new(),
+        description: format!("{name} model-visible tool description"),
         input_schema: serde_json::json!({"type": "object"}),
         output_schema: None,
         namespace: None,
@@ -911,9 +945,10 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
     // about the request the driver built.
     let (transport, seen) =
         RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
-    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let sink = Arc::new(RecordingSink::default());
+    let sink_for_driver: Arc<dyn EventSink> = sink.clone();
     let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
-    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+    let d = ModelSamplingDriver::new(transport, sink_for_driver, ctx(), 5)
         .without_jitter()
         .with_fusion(dispatcher, recorder);
 
@@ -935,11 +970,33 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
         !req.tools.is_empty(),
         "fused driver must advertise the dispatcher's tool specs — req.tools is EMPTY"
     );
-    let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
-        names,
+        tool_names,
         vec!["browser", "python", "shell"],
         "req.tools must carry the registered tool names, in the registry's order"
+    );
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_tools = request.payload["llm_input"]["tools"]
+        .as_array()
+        .expect("llm_input tools array");
+    assert_eq!(
+        request.payload["llm_input"]["tools_count"],
+        serde_json::json!(3)
+    );
+    assert_eq!(llm_tools[0]["name"], serde_json::json!("browser"));
+    assert_eq!(
+        llm_tools[0]["description"],
+        serde_json::json!("browser model-visible tool description")
+    );
+    assert_eq!(
+        llm_tools[0]["input_schema"],
+        serde_json::json!({"type": "object"})
     );
 }
 
