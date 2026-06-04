@@ -563,6 +563,71 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
 }
 
 #[tokio::test]
+async fn turn_request_event_carries_sanitized_llm_input_messages() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5);
+
+    let input = vec![
+        Message::new(
+            MessageRole::User,
+            vec![
+                ContentPart::text("Find the account page."),
+                ContentPart::Media {
+                    mime_type: "image/png".to_string(),
+                    data: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string()),
+                    url: None,
+                    detail: Some("low".to_string()),
+                },
+            ],
+        ),
+        Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call-1".to_string(),
+                name: "browser_script".to_string(),
+                input: serde_json::json!({
+                    "code": "goto_url('https://example.com')",
+                    "api_key": "secret-value",
+                }),
+                provider_metadata: None,
+            }],
+        ),
+    ];
+
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    assert_eq!(llm_input["message_count"], serde_json::json!(2));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(0));
+    assert_eq!(
+        llm_input["messages"][0]["content"][0]["text"],
+        serde_json::json!("Find the account page.")
+    );
+    assert_eq!(
+        llm_input["messages"][0]["content"][1]["data"],
+        serde_json::json!("[redacted inline data]")
+    );
+    assert_eq!(
+        llm_input["messages"][1]["content"][0]["input"]["api_key"],
+        serde_json::json!("[redacted]")
+    );
+    assert!(!llm_input["system"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
     let (transport, seen) =
         RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
