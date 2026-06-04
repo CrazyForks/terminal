@@ -2676,8 +2676,13 @@ impl RuntimeHandle {
             }
         }
         let agent_id = thread.agent_id().clone();
+        let browser_lease = request
+            .browser_id
+            .as_ref()
+            .map(|browser_id| self.claim_browser(browser_id, agent_id.clone()))
+            .transpose()?;
 
-        self.inner.publish_after_barrier(
+        if let Err(error) = self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentStarted, Durability::Barrier)
                 .with_agent_id(agent_id.clone())
                 .with_session_id(request.session_id.clone())
@@ -2693,8 +2698,13 @@ impl RuntimeHandle {
                     "input_source": request.input_source.clone(),
                     "resume_mode": request.resume_mode.clone(),
                 })),
-        )?;
-        self.inner.publish_after_barrier(
+        ) {
+            if let Some(lease) = browser_lease.as_ref() {
+                self.release_browser(lease)?;
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentTurnStarted, Durability::Barrier)
                 .with_agent_id(agent_id.clone())
                 .with_session_id(request.session_id.clone())
@@ -2704,7 +2714,12 @@ impl RuntimeHandle {
                     "runtime_owned": true,
                     "run_id": request.run_id.as_str(),
                 })),
-        )?;
+        ) {
+            if let Some(lease) = browser_lease.as_ref() {
+                self.release_browser(lease)?;
+            }
+            return Err(error);
+        }
         thread.live_state.begin_run(request.run_id.clone());
         thread.set_status(AgentThreadStatus::Running);
 
@@ -2725,7 +2740,7 @@ impl RuntimeHandle {
                 } else {
                     AgentThreadStatus::Failed
                 };
-                self.inner.publish_after_barrier(
+                if let Err(abort_error) = self.inner.publish_after_barrier(
                     RuntimeEvent::new(RuntimeEventKind::AgentTurnAborted, Durability::Barrier)
                         .with_agent_id(agent_id.clone())
                         .with_session_id(request.session_id.clone())
@@ -2737,14 +2752,23 @@ impl RuntimeHandle {
                             "error": format!("{error:#}"),
                             "cancelled": request.cancellation_token.is_cancelled(),
                         })),
-                )?;
+                ) {
+                    thread.live_state.finish_run();
+                    if let Some(lease) = browser_lease.as_ref() {
+                        self.release_browser(lease)?;
+                    }
+                    return Err(abort_error);
+                }
                 thread.set_status(final_status);
                 thread.live_state.finish_run();
+                if let Some(lease) = browser_lease.as_ref() {
+                    self.release_browser(lease)?;
+                }
                 return Err(error);
             }
         };
 
-        let terminal_append = self.inner.publish_after_barrier(
+        let terminal_append = match self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentTurnCompleted, Durability::Barrier)
                 .with_agent_id(agent_id.clone())
                 .with_session_id(request.session_id.clone())
@@ -2754,9 +2778,21 @@ impl RuntimeHandle {
                     "runtime_owned": true,
                     "run_id": request.run_id.as_str(),
                 })),
-        )?;
+        ) {
+            Ok(append) => append,
+            Err(error) => {
+                thread.live_state.finish_run();
+                if let Some(lease) = browser_lease.as_ref() {
+                    self.release_browser(lease)?;
+                }
+                return Err(error);
+            }
+        };
         thread.set_status(AgentThreadStatus::Completed);
         thread.live_state.finish_run();
+        if let Some(lease) = browser_lease.as_ref() {
+            self.release_browser(lease)?;
+        }
 
         Ok(RunAgentResponse {
             agent_id,
@@ -4871,6 +4907,77 @@ mod tests {
         assert!(event_types.contains(&"agent.started".to_string()));
         assert!(event_types.contains(&"agent.turn.started".to_string()));
         assert!(event_types.contains(&"agent.turn.completed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_run_agent_claims_and_releases_browser() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+        let browser_id_for_run = browser_id.clone();
+        let expected_agent_id = root.agent_id().clone();
+        let handle_for_run = handle.clone();
+
+        handle
+            .run_agent(
+                RunAgentRequest::new(root.session_id().clone())
+                    .with_agent_id(root.agent_id().clone())
+                    .with_browser_id(browser_id.clone()),
+                async move {
+                    let snapshot = handle_for_run.browsers().snapshot(&browser_id_for_run)?;
+                    assert_eq!(snapshot.active_agent_id, Some(expected_agent_id));
+                    Ok::<_, anyhow::Error>("done".to_string())
+                },
+            )
+            .await?;
+
+        let snapshot = handle.browsers().snapshot(&browser_id)?;
+        assert_eq!(snapshot.active_agent_id, None);
+        assert_eq!(snapshot.status, BrowserStatus::Released);
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"browser.claimed".to_string()));
+        assert!(event_types.contains(&"browser.released".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_run_agent_releases_browser_after_run_error() -> Result<()> {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+
+        let err = match handle
+            .run_agent(
+                RunAgentRequest::new(root.session_id().clone())
+                    .with_agent_id(root.agent_id().clone())
+                    .with_browser_id(browser_id.clone()),
+                async { Err::<String, _>(anyhow!("model exploded")) },
+            )
+            .await
+        {
+            Ok(_) => panic!("run should fail"),
+            Err(error) => error,
+        };
+
+        assert!(err.to_string().contains("model exploded"));
+        let snapshot = handle.browsers().snapshot(&browser_id)?;
+        assert_eq!(snapshot.active_agent_id, None);
+        assert_eq!(snapshot.status, BrowserStatus::Released);
         Ok(())
     }
 

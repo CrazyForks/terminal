@@ -1402,6 +1402,7 @@ fn run_session_via_engine_with_runtime(
         config,
         runtime_handle,
         tokio_util::sync::CancellationToken::new(),
+        None,
     )
 }
 
@@ -1411,13 +1412,16 @@ fn run_session_via_engine_with_runtime_and_cancel(
     mut config: ProviderRunConfig,
     runtime_handle: RuntimeHandle,
     cancellation_token: tokio_util::sync::CancellationToken,
+    browser_id: Option<BrowserId>,
 ) -> Result<String> {
     let executor = cli_runtime_agent_executor(store, runtime_handle)?;
     attach_cli_child_agent_runner(store, executor.clone(), &mut config);
-    let resolved = executor.run_blocking(
-        RuntimeAgentRunRequest::new(session_id.to_string(), config)
-            .with_cancellation_token(cancellation_token),
-    )?;
+    let mut request = RuntimeAgentRunRequest::new(session_id.to_string(), config)
+        .with_cancellation_token(cancellation_token);
+    if let Some(browser_id) = browser_id {
+        request = request.with_browser_id(browser_id);
+    }
+    let resolved = executor.run_blocking(request)?;
     Ok(resolved.session_id)
 }
 
@@ -4064,31 +4068,21 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         );
     }
 
-    let browser_lease = params
+    let browser_id = params
         .get("browser_id")
         .and_then(Value::as_str)
-        .map(|browser_id| {
-            context.runtime.claim_browser(
-                &BrowserId::from_string(browser_id.to_string())?,
-                agent_id.clone(),
-            )
-        })
+        .map(|browser_id| BrowserId::from_string(browser_id.to_string()))
         .transpose()?;
 
-    let run_result = (|| {
-        let config = sdk_provider_run_config(params, &context.store, session_id.as_str())?;
-        run_session_via_engine_with_runtime_and_cancel(
-            &context.store,
-            session_id.as_str(),
-            config,
-            context.runtime.clone(),
-            tokio_util::sync::CancellationToken::new(),
-        )
-    })();
-    if let Some(lease) = browser_lease.as_ref() {
-        context.runtime.release_browser(lease)?;
-    }
-    run_result?;
+    let config = sdk_provider_run_config(params, &context.store, session_id.as_str())?;
+    run_session_via_engine_with_runtime_and_cancel(
+        &context.store,
+        session_id.as_str(),
+        config,
+        context.runtime.clone(),
+        tokio_util::sync::CancellationToken::new(),
+        browser_id,
+    )?;
 
     let events = context.store.events_for_session(session_id.as_str())?;
     let output = session_result_from_events(&events);
@@ -6619,6 +6613,13 @@ command = "test-mcp"
             &context,
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
         );
+        let browser = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":20,"method":"browser.create","params":{"headless":true}}"#,
+        );
+        let browser_id = browser["result"]["browser_id"]
+            .as_str()
+            .context("browser id")?;
         let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
         let session_id = agent["result"]
             .get("session_id")
@@ -6630,6 +6631,7 @@ command = "test-mcp"
             "method": "agent.run",
             "params": {
                 "agent_id": agent_id,
+                "browser_id": browser_id,
                 "max_steps": 2,
                 "llm": {"provider": "fake", "model": "fake"},
                 "followups": ["extract title next"]
@@ -6662,6 +6664,15 @@ command = "test-mcp"
         assert!(
             context.store.messages_for_agent(session_id)?.is_empty(),
             "SDK followups must not enqueue Store-backed agent_messages rows"
+        );
+        let browser_snapshot = context
+            .runtime
+            .browsers()
+            .snapshot(&BrowserId::from_string(browser_id.to_string())?)?;
+        assert_eq!(browser_snapshot.active_agent_id, None);
+        assert_eq!(
+            browser_snapshot.status,
+            browser_use_runtime::BrowserStatus::Released
         );
 
         std::fs::remove_dir_all(temp)?;
