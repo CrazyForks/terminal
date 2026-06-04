@@ -758,6 +758,43 @@ async fn bounded_loop_aborts_after_max_turns() {
     ));
 }
 
+#[tokio::test]
+async fn bounded_loop_adds_progress_nudge_for_long_runs() {
+    let mut scripts: Vec<SamplingScript> = (0..50)
+        .map(|i| SamplingScript::Ok(follow_up(&format!("step {i}"))))
+        .collect();
+    scripts.push(SamplingScript::Ok(complete("done after checkpoint")));
+
+    let sampler = ScriptedSamplingDriver::new(scripts);
+    let requests = sampler.requests_handle();
+    let inputs = sampler.inputs_handle();
+    let state = InMemoryTurnState::new(Vec::new(), token_status(false));
+    let observer = RecordingObserver::new();
+
+    let turn = TurnLoop::new(state, sampler, observer.clone());
+    let out = turn
+        .run_with_max_turns(ctx(), false, CancellationToken::new(), 100)
+        .await
+        .expect("bounded long run should complete");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 51);
+    assert_eq!(out.as_deref(), Some("done after checkpoint"));
+    let recorded_inputs = inputs.lock().unwrap();
+    let Some(Message {
+        role: MessageRole::Developer,
+        content,
+        ..
+    }) = recorded_inputs[49].last()
+    else {
+        panic!("turn 50 should include the progress developer nudge");
+    };
+    assert!(
+        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("Progress checkpoint")),
+        "progress nudge should tell the agent to finalize once enough evidence exists"
+    );
+    assert_eq!(observer.kinds(), vec!["started", "complete"]);
+}
+
 // ---- (8) a hard (non-abort) sampling error propagates out of the loop ------
 
 #[tokio::test]
