@@ -170,20 +170,16 @@ impl RuntimeAgentExecutor {
                 .multi_agent_v2
                 .max_concurrent_threads_per_session,
         )?;
-        let initial_input = latest_runtime_or_store_durable_prompt_input_event(
-            &self.inner.runtime,
-            &store,
-            &runtime_session_id,
-            &request.session_id,
-        )?
-        .map(|event| {
-            json!({
-                "source": "durable_prompt_input",
-                "event_type": event.event_type,
-                "source_event_seq": event.seq,
-                "payload": event.payload,
-            })
-        });
+        let initial_input =
+            latest_runtime_durable_prompt_input_event(&self.inner.runtime, &runtime_session_id)?
+                .map(|event| {
+                    json!({
+                        "source": "durable_prompt_input",
+                        "event_type": event.event_type,
+                        "source_event_seq": event.seq,
+                        "payload": event.payload,
+                    })
+                });
         let session_meta = store
             .load_session(&request.session_id)?
             .with_context(|| format!("unknown session id: {}", request.session_id))?;
@@ -310,27 +306,13 @@ impl RuntimeAgentExecutor {
     }
 }
 
-fn latest_durable_prompt_input_event(
-    store: &Store,
-    session_id: &str,
+fn latest_runtime_durable_prompt_input_event(
+    runtime: &RuntimeHandle,
+    runtime_session_id: &RuntimeSessionId,
 ) -> Result<Option<EventRecord>> {
     Ok(latest_durable_prompt_input_from_events(
-        store.events_for_session(session_id)?,
+        runtime.events_for_session(runtime_session_id)?,
     ))
-}
-
-fn latest_runtime_or_store_durable_prompt_input_event(
-    runtime: &RuntimeHandle,
-    store: &Store,
-    runtime_session_id: &RuntimeSessionId,
-    store_session_id: &str,
-) -> Result<Option<EventRecord>> {
-    if let Some(event) =
-        latest_durable_prompt_input_from_events(runtime.events_for_session(runtime_session_id)?)
-    {
-        return Ok(Some(event));
-    }
-    latest_durable_prompt_input_event(store, store_session_id)
 }
 
 fn latest_durable_prompt_input_from_events(events: Vec<EventRecord>) -> Option<EventRecord> {
@@ -609,13 +591,8 @@ mod tests {
             Durability::Barrier,
         )?;
 
-        let selected = latest_runtime_or_store_durable_prompt_input_event(
-            &runtime,
-            &store,
-            &runtime_session_id,
-            &session.id,
-        )?
-        .context("missing selected durable input")?;
+        let selected = latest_runtime_durable_prompt_input_event(&runtime, &runtime_session_id)?
+            .context("missing selected durable input")?;
 
         assert_eq!(selected.seq, runtime_input.seq.unwrap());
         assert_eq!(selected.payload["text"], "runtime input");
@@ -623,11 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn durable_prompt_input_falls_back_to_store_when_runtime_has_none() -> Result<()> {
+    fn durable_prompt_input_does_not_fall_back_to_store_when_runtime_has_none() -> Result<()> {
         let store_dir = TempDir::new()?;
         let store = Store::open(store_dir.path())?;
         let session = store.create_session(None, Path::new("/work"))?;
-        let store_input = store.append_event(
+        store.append_event(
             &session.id,
             "session.input",
             json!({ "text": "store replay input" }),
@@ -637,16 +614,12 @@ mod tests {
         let runtime = runtime.handle();
         let runtime_session_id = create_runtime_root(&runtime, Path::new("/work"))?;
 
-        let selected = latest_runtime_or_store_durable_prompt_input_event(
-            &runtime,
-            &store,
-            &runtime_session_id,
-            &session.id,
-        )?
-        .context("missing selected durable input")?;
+        let selected = latest_runtime_durable_prompt_input_event(&runtime, &runtime_session_id)?;
 
-        assert_eq!(selected.seq, store_input.seq);
-        assert_eq!(selected.payload["text"], "store replay input");
+        assert!(
+            selected.is_none(),
+            "runtime executor must not resurrect Store-only input"
+        );
         Ok(())
     }
 
@@ -663,13 +636,8 @@ mod tests {
 
         let runtime = runtime_with_read_failing_journal();
         let runtime_session_id = create_runtime_root(&runtime, Path::new("/work"))?;
-        let error = latest_runtime_or_store_durable_prompt_input_event(
-            &runtime,
-            &store,
-            &runtime_session_id,
-            &session.id,
-        )
-        .expect_err("runtime read failures must fail closed");
+        let error = latest_runtime_durable_prompt_input_event(&runtime, &runtime_session_id)
+            .expect_err("runtime read failures must fail closed");
 
         assert!(
             format!("{error:#}").contains("forced runtime read failure"),
