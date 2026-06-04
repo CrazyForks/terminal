@@ -14582,7 +14582,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn thinking_view_explains_missing_provider_summary() -> Result<()> {
+    fn hidden_reasoning_without_summary_is_not_rendered_as_thought() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14611,15 +14611,19 @@ wire_api = "responses"
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("summary unavailable"), "{screen}");
+        assert!(!screen.contains("Thought for"), "{screen}");
+        assert!(!screen.contains("summary unavailable"), "{screen}");
 
         app.open_surface(Surface::Thinking);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("summary unavailable"), "{screen}");
         assert!(
-            screen.contains("Reasoning summary unavailable from provider."),
+            screen.contains("No reasoning summaries are available for this task."),
             "{screen}"
         );
+        assert!(screen.contains("hidden reasoning usage"), "{screen}");
+        assert!(screen.contains("35 tokens"), "{screen}");
+        assert!(!screen.contains("Thought for"), "{screen}");
+        assert!(!screen.contains("summary unavailable"), "{screen}");
         Ok(())
     }
 

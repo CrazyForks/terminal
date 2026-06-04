@@ -2250,7 +2250,7 @@ pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
 /// Build the collapsed reasoning summary for the turn that ends at `event`.
 /// The segment runs from the previous turn boundary up to and including the
 /// anchor event (so a usage event contributes its exact token count). Returns
-/// `None` when the turn produced no reasoning.
+/// `None` when the provider did not send textual reasoning summary content.
 fn thinking_summary_node_before_event(
     root: &SessionMeta,
     events: &[EventRecord],
@@ -2283,6 +2283,9 @@ fn thinking_summary_node_before_event(
     let block = thinking_blocks_for_session(segment)
         .into_iter()
         .next_back()?;
+    if block.summary_unavailable {
+        return None;
+    }
     Some(TranscriptNode {
         id: format!("{}:{}:thinking", event.session_id, event.seq),
         seq: event.seq,
