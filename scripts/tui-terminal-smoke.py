@@ -555,8 +555,77 @@ def smoke_interactive_terminal(binary: Path) -> None:
         actions = wait_for(session, "> bro", "slash-palette-filtered")
         assert_contains(actions, "/browser", "slash palette should show matching command")
         assert_not_contains(actions, "/model", "slash palette should hide non-matching commands")
-
+        tmux_send(session, "C-u")
+        wait_for(session, "/model", "slash-palette-ctrl-u-clear")
+        tmux_send_literal(session, "production")
+        production_action = wait_for(session, "> production", "slash-palette-production-filter")
+        assert_contains(
+            production_action,
+            "/go-to-production",
+            "slash palette should find go-to-production through filtering",
+        )
+        tmux_send(session, "Enter")
+        production_scale = wait_for(session, "Expected tasks per month", "go-to-production-scale")
+        assert_contains(
+            production_scale,
+            "< 10",
+            "go-to-production monthly scale should show the smallest range",
+        )
+        assert_contains(
+            production_scale,
+            "10-100",
+            "go-to-production monthly scale should show the low range",
+        )
+        assert_contains(
+            production_scale,
+            "100-1,000",
+            "go-to-production monthly scale should show the mid range",
+        )
+        assert_contains(
+            production_scale,
+            "1,000-10,000",
+            "go-to-production monthly scale should show the high range",
+        )
+        assert_contains(
+            production_scale,
+            "10,000+",
+            "go-to-production monthly scale should show the largest range",
+        )
+        assert_not_contains(
+            production_scale,
+            "Use type",
+            "go-to-production should not ask for personal or business use type",
+        )
+        assert_not_contains(
+            production_scale,
+            "Personal",
+            "go-to-production should not ask for personal use",
+        )
+        assert_not_contains(
+            production_scale,
+            "Business",
+            "go-to-production should not ask for business use",
+        )
+        assert_not_contains(
+            production_scale,
+            "Continue",
+            "go-to-production monthly scale should not duplicate the footer continue action",
+        )
+        assert_not_contains(
+            production_scale,
+            "Cancel",
+            "go-to-production monthly scale should not duplicate the footer close action",
+        )
+        tmux_send_literal(session, "4")
+        production_typed = wait_for(session, "1,000-10,000", "go-to-production-range-selected")
+        assert_contains(
+            production_typed,
+            "> 4. 1,000-10,000",
+            "go-to-production modal should accept a range shortcut",
+        )
         tmux_send(session, "Escape")
+        wait_for(session, "Type to steer the agent", "main-after-go-to-production")
+
         after_slash = capture_after_idle(session, "main-after-slash-palette", visible_only=True)
         assert_contains(after_slash, "Type to steer the agent", "slash escape should restore main composer")
         assert_not_contains(after_slash, "> bro", "slash escape should clear the slash filter")
