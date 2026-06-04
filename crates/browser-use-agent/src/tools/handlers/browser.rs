@@ -392,6 +392,7 @@ impl RealBackend {
             .filter(|mode| !mode.is_empty())
             .map(|mode| match mode {
                 "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
+                "remote-cdp" | "cdp" => "remote-cdp",
                 "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
                 other => other,
             })
@@ -411,6 +412,8 @@ impl RealBackend {
                 | ["remote", "start", ..]
                 | ["browser", "remote", "stop", ..]
                 | ["remote", "stop", ..]
+                | ["browser", "connect", "remote-cdp", ..]
+                | ["connect", "remote-cdp", ..]
         )
     }
 
@@ -466,6 +469,20 @@ impl RealBackend {
                     return Ok(events);
                 }
                 "browser connect managed --headless"
+            }
+            "remote-cdp" => {
+                if connected && current_mode == Some("remote-cdp") {
+                    return Ok(events);
+                }
+                let desired_command = remote_cdp_connect_command()?;
+                let mut started = browser_use_browser::run_browser_command(
+                    session_id,
+                    cwd,
+                    artifact_dir,
+                    &desired_command,
+                )?;
+                events.append(&mut started.events);
+                return Ok(events);
             }
             _ => return Ok(events),
         };
@@ -615,10 +632,12 @@ fn dispatch_browser_preference(
     selected_browser_mode: Option<&str>,
 ) -> anyhow::Result<Value> {
     match args.get(1).map(String::as_str) {
-        None | Some("--json") | Some("show") => browser_preference_json(store),
+        None | Some("--json") | Some("show") => {
+            browser_preference_json(store, selected_browser_mode)
+        }
         Some("use") => {
             let mode = args.get(2).map(String::as_str).ok_or_else(|| {
-                anyhow!("browser preference use requires <local|cloud|managed-headless>")
+                anyhow!("browser preference use requires <local|cloud|managed-headless|remote-cdp>")
             })?;
             let normalized = normalize_browser_preference_mode(mode)?;
             enforce_selected_browser_mode(selected_browser_mode, normalized)?;
@@ -626,7 +645,7 @@ fn dispatch_browser_preference(
             store.set_setting("browser", browser_display_name(normalized))?;
             Ok(json!({
                 "status": "ok",
-                "preference": browser_preference_json(store)?,
+                "preference": browser_preference_json(store, selected_browser_mode)?,
                 "next_step": "browser connect",
             }))
         }
@@ -644,7 +663,7 @@ fn dispatch_browser_profile_preference(
     selected_browser_mode: Option<&str>,
 ) -> anyhow::Result<Value> {
     match args.get(1).map(String::as_str) {
-        Some("current") => browser_preference_json(store),
+        Some("current") => browser_preference_json(store, selected_browser_mode),
         Some("use") => {
             enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let profile_id = args
@@ -751,7 +770,7 @@ fn dispatch_browser_profile_preference(
             }))
         }
         Some(other) => bail!("unknown browser profile command: {other}"),
-        None => browser_preference_json(store),
+        None => browser_preference_json(store, selected_browser_mode),
     }
 }
 
@@ -772,10 +791,7 @@ fn resolve_browser_command_for_selected_mode(
                 .transpose()?
                 .flatten()
         };
-        Ok(browser_connect_command_for_mode(
-            effective_mode,
-            profile_id.as_deref(),
-        ))
+        browser_connect_command_for_mode(effective_mode, profile_id.as_deref())
     } else {
         enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
         Ok(cmd.to_string())
@@ -812,9 +828,41 @@ fn preferred_browser_mode(store: Option<&Store>) -> anyhow::Result<&'static str>
     normalize_browser_preference_mode(&mode)
 }
 
-fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> String {
+fn remote_cdp_connect_command() -> anyhow::Result<String> {
+    if let Some(ws) = env_trimmed("BU_CDP_WS") {
+        return Ok(remote_cdp_connect_command_for_endpoint(&ws));
+    }
+    if let Some(url) = env_trimmed("BU_CDP_URL") {
+        return Ok(remote_cdp_connect_command_for_endpoint(&url));
+    }
+    bail!("browser mode is locked to Remote CDP, but BU_CDP_URL or BU_CDP_WS is not set")
+}
+
+fn remote_cdp_connect_command_for_endpoint(endpoint: &str) -> String {
+    let flag = if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        "--ws"
+    } else {
+        "--url"
+    };
+    format!(
+        "browser connect remote-cdp {flag} {}",
+        shell_quote_browser_arg(endpoint)
+    )
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn browser_connect_command_for_mode(
+    mode: &str,
+    profile_id: Option<&str>,
+) -> anyhow::Result<String> {
     match normalize_browser_preference_mode(mode).unwrap_or("local") {
-        "cloud" => profile_id.filter(|value| !value.is_empty()).map_or_else(
+        "cloud" => Ok(profile_id.filter(|value| !value.is_empty()).map_or_else(
             || "browser remote start".to_string(),
             |profile_id| {
                 format!(
@@ -822,10 +870,11 @@ fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> Str
                     shell_quote_browser_arg(profile_id)
                 )
             },
-        ),
-        "managed-headless" => "browser connect managed --headless".to_string(),
-        "managed-headed" => "browser connect managed --headed".to_string(),
-        _ => "browser connect local".to_string(),
+        )),
+        "managed-headless" => Ok("browser connect managed --headless".to_string()),
+        "managed-headed" => Ok("browser connect managed --headed".to_string()),
+        "remote-cdp" => remote_cdp_connect_command(),
+        _ => Ok("browser connect local".to_string()),
     }
 }
 
@@ -879,10 +928,7 @@ fn enforce_browser_command_matches_selected_mode(
                     };
                 enforce_selected_browser_mode(Some(selected_mode), requested_mode)
             }
-            Some("remote-cdp") => bail!(
-                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
-                browser_display_name(selected_mode),
-            ),
+            Some("remote-cdp") => enforce_selected_browser_mode(Some(selected_mode), "remote-cdp"),
             Some(other) => bail!("unknown browser connect mode: {other}"),
         },
         "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
@@ -906,18 +952,34 @@ fn has_browser_arg(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
-fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
-    let mode = store
-        .get_setting(BROWSER_PREF_MODE)?
-        .or_else(|| {
-            store
-                .get_setting("browser")
-                .ok()
-                .flatten()
-                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
-        })
-        .unwrap_or_else(|| "local".to_string());
-    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+fn browser_preference_json(
+    store: &Store,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Value> {
+    let selected_mode = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_browser_preference_mode)
+        .transpose()?;
+    let mode = selected_mode.map(ToOwned::to_owned).unwrap_or_else(|| {
+        store
+            .get_setting(BROWSER_PREF_MODE)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                store
+                    .get_setting("browser")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+            })
+            .unwrap_or_else(|| "local".to_string())
+    });
+    let profile_id = if selected_mode.is_some() {
+        None
+    } else {
+        store.get_setting(BROWSER_PREF_PROFILE)?
+    };
     let domain_profiles = store
         .list_settings()?
         .into_iter()
@@ -936,13 +998,18 @@ fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
         "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
         "profile_id": profile_id,
         "domain_profiles": domain_profiles,
-        "connect_command": match normalize_browser_preference_mode(&mode)? {
-            "cloud" => "browser remote start",
-            "managed-headless" => "browser connect managed --headless",
-            "managed-headed" => "browser connect managed --headed",
-            _ => "browser connect local",
-        },
+        "connect_command": browser_connect_command_display_for_mode(&mode, profile_id.as_deref())?,
     }))
+}
+
+fn browser_connect_command_display_for_mode(
+    mode: &str,
+    profile_id: Option<&str>,
+) -> anyhow::Result<String> {
+    match normalize_browser_preference_mode(mode)? {
+        "remote-cdp" => Ok("browser connect remote-cdp --url <BU_CDP_URL>".to_string()),
+        _ => browser_connect_command_for_mode(mode, profile_id),
+    }
 }
 
 fn remembered_domain_profile(store: &Store, domain: &str) -> anyhow::Result<Option<Value>> {
@@ -1045,6 +1112,7 @@ fn browser_profile_connect_next_step(mode: &str, profile_id: Option<&str>) -> St
         ),
         "managed-headless" => "browser connect managed --headless".to_string(),
         "managed-headed" => "browser connect managed --headed".to_string(),
+        "remote-cdp" => "browser connect remote-cdp --url <BU_CDP_URL>".to_string(),
         _ => profile_id.map_or_else(
             || "browser connect local".to_string(),
             |profile_id| {
@@ -1062,6 +1130,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
     match normalized.as_str() {
         "local" | "local-chrome" => Ok("local"),
         "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "remote-cdp" | "cdp" => Ok("remote-cdp"),
         "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
         "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
         other => bail!("unknown browser preference mode: {other}"),
@@ -1071,6 +1140,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
 fn browser_display_name(mode: &str) -> &'static str {
     match mode {
         "cloud" => "Browser Use cloud",
+        "remote-cdp" => "Remote CDP",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
         _ => "Local Chrome",
@@ -1080,6 +1150,7 @@ fn browser_display_name(mode: &str) -> &'static str {
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
         "Browser Use cloud" => Some("cloud"),
+        "Remote CDP" => Some("remote-cdp"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
         "Local Chrome" => Some("local"),

@@ -12,6 +12,7 @@
 //! parallel_safe = false; (4) backend error -> ToolError; (5) an
 //! orchestrator-driven run with the fake backend.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +57,29 @@ struct FakeBackend {
     last_timeout_secs: Mutex<Option<u64>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 impl FakeBackend {
@@ -315,6 +339,29 @@ async fn bare_browser_connect_resolves_to_selected_cloud_mode() {
     assert_eq!(
         backend.last(),
         LastCall::Command("browser remote start".to_string())
+    );
+}
+
+#[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_remote_cdp_mode() {
+    let _guard = EnvVarGuard::set(
+        "BU_CDP_URL",
+        "ws://127.0.0.1:9222/devtools/browser/session-id",
+    );
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("remote-cdp".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser connect remote-cdp --ws ws://127.0.0.1:9222/devtools/browser/session-id"
+                .to_string()
+        )
     );
 }
 
