@@ -366,6 +366,37 @@ async fn bare_browser_connect_resolves_to_selected_remote_cdp_mode() {
 }
 
 #[tokio::test]
+async fn selected_remote_cdp_rewrites_wrong_browser_family_commands() {
+    let _guard = EnvVarGuard::set(
+        "BU_CDP_URL",
+        "ws://127.0.0.1:9222/devtools/browser/session-id",
+    );
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("remote-cdp".to_string()));
+
+    for command in [
+        "browser connect managed --headed",
+        "browser connect managed --headless",
+        "browser connect local",
+        "browser remote start",
+    ] {
+        let req = BrowserRequest::command("sess-1", command);
+        let out = run_direct(&tool, &req).await.unwrap();
+
+        assert_eq!(out.exit_code, 0, "{command}");
+        assert_eq!(
+            backend.last(),
+            LastCall::Command(
+                "browser connect remote-cdp --ws ws://127.0.0.1:9222/devtools/browser/session-id"
+                    .to_string()
+            ),
+            "{command}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn selected_browser_mode_rejects_wrong_connection_family() {
     let backend = Arc::new(FakeBackend::default());
     let tool =

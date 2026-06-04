@@ -89,6 +89,15 @@ fn browser_mode_instruction_matches_main_local_connection_guidance() {
     assert!(prompt.contains("browser local setup"));
 }
 
+#[test]
+fn browser_mode_instruction_guides_remote_cdp_to_direct_page_work() {
+    let prompt = browser_mode_instruction("remote-cdp");
+    assert!(prompt.contains("Selected browser mode: Remote CDP"));
+    assert!(prompt.contains("already provides the browser endpoint"));
+    assert!(prompt.contains("Start page work directly with `browser_script`"));
+    assert!(prompt.contains("Do not call `browser connect managed`"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
