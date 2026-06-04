@@ -121,13 +121,34 @@ fn build_message(message: &Message) -> Result<Value, LlmError> {
         }
     };
 
-    let content: Result<Vec<Value>, LlmError> =
-        message.content.iter().map(build_content_block).collect();
+    let mut content: Vec<Value> = message
+        .content
+        .iter()
+        .map(build_content_block)
+        .collect::<Result<Vec<Value>, LlmError>>()?;
+    apply_cache_control_to_last_content_block(&mut content, message.cache);
 
     Ok(json!({
         "role": role,
-        "content": content?,
+        "content": content,
     }))
+}
+
+fn apply_cache_control_to_last_content_block(content: &mut [Value], cache: Option<CacheHint>) {
+    let Some(cache) = cache else {
+        return;
+    };
+
+    for block in content.iter_mut().rev() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) == Some("image") {
+            continue;
+        }
+        obj.insert("cache_control".to_string(), cache_control(cache));
+        break;
+    }
 }
 
 /// Translate a canonical [`ContentPart`] into an Anthropic content block.
@@ -699,6 +720,8 @@ mod tests {
         let mut system = SystemPart::new("Stable system prompt.");
         system.cache = Some(CacheHint::Ephemeral);
         req.system.push(system);
+        req.messages
+            .push(Message::user_text("Current browser state.").with_cache(CacheHint::Ephemeral));
         for name in ["first_tool", "last_tool"] {
             req.tools.push(ToolDefinition {
                 name: name.into(),
@@ -714,6 +737,10 @@ mod tests {
 
         assert_eq!(
             body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
             json!({ "type": "ephemeral" })
         );
         assert!(body["tools"][0].get("cache_control").is_none());

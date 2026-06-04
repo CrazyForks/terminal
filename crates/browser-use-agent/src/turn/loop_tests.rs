@@ -738,6 +738,7 @@ async fn bounded_loop_aborts_after_max_turns() {
     let Some(Message {
         role: MessageRole::Developer,
         content,
+        ..
     }) = recorded_inputs[1].last()
     else {
         panic!("last bounded request should include final-step developer nudge");

@@ -544,9 +544,11 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
     );
     // And it must be EXACTLY the input the driver was asked to sample, with the
     // turn's model/provider identity from `ctx()`.
+    let mut expected_messages = input.clone();
+    expected_messages.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
     assert_eq!(
-        req.messages, input,
-        "open_stream must receive the driver's per-call input messages verbatim"
+        req.messages, expected_messages,
+        "open_stream must receive the driver's per-call input messages with the current-state cache hint"
     );
     // `req.model`/`req.provider` are the `ModelId`/`ProviderId` newtypes; compare
     // against the same `.into()` conversion `LlmRequest::new` applies to `ctx()`.
@@ -564,6 +566,11 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
         req.system.first().and_then(|part| part.cache),
         Some(CacheHint::Ephemeral),
         "stable base system prompt should be cacheable for providers that support prompt caching"
+    );
+    assert_eq!(
+        req.messages.last().and_then(|message| message.cache),
+        Some(CacheHint::Ephemeral),
+        "latest browser-state message should be cacheable like the Python Anthropic serializer"
     );
 }
 
