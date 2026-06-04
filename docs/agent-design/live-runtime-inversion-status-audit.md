@@ -73,6 +73,10 @@ BrowserUseRuntime
   close.
 - Browser metadata leases exist in `BrowserManager`, including barrier tests for
   claim failure and same-browser ownership conflicts.
+- The TUI projection cache overlays live session status from the runtime snapshot
+  before calling `project_workbench`, so running/terminal runtime status can
+  correct stale Store `SessionMeta` without mutating SQLite. Runtime `Created`
+  does not resurrect a terminal Store session.
 
 ## What Is Still Not The Final Architecture
 
@@ -99,8 +103,9 @@ BrowserUseRuntime
   `browser_script` execution is not fully routed through a stateful
   `BrowserHandle` with script registry, artifacts, cancellation, and crash/lost
   resource semantics.
-- TUI uses runtime for live cancellation/follow-up/mailbox counts, but active
-  rendering is still substantially Store/history-cache based. A true
+- TUI uses runtime for live cancellation/follow-up/mailbox counts and now
+  overlays live session status from runtime snapshots, but active rendering is
+  still substantially Store/history-cache based. A true
   `RuntimeEventProjection` state machine is not the TUI authority yet.
 - Replay materialization restores important mailbox/live counters, but full
   crash recovery still does not hydrate every durable graph field or explicitly

@@ -117,6 +117,22 @@ pub(crate) fn runtime_active_child_session_count(
     ))
 }
 
+pub(crate) fn runtime_agent_statuses(
+    state_dir: &Path,
+) -> Result<Option<HashMap<String, AgentThreadStatus>>> {
+    let Some(handle) = existing_tui_runtime_handle(state_dir)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        handle
+            .snapshot()
+            .agents
+            .into_iter()
+            .map(|agent| (agent.session_id.as_str().to_string(), agent.status))
+            .collect(),
+    ))
+}
+
 fn runtime_agent_status_is_active(status: &AgentThreadStatus) -> bool {
     matches!(
         status,

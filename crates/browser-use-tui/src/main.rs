@@ -1122,6 +1122,31 @@ impl AppStateCache {
         Ok(true)
     }
 
+    fn apply_runtime_session_statuses(
+        &mut self,
+        statuses: &HashMap<String, browser_use_runtime::AgentThreadStatus>,
+    ) -> bool {
+        let mut changed = false;
+        for session in &mut self.sessions {
+            let Some(runtime_status) = statuses.get(&session.id) else {
+                continue;
+            };
+            let Some(next_status) =
+                runtime_status_overlay_for_store_status(&session.status, runtime_status)
+            else {
+                continue;
+            };
+            if session.status != next_status {
+                session.status = next_status;
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_changed();
+        }
+        changed
+    }
+
     fn upsert_session(&mut self, session: SessionMeta) -> bool {
         if let Some(existing) = self
             .sessions
@@ -1220,6 +1245,26 @@ impl AppStateCache {
             .get(session_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+}
+
+fn runtime_status_overlay_for_store_status(
+    store_status: &SessionStatus,
+    runtime_status: &browser_use_runtime::AgentThreadStatus,
+) -> Option<SessionStatus> {
+    match runtime_status {
+        browser_use_runtime::AgentThreadStatus::Queued
+        | browser_use_runtime::AgentThreadStatus::Running
+        | browser_use_runtime::AgentThreadStatus::Cancelling => Some(SessionStatus::Running),
+        browser_use_runtime::AgentThreadStatus::Completed => Some(SessionStatus::Done),
+        browser_use_runtime::AgentThreadStatus::Failed => Some(SessionStatus::Failed),
+        browser_use_runtime::AgentThreadStatus::Cancelled => Some(SessionStatus::Cancelled),
+        browser_use_runtime::AgentThreadStatus::Closed => {
+            store_status.is_active().then_some(SessionStatus::Cancelled)
+        }
+        browser_use_runtime::AgentThreadStatus::Created => {
+            store_status.is_active().then(|| store_status.clone())
+        }
     }
 }
 
@@ -1891,6 +1936,7 @@ impl App {
     }
 
     fn refresh_cached_projection(&mut self) -> &WorkbenchState {
+        self.apply_runtime_status_overlay();
         let selected_session_id = self.selected_session_id.clone();
         let browser = self.browser.clone();
         let history_tasks_visible = self.history_tasks_are_visible();
@@ -1899,6 +1945,13 @@ impl App {
             &browser,
             history_tasks_visible,
         )
+    }
+
+    fn apply_runtime_status_overlay(&mut self) -> bool {
+        let Ok(Some(statuses)) = runtime::runtime_agent_statuses(&self.args.state_dir) else {
+            return false;
+        };
+        self.state_cache.apply_runtime_session_statuses(&statuses)
     }
 
     fn drain_store_notifications(&mut self) -> Result<bool> {
@@ -12715,6 +12768,84 @@ wire_api = "responses"
         assert!(text.contains("subagent results ready"), "{text}");
         assert!(text.contains("(1 subagent result queued)"), "{text}");
         assert!(!text.contains("Working..."), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_overlay_marks_live_running_session_without_store_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep running"}),
+        )?;
+        app.store
+            .set_status(&session.id, browser_use_protocol::SessionStatus::Done)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        let thread = runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(session.id.clone())?,
+            cwd,
+            task: "keep running".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        thread.set_status(browser_use_runtime::AgentThreadStatus::Running);
+
+        let state = app.workbench_state()?;
+        assert_eq!(
+            state
+                .current_session
+                .as_ref()
+                .map(|session| &session.status),
+            Some(&SessionStatus::Running)
+        );
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Done),
+            "runtime overlay must not mutate durable SQLite history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_created_status_does_not_reactivate_terminal_store_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "done parent"}),
+        )?;
+        app.store
+            .set_status(&session.id, browser_use_protocol::SessionStatus::Done)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(session.id.clone())?,
+            cwd,
+            task: "done parent".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let state = app.workbench_state()?;
+        assert_eq!(
+            state
+                .current_session
+                .as_ref()
+                .map(|session| &session.status),
+            Some(&SessionStatus::Done)
+        );
         Ok(())
     }
 
