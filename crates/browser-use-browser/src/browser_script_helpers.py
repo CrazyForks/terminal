@@ -441,12 +441,10 @@ def ensure_real_tab():
     tabs = list_tabs(include_chrome=False)
     if not tabs:
         return None
-    try:
-        current = current_tab()
-        if current["url"] and not current["url"].startswith(INTERNAL):
-            return current
-    except Exception:
-        pass
+    # Do not probe the currently attached target before selecting a real tab.
+    # Connect can initially attach to chrome://newtab or another internal page;
+    # probing that target with Runtime.evaluate can block until the CDP timeout.
+    # Target.getTargets already gives us URLs, so choose a usable page first.
     switch_tab(tabs[0])
     return tabs[0]
 
