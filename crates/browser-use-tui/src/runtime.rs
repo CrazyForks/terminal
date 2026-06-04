@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
+use browser_use_agent::config_overrides::ChildAgentCompletionHandler;
 use browser_use_agent::config_overrides::{
     load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
     resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
-    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentCompletionHandler,
-    ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides,
-    ProviderRunConfig,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
 };
 use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
