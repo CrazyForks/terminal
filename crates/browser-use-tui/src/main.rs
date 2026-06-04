@@ -3528,7 +3528,7 @@ impl App {
         if !query.is_empty() {
             let mut entries = Vec::new();
             let exact = usable.iter().any(|model| model.id == typed);
-            if !exact && self.selected_provider == Some(ACCOUNT_OPENROUTER) {
+            if !exact && self.model_search_has_filter_input() {
                 // Offer the raw typed id so any valid model can be submitted.
                 entries.push(ModelSearchEntry::Item(typed.clone()));
             }
@@ -12709,6 +12709,40 @@ wire_api = "responses"
             .model_search_rows()
             .iter()
             .any(|id| id == "not-a-real-openai-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn non_openai_searchable_providers_allow_typed_model_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+        app.composer.set_input("claude-custom-local".to_string());
+
+        assert!(app.model_search_has_filter_input());
+        assert_eq!(
+            app.model_search_rows().first().map(String::as_str),
+            Some("claude-custom-local")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_curated_model_list_scrolls_without_phantom_search_header() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.select_provider(settings::ACCOUNT_OPENAI)?;
+        app.args.height = 10;
+        app.selected_row = app.model_search_row_count().saturating_sub(1);
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("gpt-5.3-codex"));
+        assert!(
+            !screen.contains("gpt-5.5\n"),
+            "top OpenAI row should scroll away instead of being pinned as a hidden search header:\n{screen}"
+        );
         Ok(())
     }
 

@@ -2740,8 +2740,10 @@ fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    // Pin the query-input line (index 0) so the caret stays visible.
-    crop_model_lines(lines, app.selected_row, height, 1)
+    // Pin the query-input line (index 0) only when the provider has one, so
+    // plain curated lists scroll every row normally.
+    let pinned_head = usize::from(app.model_search_has_filter_input());
+    crop_model_lines(lines, app.selected_row, height, pinned_head)
 }
 
 /// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
