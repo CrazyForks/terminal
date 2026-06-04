@@ -71,6 +71,10 @@ BrowserUseRuntime
 - SDK JSON-RPC request lifecycle is hardened for serialized writes,
   cancellation cleanup, notification writes, and pending-future failure on
   close.
+- SDK JSON-RPC now exposes `runtime.snapshot` and `agent.snapshot`, forwards
+  projected runtime events separately from raw debug events, and Python
+  `Agent.stream()` consumes the projected event queue after yielding an initial
+  agent snapshot.
 - Browser metadata leases exist in `BrowserManager`, including barrier tests for
   claim failure and same-browser ownership conflicts.
 - The TUI projection cache overlays live session status from the runtime snapshot
@@ -105,8 +109,10 @@ BrowserUseRuntime
   resource semantics.
 - TUI uses runtime for live cancellation/follow-up/mailbox counts and now
   overlays live session status from runtime snapshots, but active rendering is
-  still substantially Store/history-cache based. A true
-  `RuntimeEventProjection` state machine is not the TUI authority yet.
+  still substantially Store/history-cache based. The SDK consumes projected
+  events for `Agent.stream()`, but a true `RuntimeEventProjection` state machine
+  is not the TUI authority yet and projection is still mostly a typed event
+  mapper rather than a complete state reducer.
 - Replay materialization restores important mailbox/live counters, but full
   crash recovery still does not hydrate every durable graph field or explicitly
   journal every stale live resource as lost/orphaned.

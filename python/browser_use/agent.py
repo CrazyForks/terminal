@@ -93,7 +93,11 @@ class Agent:
             await self._ensure_created()
             params = self._run_params(max_steps)
             assert self.session_id is not None
-            queue = self.browser.runtime.event_queue(self.session_id)
+            queue = self.browser.runtime.projected_event_queue(self.session_id)
+            snapshot = await self.browser.runtime.call(
+                "agent.snapshot", {"agent_id": self.agent_id}
+            )
+            yield {"type": "agent.snapshot", "snapshot": snapshot}
             run_task = asyncio.create_task(self.browser.runtime.call("agent.run", params))
             self._active_run_id = self.session_id
             try:
@@ -111,6 +115,15 @@ class Agent:
                         for task in pending:
                             task.cancel()
                         result = run_task.result()
+                        for event in _drain_queue(queue):
+                            yield event
+                        try:
+                            event = await asyncio.wait_for(queue.get(), timeout=0.05)
+                            yield event
+                            for event in _drain_queue(queue):
+                                yield event
+                        except asyncio.TimeoutError:
+                            pass
                         history = AgentHistoryList.from_protocol(
                             result or {},
                             output_model_schema=self.output_model_schema,
@@ -198,3 +211,12 @@ def _schema_for_model(model: Type[Any]) -> Optional[Dict[str, Any]]:
     if hasattr(model, "schema"):
         return model.schema()
     return None
+
+
+def _drain_queue(queue: asyncio.Queue[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    drained: List[Dict[str, Any]] = []
+    while True:
+        try:
+            drained.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return drained

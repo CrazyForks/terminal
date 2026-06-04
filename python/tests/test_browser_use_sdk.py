@@ -19,6 +19,7 @@ class FakeRuntime:
         self.next_browser = 1
         self.next_agent = 1
         self.queues: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
+        self.projected_queues: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
 
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = dict(params or {})
@@ -31,16 +32,31 @@ class FakeRuntime:
             agent_id = f"agent-{self.next_agent}"
             self.next_agent += 1
             return {"agent_id": agent_id, "session_id": f"session-{self.next_agent}"}
+        if method == "agent.snapshot":
+            return {
+                "agent_id": payload.get("agent_id", "agent-1"),
+                "session_id": "session-2",
+                "status": "created",
+                "live": {"pending_mailbox_count": 0},
+            }
         if method == "agent.run":
             if self.run_delay:
-                queue = self.event_queue("session-2")
-                queue.put_nowait({"kind": "agent_started"})
+                queue = self.projected_event_queue("session-2")
+                queue.put_nowait(
+                    {
+                        "kind": "thread_status_changed",
+                        "payload": {"status": "running"},
+                    }
+                )
                 await asyncio.sleep(self.run_delay)
             return self.run_result
         return {}
 
     def event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
         return self.queues.setdefault(run_id, asyncio.Queue())
+
+    def projected_event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
+        return self.projected_queues.setdefault(run_id, asyncio.Queue())
 
 
 def test_llm_protocol_preserves_model_options() -> None:
@@ -124,7 +140,8 @@ async def _test_agent_stream_yields_runtime_events_and_final_history() -> None:
 
     events = [event async for event in agent.stream(max_steps=4)]
 
-    assert events[0]["kind"] == "agent_started"
+    assert events[0]["type"] == "agent.snapshot"
+    assert events[1]["kind"] == "thread_status_changed"
     assert events[-1]["type"] == "agent.completed"
     assert events[-1]["output"] == "streamed"
     assert events[-1]["history"].final_result() == "streamed"
@@ -149,6 +166,29 @@ def test_runtime_client_routes_agent_events_by_run_and_session_id() -> None:
 
     assert runtime.event_queue("run-1").get_nowait() == {"kind": "agent_started"}
     assert runtime.event_queue("session-1").get_nowait() == {"kind": "agent_started"}
+
+
+def test_runtime_client_routes_projected_agent_events_by_run_and_session_id() -> None:
+    runtime = RuntimeClient(command=["unused"])
+
+    runtime._handle_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "agent.projected_event",
+            "params": {
+                "run_id": "run-1",
+                "session_id": "session-1",
+                "event": {"kind": "thread_status_changed"},
+            },
+        }
+    )
+
+    assert runtime.projected_event_queue("run-1").get_nowait() == {
+        "kind": "thread_status_changed"
+    }
+    assert runtime.projected_event_queue("session-1").get_nowait() == {
+        "kind": "thread_status_changed"
+    }
 
 
 def test_runtime_client_cancelled_call_removes_pending_request() -> None:
@@ -241,6 +281,9 @@ async def _test_runtime_client_round_trips_against_sdk_server_binary(tmp_path: P
     binary = Path("target/debug/browser-use-terminal")
     if not binary.exists():
         pytest.skip("Rust SDK server binary is not built")
+    source = Path("crates/browser-use-cli/src/main.rs")
+    if source.exists() and binary.stat().st_mtime < source.stat().st_mtime:
+        pytest.skip("Rust SDK server binary is stale")
 
     runtime = RuntimeClient(command=[str(binary), "--state-dir", str(tmp_path), "sdk-server", "--transport", "stdio"])
     try:
@@ -250,6 +293,8 @@ async def _test_runtime_client_round_trips_against_sdk_server_binary(tmp_path: P
         agent = await runtime.call("agent.create", {"task": "inspect", "cwd": str(tmp_path)})
         assert agent["agent_id"]
         assert agent["session_id"]
+        snapshot = await runtime.call("agent.snapshot", {"agent_id": agent["agent_id"]})
+        assert snapshot["agent_id"] == agent["agent_id"]
 
         sdk_browser = Browser(_runtime=runtime)  # type: ignore[arg-type]
         sdk_agent = Agent(
@@ -270,5 +315,10 @@ async def _test_runtime_client_round_trips_against_sdk_server_binary(tmp_path: P
             observed.append(queue.get_nowait())
         assert observed
         assert any(event.get("kind") in {"agent_created", "store_event_appended"} for event in observed)
+        projected_queue = runtime.projected_event_queue(sdk_agent.session_id)
+        projected = []
+        while not projected_queue.empty():
+            projected.append(projected_queue.get_nowait())
+        assert any(event.get("kind") == "thread_status_changed" for event in projected)
     finally:
         await runtime.close()

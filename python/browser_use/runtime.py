@@ -33,6 +33,7 @@ class RuntimeClient:
         self._write_lock = asyncio.Lock()
         self._pending: Dict[int, asyncio.Future[Any]] = {}
         self._events: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
+        self._projected_events: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
         self.stderr_lines: List[str] = []
 
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -109,6 +110,9 @@ class RuntimeClient:
     def event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
         return self._events.setdefault(run_id, asyncio.Queue())
 
+    def projected_event_queue(self, run_id: str) -> asyncio.Queue[Dict[str, Any]]:
+        return self._projected_events.setdefault(run_id, asyncio.Queue())
+
     async def _read_stdout(self) -> None:
         assert self._process is not None
         assert self._process.stdout is not None
@@ -163,6 +167,17 @@ class RuntimeClient:
                 self.event_queue(run_id).put_nowait(event)
             if isinstance(session_id, str) and session_id != run_id:
                 self.event_queue(session_id).put_nowait(event)
+            return
+
+        if message.get("method") == "agent.projected_event":
+            params = message.get("params") or {}
+            run_id = params.get("run_id")
+            session_id = params.get("session_id")
+            event = params.get("event") or {}
+            if isinstance(run_id, str):
+                self.projected_event_queue(run_id).put_nowait(event)
+            if isinstance(session_id, str) and session_id != run_id:
+                self.projected_event_queue(session_id).put_nowait(event)
 
     def _fail_all(self, error: BaseException) -> None:
         for future in self._pending.values():

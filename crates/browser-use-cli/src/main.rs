@@ -71,7 +71,8 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, FailAgentRequest, LiveThreadPersistence,
     LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RuntimeEventProjection, RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
+    SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -3827,6 +3828,7 @@ fn sdk_server_stdio(store: &Store) -> Result<()> {
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
+                                let projected = RuntimeEventProjection::project(&event);
                                 let session_id =
                                     event.session_id.as_ref().map(|id| id.as_str().to_string());
                                 let run_id = event
@@ -3840,10 +3842,23 @@ fn sdk_server_stdio(store: &Store) -> Result<()> {
                                     "jsonrpc": "2.0",
                                     "method": "agent.event",
                                     "params": {
+                                        "run_id": run_id.clone(),
+                                        "session_id": session_id.clone(),
+                                        "agent_id": agent_id.clone(),
+                                        "event": event,
+                                    },
+                                });
+                                if response_tx.send(notification).is_err() {
+                                    break;
+                                }
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "agent.projected_event",
+                                    "params": {
                                         "run_id": run_id,
                                         "session_id": session_id,
                                         "agent_id": agent_id,
-                                        "event": event,
+                                        "event": projected,
                                     },
                                 });
                                 if response_tx.send(notification).is_err() {
@@ -3920,9 +3935,11 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     let id = request.id;
     let result = match request.method.as_str() {
         "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
         "agent.create" => sdk_agent_create(context, &request.params),
+        "agent.snapshot" => sdk_agent_snapshot(context, &request.params),
         "agent.run" => sdk_agent_run(context, &request.params),
         "agent.stop" => sdk_agent_stop(context, &request.params),
         "agent.close" => sdk_agent_close(context, &request.params),
@@ -3939,6 +3956,10 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         }
         Err(error) => json_rpc_error(id, -32000, error.to_string()),
     }
+}
+
+fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
+    Ok(serde_json::to_value(runtime.snapshot())?)
 }
 
 fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> {
@@ -4007,6 +4028,25 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
         "agent_id": agent.agent_id().as_str(),
         "session_id": agent.session_id().as_str(),
     }))
+}
+
+fn sdk_agent_snapshot(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    if let Some(agent_id) = params.get("agent_id").and_then(Value::as_str) {
+        let agent_id = AgentId::from_string(agent_id.to_string())?;
+        return Ok(serde_json::to_value(
+            context.runtime.snapshot_agent(&agent_id)?,
+        )?);
+    }
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .context("agent.snapshot requires string param `agent_id` or `session_id`")?;
+    let agent_id = context
+        .runtime
+        .agent_id_for_session(&SessionId::from_string(session_id.to_string())?)?;
+    Ok(serde_json::to_value(
+        context.runtime.snapshot_agent(&agent_id)?,
+    )?)
 }
 
 fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
@@ -6610,6 +6650,14 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
         );
         assert_eq!(ping["result"]["ok"], true);
+        let snapshot = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
+        );
+        assert_eq!(
+            snapshot["result"]["agents"].as_array().map(Vec::len),
+            Some(0)
+        );
 
         let browser = handle_sdk_json_rpc_line(
             &context,
@@ -6639,9 +6687,32 @@ command = "test-mcp"
         );
         assert!(agent["result"]["agent_id"].as_str().is_some());
         assert_eq!(context.runtime.snapshot().agents.len(), 1);
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
         let session_id = agent["result"]["session_id"]
             .as_str()
             .context("session id")?;
+        let agent_snapshot = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "agent.snapshot",
+                "params": { "agent_id": agent_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(agent_snapshot["result"]["agent_id"], agent_id);
+        let session_snapshot = handle_sdk_json_rpc_line(
+            &context,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "agent.snapshot",
+                "params": { "session_id": session_id }
+            })
+            .to_string(),
+        );
+        assert_eq!(session_snapshot["result"]["session_id"], session_id);
         let events = context.store.events_for_session(session_id)?;
         assert!(events
             .iter()
