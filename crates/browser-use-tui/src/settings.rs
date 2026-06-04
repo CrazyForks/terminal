@@ -431,6 +431,21 @@ pub(crate) fn custom_openrouter_choice(model_id: &str) -> ModelChoice {
     }
 }
 
+pub(crate) fn bundled_openai_model_ids() -> Vec<String> {
+    [
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-5.4-nano",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
     [
         // Anthropic
@@ -544,6 +559,22 @@ mod tests {
         }
         // Every curated id carries a vendor prefix (vendor/model).
         assert!(ids.iter().all(|id| id.contains('/')));
+    }
+
+    #[test]
+    fn bundled_openai_ids_are_the_curated_provider_set() {
+        assert_eq!(
+            bundled_openai_model_ids(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.5-pro",
+                "gpt-5.4",
+                "gpt-5.4-pro",
+                "gpt-5.4-nano",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+            ]
+        );
     }
 
     #[test]
