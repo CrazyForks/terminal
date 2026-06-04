@@ -53,10 +53,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
-use browser_use_protocol::{EventRecord, SessionStatus};
+use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
     DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest, Durability as RuntimeDurability,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItem as RuntimeMailboxItem,
@@ -2338,12 +2337,9 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
         let turn_loop = TurnLoop::new(state, driver, observer);
-        let cancel_monitor =
-            spawn_store_cancel_monitor(Arc::clone(&store), session_id.clone(), cancel.clone());
         let result = turn_loop
             .run(ctx, turn_has_fresh_input, cancel.clone())
             .await;
-        cancel_monitor.abort();
         if result.is_ok() {
             ensure_fallback_capture_recording(&store, session_id.as_str());
         }
@@ -2390,37 +2386,6 @@ async fn drive_run<Sd: SamplingDriver>(
     }
     .run()
     .await
-}
-
-fn spawn_store_cancel_monitor(
-    store: SharedStore,
-    session_id: SessionId,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let store = Arc::clone(&store);
-            let session_id = session_id.as_str().to_string();
-            let should_cancel = tokio::task::spawn_blocking(move || {
-                let store = store.lock().expect("store mutex poisoned");
-                store
-                    .load_session(&session_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|session| session.status == SessionStatus::Cancelled)
-            })
-            .await
-            .unwrap_or(false);
-            if should_cancel {
-                cancel.cancel();
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
 }
 
 /// Build the durable UI sink for loop lifecycle events.
@@ -4625,25 +4590,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_run_observes_store_cancel_requests() {
+    async fn drive_run_observes_runtime_cancel_token() {
         let (_dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "long task").await;
         let sid = SessionId(session_id.clone());
         let config = fake_config();
         let ctx = turn_ctx(&sid, &config);
-        let store_for_cancel = Arc::clone(&store);
-        let session_for_cancel = session_id.clone();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            let store = store_for_cancel.lock().expect("store mutex poisoned");
-            store
-                .request_cancel(&session_for_cancel, "test cancellation")
-                .expect("request cancel");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            cancel_for_task.cancel();
         });
 
         let result = tokio::time::timeout(
-            Duration::from_secs(2),
+            std::time::Duration::from_secs(2),
             drive_run(
                 Arc::clone(&store),
                 sid,
@@ -4658,18 +4620,18 @@ mod tests {
                 None,
                 None,
                 None,
-                CancellationToken::new(),
+                cancel,
             ),
         )
         .await
-        .expect("cancel monitor should abort the hanging driver")
+        .expect("runtime cancel token should abort the hanging driver")
         .expect("turn abort should be a graceful run result");
         assert_eq!(result, None);
 
         let log = events(&store, &session_id);
         assert!(log
             .iter()
-            .any(|event| event.event_type == "session.cancel_requested"));
+            .all(|event| event.event_type != "session.cancel_requested"));
     }
 
     // -----------------------------------------------------------------------
