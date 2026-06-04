@@ -105,14 +105,17 @@ use render::{
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
 use runtime::{cancel_agent_run, run_agent_thread};
+#[cfg(test)]
+use settings::RECOMMENDED_MODELS;
 use settings::{
     browser_use_cloud_env_key_present, bundled_codex_login_model_ids, bundled_openai_model_ids,
     bundled_openrouter_model_ids, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    model_choices_for_config, provider_model_choices, provider_model_for_display, AgentBackend,
-    ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
+    model_choices_for_config, provider_model_choices, provider_model_for_display,
+    recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -3154,9 +3157,13 @@ impl App {
         if !self.model_configured {
             return None;
         }
-        RECOMMENDED_MODELS.iter().position(|rec| {
+        self.recommended_models().iter().position(|rec| {
             self.account == rec.account && self.provider_model == rec.provider_model
         })
+    }
+
+    fn recommended_models(&self) -> Vec<RecommendedModel> {
+        recommended_models_for_codex_availability(self.has_codex_login().unwrap_or(false))
     }
 
     /// Row to start the cursor on when opening the provider screen: the active
@@ -3169,7 +3176,7 @@ impl App {
         if !self.model_configured {
             return None;
         }
-        let base = RECOMMENDED_MODELS.len();
+        let base = self.recommended_models().len();
         self.provider_rows()
             .iter()
             .position(|row| self.provider_row_is_current(row))
@@ -3200,7 +3207,7 @@ impl App {
     /// Provider screen selection: a recommended quick-pick (top rows) or a
     /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
     fn provider_surface_select(&mut self) -> Result<()> {
-        let rec_count = RECOMMENDED_MODELS.len();
+        let rec_count = self.recommended_models().len();
         if self.selected_row < rec_count {
             self.dispatch(AppCommand::SelectRecommended(self.selected_row))?;
             return Ok(());
@@ -3277,7 +3284,8 @@ impl App {
     /// Apply a recommended quick-pick directly: build its choice and save it,
     /// auto-authenticating first if the provider isn't connected yet.
     fn select_recommended(&mut self, index: usize) -> Result<()> {
-        let Some(rec) = RECOMMENDED_MODELS.get(index) else {
+        let recommended = self.recommended_models();
+        let Some(rec) = recommended.get(index) else {
             return Ok(());
         };
         self.selected_provider = Some(rec.account);
@@ -6763,7 +6771,7 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Provider => RECOMMENDED_MODELS.len() + self.provider_rows().len(),
+            Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
             Surface::OpenAiAuth => self.openai_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
             Surface::ModelSearch => self.model_search_row_count(),
