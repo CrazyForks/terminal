@@ -38,7 +38,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail};
 use base64::{engine::general_purpose, Engine as _};
@@ -377,25 +377,39 @@ pub trait BrowserBackend: Send + Sync {
 /// Production backend: a thin delegation to `browser-use-browser`.
 #[derive(Debug, Clone, Default)]
 pub struct RealBackend {
-    browser_mode: Option<String>,
+    browser_mode: Arc<Mutex<Option<String>>>,
 }
 
 impl RealBackend {
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        Self {
+            browser_mode: Arc::new(Mutex::new(browser_mode)),
+        }
+    }
+
+    pub fn with_shared_browser_mode(browser_mode: Arc<Mutex<Option<String>>>) -> Self {
         Self { browser_mode }
     }
 
-    fn normalized_browser_mode(&self) -> Option<&str> {
-        self.browser_mode
-            .as_deref()
-            .map(str::trim)
-            .filter(|mode| !mode.is_empty())
-            .map(|mode| match mode {
+    fn normalized_browser_mode(&self) -> Option<String> {
+        let mode = self
+            .browser_mode
+            .lock()
+            .ok()
+            .and_then(|mode| mode.clone())?;
+        let mode = mode.trim();
+        if mode.is_empty() {
+            return None;
+        }
+        Some(
+            match mode {
                 "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
                 "remote-cdp" | "cdp" => "remote-cdp",
                 "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
                 other => other,
-            })
+            }
+            .to_string(),
+        )
     }
 
     fn should_ensure_before_command(&self, command: &str) -> bool {
@@ -406,6 +420,9 @@ impl RealBackend {
             return false;
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+        if browser_command_is_passive(words.as_slice()) {
+            return false;
+        }
         !matches!(
             words.as_slice(),
             ["browser", "remote", "start", ..]
@@ -422,7 +439,7 @@ impl RealBackend {
             return command.to_string();
         };
         let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-        if self.normalized_browser_mode() == Some("cloud")
+        if self.normalized_browser_mode().as_deref() == Some("cloud")
             && matches!(
                 words.as_slice(),
                 ["browser", "local", ..]
@@ -457,43 +474,74 @@ impl RealBackend {
         let connected =
             status.content.get("connection").and_then(Value::as_str) == Some("connected");
         let current_mode = status.content.get("mode").and_then(Value::as_str);
-        let desired_command = match mode {
-            "cloud" => {
-                if connected && current_mode == Some("remote-cloud") {
-                    return Ok(events);
-                }
-                "browser remote start"
+        let owner = status.content.get("owner").and_then(Value::as_str);
+        let desired_command = if mode == "remote-cdp" {
+            if connected && current_mode == Some("remote-cdp") {
+                None
+            } else {
+                Some(remote_cdp_connect_command()?)
             }
-            "managed-headless" => {
-                if connected && current_mode == Some("managed") {
-                    return Ok(events);
-                }
-                "browser connect managed --headless"
-            }
-            "remote-cdp" => {
-                if connected && current_mode == Some("remote-cdp") {
-                    return Ok(events);
-                }
-                let desired_command = remote_cdp_connect_command()?;
-                let mut started = browser_use_browser::run_browser_command(
-                    session_id,
-                    cwd,
-                    artifact_dir,
-                    &desired_command,
-                )?;
-                events.append(&mut started.events);
-                return Ok(events);
-            }
-            _ => return Ok(events),
+        } else {
+            desired_browser_connect_command(mode.as_str(), connected, current_mode, owner)
+                .map(str::to_string)
+        };
+        let Some(desired_command) = desired_command else {
+            return Ok(events);
         };
         let mut started = browser_use_browser::run_browser_command(
             session_id,
             cwd,
             artifact_dir,
-            desired_command,
+            &desired_command,
         )?;
         events.append(&mut started.events);
         Ok(events)
+    }
+}
+
+pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
+    matches!(
+        words,
+        ["browser", "status", ..]
+            | ["status", ..]
+            | ["browser", "runtime", "logs", ..]
+            | ["runtime", "logs", ..]
+            | ["browser", "runtime", "ownership", ..]
+            | ["runtime", "ownership", ..]
+    )
+}
+
+pub(crate) fn desired_browser_connect_command(
+    selected_mode: &str,
+    connected: bool,
+    current_mode: Option<&str>,
+    owner: Option<&str>,
+) -> Option<&'static str> {
+    match selected_mode {
+        "cloud" => {
+            if connected && current_mode == Some("remote-cloud") {
+                None
+            } else {
+                Some("browser remote start")
+            }
+        }
+        "local" | "local-chrome" => {
+            if connected && current_mode == Some("local") {
+                None
+            } else if !connected && current_mode == Some("local") && owner == Some("external") {
+                None
+            } else {
+                Some("browser connect local")
+            }
+        }
+        "managed-headless" => {
+            if connected && current_mode == Some("managed") {
+                None
+            } else {
+                Some("browser connect managed --headless")
+            }
+        }
+        _ => None,
     }
 }
 
@@ -796,6 +844,59 @@ fn resolve_browser_command_for_selected_mode(
         enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
         Ok(cmd.to_string())
     }
+}
+
+fn local_connect_profile_preflight(
+    has_stored_profile: bool,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    resolved_command: &str,
+) -> anyhow::Result<Option<BrowserCommandOutput>> {
+    if !is_plain_local_connect_command(resolved_command) {
+        return Ok(None);
+    }
+    if has_stored_profile {
+        return Ok(None);
+    }
+    let Ok(profiles) = backend.command(
+        session_id,
+        cwd,
+        artifact_dir,
+        "browser local profiles --json",
+    ) else {
+        return Ok(None);
+    };
+    let local_profiles = profiles
+        .content
+        .get("profiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if local_profiles.len() <= 1 {
+        return Ok(None);
+    }
+    Ok(Some(BrowserCommandOutput {
+        content: json!({
+            "status": "needs-user-action",
+            "reason": "Multiple local Chromium profiles are available. Ask the user which profile to use before connecting.",
+            "local_profiles": local_profiles,
+            "next_step": "Ask the user which profile to use, then run browser profile use <profile-id> before browser connect local.",
+        }),
+        events: Vec::new(),
+    }))
+}
+
+fn is_plain_local_connect_command(command: &str) -> bool {
+    browser_command_words(command)
+        .map(|argv| {
+            let args = strip_browser_prefix(&argv);
+            args.len() == 2
+                && args.first().is_some_and(|arg| arg == "connect")
+                && args.get(1).is_some_and(|arg| arg == "local")
+        })
+        .unwrap_or(false)
 }
 
 fn effective_browser_mode(
@@ -1129,7 +1230,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
     let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
         "local" | "local-chrome" => Ok("local"),
-        "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "cloud" | "browser-use-cloud" | "remote-cloud" => Ok("cloud"),
         "remote-cdp" | "cdp" => Ok("remote-cdp"),
         "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
         "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
@@ -1139,7 +1240,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
 
 fn browser_display_name(mode: &str) -> &'static str {
     match mode {
-        "cloud" => "Browser Use cloud",
+        "cloud" => "Browser Use Cloud",
         "remote-cdp" => "Remote CDP",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
@@ -1149,7 +1250,7 @@ fn browser_display_name(mode: &str) -> &'static str {
 
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
-        "Browser Use cloud" => Some("cloud"),
+        "Browser Use Cloud" | "Browser Use cloud" => Some("cloud"),
         "Remote CDP" => Some("remote-cdp"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
@@ -1387,7 +1488,9 @@ fn browser_script_error_detail(error: &str) -> String {
 #[derive(Clone)]
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    real_backend_mode: Option<Arc<Mutex<Option<String>>>>,
     selected_browser_mode: Option<String>,
+    dynamic_browser_mode_from_store: bool,
     default_script_timeout_secs: u64,
     session_id_fallback: Option<String>,
     persistence: Option<BrowserPersistence>,
@@ -1417,7 +1520,9 @@ impl BrowserTool {
     pub fn new() -> Self {
         Self {
             backend: Arc::new(RealBackend::default()),
+            real_backend_mode: None,
             selected_browser_mode: None,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1426,9 +1531,14 @@ impl BrowserTool {
 
     /// Construct a real browser tool with the run's configured browser mode.
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        let real_backend_mode = Arc::new(Mutex::new(browser_mode.clone()));
         Self {
-            backend: Arc::new(RealBackend::with_browser_mode(browser_mode.clone())),
+            backend: Arc::new(RealBackend::with_shared_browser_mode(Arc::clone(
+                &real_backend_mode,
+            ))),
+            real_backend_mode: Some(real_backend_mode),
             selected_browser_mode: browser_mode,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1439,7 +1549,9 @@ impl BrowserTool {
     pub fn with_backend(backend: Arc<dyn BrowserBackend>) -> Self {
         Self {
             backend,
+            real_backend_mode: None,
             selected_browser_mode: None,
+            dynamic_browser_mode_from_store: false,
             default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
@@ -1453,6 +1565,14 @@ impl BrowserTool {
     /// receives the same mode.
     pub fn with_selected_browser_mode(mut self, browser_mode: Option<String>) -> Self {
         self.selected_browser_mode = browser_mode;
+        self
+    }
+
+    pub fn with_dynamic_browser_mode_from_store(mut self, dynamic: bool) -> Self {
+        self.dynamic_browser_mode_from_store = dynamic;
+        if dynamic {
+            self.selected_browser_mode = None;
+        }
         self
     }
 
@@ -1595,6 +1715,31 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
             _ => {}
         }
 
+        let selected_browser_mode = self.selected_browser_mode.clone();
+        let selected_browser_mode =
+            if self.dynamic_browser_mode_from_store && self.real_backend_mode.is_some() {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    let dynamic_mode = persistence
+                        .store
+                        .lock()
+                        .map_err(|_| ToolError::Other(anyhow!("store mutex poisoned")))
+                        .and_then(|store| {
+                            preferred_browser_mode(Some(&store))
+                                .map(|mode| Some(mode.to_string()))
+                                .map_err(ToolError::Other)
+                        })?;
+                    if let Some(mode) = self.real_backend_mode.as_ref() {
+                        *mode.lock().map_err(|_| {
+                            ToolError::Other(anyhow!("browser mode mutex poisoned"))
+                        })? = dynamic_mode.clone();
+                    }
+                    None
+                } else {
+                    selected_browser_mode
+                }
+            } else {
+                selected_browser_mode
+            };
         let backend = Arc::clone(&self.backend);
         let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
@@ -1606,7 +1751,6 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();
         let persistence = self.persistence.clone();
-        let selected_browser_mode = self.selected_browser_mode.clone();
         let tool_call_id = ctx.call_id.clone();
         let tool_name = if ctx.tool_name.trim().is_empty() {
             match &action {
@@ -1651,10 +1795,28 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            let has_stored_profile = store
+                                .get_setting(BROWSER_PREF_PROFILE)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .as_deref()
+                                .is_some_and(|profile| !profile.trim().is_empty());
                             drop(store);
-                            backend
-                                .command(&session_id, &cwd, &artifact_dir, &resolved)
-                                .map_err(ToolError::Other)?
+                            if let Some(preflight) = local_connect_profile_preflight(
+                                has_stored_profile,
+                                backend.as_ref(),
+                                &session_id,
+                                &cwd,
+                                &artifact_dir,
+                                &resolved,
+                            )
+                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                            {
+                                preflight
+                            } else {
+                                backend
+                                    .command(&session_id, &cwd, &artifact_dir, &resolved)
+                                    .map_err(ToolError::Other)?
+                            }
                         }
                     } else {
                         let resolved = resolve_browser_command_for_selected_mode(
@@ -1737,5 +1899,42 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         .map_err(|e| ToolError::Other(anyhow::anyhow!("browser task panicked: {e}")))?;
 
         result
+    }
+}
+
+#[cfg(test)]
+mod browser_mode_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_remote_cloud_as_cloud() {
+        // The browser layer serializes its cloud mode as "remote-cloud"; the
+        // preference normalizer must treat it as cloud rather than bailing with
+        // "unknown browser preference mode".
+        assert_eq!(
+            normalize_browser_preference_mode("remote-cloud").unwrap(),
+            "cloud"
+        );
+        assert_eq!(
+            normalize_browser_preference_mode("remote_cloud").unwrap(),
+            "cloud"
+        );
+        assert_eq!(normalize_browser_preference_mode("cloud").unwrap(), "cloud");
+        assert_eq!(
+            normalize_browser_preference_mode("browser-use-cloud").unwrap(),
+            "cloud"
+        );
+    }
+
+    #[test]
+    fn enforce_allows_cloud_command_when_run_locked_to_remote_cloud() {
+        // A run locked to the cloud browser reports its mode as "remote-cloud";
+        // issuing `browser remote ...` must be permitted, not rejected.
+        enforce_selected_browser_mode(Some("remote-cloud"), "cloud").unwrap();
+        enforce_browser_command_matches_selected_mode(
+            &["remote".to_string(), "start".to_string()],
+            Some("remote-cloud"),
+        )
+        .unwrap();
     }
 }
