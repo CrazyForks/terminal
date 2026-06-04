@@ -67,7 +67,13 @@ impl Protocol for AnthropicMessagesProtocol {
 
         // Tool definitions.
         if !req.tools.is_empty() {
-            let tools: Vec<Value> = req.tools.iter().map(build_tool).collect();
+            let mut tools: Vec<Value> = req.tools.iter().map(build_tool).collect();
+            if let Some(Value::Object(last_tool)) = tools.last_mut() {
+                last_tool.insert(
+                    "cache_control".to_string(),
+                    cache_control(CacheHint::Ephemeral),
+                );
+            }
             body.insert("tools".to_string(), Value::Array(tools));
         }
 
@@ -677,13 +683,44 @@ mod tests {
                         "type": "object",
                         "properties": { "city": { "type": "string" } },
                         "required": ["city"],
-                    }
+                    },
+                    "cache_control": { "type": "ephemeral" }
                 }
             ])
         );
 
         // tool_choice: Auto -> {"type":"auto"}.
         assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    #[test]
+    fn build_body_marks_cache_control_breakpoints() {
+        let mut req = LlmRequest::new("claude-sonnet-4-6", "anthropic");
+        let mut system = SystemPart::new("Stable system prompt.");
+        system.cache = Some(CacheHint::Ephemeral);
+        req.system.push(system);
+        for name in ["first_tool", "last_tool"] {
+            req.tools.push(ToolDefinition {
+                name: name.into(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+                output_schema: None,
+                namespace: None,
+                namespace_description: None,
+            });
+        }
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
     }
 
     #[test]
