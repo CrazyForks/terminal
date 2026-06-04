@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ use browser_use_agent::context::{
     typed_user_input_payload_from_text_for_cwd,
 };
 use browser_use_agent::entrypoint::cleanup_unified_exec_manager_for_session_id;
+use browser_use_agent::entrypoint::RuntimeTurnDriver;
 use browser_use_agent::infra::{
     capture_async, capture_blocking, install_process_crypto_provider,
     record_browser_script_response_events, record_python_response_final_event,
@@ -68,12 +69,11 @@ use browser_use_providers::{
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
     send_local_runtime_request, AgentId, BrowserConfig, BrowserId, BrowserUseRuntime,
-    CompleteAgentRequest, CreateRootAgentRequest, DrainAgentMailboxRequest,
-    Durability as RuntimeDurability, FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest,
-    LocalRuntimeWaitTarget, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
-    MailboxItemKind as RuntimeMailboxItemKind, MemoryJournal, RunAgentRequest,
-    RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId, SpawnChildRequest,
-    SqliteJournal, StateIndex, SubmitInputRequest,
+    CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
+    FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
+    MemoryJournal, RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState,
+    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -3810,21 +3810,29 @@ struct JsonRpcRequest {
 struct SdkServerContext {
     journal: Arc<MemoryJournal>,
     runtime: RuntimeHandle,
+    store: SharedStore,
+    _ephemeral_state_dir: Arc<tempfile::TempDir>,
 }
 
 impl SdkServerContext {
-    fn memory() -> Self {
+    fn memory() -> Result<Self> {
         let (runtime, journal) = BrowserUseRuntime::memory();
-        Self {
+        let ephemeral_state_dir = Arc::new(tempfile::Builder::new().prefix("but-sdk-").tempdir()?);
+        let store = Store::open_in_memory(ephemeral_state_dir.path())?;
+        Ok(Self {
             journal,
             runtime: runtime.handle(),
-        }
+            store: Arc::new(Mutex::new(store)),
+            _ephemeral_state_dir: ephemeral_state_dir,
+        })
     }
 
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             journal: Arc::clone(&self.journal),
             runtime: self.runtime.clone(),
+            store: Arc::clone(&self.store),
+            _ephemeral_state_dir: Arc::clone(&self._ephemeral_state_dir),
         })
     }
 }
@@ -3836,7 +3844,7 @@ fn sdk_server(transport: SdkTransportArg) -> Result<()> {
 }
 
 fn sdk_server_stdio() -> Result<()> {
-    let context = SdkServerContext::memory();
+    let context = SdkServerContext::memory()?;
     let (response_tx, response_rx) = mpsc::channel::<Value>();
     let event_thread_stop = Arc::new(AtomicBool::new(false));
     let writer = thread::Builder::new()
@@ -4053,10 +4061,31 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
         task: task.clone(),
         max_concurrent_threads_per_session,
     })?;
+    let runtime_session = context
+        .runtime
+        .load_session(agent.session_id())?
+        .with_context(|| format!("runtime did not create session {}", agent.session_id()))?;
+    let input_payload = typed_user_input_payload_from_text_for_cwd(&task, &cwd)?;
+    {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        if store.load_session(agent.session_id().as_str())?.is_none() {
+            store.create_session_with_id_and_artifact_root(
+                None,
+                Path::new(&runtime_session.cwd),
+                Path::new(&runtime_session.artifact_root),
+                agent.session_id().as_str().to_string(),
+            )?;
+        }
+        store.append_event(
+            agent.session_id().as_str(),
+            "session.input",
+            input_payload.clone(),
+        )?;
+    }
     context.runtime.append_observed_session_event(
         agent.session_id().clone(),
         "session.input",
-        typed_user_input_payload_from_text_for_cwd(&task, &cwd)?,
+        input_payload,
         RuntimeDurability::Barrier,
     )?;
     Ok(serde_json::json!({
@@ -4139,12 +4168,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let events_before_run = context.runtime.events_for_session(&session_id)?;
     let task = task_from_events(&events_before_run).unwrap_or_else(|| "task".to_string());
     let config = sdk_provider_run_config(params, Some(&task))?;
-    if config.backend != ProviderBackend::Fake {
-        bail!(
-            "agent.run is memory-only in sdk-server, but real model execution still depends on the store-backed turn driver; use the CLI/TUI runtime until RuntimeTurnDriver is store-free"
-        );
-    }
-    sdk_run_fake_agent_with_runtime(context, &agent_id, &session_id, browser_id, &config)?;
+    sdk_run_agent_with_runtime(context, &agent_id, &session_id, browser_id, config)?;
 
     let events = context.runtime.events_for_session(&session_id)?;
     let output = session_result_from_events(&events);
@@ -4180,28 +4204,37 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     }))
 }
 
-fn sdk_run_fake_agent_with_runtime(
+fn sdk_run_agent_with_runtime(
     context: &SdkServerContext,
     agent_id: &AgentId,
     session_id: &SessionId,
     browser_id: Option<BrowserId>,
-    config: &ProviderRunConfig,
+    config: ProviderRunConfig,
 ) -> Result<()> {
-    let output = config
-        .fake_result
-        .clone()
-        .unwrap_or_else(|| fake_agent_result_text("task", None));
     let runtime = context.runtime.clone();
-    let runtime_for_turn = runtime.clone();
-    let run_session_id = session_id.clone();
+    let driver_runtime = runtime.clone();
+    let store = Arc::clone(&context.store);
+    let session_id_for_driver = session_id.as_str().to_string();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_driver = cancel.clone();
+    let run_cwd = {
+        let store = context.store.lock().expect("sdk store mutex poisoned");
+        store
+            .load_session(session_id.as_str())?
+            .map(|session| PathBuf::from(session.cwd))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+    };
+    let provider_config = serde_json::json!({
+        "backend": format!("{:?}", config.backend),
+        "model": config.model.clone(),
+        "source": "sdk-memory",
+    });
     let mut request = RunAgentRequest::new(session_id.clone())
         .with_agent_id(agent_id.clone())
-        .with_provider_config(serde_json::json!({
-            "backend": "fake",
-            "model": config.model.as_str(),
-            "source": "sdk-memory",
-        }))
-        .with_input_source("sdk-memory");
+        .with_provider_config(provider_config)
+        .with_cwd(run_cwd)
+        .with_input_source("sdk-memory")
+        .with_cancellation_token(cancel);
     if let Some(browser_id) = browser_id {
         request = request.with_browser_id(browser_id);
     }
@@ -4209,34 +4242,20 @@ fn sdk_run_fake_agent_with_runtime(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .context("build sdk fake run runtime")?;
+        .context("build sdk run runtime")?;
     rt.block_on(async move {
         runtime
             .run_agent(request, async move {
-                let _ = runtime_for_turn.drain_agent_mailbox(DrainAgentMailboxRequest {
-                    session_id: run_session_id.clone(),
-                    delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
-                })?;
-                runtime_for_turn.append_observed_session_event(
-                    run_session_id.clone(),
-                    "model.stream_delta",
-                    serde_json::json!({
-                        "text": output,
-                        "source": "sdk-memory-fake",
-                    }),
-                    RuntimeDurability::BestEffort,
-                )?;
-                runtime_for_turn.append_observed_session_event(
-                    run_session_id.clone(),
-                    "session.done",
-                    serde_json::json!({
-                        "result": output,
-                        "runtime_owned": true,
-                        "source": "sdk-memory-fake",
-                    }),
-                    RuntimeDurability::Barrier,
-                )?;
-                Ok(run_session_id.as_str().to_string())
+                RuntimeTurnDriver::new(
+                    store,
+                    session_id_for_driver,
+                    config,
+                    cancel_for_driver,
+                    driver_runtime,
+                )
+                .run()
+                .await
+                .map(|resolved| resolved.as_str().to_string())
             })
             .await?;
         Ok::<(), anyhow::Error>(())
@@ -6859,7 +6878,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc")?;
-        let context = SdkServerContext::memory();
+        let context = SdkServerContext::memory()?;
 
         let ping = handle_sdk_json_rpc_line(
             &context,
@@ -6947,7 +6966,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_reports_protocol_errors() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc-errors")?;
-        let context = SdkServerContext::memory();
+        let context = SdkServerContext::memory()?;
 
         let parse = handle_sdk_json_rpc_line(&context, "{not-json");
         assert_eq!(parse["error"]["code"], -32700);
@@ -6969,7 +6988,7 @@ command = "test-mcp"
     #[test]
     fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
-        let context = SdkServerContext::memory();
+        let context = SdkServerContext::memory()?;
         let agent = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
@@ -7042,42 +7061,6 @@ command = "test-mcp"
         assert_eq!(
             browser_snapshot.status,
             browser_use_runtime::BrowserStatus::Released
-        );
-
-        std::fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[test]
-    fn sdk_json_rpc_agent_run_rejects_store_backed_real_backend() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-run-real-rejected")?;
-        let context = SdkServerContext::memory();
-        let agent = handle_sdk_json_rpc_line(
-            &context,
-            r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
-        );
-        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "agent.run",
-            "params": {
-                "agent_id": agent_id,
-                "max_steps": 2,
-                "llm": {"provider": "openai", "model": "gpt-5.5"}
-            }
-        });
-
-        let result = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
-
-        assert_eq!(result["error"]["code"], -32000);
-        assert!(result["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("store-backed turn driver"));
-        assert!(
-            !temp.join("state.db").exists(),
-            "Rejected SDK real runs must not create SQLite state"
         );
 
         std::fs::remove_dir_all(temp)?;

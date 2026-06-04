@@ -332,23 +332,23 @@ async def _test_agent_run_fails_loudly_when_server_does_not_support_run() -> Non
         await agent.run()
 
 
-def test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run() -> None:
-    asyncio.run(_test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run())
+def test_agent_run_propagates_real_backend_runtime_errors() -> None:
+    asyncio.run(_test_agent_run_propagates_real_backend_runtime_errors())
 
 
-async def _test_agent_run_fails_loudly_when_memory_sdk_rejects_real_run() -> None:
-    class MemoryOnlyRuntime(FakeRuntime):
+async def _test_agent_run_propagates_real_backend_runtime_errors() -> None:
+    class ProviderErrorRuntime(FakeRuntime):
         async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             if method == "agent.run":
                 raise JsonRpcError(
                     -32000,
-                    "agent.run is memory-only in sdk-server, but real model execution still depends on the store-backed turn driver",
+                    "no provider credentials found in environment",
                 )
             return await super().call(method, params)
 
-    agent = Agent("task", browser=Browser(_runtime=MemoryOnlyRuntime()))  # type: ignore[arg-type]
+    agent = Agent("task", browser=Browser(_runtime=ProviderErrorRuntime()))  # type: ignore[arg-type]
 
-    with pytest.raises(NotImplementedError, match="agent.run is not supported"):
+    with pytest.raises(JsonRpcError, match="no provider credentials"):
         await agent.run()
 
 

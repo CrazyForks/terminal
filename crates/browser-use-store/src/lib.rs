@@ -169,6 +169,41 @@ impl Store {
         Self::open_with_optional_notifier(state_dir, None)
     }
 
+    /// Open an ephemeral store over an in-memory SQLite connection.
+    ///
+    /// This keeps the legacy `Store` API available to compatibility callers
+    /// without creating `state.db`. Files/artifacts still use `state_dir` so
+    /// tool outputs have a real filesystem home.
+    pub fn open_in_memory(state_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in_memory_with_optional_notifier(state_dir, None)
+    }
+
+    pub fn open_in_memory_with_optional_notifier(
+        state_dir: impl AsRef<Path>,
+        notifier: Option<StoreNotifier>,
+    ) -> Result<Self> {
+        let state_dir = resolve_state_dir(state_dir);
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("create state dir {}", state_dir.display()))?;
+        std::fs::create_dir_all(state_dir.join("artifacts")).with_context(|| {
+            format!(
+                "create artifact dir {}",
+                state_dir.join("artifacts").display()
+            )
+        })?;
+        let conn = Connection::open_in_memory().context("open in-memory state database")?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA busy_timeout = 30000;")?;
+        let store = Self {
+            state_dir,
+            conn,
+            notifier,
+            notification_state: Arc::new(StoreNotificationState::default()),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
     pub fn open_with_notifier(
         state_dir: impl AsRef<Path>,
         notifier: StoreNotifier,
@@ -290,7 +325,22 @@ impl Store {
         self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
     }
 
-    fn create_session_with_id_and_artifact_root(
+    pub fn create_session_with_id_and_artifact_root(
+        &self,
+        parent_id: Option<&str>,
+        cwd: impl AsRef<Path>,
+        artifact_root: impl AsRef<Path>,
+        id: impl Into<String>,
+    ) -> Result<SessionMeta> {
+        self.create_session_with_id_and_artifact_root_inner(
+            parent_id,
+            cwd,
+            artifact_root,
+            id.into(),
+        )
+    }
+
+    fn create_session_with_id_and_artifact_root_inner(
         &self,
         parent_id: Option<&str>,
         cwd: impl AsRef<Path>,
