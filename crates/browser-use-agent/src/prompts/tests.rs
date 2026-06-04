@@ -98,6 +98,14 @@ fn browser_mode_instruction_guides_remote_cdp_to_direct_page_work() {
     assert!(prompt.contains("Do not call `browser connect managed`"));
 }
 
+#[test]
+fn system_prompt_bounds_multi_item_collection_loops() {
+    assert!(BASE_SYSTEM_PROMPT.contains("Multi-item collection rule"));
+    assert!(BASE_SYSTEM_PROMPT.contains("maintain a checklist"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Do not keep varying one search term"));
+    assert!(BASE_SYSTEM_PROMPT.contains("audit the checklist"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
