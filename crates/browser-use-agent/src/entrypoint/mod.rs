@@ -2333,7 +2333,7 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         let mailbox_delivery_phase =
             initial_runtime_mailbox_delivery_phase(runtime_handle.as_ref(), session_id.as_str());
         let state = LiveTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
-            .with_runtime_handle(runtime_handle)
+            .with_runtime_handle(runtime_handle.clone())
             .with_mailbox_delivery_phase(mailbox_delivery_phase);
         // Enable REAL token accounting + model-based compaction when a sampler is
         // available (the real backend path). The Fake/no-credential path passes `None`
@@ -2367,11 +2367,18 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         }
         *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
-        // The observer persists the terminal agent message through a synchronous
-        // durable sink over the SharedStore. (The async `events::StoreSink` writer
-        // needs sole ownership of the Store, which the facade does not have — it keeps
-        // a SharedStore clone — so a small shared-lock adapter is used instead.)
-        let sink: Arc<dyn EventSink> = make_ui_sink(Arc::clone(&store));
+        // The observer persists the terminal agent message through the runtime
+        // when available so `session.done` is journaled and projected by the
+        // same live authority as model/tool events. The no-runtime test/replay
+        // path keeps the shared store sink.
+        let sink: Arc<dyn EventSink> = match runtime_handle {
+            Some(runtime) => Arc::new(RuntimeStoreSink {
+                runtime,
+                store: Arc::clone(&store),
+                model_context_window: None,
+            }),
+            None => make_ui_sink(Arc::clone(&store)),
+        };
         let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
         let turn_loop = TurnLoop::new(state, driver, observer);
@@ -3691,6 +3698,56 @@ mod tests {
         assert!(
             state.take_pending_input().await.is_empty(),
             "deferred runtime mail should wait for the outer runtime driver restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_turn_observer_publishes_session_done_through_runtime() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        let mut projected = runtime.subscribe_projected();
+
+        let id = run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed run");
+        assert_eq!(id.0, session_id);
+
+        let mut saw_session_done = false;
+        for _ in 0..16 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(250), projected.recv())
+                    .await
+                    .expect("runtime projected event")
+                    .expect("runtime event");
+            if event.payload.get("event_type").and_then(Value::as_str) == Some(names::SESSION_DONE)
+            {
+                saw_session_done = true;
+                break;
+            }
+        }
+        assert!(
+            saw_session_done,
+            "runtime-backed terminal observer must publish session.done through runtime projection"
         );
     }
 
