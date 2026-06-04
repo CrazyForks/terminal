@@ -51,6 +51,9 @@ enum LastCall {
 #[derive(Default)]
 struct FakeBackend {
     last: Mutex<LastCall>,
+    commands: Mutex<Vec<String>>,
+    local_profiles: Mutex<Option<serde_json::Value>>,
+    local_list: Mutex<Option<serde_json::Value>>,
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
@@ -61,6 +64,14 @@ struct FakeBackend {
 impl FakeBackend {
     fn last(&self) -> LastCall {
         self.last.lock().unwrap().clone()
+    }
+
+    fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
+    }
+
+    fn set_local_list(&self, value: serde_json::Value) {
+        *self.local_list.lock().unwrap() = Some(value);
     }
 
     fn last_session(&self) -> Option<String> {
@@ -87,6 +98,45 @@ impl FakeBackend {
         BrowserCommandOutput {
             content: json!({ "ok": true, "message": "navigated" }),
             events: vec![json!({ "type": "navigation" })],
+        }
+    }
+
+    fn default_local_profiles() -> serde_json::Value {
+        json!({
+            "local_profiles": [
+                { "id": "google-chrome:Default", "profile_name": "browser-use.com" },
+                { "id": "google-chrome:Profile 1", "profile_name": "Laith" }
+            ]
+        })
+    }
+
+    fn default_local_list() -> serde_json::Value {
+        json!({
+            "candidates": [
+                { "id": "local-1", "connectable": true, "state": "reachable" }
+            ]
+        })
+    }
+
+    fn command_output_for(&self, command: &str) -> BrowserCommandOutput {
+        let content = match command {
+            "browser local profiles --json" => self
+                .local_profiles
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(Self::default_local_profiles),
+            "browser local list --json" => self
+                .local_list
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(Self::default_local_list),
+            _ => return Self::ok_command(),
+        };
+        BrowserCommandOutput {
+            content,
+            events: vec![],
         }
     }
 
@@ -119,11 +169,12 @@ impl BrowserBackend for FakeBackend {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
+        self.commands.lock().unwrap().push(command.to_string());
         self.record_paths(cwd, artifact_dir);
         if self.fail {
             anyhow::bail!("boom");
         }
-        Ok(Self::ok_command())
+        Ok(self.command_output_for(command))
     }
 
     fn run_script(
@@ -377,6 +428,67 @@ async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
     assert_eq!(
         backend.last(),
         LastCall::Command("browser remote start --profile-id 'profile with space'".to_string())
+    );
+}
+
+#[tokio::test]
+async fn stored_local_profile_is_opened_before_plain_local_connect_when_reachable_profiles_are_ambiguous(
+) {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser local profiles --json".to_string(),
+            "browser local list --json".to_string(),
+            "browser local open --profile 'google-chrome:Profile 1'".to_string(),
+            "browser connect local".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.set_local_list(json!({
+        "candidates": [
+            { "id": "local-1", "connectable": false, "state": "stale-port" }
+        ]
+    }));
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.commands(),
+        vec![
+            "browser local profiles --json".to_string(),
+            "browser local list --json".to_string(),
+            "browser connect local".to_string(),
+        ]
     );
 }
 

@@ -405,7 +405,7 @@ def current_tab():
     page = _send_meta("current_tab")
     target_id = page.get("targetId") or page.get("target_id")
     session_id = page.get("sessionId") or page.get("session_id")
-    return {
+    tab = {
         "targetId": target_id,
         "target_id": target_id,
         "sessionId": session_id,
@@ -413,12 +413,21 @@ def current_tab():
         "url": page.get("url", ""),
         "title": page.get("title", ""),
     }
+    for target in cdp("Target.getTargets").get("targetInfos", []):
+        if target.get("targetId") == target_id and target.get("browserContextId"):
+            tab["browserContextId"] = target.get("browserContextId")
+            tab["browser_context_id"] = target.get("browserContextId")
+            break
+    return tab
 
 
-def list_tabs(include_chrome=True):
+def list_tabs(include_chrome=True, include_other_contexts=False):
     out = []
+    current_context = None if include_other_contexts else _current_target_browser_context_id()
     for target in cdp("Target.getTargets").get("targetInfos", []):
         if target.get("type") != "page":
+            continue
+        if current_context and target.get("browserContextId") != current_context:
             continue
         url = target.get("url", "")
         if not include_chrome and url.startswith(INTERNAL):
@@ -430,6 +439,8 @@ def list_tabs(include_chrome=True):
                 "target_id": target_id,
                 "title": target.get("title", ""),
                 "url": url,
+                "browserContextId": target.get("browserContextId"),
+                "browser_context_id": target.get("browserContextId"),
             }
         )
     return out
@@ -471,6 +482,13 @@ def _current_target_url():
     return None
 
 
+def _current_target_browser_context_id():
+    try:
+        return current_tab().get("browserContextId")
+    except Exception:
+        return None
+
+
 def new_tab(url="about:blank"):
     # Reuse the current controlled tab when it's blank page
     if url != "about:blank":
@@ -480,7 +498,11 @@ def new_tab(url="about:blank"):
             return current_tab().get("targetId")
     # Match browser-harness: create blank first, attach, then navigate. Passing
     # the final URL to createTarget can race with attach/load polling.
-    target_id = cdp("Target.createTarget", url="about:blank")["targetId"]
+    params = {"url": "about:blank"}
+    browser_context_id = _current_target_browser_context_id()
+    if browser_context_id:
+        params["browserContextId"] = browser_context_id
+    target_id = cdp("Target.createTarget", **params)["targetId"]
     switch_tab(target_id)
     if url != "about:blank":
         goto_url(url)

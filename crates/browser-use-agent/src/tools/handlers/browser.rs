@@ -929,9 +929,82 @@ fn enrich_local_connect_recovery_with_default_profile(
                 )),
             );
         }
+        "profile-target-missing" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "next_step".to_string(),
+                json!(
+                    "Do not ask the user to choose a profile again; a default profile is already set. Tell the user Chrome did not expose the expected selected-profile tab and ask them to open that Chrome profile window or close other Chrome profile windows, then retry `browser connect local`."
+                ),
+            );
+        }
         _ => {}
     }
     output
+}
+
+fn open_default_profile_before_local_connect(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if !is_plain_local_connect_command(resolved_command) {
+        return Ok(());
+    }
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return Ok(());
+    };
+    if !local_profile_targeting_is_ambiguous(backend, session_id, cwd, artifact_dir)? {
+        return Ok(());
+    }
+    let command = format!(
+        "browser local open --profile {}",
+        shell_quote_browser_arg(profile_id)
+    );
+    backend.command(session_id, cwd, artifact_dir, &command)?;
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    Ok(())
+}
+
+fn local_profile_targeting_is_ambiguous(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+) -> anyhow::Result<bool> {
+    let profiles = backend.command(
+        session_id,
+        cwd,
+        artifact_dir,
+        "browser local profiles --json",
+    )?;
+    if profile_values(&profiles.content).take(2).count() <= 1 {
+        return Ok(false);
+    }
+
+    let local_state =
+        backend.command(session_id, cwd, artifact_dir, "browser local list --json")?;
+    Ok(has_reachable_local_candidate(&local_state.content))
+}
+
+fn has_reachable_local_candidate(value: &serde_json::Value) -> bool {
+    value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
+            candidate
+                .get("connectable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
 }
 
 fn local_profile_label_for_id(
@@ -1840,6 +1913,15 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             {
                                 preflight
                             } else {
+                                open_default_profile_before_local_connect(
+                                    backend.as_ref(),
+                                    &session_id,
+                                    &cwd,
+                                    &artifact_dir,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                )
+                                .map_err(ToolError::Other)?;
                                 let output = backend
                                     .command(&session_id, &cwd, &artifact_dir, &resolved)
                                     .map_err(ToolError::Other)?;
