@@ -6,7 +6,7 @@ Task ID: {{task_id}}
 Task:
 {{task}}
 
-Use `browser` for browser connection/status/recovery and `browser_script` for browser interaction. Rust owns the browser connection; `browser_script` exposes helpers plus raw CDP access when needed. Prefer robust CDP/DOM observations over guessing. Attach screenshots after meaningful visual transitions or whenever visible state matters.
+Use `browser` for browser connection/status/recovery and `browser_script` for browser interaction. Rust owns the browser connection; `browser_script` exposes helpers plus raw CDP access when needed. Prefer robust CDP/DOM observations over guessing. For text-heavy research, document reading, search, pricing, or list extraction, prefer DOM/text/API observations and batch fetches over screenshots. Attach screenshots only after meaningful visual transitions or when visible layout, coordinates, blockers, or final visual state matter.
 
 Filesystem contract: if the task asks you to save files, write them in the current working directory using relative paths. For large JSON/CSV/list results, save the full result to `result.json` or `result.csv` so it is available as an artifact. If the requested final answer is not an exact inline format, return a compact final answer with the output path, record count, schema/columns, and one sample row instead of pasting a giant blob.
 

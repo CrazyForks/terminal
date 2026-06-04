@@ -115,6 +115,21 @@ fn system_prompt_commits_single_site_collection_to_one_domain() {
     assert!(BASE_SYSTEM_PROMPT.contains("mark it unavailable for that domain"));
 }
 
+#[test]
+fn prompts_avoid_screenshots_for_text_heavy_extraction() {
+    assert!(BASE_SYSTEM_PROMPT.contains(
+        "For text-heavy research, document reading, search, pricing, tables, and list extraction"
+    ));
+    assert!(BASE_SYSTEM_PROMPT.contains("screenshots add latency"));
+    assert!(BASE_SYSTEM_PROMPT.contains("If you have three or more independent URLs"));
+
+    let script = browser_script_tool_description();
+    assert!(script.contains(
+        "For text-heavy research, document reading, search, pricing, tables, and list extraction"
+    ));
+    assert!(script.contains("screenshots add latency"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
