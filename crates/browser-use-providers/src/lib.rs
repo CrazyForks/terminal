@@ -2450,6 +2450,7 @@ impl AnthropicMessagesProvider {
         let mut body = json!({
             "model": self.model,
             "max_tokens": 16000,
+            "cache_control": { "type": "ephemeral" },
             "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
             "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
         });
@@ -9483,6 +9484,7 @@ mod tests {
         )?;
 
         assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(
             body["tools"][1]["cache_control"],
             json!({"type": "ephemeral"})
