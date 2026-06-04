@@ -1041,7 +1041,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     base_system.cache = Some(CacheHint::Ephemeral);
     req.system.push(base_system);
     req.messages = input;
-    mark_last_message_cacheable(&mut req.messages);
+    mark_message_cache_breakpoints(&mut req.messages);
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
             0,
@@ -1054,13 +1054,44 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     req
 }
 
-fn mark_last_message_cacheable(messages: &mut [Message]) {
-    if let Some(message) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| !matches!(message.role, MessageRole::System | MessageRole::Developer))
-    {
-        message.cache = Some(CacheHint::Ephemeral);
+fn mark_message_cache_breakpoints(messages: &mut [Message]) {
+    const LOOKBACK_TARGET_BLOCKS: usize = 16;
+    const MAX_MESSAGE_BREAKPOINTS: usize = 2;
+
+    for message in messages.iter_mut() {
+        message.cache = None;
+    }
+
+    let eligible: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            !matches!(message.role, MessageRole::System | MessageRole::Developer)
+        })
+        .map(|(index, message)| (index, message.content.len().max(1)))
+        .collect();
+    let Some((last_index, _)) = eligible.last().copied() else {
+        return;
+    };
+
+    let mut selected = vec![last_index];
+    let mut blocks_since_last = 0usize;
+    for (index, block_count) in eligible.into_iter().rev().skip(1) {
+        blocks_since_last = blocks_since_last.saturating_add(block_count);
+        if blocks_since_last >= LOOKBACK_TARGET_BLOCKS {
+            selected.push(index);
+            break;
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.len() > MAX_MESSAGE_BREAKPOINTS {
+        selected.drain(0..selected.len() - MAX_MESSAGE_BREAKPOINTS);
+    }
+    for index in selected {
+        if let Some(message) = messages.get_mut(index) {
+            message.cache = Some(CacheHint::Ephemeral);
+        }
     }
 }
 
