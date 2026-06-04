@@ -2214,18 +2214,12 @@ fn notify_parent_after_cli_child_run(
     Ok(())
 }
 
-/// Store-based parent-link update run after a child agent terminates.
+/// Store-based parent-link projection run after a child agent terminates.
 ///
-/// Faithful port of the legacy `browser-use-core::update_parent_from_child_run`
-/// (lib.rs:20767) reconstructed locally on `&Store` primitives, because the
-/// agent crate only exposes a *registry*-based `update_parent_from_child_run`
-/// (`subagents::parent_link`, a pure `(registry, mailbox, …)` function), not a
-/// Store-driven one. Writes the parent's terminal `agent.{completed,failed,
-/// cancelled,updated}` event, flips the child edge status, and (when the parent
-/// can still receive mail) queues the `<subagent_notification>` into the parent's
-/// mailbox. The legacy subagent-stop hook fan-out is intentionally NOT
-/// reconstructed (hooks are a not-yet-ported engine seam; the CLI never wired
-/// runtime hooks here) — see report.
+/// Writes the parent's terminal `agent.{completed,failed,cancelled,updated}`
+/// event and flips the child edge status. It deliberately does not enqueue
+/// Store-backed `agent_messages`; live completion delivery belongs to the
+/// runtime mailbox.
 fn update_parent_from_child_run(
     store: &Store,
     parent_id: &str,
@@ -2334,14 +2328,6 @@ fn update_parent_from_child_run(
             "payload": payload,
         }),
     )?;
-    if matches!(status.as_str(), "done" | "failed" | "cancelled")
-        && parent_can_receive_subagent_completion_mail(store, parent_id)?
-    {
-        let child_path = display_agent_path_for_session(store, child_id)?;
-        let notification =
-            format_subagent_notification_message(&child_path, status.as_str(), &payload);
-        store.send_agent_message(child_id, parent_id, &notification, false)?;
-    }
     Ok(payload)
 }
 
@@ -2442,49 +2428,6 @@ fn parent_has_child_terminal_event_for_run(
 
 fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRecord]) -> bool {
     session_was_interrupted(events)
-}
-
-/// Whether `parent_id` can still receive child-completion mail.
-fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
-    let Some(_parent) = store.load_session(parent_id)? else {
-        return Ok(false);
-    };
-    // Children can finish after the parent has ended its current turn. Keep the
-    // completion durable so the next parent turn or wait-agent command can see it.
-    if store
-        .agent_summary_for_child(parent_id)?
-        .is_some_and(|agent| agent.status == "closed")
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Render the `<subagent_notification>` body. Byte-for-byte port of legacy
-/// `format_subagent_notification_message` (browser-use-core lib.rs:20950): the
-/// status maps to `{completed: result}` / `{errored: failure}` / `"shutdown"` /
-/// `"not_found"` inside a `{agent_path, status}` JSON object.
-fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
-    let agent_status = match status {
-        "done" => serde_json::json!({
-            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
-        }),
-        "failed" => serde_json::json!({
-            "errored": payload
-                .get("failure")
-                .and_then(Value::as_str)
-                .unwrap_or("agent failed"),
-        }),
-        "cancelled" => serde_json::json!("shutdown"),
-        _ => serde_json::json!("not_found"),
-    };
-    format!(
-        "<subagent_notification>\n{}\n</subagent_notification>",
-        serde_json::json!({
-            "agent_path": agent_path,
-            "status": agent_status,
-        })
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7496,11 +7439,10 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "agent.completed"));
-        let mail = store.messages_for_agent(&parent.id)?;
-        assert_eq!(mail.len(), 1);
-        assert!(mail[0].content.contains("<subagent_notification>"));
-        assert!(mail[0].content.contains("cli late result"));
-        assert!(!mail[0].trigger_turn);
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -7911,7 +7853,7 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_child_terminal_status_queues_parent_subagent_notification_like_core() -> Result<()> {
+    fn cli_child_terminal_status_projects_parent_without_store_mail() -> Result<()> {
         let temp = unique_cli_test_dir("child-notification")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -7946,16 +7888,10 @@ command = "test-mcp"
         assert_eq!(completed.payload["payload"]["child_session_id"], child.id);
         assert_eq!(completed.payload["payload"]["status"], "done");
         assert_eq!(completed.payload["payload"]["result"], "done");
-        let mail = store.messages_for_agent(&parent.id)?;
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].author_session_id, child.id);
-        assert_eq!(mail[0].target_session_id, parent.id);
-        assert!(!mail[0].trigger_turn);
-        assert!(mail[0].content.contains("<subagent_notification>"));
-        assert!(mail[0]
-            .content
-            .contains("\"agent_path\":\"/root/cli_child\""));
-        assert!(mail[0].content.contains("\"completed\":\"done\""));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -8006,7 +7942,7 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_child_terminal_status_queues_parent_notification_once() -> Result<()> {
+    fn cli_child_terminal_status_projects_parent_once_without_store_mail() -> Result<()> {
         let temp = unique_cli_test_dir("child-notification-once")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -8043,9 +7979,10 @@ command = "test-mcp"
                 .count(),
             1
         );
-        let mail = store.messages_for_agent(&parent.id)?;
-        assert_eq!(mail.len(), 1);
-        assert!(mail[0].content.contains("done once"));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
@@ -8110,9 +8047,10 @@ command = "test-mcp"
                 .count(),
             1
         );
-        assert!(store.messages_for_agent(&parent.id)?[0]
-            .content
-            .contains("new completion"));
+        assert!(
+            store.messages_for_agent(&parent.id)?.is_empty(),
+            "CLI parent projection must not enqueue Store-backed mailbox rows"
+        );
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
