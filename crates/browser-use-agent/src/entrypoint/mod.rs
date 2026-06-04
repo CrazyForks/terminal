@@ -2478,7 +2478,7 @@ struct RuntimeTurnLoopDriver<Sd> {
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
-    runtime_handle: Option<RuntimeHandle>,
+    runtime_handle: RuntimeHandle,
     cancel: CancellationToken,
 }
 
@@ -2502,9 +2502,9 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         } = self;
 
         let mailbox_delivery_phase =
-            initial_runtime_mailbox_delivery_phase(runtime_handle.as_ref(), session_id.as_str());
+            initial_runtime_mailbox_delivery_phase(Some(&runtime_handle), session_id.as_str());
         let state = LiveTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
-            .with_runtime_handle(runtime_handle.clone())
+            .with_runtime_handle(Some(runtime_handle.clone()))
             .with_mailbox_delivery_phase(mailbox_delivery_phase);
         // Enable REAL token accounting + model-based compaction when a sampler is
         // available (the real backend path). The Fake/no-credential path passes `None`
@@ -2538,18 +2538,14 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         }
         *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
-        // The observer persists the terminal agent message through the runtime
-        // when available so `session.done` is journaled and projected by the
-        // same live authority as model/tool events. The no-runtime test/replay
-        // path keeps the shared store sink.
-        let sink: Arc<dyn EventSink> = match runtime_handle {
-            Some(runtime) => Arc::new(RuntimeStoreSink {
-                runtime,
-                store: Arc::clone(&store),
-                model_context_window: None,
-            }),
-            None => make_ui_sink(Arc::clone(&store)),
-        };
+        // The observer persists the terminal agent message through the runtime so
+        // `session.done` is journaled and projected by the same live authority as
+        // model/tool events.
+        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
+            runtime: runtime_handle,
+            store: Arc::clone(&store),
+            model_context_window: None,
+        });
         let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
         let turn_loop = TurnLoop::new(state, driver, observer);
@@ -2581,7 +2577,7 @@ async fn drive_run<Sd: SamplingDriver>(
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
-    runtime_handle: Option<RuntimeHandle>,
+    runtime_handle: RuntimeHandle,
     cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
     RuntimeTurnLoopDriver {
@@ -2610,10 +2606,7 @@ async fn drive_run<Sd: SamplingDriver>(
 /// which the facade does not have (the caller keeps the `SharedStore`). So the
 /// lifecycle observer persists through a small synchronous adapter over the
 /// `SharedStore` instead.
-fn make_ui_sink(store: SharedStore) -> Arc<dyn EventSink> {
-    make_ui_sink_with_context_window(store, None)
-}
-
+#[cfg(test)]
 fn make_ui_sink_with_context_window(
     store: SharedStore,
     model_context_window: Option<i64>,
@@ -2630,11 +2623,13 @@ fn make_ui_sink_with_context_window(
 /// shared handle, so this adapter appends events directly under the shared lock.
 /// Best-effort: append errors are swallowed (the loop's return value also carries
 /// the result), matching the infallible-fan-out contract of [`EventSink::emit`].
+#[cfg(test)]
 struct SharedStoreSink {
     store: SharedStore,
     model_context_window: Option<i64>,
 }
 
+#[cfg(test)]
 impl EventSink for SharedStoreSink {
     fn emit(&self, ev: PendingEvent) {
         if let Ok(store) = self.store.lock() {
@@ -3013,7 +3008,7 @@ async fn run_session_once_with_config_with_cancel(
                 Some(base_instructions_for_config(&config)),
                 config.options.developer_instructions.clone(),
                 previous_model_compaction,
-                Some(runtime_handle.clone()),
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -3038,7 +3033,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 None,
                 None,
-                Some(runtime_handle.clone()),
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -5438,8 +5433,20 @@ mod tests {
 
     #[tokio::test]
     async fn drive_run_observes_runtime_cancel_token() {
-        let (_dir, store, session_id) = store_with_session();
+        let (dir, store, session_id) = store_with_session();
         seed_user_input(&store, &session_id, "long task").await;
+        let journal = Arc::new(SqliteJournal::open(dir.path()).expect("sqlite journal"));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).expect("session id"),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "long task".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach runtime root");
         let sid = SessionId(session_id.clone());
         let config = fake_config();
         let ctx = turn_ctx(&sid, &config);
@@ -5466,7 +5473,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                runtime_handle,
                 cancel,
             ),
         )
