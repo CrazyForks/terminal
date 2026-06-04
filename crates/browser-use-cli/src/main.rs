@@ -2626,16 +2626,18 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let live_cancelled = cancel_via_live_runtime(store, task_id)?;
-    store.request_cancel(task_id, reason)?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, task_id, |_| 0)?;
-    notify_parent_agent_done(store, &task)?;
     if live_cancelled {
         store.append_event(
             task_id,
             "runtime.cancel.forwarded",
-            serde_json::json!({ "source": "cli" }),
+            serde_json::json!({ "source": "cli", "reason": reason }),
         )?;
+        println!("cancelled {task_id}");
+        return Ok(());
     }
+    store.request_cancel(task_id, reason)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, task_id, |_| 0)?;
+    notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
 }
@@ -7516,10 +7518,16 @@ command = "test-mcp"
         let events = store.events_for_session(&session.id)?;
         assert!(events
             .iter()
-            .any(|event| event.event_type == "session.cancel_requested"));
+            .any(|event| event.event_type == "agent.cancel_requested"));
         assert!(events
             .iter()
             .any(|event| event.event_type == "runtime.cancel.forwarded"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancelled"));
 
         let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
