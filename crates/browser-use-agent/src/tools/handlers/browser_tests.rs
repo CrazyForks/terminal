@@ -57,6 +57,8 @@ struct FakeBackend {
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
     script_text: Mutex<Option<String>>,
+    script_outputs: Mutex<Vec<serde_json::Value>>,
+    script_summary: Mutex<Vec<serde_json::Value>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
 }
@@ -138,6 +140,8 @@ impl FakeBackend {
             .clone()
             .unwrap_or_else(|| "script-output".to_string());
         BrowserScriptOutput {
+            outputs: self.script_outputs.lock().unwrap().clone(),
+            summary: self.script_summary.lock().unwrap().clone(),
             images: self.script_images(),
             ..Self::ok_script_with_text(status, ok, text)
         }
@@ -656,6 +660,52 @@ async fn script_oversized_stdout_is_truncated_for_model_output() {
         !out.stdout
             .contains(&"x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 100)),
         "uncapped browser_script output leaked into model stdout"
+    );
+}
+
+#[tokio::test]
+async fn script_truncated_structured_output_preserves_summary_first() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_summary.lock().unwrap().push(json!({
+        "kind": "extracted",
+        "message": "Read 40 candidate rows",
+        "output_label": "candidate_rows"
+    }));
+    backend.script_outputs.lock().unwrap().push(json!({
+        "label": "candidate_rows",
+        "value": "x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 8_000)
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "emit_output(rows, label='candidate_rows')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("summary:"),
+        "summary should remain visible before large raw output: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("Read 40 candidate rows"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("[browser_script stdout truncated"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("Use a narrower browser_script extraction"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.find("summary:") < out.stdout.find("outputs:"),
+        "summary should precede raw outputs: {}",
+        out.stdout
     );
 }
 
