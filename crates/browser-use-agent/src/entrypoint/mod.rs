@@ -1221,12 +1221,15 @@ fn runtime_mailbox_items_as_pending_input(
                             );
                         }
                     }
-                    let committed_seq = append_runtime_prompt_projection_event(
+                    let committed_seq = match append_runtime_prompt_projection_event(
                         runtime_handle,
                         session_id,
                         names::SESSION_FOLLOWUP,
                         payload.clone(),
-                    );
+                    ) {
+                        Ok(committed_seq) => committed_seq,
+                        Err(_) => return Vec::new(),
+                    };
                     if let (Some(pending_from_seq), Some(committed_seq)) =
                         (pending_from_seq, committed_seq)
                     {
@@ -1249,7 +1252,7 @@ fn runtime_mailbox_items_as_pending_input(
                 }
             }
 
-            let _ = append_runtime_prompt_projection_event(
+            if append_runtime_prompt_projection_event(
                 runtime_handle,
                 session_id,
                 "agent.mailbox_input",
@@ -1266,7 +1269,11 @@ fn runtime_mailbox_items_as_pending_input(
                     "kind": item_kind.clone(),
                     "source": "runtime",
                 }),
-            );
+            )
+            .is_err()
+            {
+                return Vec::new();
+            }
             let label = match item_kind {
                 RuntimeMailboxItemKind::Completion => "Subagent completion",
                 RuntimeMailboxItemKind::Notification => "Inter-agent notification",
@@ -1290,8 +1297,8 @@ fn append_runtime_prompt_projection_event(
     session_id: &str,
     event_type: &str,
     payload: Value,
-) -> Option<i64> {
-    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string()).ok()?;
+) -> anyhow::Result<Option<i64>> {
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
     runtime_handle
         .append_observed_session_event(
             runtime_session_id,
@@ -1299,8 +1306,7 @@ fn append_runtime_prompt_projection_event(
             payload,
             RuntimeDurability::Barrier,
         )
-        .ok()
-        .and_then(|append| append.seq)
+        .map(|append| append.seq)
 }
 
 fn append_runtime_or_store_event(
@@ -4960,6 +4966,36 @@ mod tests {
         assert_eq!(
             mailbox_input.payload["content"],
             "runtime-only child update"
+        );
+    }
+
+    #[test]
+    fn runtime_mailbox_projection_failure_does_not_enter_prompt() {
+        let (runtime, _journal) = BrowserUseRuntime::memory();
+        let runtime_handle = runtime.handle();
+        let author = RuntimeAgentId::from_string("author").unwrap();
+        let target = RuntimeAgentId::from_string("target").unwrap();
+        let drained = runtime_mailbox_items_as_pending_input(
+            &runtime_handle,
+            None,
+            "",
+            vec![RuntimeMailboxItem {
+                seq: 1,
+                id: "mail-1".to_string(),
+                kind: RuntimeMailboxItemKind::Input,
+                author_agent_id: author,
+                target_agent_id: target,
+                target_path: Some("/root".to_string()),
+                content: "should not be visible".to_string(),
+                trigger_turn: false,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: json!({}),
+            }],
+        );
+
+        assert!(
+            drained.is_empty(),
+            "mailbox content must not enter the prompt when its projection append fails"
         );
     }
 

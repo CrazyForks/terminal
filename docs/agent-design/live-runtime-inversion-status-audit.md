@@ -66,6 +66,9 @@ BrowserUseRuntime
   `agent.mailbox_input`, `session.followup`, and `agent.turn_queue_drained`
   through `RuntimeHandle::append_observed_session_event`, so live mailbox
   delivery no longer writes those rows directly through `Store`.
+- Runtime mailbox prompt projection now fails closed: if the runtime journal
+  append for the prompt-visible `session.followup` or `agent.mailbox_input` row
+  fails, that mailbox content is not returned to the model prompt.
 - Runtime-backed compaction progress, errors, token usage, context-window-full
   markers, and `session.compacted` checkpoints now append through
   `RuntimeHandle::append_observed_session_event` when a runtime handle exists.
