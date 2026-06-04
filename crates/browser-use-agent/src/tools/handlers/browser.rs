@@ -1827,10 +1827,19 @@ mod browser_mode_tests {
         // The browser layer serializes its cloud mode as "remote-cloud"; the
         // preference normalizer must treat it as cloud rather than bailing with
         // "unknown browser preference mode".
-        assert_eq!(normalize_browser_preference_mode("remote-cloud").unwrap(), "cloud");
-        assert_eq!(normalize_browser_preference_mode("remote_cloud").unwrap(), "cloud");
+        assert_eq!(
+            normalize_browser_preference_mode("remote-cloud").unwrap(),
+            "cloud"
+        );
+        assert_eq!(
+            normalize_browser_preference_mode("remote_cloud").unwrap(),
+            "cloud"
+        );
         assert_eq!(normalize_browser_preference_mode("cloud").unwrap(), "cloud");
-        assert_eq!(normalize_browser_preference_mode("browser-use-cloud").unwrap(), "cloud");
+        assert_eq!(
+            normalize_browser_preference_mode("browser-use-cloud").unwrap(),
+            "cloud"
+        );
     }
 
     #[test]
