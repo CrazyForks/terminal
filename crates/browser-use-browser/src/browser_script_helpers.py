@@ -691,7 +691,7 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
 def note(caption):
     """Mark the current moment as important for the recording, with a short
     human-readable caption (e.g. note("Delta $209 - cheapest fare details")).
-    Cheap: it just timestamps a caption; the 2fps session capture already has the
+    Cheap: it just timestamps a caption; when enabled, session capture already has the
     frame. Call it at each meaningful step so the end-of-run highlight GIF can be
     captioned. Returns the recorded note."""
     record = {"ts_ms": int(_time.time() * 1000), "caption": str(caption)}
