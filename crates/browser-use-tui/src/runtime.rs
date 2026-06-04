@@ -26,8 +26,8 @@ use browser_use_agent::subagents::{display_agent_path_for_session, session_was_i
 use browser_use_protocol::{failure_from_events, session_result_from_events, SessionMeta};
 use browser_use_runtime::{
     spawn_local_runtime_server, AgentId, BrowserUseRuntime, CompleteAgentRequest, FailAgentRequest,
-    LiveThreadPersistence, MailboxDeliveryPhase, MailboxItem, MailboxItemKind, RuntimeHandle,
-    SendAgentMessageRequest, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
+    LiveThreadPersistence, MailboxDeliveryPhase, MailboxItem, RuntimeHandle, SessionId,
+    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 use browser_use_store::{Store, StoreNotifier};
 
@@ -96,7 +96,7 @@ pub(crate) fn submit_runtime_user_input(
     input_items: Option<serde_json::Value>,
     trigger_turn: bool,
     delivery_phase: MailboxDeliveryPhase,
-    mut payload: serde_json::Value,
+    payload: serde_json::Value,
 ) -> Result<MailboxItem> {
     let handle = existing_tui_runtime_handle(state_dir)?
         .context("no live TUI runtime is attached for this state dir")?;
@@ -108,27 +108,12 @@ pub(crate) fn submit_runtime_user_input(
         browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
     )?;
     let agent_id = AgentId::from_string(session_id.to_string())?;
-    if !payload.is_object() {
-        payload = serde_json::json!({});
-    }
-    if let Some(obj) = payload.as_object_mut() {
-        obj.entry("source".to_string())
-            .or_insert_with(|| serde_json::json!("tui"));
-        obj.insert(
-            "target_session_id".to_string(),
-            serde_json::json!(session_id),
-        );
-        if let Some(input_items) = input_items {
-            obj.insert("input_items".to_string(), input_items);
-        }
-    }
-    let response = handle.send_agent_message(SendAgentMessageRequest {
-        author_agent_id: agent_id.clone(),
+    let response = handle.submit_followup(SubmitInputRequest {
         target_agent_id: agent_id,
         content,
         trigger_turn,
-        kind: MailboxItemKind::Followup,
         delivery_phase,
+        input_items,
         payload,
     })?;
     Ok(response.mailbox_item)

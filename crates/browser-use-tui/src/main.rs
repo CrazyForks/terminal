@@ -3258,6 +3258,7 @@ impl App {
                 true,
                 browser_use_runtime::MailboxDeliveryPhase::CurrentTurn,
                 serde_json::json!({
+                    "source": "tui",
                     "pending_from_seq": followup_record.seq,
                     "runtime_marker_event_id": followup_record.id,
                 }),
