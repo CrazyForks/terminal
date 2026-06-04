@@ -8843,6 +8843,43 @@ print("http_get_many parity ok")
     }
 
     #[test]
+    fn browser_script_browser_fetch_single_returns_structured_errors_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-browser-fetch-single-error",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def fake_runtime_evaluate(expression, await_promise=False, return_by_value=False):
+    return [{"ok": False, "url": "https://example.test/api", "error": "Failed to fetch"}]
+
+globals()["_runtime_evaluate"] = fake_runtime_evaluate
+
+result = browser_fetch("https://example.test/api")
+assert result["ok"] is False, result
+assert result["url"] == "https://example.test/api", result
+assert "Failed to fetch" in result["error"], result
+
+try:
+    browser_fetch("https://example.test/api", return_error=False)
+except RuntimeError as exc:
+    assert "browser_fetch failed" in str(exc), exc
+else:
+    raise AssertionError("return_error=False should raise")
+
+print("browser_fetch single structured error ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output
+            .text
+            .contains("browser_fetch single structured error ok"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
