@@ -73,7 +73,12 @@ pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 /// [`ContentPart`]s so provider protocols can send images to vision-capable
 /// models while preserving a plain text fallback for logs/tests.
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
-pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 16 * 1024;
+/// Maximum bytes of browser-script text returned to the next model turn.
+///
+/// Full browser-script output is persisted through durable events/artifacts; the
+/// inline model view is deliberately smaller because long eval tasks repeatedly
+/// carry every prior tool result in later prompts.
+pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 4 * 1024;
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";

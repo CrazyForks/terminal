@@ -659,6 +659,11 @@ async fn script_oversized_stdout_is_truncated_for_model_output() {
     );
 }
 
+#[test]
+fn browser_script_stdout_cap_defaults_to_four_kib_for_eval_cost() {
+    assert_eq!(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, 4 * 1024);
+}
+
 #[tokio::test]
 async fn script_unreadable_images_warn_in_stdout() {
     let temp = tempfile::tempdir().expect("tempdir");
