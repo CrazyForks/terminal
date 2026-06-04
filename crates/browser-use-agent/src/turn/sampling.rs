@@ -1093,58 +1093,35 @@ fn request_composition(req: &LlmRequest) -> Value {
     })
 }
 
-const OBSERVABILITY_MAX_MESSAGES: usize = 80;
-const OBSERVABILITY_MAX_TEXT_CHARS: usize = 80_000;
-const OBSERVABILITY_MAX_STRING_CHARS: usize = 4_000;
-
 fn request_observability_input(req: &LlmRequest) -> Value {
-    let mut remaining_text_chars = OBSERVABILITY_MAX_TEXT_CHARS;
     let message_count = req.messages.len();
-    let omitted_earlier_messages = message_count.saturating_sub(OBSERVABILITY_MAX_MESSAGES);
-    let messages: Vec<Value> = req
-        .messages
-        .iter()
-        .skip(omitted_earlier_messages)
-        .map(|message| observability_json_value(message, &mut remaining_text_chars))
-        .collect();
-    let system: Vec<Value> = req
-        .system
-        .iter()
-        .map(|part| observability_json_value(part, &mut remaining_text_chars))
-        .collect();
+    let messages: Vec<Value> = req.messages.iter().map(observability_json_value).collect();
+    let system: Vec<Value> = req.system.iter().map(observability_json_value).collect();
 
     serde_json::json!({
         "system": system,
         "messages": messages,
         "message_count": message_count,
-        "omitted_earlier_messages": omitted_earlier_messages,
-        "truncated": remaining_text_chars == 0,
+        "omitted_earlier_messages": 0,
+        "truncated": false,
     })
 }
 
-fn observability_json_value<T: serde::Serialize>(
-    value: &T,
-    remaining_text_chars: &mut usize,
-) -> Value {
+fn observability_json_value<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value)
-        .map(|value| sanitize_observability_value(value, remaining_text_chars))
+        .map(sanitize_observability_value)
         .unwrap_or(Value::Null)
 }
 
-fn sanitize_observability_value(value: Value, remaining_text_chars: &mut usize) -> Value {
+fn sanitize_observability_value(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (key, value) in map {
                 if is_observability_secret_key(&key) {
                     out.insert(key, Value::String("[redacted]".to_string()));
-                } else if key == "data" {
-                    out.insert(key, Value::String("[redacted inline data]".to_string()));
                 } else {
-                    out.insert(
-                        key,
-                        sanitize_observability_value(value, remaining_text_chars),
-                    );
+                    out.insert(key, sanitize_observability_value(value));
                 }
             }
             Value::Object(out)
@@ -1152,12 +1129,9 @@ fn sanitize_observability_value(value: Value, remaining_text_chars: &mut usize) 
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
-                .map(|value| sanitize_observability_value(value, remaining_text_chars))
+                .map(sanitize_observability_value)
                 .collect(),
         ),
-        Value::String(text) => {
-            Value::String(truncate_observability_string(&text, remaining_text_chars))
-        }
         other => other,
     }
 }
@@ -1172,29 +1146,4 @@ fn is_observability_secret_key(key: &str) -> bool {
         || key.contains("secret")
         || key.contains("token")
         || key.contains("cookie")
-}
-
-fn truncate_observability_string(text: &str, remaining_text_chars: &mut usize) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    if *remaining_text_chars == 0 {
-        return "[truncated: request observability text budget exhausted]".to_string();
-    }
-
-    let limit = OBSERVABILITY_MAX_STRING_CHARS.min(*remaining_text_chars);
-    let mut out = String::new();
-    let mut chars = text.chars();
-    for _ in 0..limit {
-        let Some(ch) = chars.next() else {
-            *remaining_text_chars = (*remaining_text_chars).saturating_sub(out.chars().count());
-            return out;
-        };
-        out.push(ch);
-    }
-    *remaining_text_chars = (*remaining_text_chars).saturating_sub(out.chars().count());
-    if chars.next().is_some() {
-        out.push_str("...[truncated]");
-    }
-    out
 }
