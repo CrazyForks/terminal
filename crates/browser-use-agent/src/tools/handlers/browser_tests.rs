@@ -620,6 +620,46 @@ async fn script_unreadable_images_warn_in_stdout() {
 }
 
 #[tokio::test]
+async fn script_oversized_png_images_warn_in_stdout_without_media_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let image_path = temp.path().join("wide.png");
+    let mut png = vec![0_u8; 24];
+    png[0..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&8001_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&600_u32.to_be_bytes());
+    std::fs::write(&image_path, png).expect("write png");
+
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_images.lock().unwrap().push(json!({
+        "path": image_path,
+        "mime_type": "image/png",
+        "detail": "auto",
+        "label": "wide",
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "capture_screenshot()", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert!(
+        out.stdout
+            .contains("dimensions 8001x600 exceed provider limit"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("artifact remains at"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX),
+        "oversized-only images should not emit a media marker: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
 async fn default_artifact_dir_comes_from_tool_ctx_artifact_root() {
     let backend = Arc::new(FakeBackend::default());
     let tool = tool_with(Arc::clone(&backend));

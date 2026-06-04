@@ -28,7 +28,7 @@ use tungstenite::{connect, Message, WebSocket};
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
-const BROWSER_SCRIPT_INITIAL_WAIT_MS: u64 = 750;
+const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 7_000;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 
@@ -411,7 +411,7 @@ pub fn start_browser_script(
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
     let mut run = spawn_browser_script(session_id, cwd, artifact_dir, code, timeout_seconds)?;
-    let initial_deadline = Instant::now() + Duration::from_millis(BROWSER_SCRIPT_INITIAL_WAIT_MS);
+    let initial_deadline = Instant::now() + Duration::from_millis(browser_script_initial_wait_ms());
     loop {
         if run.child.try_wait()?.is_some() {
             return finish_browser_script_run(run, false);
@@ -456,6 +456,22 @@ pub fn start_browser_script(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn browser_script_initial_wait_ms() -> u64 {
+    [
+        "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
+        "BROWSER_SCRIPT_INITIAL_WAIT_MS",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    })
+    .map(|value| value.clamp(250, 30_000))
+    .unwrap_or(BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS)
 }
 
 pub fn observe_browser_script(
@@ -8602,9 +8618,33 @@ print("http_get parity ok")
     }
 
     #[test]
+    fn browser_script_initial_wait_defaults_to_seven_seconds_and_clamps_env() {
+        {
+            let _env = EnvRestore::unset(&[
+                "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
+                "BROWSER_SCRIPT_INITIAL_WAIT_MS",
+            ]);
+            assert_eq!(browser_script_initial_wait_ms(), 7_000);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "1500")]);
+            assert_eq!(browser_script_initial_wait_ms(), 1_500);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "50")]);
+            assert_eq!(browser_script_initial_wait_ms(), 250);
+        }
+        {
+            let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "45000")]);
+            assert_eq!(browser_script_initial_wait_ms(), 30_000);
+        }
+    }
+
+    #[test]
     fn browser_script_start_observe_finishes_slow_scripts() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-start-observe";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
         let started = start_browser_script(
             session_id,
             temp.path(),
