@@ -77,6 +77,7 @@ pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_conte
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
+const BROWSER_SCRIPT_MAX_IMAGE_DIMENSION: u32 = 8_000;
 
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1357,12 +1358,29 @@ fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, Strin
     if !mime_type.starts_with("image/") {
         return Ok(None);
     }
+    if let Some((width, height)) = png_dimensions(&bytes) {
+        if width > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION || height > BROWSER_SCRIPT_MAX_IMAGE_DIMENSION
+        {
+            return Err(format!(
+                "Warning: image artifact was not attached because its dimensions {width}x{height} exceed provider limit; artifact remains at {path}"
+            ));
+        }
+    }
     Ok(Some(ContentPart::Media {
         mime_type: mime_type.to_string(),
         data: Some(general_purpose::STANDARD.encode(bytes)),
         url: None,
         detail: None,
     }))
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((width, height))
 }
 
 fn browser_script_tool_message_content(response: &BrowserScriptOutput) -> String {

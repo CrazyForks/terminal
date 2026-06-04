@@ -387,6 +387,10 @@ def goto_url(url):
 
 def page_info():
     """Return url, title, viewport, scroll position, page size, and target info."""
+    try:
+        ensure_real_tab()
+    except Exception:
+        pass
     dialog = _send_meta("pending_dialog").get("dialog")
     if dialog:
         return {"dialog": dialog}
@@ -547,10 +551,21 @@ def _wait_for_browser_profile_page_load():
 def wait_for_load(timeout=15.0):
     timeout = _timeout_seconds(timeout)
     deadline = _time.time() + timeout
+    interactive_since = None
     while _time.time() < deadline:
         try:
-            if js("document.readyState") == "complete":
+            state = js("document.readyState")
+            if state == "complete":
                 return True
+            if state == "interactive":
+                has_body = js("!!document.body && !!location.href && !location.href.startsWith('about:')")
+                if has_body:
+                    if interactive_since is None:
+                        interactive_since = _time.time()
+                    if _time.time() - interactive_since >= 1.0:
+                        return True
+            else:
+                interactive_since = None
         except Exception:
             pass
         _time.sleep(0.3)
@@ -614,9 +629,53 @@ def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     return str(path)
 
 
+def _positive_int_env(names, default=None):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+        if value == 0:
+            return None
+    return default
+
+
+def _screenshot_max_dim(max_dim):
+    if max_dim is not None:
+        try:
+            value = int(max_dim)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+    return _positive_int_env(("BU_BROWSER_SCREENSHOT_MAX_DIM", "BROWSER_USE_SCREENSHOT_MAX_DIM"), 7600)
+
+
+def _downscale_image_artifact(path, max_dim):
+    if not max_dim:
+        return None
+    try:
+        from PIL import Image
+
+        img = Image.open(path)
+        original_size = img.size
+        if max(original_size) > max_dim:
+            img.thumbnail((max_dim, max_dim))
+            img.save(path)
+            return {"width": img.size[0], "height": img.size[1], "downscaled": True, "original_size": original_size}
+        return {"width": original_size[0], "height": original_size[1], "downscaled": False}
+    except Exception:
+        return None
+
+
 def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None, **kwargs):
     """Save a PNG of the current viewport and return its local artifact path."""
     try:
+        ensure_real_tab()
         target_id = (current_tab() or {}).get("targetId")
         if target_id:
             cdp("Target.activateTarget", session_id=None, targetId=target_id)
@@ -631,20 +690,26 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
     if full:
         params["captureBeyondViewport"] = True
     params.update(kwargs)
-    result = cdp("Page.captureScreenshot", **params)
+    last_error = None
+    for attempt in range(3):
+        try:
+            result = cdp("Page.captureScreenshot", **params)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+            _time.sleep(0.35 * (attempt + 1))
+    else:
+        raise last_error
     if not attach:
         return result
     path = _write_b64_artifact(label, result["data"], ".png", "image/png")
-    if max_dim:
-        try:
-            from PIL import Image
-
-            img = Image.open(path)
-            if max(img.size) > max_dim:
-                img.thumbnail((max_dim, max_dim))
-                img.save(path)
-        except Exception:
-            pass
+    image_info = _downscale_image_artifact(path, _screenshot_max_dim(max_dim))
+    if image_info and __images:
+        __images[-1].update(image_info)
+    if image_info and __artifacts:
+        __artifacts[-1].update({key: image_info[key] for key in ("width", "height") if key in image_info})
     return path
 
 
