@@ -13,11 +13,12 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    apply_child_request_runtime_config, load_mcp_servers_for_profile, parse_config_overrides,
-    resolve_agent_roles_for_profile, resolve_approval_policy_for_profile,
-    resolve_collab_for_profile, resolve_guardian_for_profile, resolve_multi_agent_v2_for_profile,
-    AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
-    ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    apply_child_request_runtime_config, apply_runtime_config_overrides,
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
 };
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
@@ -1763,6 +1764,7 @@ fn cli_agent_options(
         options = options.with_mcp_servers(mcp_servers);
     }
     if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
         options = options.with_config_overrides(config_overrides);
     }
     Ok(options)
