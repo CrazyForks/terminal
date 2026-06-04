@@ -251,6 +251,10 @@ struct StoreTurnState {
     /// `Some`, it REPLACES the durable-log prompt; later recorded turns are
     /// appended after it. `None` until the first compaction.
     compacted: Mutex<Option<Vec<Message>>>,
+    /// Unit/offline seams rely on the in-memory recorder because they do not emit
+    /// durable model/tool events. Production emits those events synchronously, so
+    /// replaying both durable history and this recorder tail duplicates turns.
+    include_recorded_tail_in_prompt: bool,
 }
 
 impl StoreTurnState {
@@ -278,7 +282,19 @@ impl StoreTurnState {
             previous_model_compaction: None,
             compaction_sampler: None,
             compacted: Mutex::new(None),
+            include_recorded_tail_in_prompt: true,
         }
+    }
+
+    /// Use only the durable event log when rebuilding prompts.
+    ///
+    /// The live facade persists model/tool events as they happen, before the next
+    /// sampling iteration. The in-memory fusion recorder is therefore redundant
+    /// for production prompt replay and would duplicate the same assistant/tool
+    /// turns that the event log already reconstructs.
+    fn with_durable_prompt_replay(mut self) -> Self {
+        self.include_recorded_tail_in_prompt = false;
+        self
     }
 
     /// Enable REAL token accounting + model-based compaction against a context
@@ -332,8 +348,14 @@ impl StoreTurnState {
                 history_from_store(&self.store, &session_id)
             }
         };
-        msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        self.append_recorded_tail_if_enabled(&mut msgs);
         msgs
+    }
+
+    fn append_recorded_tail_if_enabled(&self, msgs: &mut Vec<Message>) {
+        if self.include_recorded_tail_in_prompt {
+            msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        }
     }
 
     fn current_prompt_items_for_compaction(&self, mode: CompactionMode) -> Vec<Item> {
@@ -353,13 +375,15 @@ impl StoreTurnState {
         events: &[browser_use_protocol::EventRecord],
     ) -> Vec<Item> {
         let mut items = provider_messages_from_events(events);
-        items.extend(
-            self.recorded
-                .lock()
-                .unwrap()
-                .iter()
-                .map(message_to_provider_item),
-        );
+        if self.include_recorded_tail_in_prompt {
+            items.extend(
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(message_to_provider_item),
+            );
+        }
         items
     }
 
@@ -1578,10 +1602,10 @@ fn enrich_token_count_payload(
 impl TurnState for StoreTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
-        // replaced history); otherwise it is the lowered durable log. The recorded
-        // buffer (this run's assistant turns + the fused driver's dispatched tool
-        // outputs) is appended either way, so tool outputs always re-enter the next
-        // prompt (the fusion seam is preserved across compaction).
+        // replaced history); otherwise it is the lowered durable log. Offline
+        // tests append the recorder tail so tool outputs re-enter the next prompt
+        // without a durable sink. Production disables that tail because the same
+        // model/tool events have already been persisted and replay from the log.
         if self.compacted.lock().unwrap().is_some() {
             return self.assemble_prompt_blocking();
         }
@@ -1591,10 +1615,7 @@ impl TurnState for StoreTurnState {
         let mut msgs = tokio::task::spawn_blocking(move || history_from_store(&store, &session_id))
             .await
             .unwrap_or_default();
-        // The recorded buffer carries this run's assistant turns AND the fused
-        // driver's dispatched tool outputs (both append through the same `Arc`), so
-        // the next prompt sees everything produced so far.
-        msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        self.append_recorded_tail_if_enabled(&mut msgs);
         msgs
     }
 
@@ -2062,7 +2083,8 @@ async fn drive_run<Sd: SamplingDriver>(
     cancel: CancellationToken,
     max_turns: Option<usize>,
 ) -> Result<Option<String>, AgentError> {
-    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
+    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
+        .with_durable_prompt_replay();
     // Enable REAL token accounting + model-based compaction when a sampler is
     // available (the real backend path). The Fake/no-credential path passes `None`
     // and keeps the inert (never-compacts) behavior.
@@ -2706,6 +2728,32 @@ mod tests {
         )
     }
 
+    fn count_tool_call_ids(messages: &[Message], call_id: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolCall { id, .. } if id == call_id
+                )
+            })
+            .count()
+    }
+
+    fn count_tool_result_ids(messages: &[Message], call_id: &str) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == call_id
+                )
+            })
+            .count()
+    }
+
     fn seed_workspace_context(store: &SharedStore, session_id: &str, content: &str) {
         let store = store.lock().expect("store mutex poisoned");
         store
@@ -3020,6 +3068,84 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn durable_prompt_replay_ignores_duplicate_fusion_tail() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "use the browser").await;
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    "model.tool_call",
+                    serde_json::json!({
+                        "id": "call_browser",
+                        "name": "browser_script",
+                        "arguments": { "code": "return document.title" },
+                    }),
+                )
+                .expect("seed durable tool call");
+            store
+                .append_event(
+                    &session_id,
+                    "tool.output",
+                    serde_json::json!({
+                        "tool_call_id": "call_browser",
+                        "name": "browser_script",
+                        "text": "Example Domain",
+                    }),
+                )
+                .expect("seed durable tool output");
+        }
+
+        let recorded = Arc::new(Mutex::new(vec![
+            Message::new(
+                MessageRole::Assistant,
+                vec![ContentPart::ToolCall {
+                    id: "call_browser".to_string(),
+                    name: "browser_script".to_string(),
+                    input: serde_json::json!({ "code": "return document.title" }),
+                    provider_metadata: None,
+                }],
+            ),
+            Message::new(
+                MessageRole::Tool,
+                vec![ContentPart::ToolResult {
+                    tool_call_id: "call_browser".to_string(),
+                    content: vec![ContentPart::text("Example Domain")],
+                    is_error: false,
+                }],
+            ),
+        ]));
+
+        let default_state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        );
+        let default_prompt = default_state.clone_history_for_prompt().await;
+        assert_eq!(
+            count_tool_call_ids(&default_prompt, "call_browser"),
+            2,
+            "test fixture should reproduce the old durable+recorder duplication"
+        );
+
+        let durable_state =
+            StoreTurnState::new(Arc::clone(&store), SessionId(session_id), recorded)
+                .with_durable_prompt_replay();
+        let prompt = durable_state.clone_history_for_prompt().await;
+        assert_eq!(
+            count_tool_call_ids(&prompt, "call_browser"),
+            1,
+            "production prompt replay must not duplicate durable tool calls"
+        );
+        assert_eq!(
+            count_tool_result_ids(&prompt, "call_browser"),
+            1,
+            "production prompt replay must not duplicate durable tool outputs"
+        );
     }
 
     #[tokio::test]
