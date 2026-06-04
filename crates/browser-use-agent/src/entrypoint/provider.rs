@@ -261,24 +261,40 @@ fn unified_exec_manager_for_session(session_id: Option<&SessionId>) -> UnifiedEx
 fn unified_exec_manager_for_runtime_or_session(
     runtime_handle: Option<&RuntimeHandle>,
     session_id: Option<&SessionId>,
-) -> UnifiedExecManager {
+) -> Result<UnifiedExecManager, ProviderResolveError> {
     let Some(session_id) = session_id else {
-        return UnifiedExecManager::default();
+        return if runtime_handle.is_some() {
+            Err(ProviderResolveError::RuntimeResource(
+                "runtime-backed exec manager requires an attached session".to_string(),
+            ))
+        } else {
+            Ok(UnifiedExecManager::default())
+        };
     };
     if let Some(runtime_handle) = runtime_handle {
-        if let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.as_str()) {
-            if let Ok(manager) = runtime_handle.get_or_insert_session_resource(
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.as_str()).map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "invalid runtime session id for exec manager {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let manager = runtime_handle
+            .get_or_insert_session_resource(
                 &runtime_session_id,
                 UNIFIED_EXEC_RESOURCE_KEY,
                 UnifiedExecManager::default,
                 |manager: Arc<UnifiedExecManager>| manager.terminate_all_best_effort(),
-            ) {
-                return (*manager).clone();
-            }
-        }
-        return UnifiedExecManager::default();
+            )
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to attach runtime exec manager for {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        return Ok((*manager).clone());
     }
-    unified_exec_manager_for_session(Some(session_id))
+    Ok(unified_exec_manager_for_session(Some(session_id)))
 }
 
 pub fn cleanup_unified_exec_manager_for_session_id(session_id: &str) -> usize {
@@ -331,21 +347,34 @@ fn browser_backend_for_runtime_or_config(
     config: &ProviderRunConfig,
     runtime_handle: Option<&RuntimeHandle>,
     session_id: Option<&SessionId>,
-) -> Arc<dyn BrowserBackend> {
+) -> Result<Arc<dyn BrowserBackend>, ProviderResolveError> {
     let key = runtime_resource_key(
         BROWSER_BACKEND_RESOURCE_PREFIX,
         &config.options.browser_mode.clone(),
     );
-    if let (Some(handle), Some(session_id)) = (runtime_handle, session_id) {
-        if let Some(runtime_session_id) = runtime_session_id_for_agent_session(session_id) {
-            let Ok(agent_id) = RuntimeAgentId::from_string(session_id.as_str()) else {
-                return Arc::new(
-                    crate::tools::handlers::browser::RealBackend::with_browser_mode(
-                        config.options.browser_mode.clone(),
-                    ),
-                );
-            };
-            if let Ok(resource) = handle.get_or_insert_session_resource(
+    if let Some(handle) = runtime_handle {
+        let session_id = session_id.ok_or_else(|| {
+            ProviderResolveError::RuntimeResource(
+                "runtime-backed browser backend requires an attached session".to_string(),
+            )
+        })?;
+        let runtime_session_id =
+            runtime_session_id_for_agent_session(session_id).ok_or_else(|| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "invalid runtime session id for browser backend {}",
+                    session_id.as_str()
+                ))
+            })?;
+        let agent_id = handle
+            .agent_id_for_session(&runtime_session_id)
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to resolve runtime agent for browser backend {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let resource = handle
+            .get_or_insert_session_resource(
                 &runtime_session_id,
                 &key,
                 || {
@@ -371,18 +400,22 @@ fn browser_backend_for_runtime_or_config(
                     let _ = resource.runtime.close_browser(&resource.browser_id);
                     cleaned
                 },
-            ) {
-                let backend: Arc<dyn BrowserBackend> = resource;
-                return backend;
-            }
-        }
+            )
+            .map_err(|e| {
+                ProviderResolveError::RuntimeResource(format!(
+                    "failed to attach runtime browser backend for {}: {e}",
+                    session_id.as_str()
+                ))
+            })?;
+        let backend: Arc<dyn BrowserBackend> = resource;
+        return Ok(backend);
     }
 
-    Arc::new(
+    Ok(Arc::new(
         crate::tools::handlers::browser::RealBackend::with_browser_mode(
             config.options.browser_mode.clone(),
         ),
-    )
+    ))
 }
 
 fn python_backend_for_runtime_or_config(
@@ -413,6 +446,14 @@ fn python_backend_for_runtime_or_config(
                 .map_err(|e| ProviderResolveError::PythonWorker(e.to_string()))?;
             return Ok(Arc::clone(&resource.backend));
         }
+        return Err(ProviderResolveError::RuntimeResource(format!(
+            "invalid runtime session id for python backend {}",
+            session_id.as_str()
+        )));
+    } else if runtime_handle.is_some() {
+        return Err(ProviderResolveError::RuntimeResource(
+            "runtime-backed python backend requires an attached session".to_string(),
+        ));
     }
 
     start_python_backend(config)
@@ -443,6 +484,12 @@ fn mcp_client_for_runtime_or_config(
                 |_| 1,
             );
         }
+        anyhow::bail!(
+            "invalid runtime session id for mcp client {}",
+            session_id.as_str()
+        );
+    } else if runtime_handle.is_some() {
+        anyhow::bail!("runtime-backed mcp client requires an attached session");
     }
 
     Ok(Arc::new(runtime_mcp_client_from_config(
@@ -533,6 +580,10 @@ pub enum ProviderResolveError {
     ///
     /// [`PythonWorker`]: browser_use_python_worker::PythonWorker
     PythonWorker(String),
+    /// A runtime-backed provider could not attach a live resource to the runtime
+    /// session resource bag. Runtime-owned runs must fail here rather than
+    /// continuing with orphan exec/browser/MCP/Python resources.
+    RuntimeResource(String),
 }
 
 impl std::fmt::Display for ProviderResolveError {
@@ -550,6 +601,9 @@ impl std::fmt::Display for ProviderResolveError {
             }
             ProviderResolveError::PythonWorker(why) => {
                 write!(f, "failed to start python worker: {why}")
+            }
+            ProviderResolveError::RuntimeResource(why) => {
+                write!(f, "failed to attach runtime resource: {why}")
             }
         }
     }
@@ -952,19 +1006,17 @@ fn resolve_provider_with_python(
     if goals_enabled {
         driver = driver.with_goal_store(goal_store.clone());
     }
-    let mut driver = driver.with_fusion(
-        build_tool_dispatcher_with_cwd_and_goal_store(
-            python_backend,
-            config,
-            user_input,
-            tool_cwd,
-            tool_artifact_root,
-            sink,
-            goal_store,
-            runtime_handle,
-        ),
-        recorder,
+    let dispatcher = build_tool_dispatcher_with_cwd_and_goal_store(
+        python_backend,
+        config,
+        user_input,
+        tool_cwd,
+        tool_artifact_root,
+        sink,
+        goal_store,
+        runtime_handle,
     );
+    let mut driver = driver.with_fusion(dispatcher?, recorder);
     if let Some(probe) = preemption_probe {
         driver = driver.with_mailbox_preemption_probe(probe);
     }
@@ -1065,6 +1117,7 @@ fn build_tool_dispatcher_with_cwd(
         goal_store,
         None,
     )
+    .expect("test dispatcher should build")
 }
 
 fn build_tool_dispatcher_with_cwd_and_goal_store(
@@ -1076,7 +1129,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     event_sink: Arc<dyn EventSink>,
     goal_store: Arc<crate::tools::handlers::goal::GoalStore>,
     runtime_handle: Option<RuntimeHandle>,
-) -> Arc<RealToolDispatcher> {
+) -> Result<Arc<RealToolDispatcher>, ProviderResolveError> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
     use crate::tools::handlers::capture::{CaptureCurationRequest, CaptureCurationTool};
@@ -1102,7 +1155,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     let unified_exec = unified_exec_manager_for_runtime_or_session(
         runtime_handle.as_ref(),
         user_input.as_ref().map(|(_, session_id)| session_id),
-    );
+    )?;
     let unified_exec_emitter = user_input.as_ref().map(|(_, session_id)| {
         Arc::new(crate::tools::UnifiedExecEventEmitter::new(
             Arc::clone(&event_sink),
@@ -1171,7 +1224,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         config,
         runtime_handle.as_ref(),
         user_input.as_ref().map(|(_, session_id)| session_id),
-    );
+    )?;
     let browser_tool = BrowserTool::with_backend(browser_backend)
         .with_selected_browser_mode(config.options.browser_mode.clone())
         .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds);
@@ -1255,27 +1308,21 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     // manager (which implements `McpClient`). Registered `parallel_safe = false`;
     // the handler's per-request read-only hint still drives its own gate.
     if !config.options.mcp_servers.is_empty() {
-        match mcp_client_for_runtime_or_config(
+        let resource = mcp_client_for_runtime_or_config(
             config,
             runtime_handle.as_ref(),
             user_input.as_ref().map(|(_, session_id)| session_id),
-        ) {
-            Ok(resource) => {
-                for (server, err) in &resource.startup_errors {
-                    eprintln!("warning: MCP server '{server}' failed to connect: {err}");
-                }
-                reg.register::<_, McpToolCallRequest>(
-                    "mcp",
-                    definitions::mcp(),
-                    false,
-                    McpTool::new(Arc::clone(&resource.client)),
-                );
-            }
-            // A runtime-build failure (rare) drops the `mcp` tool rather than
-            // aborting the whole run; a model call to `mcp` then returns "unknown
-            // tool". The other tools are unaffected.
-            Err(e) => eprintln!("warning: failed to start MCP runtime, mcp tool disabled: {e}"),
+        )
+        .map_err(|e| ProviderResolveError::RuntimeResource(e.to_string()))?;
+        for (server, err) in &resource.startup_errors {
+            eprintln!("warning: MCP server '{server}' failed to connect: {err}");
         }
+        reg.register::<_, McpToolCallRequest>(
+            "mcp",
+            definitions::mcp(),
+            false,
+            McpTool::new(Arc::clone(&resource.client)),
+        );
     }
 
     apply_role_tool_policy(&mut reg, config);
@@ -1354,9 +1401,9 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         policy,
     );
 
-    Arc::new(ToolDispatcher::with_runner_and_specs(
+    Ok(Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
-    ))
+    )))
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -4033,7 +4080,8 @@ mod tests {
             .expect("root agent");
         let session_id = SessionId(root.session_id().as_str().to_string());
 
-        let first = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id));
+        let first = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect("runtime exec manager resource");
         let started = first
             .spawn_process(crate::tools::unified_exec::SpawnProcessRequest {
                 argv: vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()],
@@ -4053,7 +4101,8 @@ mod tests {
             .expect("spawn process");
         assert!(started.running);
 
-        let second = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id));
+        let second = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect("runtime exec manager resource");
         assert_eq!(
             second.terminate_all().await,
             1,
@@ -4071,7 +4120,12 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
 
-        let _ = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id));
+        let err = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id))
+            .expect_err("unattached runtime session should fail loudly");
+        assert!(
+            matches!(err, ProviderResolveError::RuntimeResource(_)),
+            "expected runtime resource error, got {err:?}"
+        );
 
         assert!(
             !unified_exec_managers()
@@ -4103,9 +4157,11 @@ mod tests {
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
 
         let first =
-            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id));
+            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+                .expect("runtime browser backend resource");
         let second =
-            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id));
+            browser_backend_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+                .expect("runtime browser backend resource");
 
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -4136,6 +4192,32 @@ mod tests {
                 .expect("cleanup browser runtime resource"),
             1,
             "runtime resource cleanup should close the underlying browser session"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_browser_backend_fails_loudly() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+
+        let err = match browser_backend_for_runtime_or_config(
+            &config,
+            Some(&handle),
+            Some(&session_id),
+        ) {
+            Ok(_) => panic!("unattached runtime session should fail loudly"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, ProviderResolveError::RuntimeResource(_)),
+            "expected runtime resource error, got {err:?}"
+        );
+        assert!(
+            handle.snapshot().browsers.is_empty(),
+            "failed runtime browser resource attachment must not create browser handles"
         );
     }
 
@@ -4188,6 +4270,46 @@ mod tests {
             first.startup_errors.len(),
             1,
             "startup errors should be retained with the runtime-owned MCP resource"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_mcp_client_fails_loudly() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "missing".to_string(),
+            crate::mcp::McpServerConfig {
+                transport: crate::mcp::McpServerTransport::Stdio {
+                    command: "__browser_use_missing_mcp_test_command__".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+                startup_timeout_ms: Some(50),
+                tool_timeout_ms: Some(50),
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        );
+        let options = crate::config_overrides::AgentRunOptions {
+            mcp_servers: servers,
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let err = match mcp_client_for_runtime_or_config(&config, Some(&handle), Some(&session_id))
+        {
+            Ok(_) => panic!("unattached runtime session should fail loudly"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("unknown agent"),
+            "unexpected mcp error: {err}"
         );
     }
 

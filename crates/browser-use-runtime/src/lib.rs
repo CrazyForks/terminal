@@ -2700,6 +2700,15 @@ impl RuntimeHandle {
         Ok(self.inner.agents.thread(agent_id)?.snapshot())
     }
 
+    pub fn agent_id_for_session(&self, session_id: &SessionId) -> Result<AgentId> {
+        Ok(self
+            .inner
+            .agents
+            .thread_for_session(session_id)?
+            .agent_id()
+            .clone())
+    }
+
     pub fn subscribe_projected(&self) -> ProjectedRuntimeSubscription {
         self.inner.subscribe_projected()
     }
