@@ -106,6 +106,14 @@ fn system_prompt_bounds_multi_item_collection_loops() {
     assert!(BASE_SYSTEM_PROMPT.contains("audit the checklist"));
 }
 
+#[test]
+fn system_prompt_commits_single_site_collection_to_one_domain() {
+    assert!(BASE_SYSTEM_PROMPT.contains("Single-site collection rule"));
+    assert!(BASE_SYSTEM_PROMPT.contains("choose one viable domain early"));
+    assert!(BASE_SYSTEM_PROMPT.contains("Do not stitch rows from multiple domains"));
+    assert!(BASE_SYSTEM_PROMPT.contains("mark it unavailable for that domain"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
