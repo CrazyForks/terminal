@@ -91,7 +91,10 @@ impl Protocol for OpenAiResponsesProtocol {
         }
         if let Some(effort) = gen.reasoning_effort {
             if let Some(s) = reasoning_effort_str(effort) {
-                body.insert("reasoning".to_string(), json!({ "effort": s }));
+                body.insert(
+                    "reasoning".to_string(),
+                    json!({ "effort": s, "summary": "auto" }),
+                );
             }
         }
 
@@ -765,7 +768,10 @@ mod tests {
         // temperature is an f32; compare against the f32-derived JSON number so
         // the assertion does not trip on f32->f64 widening.
         assert_eq!(body["temperature"], json!(0.2_f32));
-        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
         assert_eq!(body["tool_choice"], json!("auto"));
 
         // Input: one user message with an input_text part.

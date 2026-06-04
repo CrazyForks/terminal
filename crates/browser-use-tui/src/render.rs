@@ -1393,7 +1393,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
         Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
         Surface::FeedbackThanks => ("Feedback", ""),
-        Surface::Thinking => ("Thinking", "Agent reasoning for this task"),
+        Surface::Thinking => ("Thinking", "Agent reasoning summaries for this task"),
         Surface::Main => ("", ""),
     }
 }
@@ -1506,7 +1506,7 @@ fn surface_lines(
 }
 
 /// The dedicated agent-thinking surface (opened with Ctrl+O): every reasoning
-/// block for the current task, full text, in the distinct `thought()` color.
+/// summary block for the current task in the distinct `thought()` color.
 /// The per-block aggregation lives in `transcript` so the inline collapsed
 /// summary and this view stay in lockstep.
 fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<Line<'static>> {
