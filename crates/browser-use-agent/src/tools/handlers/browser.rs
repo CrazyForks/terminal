@@ -873,6 +873,67 @@ fn local_connect_default_profile_preflight(
     }))
 }
 
+fn enrich_local_connect_recovery_with_default_profile(
+    mut output: BrowserCommandOutput,
+    resolved_command: &str,
+    default_profile_id: Option<&str>,
+) -> BrowserCommandOutput {
+    if !is_plain_local_connect_command(resolved_command) {
+        return output;
+    }
+    let Some(profile_id) = default_profile_id
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+    else {
+        return output;
+    };
+    let Some(content) = output.content.as_object_mut() else {
+        return output;
+    };
+    let status = content
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if status != "blocked" {
+        return output;
+    }
+    let state = content
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let quoted_profile = shell_quote_browser_arg(profile_id);
+    match state {
+        "stale-port" | "browser-not-running" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "profile_recovery_command".to_string(),
+                json!(format!("browser local open --profile {quoted_profile}")),
+            );
+            content.insert(
+                "next_step".to_string(),
+                json!(format!(
+                    "Run `browser local open --profile {quoted_profile}`, give Chrome a moment to start, then run `browser connect local`."
+                )),
+            );
+        }
+        "permission-blocked" => {
+            content.insert("default_profile_id".to_string(), json!(profile_id));
+            content.insert(
+                "profile_recovery_command".to_string(),
+                json!(format!("browser local open --profile {quoted_profile}")),
+            );
+            content.insert(
+                "next_step".to_string(),
+                json!(format!(
+                    "If the Allow popup is not visible, run `browser local open --profile {quoted_profile}` to focus the default profile window. Then ask the user to click Allow in Chrome's 'Allow remote debugging?' popup and run `browser connect local`."
+                )),
+            );
+        }
+        _ => {}
+    }
+    output
+}
+
 fn local_profile_label_for_id(
     backend: &dyn BrowserBackend,
     session_id: &str,
@@ -1761,11 +1822,11 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
-                            let has_default_profile = store
+                            let default_profile_id = store
                                 .get_setting(BROWSER_PREF_PROFILE)
                                 .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
-                                .as_deref()
-                                .is_some_and(|profile| !profile.trim().is_empty());
+                                .filter(|profile| !profile.trim().is_empty());
+                            let has_default_profile = default_profile_id.is_some();
                             drop(store);
                             if let Some(preflight) = local_connect_default_profile_preflight(
                                 has_default_profile,
@@ -1779,9 +1840,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             {
                                 preflight
                             } else {
-                                backend
+                                let output = backend
                                     .command(&session_id, &cwd, &artifact_dir, &resolved)
-                                    .map_err(ToolError::Other)?
+                                    .map_err(ToolError::Other)?;
+                                enrich_local_connect_recovery_with_default_profile(
+                                    output,
+                                    &resolved,
+                                    default_profile_id.as_deref(),
+                                )
                             }
                         }
                     } else {

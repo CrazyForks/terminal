@@ -1590,6 +1590,18 @@ fn dispatch_local(
 ) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("list") => Ok(json!({ "candidates": local_candidates() })),
+        Some("open") => {
+            let profile_ref = option_value(argv, "--profile")
+                .or_else(|| {
+                    argv.get(2)
+                        .filter(|value| !value.starts_with("--"))
+                        .cloned()
+                })
+                .ok_or_else(|| anyhow!("browser local open requires --profile <profile-id>"))?;
+            let profiles = detect_local_profiles();
+            let profile = resolve_local_profile(&profiles, &profile_ref)?;
+            open_local_profile(&profile)
+        }
         Some("setup") => {
             // The agent decides how to open the URL
             let profile_ref = option_value(argv, "--profile");
@@ -1604,8 +1616,42 @@ fn dispatch_local(
         }
         Some("profiles") => dispatch_local_profiles(argv),
         Some(other) => bail!("unknown browser local command: {other}"),
-        None => bail!("browser local requires list, setup, or profiles"),
+        None => bail!("browser local requires list, open, setup, or profiles"),
     }
+}
+
+fn open_local_profile(profile: &LocalBrowserProfile) -> Result<Value> {
+    let profile_directory_arg = format!("--profile-directory={}", profile.profile_dir);
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.args(["-a", profile.browser_name.as_str(), "--args"]);
+        command.arg(&profile_directory_arg);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut command = {
+        let mut command = Command::new(&profile.browser_path);
+        command.arg(&profile_directory_arg);
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "open {} with profile {}",
+                profile.browser_name, profile.profile_name
+            )
+        })?;
+    Ok(json!({
+        "status": "ok",
+        "opened": true,
+        "profile": profile,
+        "next_step": "Give Chrome a moment to start, then run browser connect local.",
+    }))
 }
 
 fn local_setup_user_action_response(profile: Option<LocalBrowserProfile>) -> Value {
