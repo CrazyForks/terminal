@@ -3459,6 +3459,9 @@ impl App {
         }
         let cancelled_live_run = cancel_agent_run(&self.args.state_dir, &id);
         self.pause_active_goal_for_interrupt(&id)?;
+        if cancelled_live_run {
+            return Ok(true);
+        }
         self.store.request_cancel(&id, "stopped from terminal")?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
             usize::from(cancel_agent_run(&self.args.state_dir, session_id))
@@ -8726,6 +8729,50 @@ mod redesign_tests {
         );
         assert!(app.escape_stop_until.is_none());
         assert_ne!(app.surface, Surface::Messages);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_current_task_uses_live_runtime_without_store_cancel_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Working..."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        let runtime_session_id = browser_use_runtime::SessionId::from_string(session.id.clone())?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: runtime_session_id.clone(),
+            cwd: temp.path().to_path_buf(),
+            task: "keep working".to_string(),
+            max_concurrent_threads_per_session:
+                browser_use_agent::config_overrides::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        })?;
+        let token = runtime.register_run(runtime_session_id);
+
+        assert!(app.cancel_current_task()?);
+
+        assert!(token.is_cancelled());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancel_requested"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "session.cancelled"));
         Ok(())
     }
 
