@@ -1362,7 +1362,7 @@ fn cap_inline_browser_script_stdout(text: String) -> String {
     let elided = text.len() - end;
     let mut out = text[..end].to_string();
     out.push_str(&format!(
-        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted]"
+        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted. Use a narrower browser_script extraction, the emitted summaries, or a saved artifact instead of re-reading broad page text.]"
     ));
     out
 }
@@ -1519,12 +1519,6 @@ fn browser_script_failure_message(response: &BrowserScriptOutput) -> String {
 
 fn browser_script_structured_message_parts(response: &BrowserScriptOutput) -> Vec<String> {
     let mut parts = Vec::new();
-    if !response.outputs.is_empty() {
-        parts.push(format!(
-            "outputs: {}",
-            Value::Array(response.outputs.clone())
-        ));
-    }
     if !response.summary.is_empty() {
         parts.push(format!(
             "summary: {}",
@@ -1533,6 +1527,12 @@ fn browser_script_structured_message_parts(response: &BrowserScriptOutput) -> Ve
     }
     if !response.data.is_null() && response.data != serde_json::json!({}) {
         parts.push(format!("data: {}", response.data));
+    }
+    if !response.outputs.is_empty() {
+        parts.push(format!(
+            "outputs: {}",
+            Value::Array(response.outputs.clone())
+        ));
     }
     parts
 }
