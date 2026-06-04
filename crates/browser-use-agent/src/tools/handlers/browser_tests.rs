@@ -24,6 +24,7 @@ use serde_json::json;
 use super::browser::{
     browser_command_is_passive, desired_browser_connect_command, BrowserAction, BrowserBackend,
     BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
+    MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES,
 };
 use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
@@ -55,6 +56,7 @@ struct FakeBackend {
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
+    script_text: Mutex<Option<String>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
 }
@@ -99,6 +101,10 @@ impl FakeBackend {
         *self.last_timeout_secs.lock().unwrap()
     }
 
+    fn set_script_text(&self, text: impl Into<String>) {
+        *self.script_text.lock().unwrap() = Some(text.into());
+    }
+
     fn record_paths(&self, cwd: &std::path::Path, artifact_dir: &std::path::Path) {
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
     }
@@ -114,20 +120,26 @@ impl FakeBackend {
         }
     }
 
-    fn ok_script(status: Option<&str>, ok: bool) -> BrowserScriptOutput {
+    fn ok_script_with_text(status: Option<&str>, ok: bool, text: String) -> BrowserScriptOutput {
         BrowserScriptOutput {
             ok,
             status: status.map(|s| s.to_string()),
             run_id: Some("run-1".to_string()),
-            text: "script-output".to_string(),
+            text,
             ..Default::default()
         }
     }
 
     fn ok_script_with_images(&self, status: Option<&str>, ok: bool) -> BrowserScriptOutput {
+        let text = self
+            .script_text
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "script-output".to_string());
         BrowserScriptOutput {
             images: self.script_images(),
-            ..Self::ok_script(status, ok)
+            ..Self::ok_script_with_text(status, ok, text)
         }
     }
 }
@@ -618,6 +630,33 @@ async fn script_images_are_appended_as_structured_stdout_payload() {
     assert_eq!(media.0, "image/png");
     assert!(media.1.as_deref().is_some_and(|data| !data.is_empty()));
     assert!(media.2.is_none());
+}
+
+#[tokio::test]
+async fn script_oversized_stdout_is_truncated_for_model_output() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.set_script_text("x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 5_000));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "document.body.innerText", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.len() < MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 1_000,
+        "stdout should be capped, got {} bytes",
+        out.stdout.len()
+    );
+    assert!(
+        out.stdout.contains("[browser_script stdout truncated"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout
+            .contains(&"x".repeat(MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES + 100)),
+        "uncapped browser_script output leaked into model stdout"
+    );
 }
 
 #[tokio::test]

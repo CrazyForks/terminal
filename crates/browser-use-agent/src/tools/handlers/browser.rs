@@ -73,6 +73,7 @@ pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 /// [`ContentPart`]s so provider protocols can send images to vision-capable
 /// models while preserving a plain text fallback for logs/tests.
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
+pub const MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES: usize = 16 * 1024;
 
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
@@ -1337,11 +1338,28 @@ fn map_script_output(out: BrowserScriptOutput) -> ExecOutput {
 fn browser_script_stdout(response: &BrowserScriptOutput) -> String {
     let text = browser_script_tool_message_content(response);
     let (image_parts, warnings) = browser_script_image_parts(response);
-    let text = append_browser_script_image_warnings(text, &warnings);
+    let text =
+        cap_inline_browser_script_stdout(append_browser_script_image_warnings(text, &warnings));
     let Some(payload) = browser_script_content_payload(&text, image_parts) else {
         return text;
     };
     format!("{text}{BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX}{payload}")
+}
+
+fn cap_inline_browser_script_stdout(text: String) -> String {
+    if text.len() <= MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES {
+        return text;
+    }
+    let mut end = MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let elided = text.len() - end;
+    let mut out = text[..end].to_string();
+    out.push_str(&format!(
+        "\n... [browser_script stdout truncated, {elided} more bytes; full output persisted]"
+    ));
+    out
 }
 
 fn browser_script_content_payload(text: &str, image_parts: Vec<ContentPart>) -> Option<String> {
