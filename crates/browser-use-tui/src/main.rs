@@ -106,13 +106,13 @@ use render::{
 };
 use runtime::{cancel_agent_run, run_agent_thread};
 use settings::{
-    browser_use_cloud_env_key_present, bundled_openai_model_ids, bundled_openrouter_model_ids,
-    display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
-    is_claude_code_account, model_choices_for_config, provider_model_choices,
-    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
-    ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
-    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
+    browser_use_cloud_env_key_present, bundled_codex_login_model_ids, bundled_openai_model_ids,
+    bundled_openrouter_model_ids, display_and_provider_model_for_input,
+    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
+    model_choices_for_config, provider_model_choices, provider_model_for_display, AgentBackend,
+    ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -3318,7 +3318,19 @@ impl App {
     /// Seed the typeahead from curated provider ids or the per-source disk cache
     /// so it shows instantly.
     fn seed_provider_models(&mut self, account: &str) {
-        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+        if account == ACCOUNT_CODEX {
+            self.provider_models = bundled_codex_login_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+            return;
+        }
+        if account == ACCOUNT_OPENAI {
             self.provider_models = bundled_openai_model_ids()
                 .into_iter()
                 .map(|id| ProviderModel {
@@ -12467,15 +12479,7 @@ wire_api = "responses"
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
         assert_eq!(
             app.model_search_rows(),
-            vec![
-                "gpt-5.5",
-                "gpt-5.5-pro",
-                "gpt-5.4",
-                "gpt-5.4-pro",
-                "gpt-5.4-nano",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex",
-            ]
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini",]
         );
         assert!(!app.model_search_has_filter_input());
 

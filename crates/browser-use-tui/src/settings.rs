@@ -446,6 +446,18 @@ pub(crate) fn bundled_openai_model_ids() -> Vec<String> {
     .collect()
 }
 
+pub(crate) fn bundled_codex_login_model_ids() -> Vec<String> {
+    bundled_openai_model_ids()
+        .into_iter()
+        .filter(|id| {
+            !matches!(
+                id.as_str(),
+                "gpt-5.5-pro" | "gpt-5.4-pro" | "gpt-5.4-nano" | "gpt-5.3-codex"
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
     [
         // Anthropic
@@ -574,6 +586,14 @@ mod tests {
                 "gpt-5.4-mini",
                 "gpt-5.3-codex",
             ]
+        );
+    }
+
+    #[test]
+    fn bundled_codex_login_ids_exclude_login_only_unsupported_models() {
+        assert_eq!(
+            bundled_codex_login_model_ids(),
+            vec!["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
         );
     }
 
