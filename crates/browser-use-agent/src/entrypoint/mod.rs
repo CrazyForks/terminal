@@ -57,10 +57,12 @@ use std::sync::Mutex;
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use browser_use_protocol::EventRecord;
 use browser_use_runtime::{
-    DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest, Durability as RuntimeDurability,
+    AcceptPromptInputRequest as RuntimeAcceptPromptInputRequest, AgentId as RuntimeAgentId,
+    BrowserUseRuntime, DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest,
+    Durability as RuntimeDurability, LiveThreadPersistence,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItem as RuntimeMailboxItem,
     MailboxItemKind as RuntimeMailboxItemKind, RunAgentRequest as RuntimeRunAgentRequest,
-    RuntimeHandle, SessionId as RuntimeSessionId,
+    RuntimeHandle, SessionId as RuntimeSessionId, SqliteJournal, StateIndex,
 };
 use browser_use_store::Store;
 use serde_json::{json, Value};
@@ -82,6 +84,7 @@ use crate::context::{
 };
 use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
 use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
+use crate::live_executor::ensure_agent_attached as ensure_runtime_agent_attached;
 use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
 use crate::session::SharedStore;
@@ -2529,25 +2532,87 @@ pub async fn run_session_with_config_with_cancel_and_runtime(
     cancel: CancellationToken,
     runtime_handle: Option<RuntimeHandle>,
 ) -> anyhow::Result<SessionId> {
-    if let Some(runtime_handle) = runtime_handle.clone() {
-        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
-        let request = RuntimeRunAgentRequest::new(runtime_session_id)
-            .with_input_source("run_session_with_config_with_cancel_and_runtime")
-            .with_cancellation_token(cancel.clone());
-        let response = runtime_handle
-            .run_agent(
-                request,
-                RuntimeTurnDriver::new(store, session_id, config, cancel)
-                    .with_runtime_handle(Some(runtime_handle.clone()))
-                    .run(),
-            )
-            .await?;
-        return Ok(response.output);
+    let runtime_handle = match runtime_handle {
+        Some(runtime_handle) => runtime_handle,
+        None => transient_runtime_for_store_session(&store, session_id, &config)?,
+    };
+    let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+    let request = RuntimeRunAgentRequest::new(runtime_session_id)
+        .with_input_source("run_session_with_config_with_cancel_and_runtime")
+        .with_cancellation_token(cancel.clone());
+    let response = runtime_handle
+        .run_agent(
+            request,
+            RuntimeTurnDriver::new(store, session_id, config, cancel)
+                .with_runtime_handle(Some(runtime_handle.clone()))
+                .run(),
+        )
+        .await?;
+    Ok(response.output)
+}
+
+fn transient_runtime_for_store_session(
+    store: &SharedStore,
+    session_id: &str,
+    config: &ProviderRunConfig,
+) -> anyhow::Result<RuntimeHandle> {
+    let state_dir = {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        store_guard.state_dir().to_path_buf()
+    };
+    let journal = Arc::new(SqliteJournal::open(&state_dir)?);
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+    {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        ensure_runtime_agent_attached(
+            &runtime_handle,
+            &store_guard,
+            session_id,
+            config
+                .options
+                .multi_agent_v2
+                .max_concurrent_threads_per_session,
+        )?;
+        accept_latest_durable_prompt_input(&runtime_handle, &store_guard, session_id)?;
     }
-    RuntimeTurnDriver::new(store, session_id, config, cancel)
-        .with_runtime_handle(None)
-        .run()
-        .await
+    Ok(runtime_handle)
+}
+
+fn accept_latest_durable_prompt_input(
+    runtime_handle: &RuntimeHandle,
+    store: &Store,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let Some(event) = latest_durable_prompt_input_event(store, session_id)? else {
+        return Ok(());
+    };
+    runtime_handle.accept_prompt_input(RuntimeAcceptPromptInputRequest {
+        target_agent_id: RuntimeAgentId::from_string(session_id.to_string())?,
+        source_event_seq: Some(event.seq),
+        payload: json!({
+            "source": "durable_prompt_input",
+            "event_type": event.event_type,
+        }),
+    })?;
+    Ok(())
+}
+
+fn latest_durable_prompt_input_event(
+    store: &Store,
+    session_id: &str,
+) -> anyhow::Result<Option<EventRecord>> {
+    Ok(store
+        .events_for_session(session_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup" | "agent.mailbox_input"
+            )
+        }))
 }
 
 /// Runtime-owned turn driver boundary.
@@ -3163,6 +3228,24 @@ mod tests {
         assert!(
             log.iter().any(|e| e.event_type == "workspace.context"),
             "expected a seeded workspace.context event"
+        );
+        assert!(
+            log.iter().any(|e| e.event_type == "agent.started"
+                && e.payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("runtime_owned"))
+                    .and_then(Value::as_bool)
+                    == Some(true)),
+            "compat facade must enter BrowserUseRuntime before driving"
+        );
+        assert!(
+            log.iter().any(|e| e.event_type == "agent.turn.completed"
+                && e.payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("runtime_owned"))
+                    .and_then(Value::as_bool)
+                    == Some(true)),
+            "compat facade must complete through BrowserUseRuntime"
         );
         // the terminal agent message was persisted as the visible session result.
         assert!(
