@@ -1515,46 +1515,14 @@ fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<
     };
     let events = app.cached_events_for_session(&session.id);
     let blocks = transcript::thinking_blocks_for_session(events);
-    let summary_blocks = blocks
-        .iter()
-        .filter(|block| !block.summary_unavailable)
-        .collect::<Vec<_>>();
-    let unavailable_blocks = blocks
-        .iter()
-        .filter(|block| block.summary_unavailable)
-        .collect::<Vec<_>>();
-    if summary_blocks.is_empty() {
-        if !unavailable_blocks.is_empty() {
-            let tokens = unavailable_blocks
-                .iter()
-                .map(|block| block.tokens.max(0))
-                .sum::<i64>();
-            let turn_text = if unavailable_blocks.len() == 1 {
-                "1 turn".to_string()
-            } else {
-                format!("{} turns", unavailable_blocks.len())
-            };
-            return vec![
-                Line::from(Span::styled(
-                    "No reasoning summaries are available for this task.",
-                    dim(),
-                )),
-                Line::from(Span::styled(
-                    format!(
-                        "Provider reported hidden reasoning usage ({} tokens across {turn_text}) but did not send summary text.",
-                        format_token_count(tokens)
-                    ),
-                    dim(),
-                )),
-            ];
-        }
+    if blocks.is_empty() {
         return vec![Line::from(Span::styled(
             "No agent thinking for this task yet.",
             dim(),
         ))];
     }
     let mut lines = Vec::new();
-    for (idx, block) in summary_blocks.iter().enumerate() {
+    for (idx, block) in blocks.iter().enumerate() {
         if idx > 0 {
             lines.push(Line::from(""));
         }
@@ -1563,28 +1531,16 @@ fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<
             bold(),
         )));
         lines.push(Line::from(""));
-        for text_line in block.text.lines() {
-            lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
-        }
-    }
-    if !unavailable_blocks.is_empty() {
-        let tokens = unavailable_blocks
-            .iter()
-            .map(|block| block.tokens.max(0))
-            .sum::<i64>();
-        let turn_text = if unavailable_blocks.len() == 1 {
-            "1 other turn".to_string()
+        if block.summary_unavailable {
+            lines.push(Line::from(Span::styled(
+                "Provider reported hidden reasoning usage but did not send readable reasoning text.",
+                dim(),
+            )));
         } else {
-            format!("{} other turns", unavailable_blocks.len())
-        };
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{turn_text} used hidden reasoning tokens without provider summary text ({} tokens).",
-                format_token_count(tokens)
-            ),
-            dim(),
-        )));
+            for text_line in block.text.lines() {
+                lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
+            }
+        }
     }
     lines
 }

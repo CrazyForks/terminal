@@ -1906,6 +1906,7 @@ fn active_node_for_session(
     let status_detail = if live_status == "Thinking..." {
         live_thinking_text
             .map(|text| live_thinking_status_detail(live_events, text))
+            .or_else(|| live_reasoning_pending_detail(live_events))
             .or_else(|| active_subagent_summary(active_child_count))
     } else {
         active_subagent_summary(active_child_count)
@@ -2050,6 +2051,14 @@ fn live_thinking_status_detail(live_events: &[EventRecord], thinking_text: &str)
         "({elapsed_s}s · ↓ ~{} tokens)",
         crate::render::format_token_count(est_tokens)
     )
+}
+
+fn live_reasoning_pending_detail(live_events: &[EventRecord]) -> Option<String> {
+    live_events
+        .iter()
+        .rev()
+        .any(|event| event.event_type == "model.turn.request")
+        .then(|| "reasoning pending".to_string())
 }
 
 /// Approximate characters per token — mirrors `product_analytics` so estimated
@@ -2297,8 +2306,7 @@ pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
 
 /// Build the collapsed reasoning summary for the turn that ends at `event`.
 /// The segment runs from the previous turn boundary up to and including the
-/// anchor event (so a usage event contributes its exact token count). Returns
-/// `None` when the provider did not send textual reasoning summary content.
+/// anchor event (so a usage event contributes its exact token count).
 fn thinking_summary_node_before_event(
     root: &SessionMeta,
     events: &[EventRecord],
@@ -2331,9 +2339,6 @@ fn thinking_summary_node_before_event(
     let block = thinking_blocks_for_session(segment)
         .into_iter()
         .next_back()?;
-    if block.summary_unavailable {
-        return None;
-    }
     Some(TranscriptNode {
         id: format!("{}:{}:thinking", event.session_id, event.seq),
         seq: event.seq,

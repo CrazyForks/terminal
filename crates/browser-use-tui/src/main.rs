@@ -14662,7 +14662,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn hidden_reasoning_without_summary_is_not_rendered_as_thought() -> Result<()> {
+    fn hidden_reasoning_without_summary_still_renders_token_summary() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14691,19 +14691,19 @@ wire_api = "responses"
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains("Thought for"), "{screen}");
-        assert!(!screen.contains("summary unavailable"), "{screen}");
+        assert!(screen.contains("Thought for"), "{screen}");
+        assert!(screen.contains("35 tokens"), "{screen}");
+        assert!(screen.contains("summary unavailable"), "{screen}");
 
         app.open_surface(Surface::Thinking);
         let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Thought for"), "{screen}");
+        assert!(screen.contains("35 tokens"), "{screen}");
+        assert!(screen.contains("summary unavailable"), "{screen}");
         assert!(
-            screen.contains("No reasoning summaries are available for this task."),
+            screen.contains("did not send readable reasoning text"),
             "{screen}"
         );
-        assert!(screen.contains("hidden reasoning usage"), "{screen}");
-        assert!(screen.contains("35 tokens"), "{screen}");
-        assert!(!screen.contains("Thought for"), "{screen}");
-        assert!(!screen.contains("summary unavailable"), "{screen}");
         Ok(())
     }
 
@@ -14752,6 +14752,33 @@ wire_api = "responses"
                 .any(|span| span.style == theme::accent()),
             "live thinking status should include a moving shimmer highlight"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_thinking_without_streamed_text_shows_pending_reasoning_detail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "think through the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("Thinking..."), "{text}");
+        assert!(text.contains("reasoning pending"), "{text}");
         Ok(())
     }
 
