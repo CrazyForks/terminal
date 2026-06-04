@@ -690,18 +690,31 @@ fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
 
 /// The final summary carried by the model's `done` call, if any.
 ///
-/// Reads the `text` field from the first `done` tool call's JSON arguments
-/// (matching the `done` handler's `DoneRequest { text }`). Returns `None` when
-/// there is no `done` call or it carried no (non-empty) summary, so the caller
-/// only overrides the turn result when there is a real message to surface.
+/// Reads the `result` field from the first `done` tool call's JSON arguments,
+/// falling back to the legacy `text` alias and then to a compact `result_file`
+/// pointer. Returns `None` when there is no `done` call or it carried no
+/// non-empty completion payload, so the caller only overrides the turn result
+/// when there is a real message to surface.
 fn done_summary(tool_calls: &[ContentPart]) -> Option<String> {
     tool_calls.iter().find_map(|p| match p {
-        ContentPart::ToolCall { name, input, .. } if name == DONE_TOOL_NAME => input
-            .get("text")
-            .and_then(|t| t.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        ContentPart::ToolCall { name, input, .. } if name == DONE_TOOL_NAME => {
+            for field in ["result", "text"] {
+                if let Some(value) = input
+                    .get(field)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(value.to_string());
+                }
+            }
+            input
+                .get("result_file")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|path| format!("Result file: {path}"))
+        }
         _ => None,
     })
 }
