@@ -29,8 +29,8 @@ use browser_use_protocol::{failure_from_events, session_result_from_events, Sess
 use browser_use_runtime::{
     spawn_local_runtime_server, AgentId, AgentThreadStatus, BrowserUseRuntime,
     CompleteAgentRequest, FailAgentRequest, LiveThreadPersistence, MailboxDeliveryPhase,
-    MailboxItem, RuntimeHandle, SessionId, SpawnChildRequest, SqliteJournal, StateIndex,
-    SubmitInputRequest,
+    MailboxItem, RuntimeHandle, RuntimeSnapshot, SessionId, SpawnChildRequest, SqliteJournal,
+    StateIndex, SubmitInputRequest,
 };
 use browser_use_store::{Store, StoreNotifier};
 
@@ -117,20 +117,11 @@ pub(crate) fn runtime_active_child_session_count(
     ))
 }
 
-pub(crate) fn runtime_agent_statuses(
-    state_dir: &Path,
-) -> Result<Option<HashMap<String, AgentThreadStatus>>> {
+pub(crate) fn runtime_snapshot(state_dir: &Path) -> Result<Option<RuntimeSnapshot>> {
     let Some(handle) = existing_tui_runtime_handle(state_dir)? else {
         return Ok(None);
     };
-    Ok(Some(
-        handle
-            .snapshot()
-            .agents
-            .into_iter()
-            .map(|agent| (agent.session_id.as_str().to_string(), agent.status))
-            .collect(),
-    ))
+    Ok(Some(handle.snapshot()))
 }
 
 fn runtime_agent_status_is_active(status: &AgentThreadStatus) -> bool {

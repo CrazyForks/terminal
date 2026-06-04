@@ -132,11 +132,11 @@ BrowserUseRuntime
   browser backend resource in the agent provider, not directly by a rich
   `BrowserHandle` with artifacts and crash semantics.
 - TUI uses runtime for live cancellation/follow-up/mailbox counts and now
-  overlays live session status from runtime snapshots, but active rendering is
-  still substantially Store/history-cache based. The SDK consumes projected
-  events for `Agent.stream()`, and runtime projection now has a state reducer,
-  but the reducer does not yet cover the full model request/retry/error
-  lifecycle or serve as the TUI authority.
+  projects active sessions from cached runtime snapshots at render time without
+  mutating Store-derived history. Durable history/sidebar/event text still come
+  from SQLite. The SDK consumes projected events for `Agent.stream()`, and
+  runtime projection now has a state reducer, but the reducer does not yet cover
+  the full model request/retry/error lifecycle.
 - Replay materialization restores important mailbox/live counters and marks
   common stale tool resources lost, but full crash recovery still does not
   hydrate every durable graph field or make browser leases/script registries

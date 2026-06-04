@@ -978,6 +978,7 @@ struct AppStateCache {
     sessions: Vec<SessionMeta>,
     events_by_session: HashMap<String, Vec<EventRecord>>,
     last_seq_by_session: HashMap<String, i64>,
+    runtime_projection: Option<browser_use_runtime::RuntimeSnapshot>,
     revision: u64,
     projected: WorkbenchState,
     projection_key: Option<ProjectionKey>,
@@ -1006,6 +1007,7 @@ impl AppStateCache {
             sessions,
             events_by_session,
             last_seq_by_session,
+            runtime_projection: None,
             revision: 0,
             projected: empty_workbench_state(browser),
             projection_key: None,
@@ -1122,26 +1124,13 @@ impl AppStateCache {
         Ok(true)
     }
 
-    fn apply_runtime_session_statuses(
+    fn apply_runtime_projection(
         &mut self,
-        statuses: &HashMap<String, browser_use_runtime::AgentThreadStatus>,
+        projection: Option<browser_use_runtime::RuntimeSnapshot>,
     ) -> bool {
-        let mut changed = false;
-        for session in &mut self.sessions {
-            let Some(runtime_status) = statuses.get(&session.id) else {
-                continue;
-            };
-            let Some(next_status) =
-                runtime_status_overlay_for_store_status(&session.status, runtime_status)
-            else {
-                continue;
-            };
-            if session.status != next_status {
-                session.status = next_status;
-                changed = true;
-            }
-        }
+        let changed = self.runtime_projection != projection;
         if changed {
+            self.runtime_projection = projection;
             self.mark_changed();
         }
         changed
@@ -1180,12 +1169,13 @@ impl AppStateCache {
             return &self.projected;
         }
 
+        let projected_sessions = self.projected_sessions();
         let current_events = selected_session_id
             .and_then(|id| self.events_by_session.get(id))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let all_events = if history_tasks_visible {
-            self.sessions
+            projected_sessions
                 .iter()
                 .map(|session| {
                     (
@@ -1202,8 +1192,7 @@ impl AppStateCache {
             let mut index = 0;
             while index < session_ids.len() {
                 let parent_id = session_ids[index].clone();
-                for session in self
-                    .sessions
+                for session in projected_sessions
                     .iter()
                     .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
                 {
@@ -1229,7 +1218,7 @@ impl AppStateCache {
             Vec::new()
         };
         self.projected = project_workbench(
-            &self.sessions,
+            &projected_sessions,
             current_events,
             &all_events,
             selected_session_id,
@@ -1245,6 +1234,46 @@ impl AppStateCache {
             .get(session_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    fn projected_sessions(&self) -> Vec<SessionMeta> {
+        let mut sessions = self.sessions.clone();
+        let Some(projection) = self.runtime_projection.as_ref() else {
+            return sessions;
+        };
+        let synthetic_ts = browser_use_store::now_ms();
+        for agent in &projection.agents {
+            if let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.id == agent.session_id.as_str())
+            {
+                if let Some(next_status) =
+                    runtime_status_overlay_for_store_status(&session.status, &agent.status)
+                {
+                    session.status = next_status;
+                }
+                session.updated_ms = session.updated_ms.max(synthetic_ts);
+                continue;
+            }
+            sessions.push(SessionMeta {
+                id: agent.session_id.as_str().to_string(),
+                parent_id: agent
+                    .parent_session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_str().to_string()),
+                cwd: agent.cwd.display().to_string(),
+                artifact_root: agent.cwd.display().to_string(),
+                status: runtime_status_overlay_for_store_status(
+                    &SessionStatus::Created,
+                    &agent.status,
+                )
+                .unwrap_or(SessionStatus::Created),
+                created_ms: synthetic_ts,
+                updated_ms: synthetic_ts,
+            });
+        }
+        sessions.sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms));
+        sessions
     }
 }
 
@@ -1948,10 +1977,10 @@ impl App {
     }
 
     fn apply_runtime_status_overlay(&mut self) -> bool {
-        let Ok(Some(statuses)) = runtime::runtime_agent_statuses(&self.args.state_dir) else {
+        let Ok(snapshot) = runtime::runtime_snapshot(&self.args.state_dir) else {
             return false;
         };
-        self.state_cache.apply_runtime_session_statuses(&statuses)
+        self.state_cache.apply_runtime_projection(snapshot)
     }
 
     fn drain_store_notifications(&mut self) -> Result<bool> {
