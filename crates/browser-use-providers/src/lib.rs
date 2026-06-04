@@ -5306,7 +5306,7 @@ fn chat_tool_description(tool: &ToolSpec) -> String {
 }
 
 fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Value> {
-    tools
+    let mut anthropic_tools: Vec<Value> = tools
         .iter()
         .map(|tool| {
             json!({
@@ -5315,7 +5315,11 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
                 "input_schema": tool.input_schema,
             })
         })
-        .collect()
+        .collect();
+    if let Some(Value::Object(last_tool)) = anthropic_tools.last_mut() {
+        last_tool.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+    anthropic_tools
 }
 
 fn anthropic_tool_description(tool: &ToolSpec) -> String {
@@ -9442,6 +9446,51 @@ mod tests {
             }
         }));
         assert!(matches!(events.last(), Some(ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_request_marks_last_tool_cacheable() -> Result<()> {
+        let provider = AnthropicMessagesProvider::new("anthropic-key", "claude-test");
+        let body = provider.messages_request_body(
+            &ProviderTurn {
+                instructions: Some("Stable system prompt".to_string()),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: vec![
+                    ToolSpec {
+                        name: "browser".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Inspect a page".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                    ToolSpec {
+                        name: "done".to_string(),
+                        namespace: None,
+                        namespace_description: None,
+                        description: "Finish the task".to_string(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        freeform: None,
+                    },
+                ],
+                ..ProviderTurn::default()
+            },
+            false,
+            true,
+        )?;
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         Ok(())
     }
 
