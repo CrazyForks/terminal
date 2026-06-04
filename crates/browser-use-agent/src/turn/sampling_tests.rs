@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use browser_use_llm::schema::{
-    ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
+    CacheHint, ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
     MessageRole, TextPhase, Usage,
 };
 use browser_use_protocol::EventRecord;
@@ -559,6 +559,11 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
         req.provider,
         ctx().provider.into(),
         "request carries the turn's provider"
+    );
+    assert_eq!(
+        req.system.first().and_then(|part| part.cache),
+        Some(CacheHint::Ephemeral),
+        "stable base system prompt should be cacheable for providers that support prompt caching"
     );
 }
 

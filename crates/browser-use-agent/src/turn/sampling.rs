@@ -59,7 +59,7 @@ use std::time::Instant;
 
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
-    ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
+    CacheHint, ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
     MessageRole, SystemPart, TextPhase, Usage,
 };
 use futures_util::{Stream, StreamExt};
@@ -1037,8 +1037,9 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
-    req.system
-        .push(SystemPart::new(ctx.base_instructions.clone()));
+    let mut base_system = SystemPart::new(ctx.base_instructions.clone());
+    base_system.cache = Some(CacheHint::Ephemeral);
+    req.system.push(base_system);
     req.messages = input;
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
