@@ -524,14 +524,33 @@ impl AnthropicMessagesStream {
     /// Merge any usage fields present in `usage` into the running total.
     fn apply_usage(&mut self, usage: &Value) {
         if let Some(v) = usage.get("input_tokens").and_then(Value::as_u64) {
-            self.usage.input_tokens = v;
+            self.set_uncached_input_tokens(v);
         }
         if let Some(v) = usage.get("output_tokens").and_then(Value::as_u64) {
             self.usage.output_tokens = v;
         }
         if let Some(v) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-            self.usage.cached_input_tokens = v;
+            self.set_cached_input_tokens(v);
         }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.usage.cache_creation_input_tokens = v;
+        }
+    }
+
+    fn set_uncached_input_tokens(&mut self, raw_input_tokens: u64) {
+        self.usage.input_tokens = raw_input_tokens.saturating_add(self.usage.cached_input_tokens);
+    }
+
+    fn set_cached_input_tokens(&mut self, cached_input_tokens: u64) {
+        let raw_input_tokens = self
+            .usage
+            .input_tokens
+            .saturating_sub(self.usage.cached_input_tokens);
+        self.usage.cached_input_tokens = cached_input_tokens;
+        self.usage.input_tokens = raw_input_tokens.saturating_add(cached_input_tokens);
     }
 
     /// Flush open blocks and emit `StepFinish` + `Finish` (idempotent).
@@ -1097,6 +1116,58 @@ mod tests {
         ];
 
         assert_eq!(events, expected);
+    }
+
+    #[test]
+    fn decoder_normalizes_anthropic_cached_usage_to_inclusive_input() {
+        let frames = vec![
+            frame(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_cache",
+                        "role": "assistant",
+                        "content": [],
+                        "usage": {
+                            "input_tokens": 12,
+                            "cache_creation_input_tokens": 44,
+                            "output_tokens": 0
+                        }
+                    }
+                }),
+            ),
+            frame(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": {
+                        "output_tokens": 3088,
+                        "cache_read_input_tokens": 183250
+                    }
+                }),
+            ),
+            frame("message_stop", json!({ "type": "message_stop" })),
+        ];
+
+        let events = drive(&frames);
+        let usage = Usage {
+            input_tokens: 183262,
+            cached_input_tokens: 183250,
+            cache_creation_input_tokens: 44,
+            output_tokens: 3088,
+            ..Default::default()
+        };
+
+        assert!(events.contains(&LlmEvent::StepFinish {
+            usage,
+            finish_reason: Some(FinishReason::Stop),
+        }));
+        assert!(events.contains(&LlmEvent::Finish {
+            usage,
+            finish_reason: Some(FinishReason::Stop),
+        }));
     }
 
     #[test]
