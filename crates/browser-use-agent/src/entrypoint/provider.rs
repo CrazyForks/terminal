@@ -1675,9 +1675,10 @@ impl EventSink for NoopSubagentSink {
 /// children therefore inherit the parent's provider/model from whatever the
 /// entrypoint wired into that runner. When the run config carries no runner,
 /// [`UnconfiguredChildSpawner`] is used so a spawn attempt fails honestly.
-/// Lifecycle events are persisted through a store-backed [`SubagentStoreSink`]
-/// when a session store is available (the live run path), else dropped via
-/// [`NoopSubagentSink`] (tests/headless).
+/// Lifecycle events are persisted through the durable session journal when a
+/// session store is available, else dropped via [`NoopSubagentSink`]
+/// (tests/headless). Live mailbox/send/wait/close behavior is runtime-backed;
+/// the store sink is the debug/replay projection.
 fn register_subagent_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     config: &ProviderRunConfig,
@@ -1736,9 +1737,9 @@ fn register_subagent_tools<S, A>(
         mailbox: manager.mailbox(),
     });
 
-    // The parent context the children hang off. On the live store-backed path,
-    // use the current session's agent path so nested spawns resolve beneath the
-    // child, not always beneath `/root`.
+    // The parent context the children hang off. On the live runtime path, use
+    // the current session's durable agent path so nested spawns resolve beneath
+    // the child, not always beneath `/root`.
     let parent_agent_path =
         parent_agent_path_from_store(user_input).unwrap_or_else(|| "/root".to_string());
     let parent = ParentContext {
@@ -1747,7 +1748,7 @@ fn register_subagent_tools<S, A>(
         base_config: parent_agent_config_layer(config, tool_cwd),
     };
 
-    // Durable lifecycle sink + session scope: the store-backed sink on the live
+    // Durable lifecycle sink + session scope: journal projection on the live
     // run path, a no-op when no session store is wired.
     let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
         Some((store, sid)) => (
@@ -2289,16 +2290,15 @@ fn session_allows_goal_tools(store: &SharedStore, session_id: &str) -> bool {
 /// `reg`, all sharing ONE [`GoalStore`].
 ///
 /// The store wraps a [`GoalManager`](crate::goals::GoalManager) whose injected
-/// [`EventSink`] persists durable `goal.*` events: on the live run path it is the
-/// store-backed [`SubagentStoreSink`] (the same `crate::events::EventSink` the
-/// subagent tools use — it appends each event to the session's durable log so the
-/// TUI render / resume-by-replay observe `goal.created` / `goal.updated`), and in
-/// tests/headless it is the no-op [`NoopSubagentSink`]. `create_goal` (and
-/// budget-threshold crossings) emit through the manager's sink automatically;
-/// `update_goal` emits `goal.updated` from its handler.
+/// [`EventSink`] persists durable `goal.*` events: on the live run path it writes
+/// the same journal projection as subagent lifecycle events, so TUI render /
+/// resume-by-replay observe `goal.created` / `goal.updated`; in tests/headless it
+/// is the no-op [`NoopSubagentSink`]. `create_goal` (and budget-threshold
+/// crossings) emit through the manager's sink automatically; `update_goal` emits
+/// `goal.updated` from its handler.
 ///
-/// Mirrors [`register_subagent_tools`]: a shared store + a store-backed event sink
-/// + the session id from the threaded `(SharedStore, SessionId)`.
+/// Mirrors [`register_subagent_tools`]: a shared durable journal sink plus the
+/// session id from the threaded `(SharedStore, SessionId)`.
 fn register_goal_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     store: Arc<crate::tools::handlers::goal::GoalStore>,
@@ -3798,8 +3798,8 @@ mod tests {
     /// dispatcher (BY NAME via `dispatch_ordered`, the same path the turn loop
     /// uses for a model tool-call) into the shared `GoalStore`: a follow-up
     /// `get_goal` observes the goal, AND a durable `goal.created` event lands in
-    /// the session store (proving the store-backed event sink is wired, not just
-    /// the tool listed). `update_goal` then emits a durable `goal.updated`.
+    /// the session journal (proving durable projection is wired, not just the
+    /// tool listed). `update_goal` then emits a durable `goal.updated`.
     #[tokio::test]
     async fn create_goal_routes_into_store_and_emits_durable_event() {
         use browser_use_llm::schema::{ContentPart, MessageRole};

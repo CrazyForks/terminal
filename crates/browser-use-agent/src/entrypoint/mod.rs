@@ -17,8 +17,9 @@
 //!      [`provider::resolve_provider`] (**where `build_sampling_driver` is called**),
 //!   2. seed the environment workspace-context durable event before the first
 //!      turn ([`append_environment_context_event`]),
-//!   3. drive the [`TurnLoop`] to quiescence over a store-backed [`TurnState`] +
-//!      a [`TurnObserver`] that persists the run's result,
+//!   3. enter [`BrowserUseRuntime`] and drive the [`TurnLoop`] to quiescence over
+//!      a runtime-aware [`TurnState`] + a [`TurnObserver`] that persists the
+//!      run's result,
 //!   4. return the [`SessionId`].
 //!
 //! The run's prompt history is whatever is already in the session's durable log
@@ -37,15 +38,14 @@
 //!   never touch the network (they assert real-driver *construction* offline and
 //!   drive the loop only via the fake/scripted path).
 //!
-//! ## Phase-E seams (NOT yet wired)
-//! The agent crate has no production [`TurnState`]/[`TurnObserver`] for the live
-//! turn loop yet (only `compact::CompactingTurnState`, which needs a
-//! `ContextManager` + a `CompactionSampler`, and the test fakes). This facade
-//! provides minimal store-backed impls so it can actually drive a run today; the
-//! richer `ContextManager`-backed `TurnState` (token accounting, mid-turn
-//! compaction, pending steer queue), tools/dispatch fusion, goals, hooks,
-//! guardian, skills and personality context all remain Phase-E work. Each seam is
-//! marked inline with `// Phase-E seam:`.
+//! ## Runtime Boundary
+//! Public compatibility entrypoints (`run_session_with_config*`) are wrappers over
+//! [`BrowserUseRuntime`]. If a caller does not provide a runtime handle, this
+//! module creates a transient runtime attached to the session's SQLite journal,
+//! accepts the latest durable input into runtime state, and enters
+//! `RuntimeHandle::run_agent`. SQLite remains the replay/debug journal; runtime
+//! state decides live input, mailbox delivery, cancellation, and resource
+//! ownership.
 
 pub mod provider;
 
@@ -2254,8 +2254,9 @@ impl EventSink for DiscardSink {
     fn emit(&self, _ev: PendingEvent) {}
 }
 
-/// Drive a loop run to quiescence with `driver`, over a store-backed state +
-/// observer. Returns the final assistant message (`None` if no text was produced).
+/// Drive a loop run to quiescence with `driver`, over a runtime-aware state and
+/// durable observer. Returns the final assistant message (`None` if no text was
+/// produced).
 ///
 /// `recorded` is the SHARED conversation buffer: for the real fused path it is the
 /// SAME `Arc` the driver's [`FusionRecorder`] writes (so dispatched tool outputs
@@ -2617,11 +2618,11 @@ fn latest_durable_prompt_input_event(
 
 /// Runtime-owned turn driver boundary.
 ///
-/// The driver still uses the existing model/tool loop implementation, but live
-/// callers should enter through this object rather than the old
-/// `run_session_with_config*` compatibility functions. This makes the remaining
-/// inversion explicit: move prompt state, resources, and scheduling decisions
-/// from the store-backed implementation below into this runtime driver.
+/// The driver still reuses the existing model/tool loop implementation, but all
+/// live callers enter through `RuntimeHandle::run_agent` before this driver is
+/// polled. Prompt reconstruction still reads the durable journal for replayable
+/// transcript history; fresh input, mailbox delivery, cancellation, and resources
+/// are runtime-owned.
 pub struct RuntimeTurnDriver {
     store: SharedStore,
     session_id: SessionId,

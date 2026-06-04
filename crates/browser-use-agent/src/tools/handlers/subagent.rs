@@ -1,18 +1,18 @@
 //! Model-callable subagent orchestration tools.
 //!
-//! These are thin handlers over the durable Store-backed agent tree when a live
-//! session store is available, falling back to the in-memory [`SubagentManager`]
-//! for isolated/no-store runs. The manager still owns spawn, role application,
-//! depth enforcement, the fallback live-agent registry, the EVENT-NOTIFY
-//! mailbox, and the [`ChildSpawner`](crate::subagents::ChildSpawner) seam.
+//! These are thin handlers over the live [`RuntimeHandle`] when one is present.
+//! The durable store is used to resolve/list the replayable agent tree and to
+//! keep the SQLite postmortem complete; it is not a live mailbox/wakeup
+//! authority. Isolated no-store tests still fall back to the in-memory
+//! [`SubagentManager`].
 //!
 //! Parity:
 //! - tool names + arg shapes: codex `multi_agents_spec.rs` (`spawn_agent`,
 //!   `wait_agent`, `send_input`, `send_message`, `followup_task`, `list_agents`,
 //!   `close_agent`).
-//! - lifecycle: a spawn enqueues a child through the manager and emits
-//!   `subagent.spawned`; Store-backed messaging persists `agent.message` rows
-//!   and mailbox entries; close updates the durable child edge where available.
+//! - lifecycle: spawn creates a runtime child thread and journals the edge;
+//!   send/followup/wait use the runtime mailbox; close updates runtime state and
+//!   the durable child edge.
 //!
 //! Each handler implements the [`ToolRuntime`] stack ONCE (like `done`): no
 //! sandbox, no approval, never denied — they route through the orchestrator on

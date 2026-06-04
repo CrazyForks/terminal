@@ -1472,7 +1472,7 @@ fn attach_cli_child_agent_runner(
             .as_ref()
             .cloned()
             .context("child agent runner base config not initialized")?;
-        spawn_cli_child_agent(executor.clone(), state_dir.clone(), base_config, request)
+        spawn_runtime_cli_child_agent(executor.clone(), state_dir.clone(), base_config, request)
     });
     config.options = config.options.clone().with_child_agent_runner(runner);
     *base_config_slot
@@ -1480,7 +1480,7 @@ fn attach_cli_child_agent_runner(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config.clone());
 }
 
-fn spawn_cli_child_agent(
+fn spawn_runtime_cli_child_agent(
     executor: RuntimeAgentExecutor,
     state_dir: PathBuf,
     mut base_config: ProviderRunConfig,
