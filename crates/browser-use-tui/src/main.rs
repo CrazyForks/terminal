@@ -14662,7 +14662,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn hidden_reasoning_without_summary_still_renders_token_summary() -> Result<()> {
+    fn hidden_reasoning_without_summary_omits_token_count() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14691,22 +14691,22 @@ wire_api = "responses"
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Hidden reasoning used"), "{screen}");
-        assert!(screen.contains("35 tokens"), "{screen}");
-        assert!(screen.contains("no readable text"), "{screen}");
-        assert!(!screen.contains("Thought for"), "{screen}");
+        assert!(screen.contains("Thought for 0s"), "{screen}");
+        assert!(!screen.contains("Hidden reasoning used"), "{screen}");
+        assert!(!screen.contains("35 tokens"), "{screen}");
+        assert!(!screen.contains("no readable text"), "{screen}");
         assert!(!screen.contains("summary unavailable"), "{screen}");
 
         app.open_surface(Surface::Thinking);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Hidden reasoning used"), "{screen}");
-        assert!(screen.contains("35 tokens"), "{screen}");
-        assert!(screen.contains("no readable text"), "{screen}");
+        assert!(screen.contains("Thought for 0s"), "{screen}");
+        assert!(!screen.contains("Hidden reasoning used"), "{screen}");
+        assert!(!screen.contains("35 tokens"), "{screen}");
+        assert!(!screen.contains("no readable text"), "{screen}");
         assert!(
-            screen.contains("no reasoning text was streamed"),
+            !screen.contains("no reasoning text was streamed"),
             "{screen}"
         );
-        assert!(!screen.contains("Thought for"), "{screen}");
         assert!(!screen.contains("summary unavailable"), "{screen}");
         Ok(())
     }

@@ -2288,22 +2288,16 @@ fn append_thinking_delta(current: &mut String, incoming: &str) {
 }
 
 /// One-line summary for a reasoning block. If only token accounting was
-/// reported, call that out as hidden usage instead of suggesting there are
-/// readable tokens to display.
+/// reported, omit token details because there is no readable text to expand.
 pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
+    if block.summary_unavailable {
+        return format!("Thought for {}s", block.duration_s.max(0));
+    }
     let tokens = if block.tokens_estimated {
         format!("~{}", crate::render::format_token_count(block.tokens))
     } else {
         crate::render::format_token_count(block.tokens)
     };
-    if block.summary_unavailable {
-        let mut summary = format!("Hidden reasoning used {tokens} tokens");
-        if block.duration_s > 0 {
-            summary.push_str(&format!(" over {}s", block.duration_s));
-        }
-        summary.push_str(" · no readable text");
-        return summary;
-    }
     format!(
         "Thought for {}s · {} tokens",
         block.duration_s.max(0),

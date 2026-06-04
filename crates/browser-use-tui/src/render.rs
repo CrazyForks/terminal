@@ -1531,12 +1531,7 @@ fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<
             bold(),
         )));
         lines.push(Line::from(""));
-        if block.summary_unavailable {
-            lines.push(Line::from(Span::styled(
-                "Those tokens are provider accounting; no reasoning text was streamed.",
-                dim(),
-            )));
-        } else {
+        if !block.summary_unavailable {
             for text_line in block.text.lines() {
                 lines.push(Line::from(Span::styled(text_line.to_string(), thought())));
             }
