@@ -404,6 +404,15 @@ impl SpawnEdgeStatus {
             _ => Self::Open,
         }
     }
+
+    fn as_thread_status(&self) -> AgentThreadStatus {
+        match self {
+            Self::Open => AgentThreadStatus::Created,
+            Self::Done => AgentThreadStatus::Completed,
+            Self::Failed => AgentThreadStatus::Failed,
+            Self::Closed => AgentThreadStatus::Closed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -790,6 +799,19 @@ impl SubagentScheduler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queued
             .len()
+    }
+
+    fn materialize_open_spawned_agent(
+        &self,
+        child_agent_id: AgentId,
+        task_name: impl Into<String>,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open_spawned_agents
+            .entry(child_agent_id)
+            .or_insert_with(|| task_name.into());
     }
 }
 
@@ -3041,6 +3063,7 @@ impl BrowserUseRuntime {
         )?;
         self.materialize_live_state_after_resume(&thread)?;
         self.record_lost_resources_after_resume(&thread)?;
+        self.materialize_descendants_after_resume(&thread)?;
         Ok(thread)
     }
 
@@ -3084,6 +3107,7 @@ impl BrowserUseRuntime {
         self.publish_after_barrier(event)?;
         self.materialize_live_state_after_resume(&child)?;
         self.record_lost_resources_after_resume(&child)?;
+        self.materialize_descendants_after_resume(&child)?;
         Ok(child)
     }
 
@@ -3721,6 +3745,93 @@ impl BrowserUseRuntime {
             .materialize_pending(replay.pending_mailbox_items.clone());
         thread.live_state.materialize_from_replay(&replay);
         Ok(())
+    }
+
+    fn materialize_descendants_after_resume(&self, root: &AgentThread) -> Result<()> {
+        let mut remaining = self.state_index.list_descendants(&root.session_id)?;
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            let mut deferred = Vec::new();
+            for edge in remaining {
+                if self
+                    .agents
+                    .thread_for_session(&edge.child_session_id)
+                    .is_ok()
+                {
+                    continue;
+                }
+                let Ok(parent) = self.agents.thread_for_session(&edge.parent_session_id) else {
+                    deferred.push(edge);
+                    continue;
+                };
+                self.materialize_child_edge_after_resume(&parent, edge)?;
+            }
+            if deferred.len() == before {
+                let missing = deferred
+                    .iter()
+                    .map(|edge| {
+                        format!(
+                            "{} -> {}",
+                            edge.parent_session_id.as_str(),
+                            edge.child_session_id.as_str()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("could not materialize durable child edges without parents: {missing}");
+            }
+            remaining = deferred;
+        }
+        Ok(())
+    }
+
+    fn materialize_child_edge_after_resume(
+        &self,
+        parent: &AgentThread,
+        edge: SpawnEdge,
+    ) -> Result<Arc<AgentThread>> {
+        let session = self
+            .persistence
+            .load_session(&edge.child_session_id)?
+            .with_context(|| format!("unknown child session id: {}", edge.child_session_id))?;
+        let child_agent_id = AgentId::from_string(edge.child_session_id.as_str())?;
+        let agent_path = edge.path.clone().unwrap_or_else(|| {
+            child_agent_path(&parent.agent_path, edge.child_session_id.as_str())
+        });
+        let child = Arc::new(AgentThread::new(
+            child_agent_id.clone(),
+            edge.child_session_id.clone(),
+            parent.root_id.clone(),
+            PathBuf::from(session.cwd),
+            Some(parent.agent_id.clone()),
+            Some(parent.session_id.clone()),
+            agent_path.clone(),
+            edge.nickname.clone(),
+            edge.role.clone(),
+        ));
+        child.set_status(edge.status.as_thread_status());
+        self.agents.insert_thread(child.clone());
+        if edge.status != SpawnEdgeStatus::Closed {
+            let control = self.agents.control_for_thread(parent)?;
+            control
+                .scheduler
+                .materialize_open_spawned_agent(child_agent_id.clone(), agent_path.clone());
+        }
+        let mut event = RuntimeEvent::new(RuntimeEventKind::AgentResumed, Durability::Barrier)
+            .with_session_id(edge.child_session_id)
+            .with_agent_id(child_agent_id)
+            .with_payload(json!({
+                "agent_path": agent_path,
+                "nickname": edge.nickname,
+                "role": edge.role,
+                "status": edge.status,
+                "materialized_from_replay": true,
+            }));
+        event.root_id = Some(parent.root_id.clone());
+        self.publish_after_barrier(event)?;
+        self.materialize_live_state_after_resume(&child)?;
+        self.record_lost_resources_after_resume(&child)?;
+        Ok(child)
     }
 }
 
@@ -5763,6 +5874,125 @@ mod tests {
         assert_eq!(live.last_consumed_prompt_input_seq, 11);
         let consumed = handle.consume_prompt_input_for_session(&session_id)?;
         assert!(!consumed.consumed);
+        Ok(())
+    }
+
+    #[test]
+    fn attach_root_materializes_durable_child_tree_and_status() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: Some(AgentId::from_string("child")?),
+            child_session_id: Some(SessionId::from_string("child")?),
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: Some("Curie".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: child.agent_id().clone(),
+            result: "findings ready".to_string(),
+        })?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let resumed = BrowserUseRuntime::new(persistence, state_index).handle();
+        let resumed_root = resumed.attach_root_agent(AttachRootAgentRequest {
+            session_id: root.session_id().clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let snapshot = resumed.snapshot();
+        let resumed_child = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.session_id.as_str() == "child")
+            .context("resumed child")?;
+        assert_eq!(
+            resumed_child.parent_session_id,
+            Some(root.session_id().clone())
+        );
+        assert_eq!(resumed_child.agent_path, "/root/research");
+        assert_eq!(resumed_child.nickname.as_deref(), Some("Curie"));
+        assert_eq!(resumed_child.role.as_deref(), Some("explorer"));
+        assert_eq!(resumed_child.status, AgentThreadStatus::Completed);
+
+        let pending = resumed.pending_agent_mail_for_session(root.session_id())?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].author_agent_id.as_str(), "child");
+        assert_eq!(resumed_root.live_state_snapshot().pending_mailbox_count, 1);
+        assert_eq!(snapshot.agent_controls[0].open_spawned_agents, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_completed_child_holds_capacity_until_close() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 2,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: Some(AgentId::from_string("child")?),
+            child_session_id: Some(SessionId::from_string("child")?),
+            task_name: "research".to_string(),
+            message: "inspect docs".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        handle.complete_agent(CompleteAgentRequest {
+            child_agent_id: child.agent_id().clone(),
+            result: "done".to_string(),
+        })?;
+
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let resumed = BrowserUseRuntime::new(persistence, state_index).handle();
+        let resumed_root = resumed.attach_root_agent(AttachRootAgentRequest {
+            session_id: root.session_id().clone(),
+            cwd: PathBuf::from("/tmp"),
+            task: "resume".to_string(),
+            max_concurrent_threads_per_session: 2,
+        })?;
+
+        let err = match resumed.spawn_child(SpawnChildRequest {
+            parent_agent_id: resumed_root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "second".to_string(),
+            message: "no capacity yet".to_string(),
+            nickname: None,
+            role: None,
+        }) {
+            Ok(_) => panic!("completed child should keep capacity until close"),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("agent limit reached"));
+
+        resumed.close_agent(CloseAgentRequest {
+            agent_id: AgentId::from_string("child")?,
+            reason: "done".to_string(),
+        })?;
+        resumed.spawn_child(SpawnChildRequest {
+            parent_agent_id: resumed_root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "second".to_string(),
+            message: "capacity released".to_string(),
+            nickname: None,
+            role: None,
+        })?;
         Ok(())
     }
 
