@@ -1415,15 +1415,63 @@ fn run_session_via_engine_with_runtime_and_cancel(
     cancellation_token: tokio_util::sync::CancellationToken,
     browser_id: Option<BrowserId>,
 ) -> Result<String> {
+    let _local_runtime_server = CliLocalRuntimeServer::ensure(store, &runtime_handle)?;
     let executor = cli_runtime_agent_executor(store, runtime_handle)?;
     attach_cli_child_agent_runner(store, executor.clone(), &mut config);
     let mut request = RuntimeAgentRunRequest::new(session_id.to_string(), config)
         .with_cancellation_token(cancellation_token);
+    let root_cancel = request
+        .cancellation_token
+        .clone()
+        .unwrap_or_else(tokio_util::sync::CancellationToken::new);
     if let Some(browser_id) = browser_id {
         request = request.with_browser_id(browser_id);
     }
     let resolved = executor.run_blocking(request)?;
+    if root_cancel.is_cancelled() {
+        let _ = executor.wait_for_background_idle(Duration::from_secs(30));
+    }
     Ok(resolved.session_id)
+}
+
+struct CliLocalRuntimeServer {
+    owned_socket_path: Option<PathBuf>,
+}
+
+impl CliLocalRuntimeServer {
+    fn ensure(store: &Store, runtime: &RuntimeHandle) -> Result<Self> {
+        Self::ensure_for_state_dir(store.state_dir(), runtime)
+    }
+
+    #[cfg(unix)]
+    fn ensure_for_state_dir(state_dir: &Path, runtime: &RuntimeHandle) -> Result<Self> {
+        let existing_live_server = send_local_runtime_request(
+            state_dir,
+            &LocalRuntimeRequest::Ping,
+            Duration::from_millis(100),
+        )?
+        .is_some_and(|response| response.ok);
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(state_dir, runtime.clone())?;
+        Ok(Self {
+            owned_socket_path: (!existing_live_server).then_some(socket_path),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_for_state_dir(_state_dir: &Path, _runtime: &RuntimeHandle) -> Result<Self> {
+        Ok(Self {
+            owned_socket_path: None,
+        })
+    }
+}
+
+impl Drop for CliLocalRuntimeServer {
+    fn drop(&mut self) {
+        if let Some(socket_path) = self.owned_socket_path.take() {
+            let _ = fs::remove_file(socket_path);
+        }
+    }
 }
 
 fn cli_runtime_handle(store: &Store) -> Result<RuntimeHandle> {
@@ -1597,7 +1645,7 @@ fn cli_child_completion_from_background(
     events: Option<&[browser_use_protocol::EventRecord]>,
 ) -> Option<ChildAgentRunCompletion> {
     if success {
-        if events.is_some_and(child_run_was_interrupted_from_events) {
+        if events.is_some_and(child_run_should_skip_success_completion) {
             return None;
         }
         let summary = events.and_then(session_result_from_events);
@@ -1607,6 +1655,28 @@ fn cli_child_completion_from_background(
             error.unwrap_or_else(|| "child agent failed".to_string()),
         ))
     }
+}
+
+fn child_run_should_skip_success_completion(events: &[browser_use_protocol::EventRecord]) -> bool {
+    child_run_was_interrupted_from_events(events) || child_run_latest_terminal_is_cancelled(events)
+}
+
+fn child_run_latest_terminal_is_cancelled(events: &[browser_use_protocol::EventRecord]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.cancelled"
+                    | "session.interrupted"
+                    | "session.input"
+                    | "session.followup"
+                    | "session.done"
+                    | "session.failed"
+            )
+        })
+        .is_some_and(|event| event.event_type == "session.cancelled")
 }
 
 fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
@@ -6582,6 +6652,19 @@ command = "test-mcp"
             cli_child_completion_from_background(true, None, Some(&interrupted_events)).is_none()
         );
 
+        let cancelled_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "cancelled".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.cancelled".to_string(),
+            payload: serde_json::json!({"reason": "cancelled by user", "runtime_owned": true}),
+        }];
+        assert!(
+            cli_child_completion_from_background(true, None, Some(&cancelled_events)).is_none(),
+            "clean cancellation unwind must not notify the parent as child success"
+        );
+
         let done_events = vec![browser_use_protocol::EventRecord {
             seq: 1,
             id: "e2".to_string(),
@@ -7739,6 +7822,35 @@ command = "test-mcp"
 
         let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_runtime_server_guard_exposes_runtime_socket_for_run_process() -> Result<()> {
+        let temp = unique_cli_test_dir("run-runtime-socket")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("work");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let _session = store.create_session(None, &cwd)?;
+        let runtime = cli_runtime_handle(&store)?;
+        let socket_path = browser_use_runtime::local_runtime_socket_path(&state_dir);
+        assert!(!socket_path.exists());
+
+        let guard = CliLocalRuntimeServer::ensure(&store, &runtime)?;
+        let response = send_local_runtime_request(
+            &state_dir,
+            &LocalRuntimeRequest::Ping,
+            Duration::from_millis(500),
+        )?;
+        assert!(response.is_some_and(|response| response.ok));
+        assert!(socket_path.exists());
+
+        drop(guard);
+        assert!(
+            !socket_path.exists(),
+            "run-owned local runtime socket should be removed when the run bridge drops"
+        );
         Ok(())
     }
 

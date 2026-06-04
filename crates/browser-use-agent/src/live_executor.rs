@@ -1,8 +1,9 @@
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use browser_use_protocol::EventRecord;
@@ -29,6 +30,7 @@ struct RuntimeAgentExecutorInner {
     runtime: RuntimeHandle,
     notifier: Option<StoreNotifier>,
     tokio: tokio::runtime::Runtime,
+    background_active: Arc<(Mutex<usize>, Condvar)>,
 }
 
 #[derive(Clone)]
@@ -130,6 +132,7 @@ impl RuntimeAgentExecutor {
                 runtime: config.runtime,
                 notifier: config.notifier,
                 tokio,
+                background_active: Arc::new((Mutex::new(0), Condvar::new())),
             }),
         })
     }
@@ -281,9 +284,11 @@ impl RuntimeAgentExecutor {
     ) -> Result<()> {
         let executor = self.clone();
         let session_id = request.session_id.clone();
+        let active = BackgroundRunGuard::increment(Arc::clone(&self.inner.background_active));
         thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
+                let _active = active;
                 let result = match catch_unwind(AssertUnwindSafe(|| executor.run_blocking(request)))
                 {
                     Ok(result) => result,
@@ -303,6 +308,47 @@ impl RuntimeAgentExecutor {
             })
             .context("spawn live agent executor thread")?;
         Ok(())
+    }
+
+    pub fn wait_for_background_idle(&self, timeout: Duration) -> bool {
+        let (lock, cvar) = &*self.inner.background_active;
+        let active = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *active == 0 {
+            return true;
+        }
+        let (active, _) = cvar
+            .wait_timeout_while(active, timeout, |active| *active > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active == 0
+    }
+}
+
+struct BackgroundRunGuard {
+    active: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl BackgroundRunGuard {
+    fn increment(active: Arc<(Mutex<usize>, Condvar)>) -> Self {
+        let (lock, _) = &*active;
+        let mut count = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count = count.saturating_add(1);
+        drop(count);
+        Self { active }
+    }
+}
+
+impl Drop for BackgroundRunGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.active;
+        let mut count = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        cvar.notify_all();
     }
 }
 

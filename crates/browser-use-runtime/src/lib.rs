@@ -4181,17 +4181,52 @@ impl RuntimeHandle {
     }
 
     pub fn request_cancel_run(&self, session_id: &SessionId) -> Result<bool> {
-        let Some(token) = self.inner.active_runs.token(session_id) else {
+        let thread = self.inner.agents.thread_for_session(session_id)?;
+        let mut cancelled = self.request_cancel_run_for_thread(
+            &thread,
+            json!({
+                "runtime_owned": true,
+            }),
+        )?;
+        let descendant_edges = self
+            .inner
+            .state_index
+            .list_descendants(&thread.session_id)?;
+        for edge in descendant_edges {
+            let Ok(descendant) = self.inner.agents.thread_for_session(&edge.child_session_id)
+            else {
+                continue;
+            };
+            cancelled |= self.request_cancel_run_for_thread(
+                &descendant,
+                json!({
+                    "runtime_owned": true,
+                    "propagated_from_session_id": thread.session_id.as_str(),
+                    "propagated_from_agent_id": thread.agent_id.as_str(),
+                }),
+            )?;
+        }
+        Ok(cancelled)
+    }
+
+    fn request_cancel_run_for_thread(
+        &self,
+        thread: &AgentThread,
+        mut payload: Value,
+    ) -> Result<bool> {
+        let Some(token) = self.inner.active_runs.token(&thread.session_id) else {
             return Ok(false);
         };
-        let thread = self.inner.agents.thread_for_session(session_id)?;
+        if !payload.is_object() {
+            payload = json!({
+                "runtime_owned": true,
+            });
+        }
         let event = RuntimeEvent::new(RuntimeEventKind::AgentCancelRequested, Durability::Barrier)
             .with_agent_id(thread.agent_id.clone())
             .with_session_id(thread.session_id.clone())
             .with_root_id(thread.root_id.clone())
-            .with_payload(json!({
-                "runtime_owned": true,
-            }));
+            .with_payload(payload);
         self.inner.append_runtime_event(&event)?;
         thread.set_status(AgentThreadStatus::Cancelling);
         thread.live_state.request_cancel();
@@ -4386,6 +4421,87 @@ impl RuntimeHandle {
                 return Err(error);
             }
         };
+
+        if request.cancellation_token.is_cancelled() {
+            let reason = "cancelled by user";
+            if let Err(abort_error) = self.inner.publish_after_barrier(
+                RuntimeEvent::new(RuntimeEventKind::AgentTurnAborted, Durability::Barrier)
+                    .with_agent_id(agent_id.clone())
+                    .with_session_id(request.session_id.clone())
+                    .with_root_id(thread.root_id.clone())
+                    .with_run_id(request.run_id.clone())
+                    .with_payload(json!({
+                        "runtime_owned": true,
+                        "run_id": request.run_id.as_str(),
+                        "error": reason,
+                        "cancelled": true,
+                    })),
+            ) {
+                thread.live_state.finish_run();
+                if let Some(lease) = browser_lease.as_ref() {
+                    self.release_browser(lease)?;
+                }
+                return Err(abort_error);
+            }
+            let terminal_append = match self.inner.persistence.append_session_event(
+                &request.session_id,
+                "session.cancelled",
+                json!({
+                    "reason": reason,
+                    "runtime_owned": true,
+                }),
+                Durability::Barrier,
+            ) {
+                Ok(append) => append,
+                Err(error) => {
+                    thread.live_state.finish_run();
+                    if let Some(lease) = browser_lease.as_ref() {
+                        self.release_browser(lease)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let terminal_append = match self.inner.publish_after_barrier(
+                RuntimeEvent::new(RuntimeEventKind::AgentCancelled, Durability::Barrier)
+                    .with_agent_id(agent_id.clone())
+                    .with_session_id(request.session_id.clone())
+                    .with_root_id(thread.root_id.clone())
+                    .with_run_id(request.run_id.clone())
+                    .with_payload(json!({
+                        "runtime_owned": true,
+                        "run_id": request.run_id.as_str(),
+                        "error": reason,
+                        "cancelled": true,
+                        "terminal_event_type": "session.cancelled",
+                        "terminal_event_seq": terminal_append.seq,
+                    })),
+            ) {
+                Ok(append) => append,
+                Err(error) => {
+                    thread.live_state.finish_run();
+                    if let Some(lease) = browser_lease.as_ref() {
+                        self.release_browser(lease)?;
+                    }
+                    return Err(error);
+                }
+            };
+            thread.set_status(AgentThreadStatus::Cancelled);
+            thread.live_state.finish_run();
+            if let Some(lease) = browser_lease.as_ref() {
+                self.release_browser(lease)?;
+            }
+
+            return Ok(RunAgentResponse {
+                agent_id,
+                session_id: request.session_id,
+                run_id: request.run_id,
+                final_status: AgentThreadStatus::Cancelled,
+                final_result: None,
+                usage: None,
+                terminal_event_seq: terminal_append.seq,
+                output,
+            });
+        }
 
         let terminal_append = match self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentTurnCompleted, Durability::Barrier)
@@ -6782,6 +6898,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn cancel_request_cascades_to_active_descendant_runs_after_barriers() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let child = handle.spawn_child(SpawnChildRequest {
+            parent_agent_id: root.agent_id().clone(),
+            child_agent_id: None,
+            child_session_id: None,
+            task_name: "sleeper".to_string(),
+            message: "sleep".to_string(),
+            nickname: None,
+            role: None,
+        })?;
+        let root_token = CancellationToken::new();
+        let child_token = CancellationToken::new();
+        handle.register_run_with_token(root.session_id().clone(), root_token.clone());
+        handle.register_run_with_token(child.session_id().clone(), child_token.clone());
+        root.set_status(AgentThreadStatus::Running);
+        child.set_status(AgentThreadStatus::Running);
+
+        assert!(handle.request_cancel_run(root.session_id())?);
+
+        assert!(root_token.is_cancelled());
+        assert!(child_token.is_cancelled());
+        assert_eq!(root.snapshot().status, AgentThreadStatus::Cancelling);
+        assert_eq!(child.snapshot().status, AgentThreadStatus::Cancelling);
+        assert!(root.live_state_snapshot().cancellation_requested);
+        assert!(child.live_state_snapshot().cancellation_requested);
+
+        let root_cancel = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .find(|event| event.event_type == RuntimeEventKind::AgentCancelRequested.as_str())
+            .context("root cancel event")?;
+        assert_eq!(root_cancel.payload["payload"]["runtime_owned"], true);
+
+        let child_cancel = journal
+            .events_for_session(child.session_id())?
+            .into_iter()
+            .find(|event| event.event_type == RuntimeEventKind::AgentCancelRequested.as_str())
+            .context("child propagated cancel event")?;
+        assert_eq!(child_cancel.payload["payload"]["runtime_owned"], true);
+        assert_eq!(
+            child_cancel.payload["payload"]["propagated_from_session_id"].as_str(),
+            Some(root.session_id().as_str())
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_run_agent_owns_active_run_lifecycle_and_events() -> Result<()> {
         let (runtime, journal) = BrowserUseRuntime::memory();
@@ -6892,6 +7062,51 @@ mod tests {
             started.payload["run_id"],
             serde_json::Value::String("durable-child-run-1".to_string())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_run_agent_marks_clean_return_after_cancel_as_cancelled() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let cancel = CancellationToken::new();
+        let cancel_for_run = cancel.clone();
+
+        let response = handle
+            .run_agent(
+                RunAgentRequest::new(root.session_id().clone())
+                    .with_agent_id(root.agent_id().clone())
+                    .with_cancellation_token(cancel.clone()),
+                async move {
+                    cancel_for_run.cancel();
+                    Ok::<_, anyhow::Error>("clean unwind after cancel".to_string())
+                },
+            )
+            .await?;
+
+        assert_eq!(response.final_status, AgentThreadStatus::Cancelled);
+        assert_eq!(root.snapshot().status, AgentThreadStatus::Cancelled);
+        assert_eq!(
+            journal
+                .load_session(root.session_id())?
+                .expect("root session")
+                .status,
+            SessionStatus::Cancelled
+        );
+        let events = journal.events_for_session(root.session_id())?;
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.turn.aborted"));
+        assert!(event_types.contains(&"session.cancelled"));
+        assert!(event_types.contains(&"agent.cancelled"));
+        assert!(!event_types.contains(&"agent.completed"));
         Ok(())
     }
 
