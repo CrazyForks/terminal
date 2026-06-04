@@ -245,6 +245,60 @@ async def _test_two_running_agents_cannot_share_one_browser() -> None:
     await task
 
 
+def test_two_agents_with_different_browsers_can_run_concurrently() -> None:
+    asyncio.run(_test_two_agents_with_different_browsers_can_run_concurrently())
+
+
+async def _test_two_agents_with_different_browsers_can_run_concurrently() -> None:
+    runtime = FakeRuntime(run_delay=0.02)
+    first = Agent("first", browser=Browser(_runtime=runtime))  # type: ignore[arg-type]
+    second = Agent("second", browser=Browser(_runtime=runtime))  # type: ignore[arg-type]
+
+    first_history, second_history = await asyncio.gather(first.run(), second.run())
+
+    assert first_history.final_result() == "done"
+    assert second_history.final_result() == "done"
+    run_calls = [payload for method, payload in runtime.calls if method == "agent.run"]
+    assert len(run_calls) == 2
+    assert {call["browser_id"] for call in run_calls} == {"browser-1", "browser-2"}
+
+
+def test_agent_run_cancellation_requests_runtime_stop() -> None:
+    asyncio.run(_test_agent_run_cancellation_requests_runtime_stop())
+
+
+async def _test_agent_run_cancellation_requests_runtime_stop() -> None:
+    runtime = FakeRuntime(run_delay=1.0)
+    agent = Agent("cancel me", browser=Browser(_runtime=runtime))  # type: ignore[arg-type]
+
+    task = asyncio.create_task(agent.run())
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stop_calls = [payload for method, payload in runtime.calls if method == "agent.stop"]
+    assert stop_calls == [{"run_id": agent.session_id}]
+
+
+def test_agent_add_new_task_sends_followup_once() -> None:
+    asyncio.run(_test_agent_add_new_task_sends_followup_once())
+
+
+async def _test_agent_add_new_task_sends_followup_once() -> None:
+    runtime = FakeRuntime(run_result={"history": {"output": "ok", "success": True}})
+    agent = Agent("initial", browser=Browser(_runtime=runtime))  # type: ignore[arg-type]
+
+    agent.add_new_task("next task")
+    await agent.run()
+    first_run = [payload for method, payload in runtime.calls if method == "agent.run"][-1]
+    assert first_run["followups"] == ["next task"]
+
+    await agent.run()
+    second_run = [payload for method, payload in runtime.calls if method == "agent.run"][-1]
+    assert "followups" not in second_run
+
+
 def test_agent_run_fails_loudly_when_server_does_not_support_run() -> None:
     asyncio.run(_test_agent_run_fails_loudly_when_server_does_not_support_run())
 

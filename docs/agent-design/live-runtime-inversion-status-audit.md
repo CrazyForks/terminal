@@ -75,6 +75,9 @@ BrowserUseRuntime
   projected runtime events separately from raw debug events, and Python
   `Agent.stream()` consumes the projected event queue after yielding an initial
   agent snapshot.
+- Python SDK tests cover `Agent.add_new_task()` follow-up delivery, asyncio
+  cancellation to `agent.stop`, same-browser fail-fast behavior, and concurrent
+  different-browser runs.
 - Browser leases in `BrowserManager` are barrier-journaled, depth-aware for
   same-agent nested claims, and expose a runtime action-serialization helper used
   by the runtime browser backend. Same-browser conflicting owners still fail at
