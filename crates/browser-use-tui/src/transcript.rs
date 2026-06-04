@@ -257,8 +257,9 @@ enum TranscriptKind {
         text: String,
         style: NodeStyle,
     },
-    /// A settled, collapsed reasoning block: `· Thought for 31s · 1.8k tokens`.
-    /// The full text lives in the Ctrl+O thinking view.
+    /// A settled, collapsed reasoning block. Readable reasoning is summarized as
+    /// `· Thought for 31s · 1.8k tokens`; token-only hidden reasoning is labeled
+    /// as hidden usage instead of implying readable text exists.
     Thinking {
         summary: String,
     },
@@ -1295,8 +1296,8 @@ fn committed_node_for_event(
         "model.turn.response" => pre_tool_commentary_node(root, events, event),
         "model.response.continued" => continued_response_commentary_node(root, events, event),
         // Once the turn reports usage, its reasoning has settled — commit the
-        // collapsed "Thought for Xs · Nk tokens" summary so it persists in
-        // scrollback. The full text stays available in the Ctrl+O view.
+        // collapsed reasoning summary so it persists in scrollback. The full
+        // readable text, when the provider sent any, stays available in Ctrl+O.
         "model.usage" | "token_count" => thinking_summary_node_before_event(root, events, event),
         // `plan.proposed` is legacy: planning mode was removed, so nothing
         // emits these anymore. Old persisted sessions can still contain them,
@@ -1930,7 +1931,7 @@ fn active_node_for_session(
     // yet produced visible output. Gated on the Thinking state so a parent's
     // reasoning stays hidden while a subagent is the active work. Once output
     // begins this gives way to the streamed answer and, after the turn, to the
-    // collapsed "Thought for Xs".
+    // collapsed reasoning summary.
     if live_streaming_text.is_none() && live_status == "Thinking..." {
         if let Some(thinking) = live_thinking_text {
             let lines: Vec<String> = thinking.lines().map(str::to_string).collect();
@@ -2286,22 +2287,28 @@ fn append_thinking_delta(current: &mut String, incoming: &str) {
     current.push_str(incoming);
 }
 
-/// `Thought for 31s · 1.8k tokens` — the one-line summary for a reasoning block.
+/// One-line summary for a reasoning block. If only token accounting was
+/// reported, call that out as hidden usage instead of suggesting there are
+/// readable tokens to display.
 pub(crate) fn thinking_block_summary(block: &ThinkingBlock) -> String {
     let tokens = if block.tokens_estimated {
         format!("~{}", crate::render::format_token_count(block.tokens))
     } else {
         crate::render::format_token_count(block.tokens)
     };
-    let mut summary = format!(
+    if block.summary_unavailable {
+        let mut summary = format!("Hidden reasoning used {tokens} tokens");
+        if block.duration_s > 0 {
+            summary.push_str(&format!(" over {}s", block.duration_s));
+        }
+        summary.push_str(" · no readable text");
+        return summary;
+    }
+    format!(
         "Thought for {}s · {} tokens",
         block.duration_s.max(0),
         tokens
-    );
-    if block.summary_unavailable {
-        summary.push_str(" · summary unavailable");
-    }
-    summary
+    )
 }
 
 /// Build the collapsed reasoning summary for the turn that ends at `event`.

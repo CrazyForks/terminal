@@ -14691,19 +14691,23 @@ wire_api = "responses"
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Thought for"), "{screen}");
+        assert!(screen.contains("Hidden reasoning used"), "{screen}");
         assert!(screen.contains("35 tokens"), "{screen}");
-        assert!(screen.contains("summary unavailable"), "{screen}");
+        assert!(screen.contains("no readable text"), "{screen}");
+        assert!(!screen.contains("Thought for"), "{screen}");
+        assert!(!screen.contains("summary unavailable"), "{screen}");
 
         app.open_surface(Surface::Thinking);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Thought for"), "{screen}");
+        assert!(screen.contains("Hidden reasoning used"), "{screen}");
         assert!(screen.contains("35 tokens"), "{screen}");
-        assert!(screen.contains("summary unavailable"), "{screen}");
+        assert!(screen.contains("no readable text"), "{screen}");
         assert!(
-            screen.contains("did not send readable reasoning text"),
+            screen.contains("no reasoning text was streamed"),
             "{screen}"
         );
+        assert!(!screen.contains("Thought for"), "{screen}");
+        assert!(!screen.contains("summary unavailable"), "{screen}");
         Ok(())
     }
 

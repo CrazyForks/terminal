@@ -1533,7 +1533,7 @@ fn thinking_view_lines(app: &App, state: &WorkbenchState, _width: usize) -> Vec<
         lines.push(Line::from(""));
         if block.summary_unavailable {
             lines.push(Line::from(Span::styled(
-                "Provider reported hidden reasoning usage but did not send readable reasoning text.",
+                "Those tokens are provider accounting; no reasoning text was streamed.",
                 dim(),
             )));
         } else {
