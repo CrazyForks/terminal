@@ -334,22 +334,24 @@ fn render_main(
         };
         (lines, false)
     };
-    let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
-        && !layout_surface.is_bottom_pane();
-    let attach_bottom_to_body =
-        native_scrollback_active && !body.is_empty() && !layout_surface.is_bottom_pane();
-    let reserve_live_status_row = attach_bottom_to_body && reserve_live_status_row;
+    let native_live_stream_has_scrollback_prefix = native_scrollback_active
+        && state.current_session.as_ref().is_some_and(|session| {
+            app.native_history
+                .live_stream_emitted_lines_for(&session.id, body_width)
+                > 0
+        });
+    let pin_bottom = should_pin_main_bottom(product_state)
+        && !layout_surface.is_bottom_pane()
+        && !native_live_stream_has_scrollback_prefix;
+    let reserve_live_status_row = native_scrollback_active
+        && !body.is_empty()
+        && !layout_surface.is_bottom_pane()
+        && reserve_live_status_row;
     let layout_body_len = body
         .len()
         .saturating_add(usize::from(reserve_live_status_row));
-    let (body_area, bottom_area, footer_area) = main_layout_areas(
-        area,
-        bottom_h,
-        layout_body_len,
-        show_footer,
-        pin_bottom,
-        attach_bottom_to_body,
-    );
+    let (body_area, bottom_area, footer_area) =
+        main_layout_areas(area, bottom_h, layout_body_len, show_footer, pin_bottom);
     let mut body = body;
     if body.len() > body_area.height as usize {
         body = visible_main_body_lines(body, body_area.height, product_state);
@@ -364,15 +366,7 @@ fn render_main(
             ProductState::Running | ProductState::Failed | ProductState::Cancelled => empty_rows,
             ProductState::Ready | ProductState::SetupNeeded => 0,
         };
-        let top_gap = if native_scrollback_active
-            && matches!(
-                product_state,
-                ProductState::Failed | ProductState::Cancelled
-            ) {
-            0
-        } else {
-            top_gap
-        };
+        let top_gap = if native_scrollback_active { 0 } else { top_gap };
         Rect {
             y: body_area.y.saturating_add(top_gap),
             height: body_area.height.saturating_sub(top_gap),
@@ -428,7 +422,6 @@ fn main_layout_areas(
     body_len: usize,
     show_footer: bool,
     pin_bottom: bool,
-    attach_bottom_to_body: bool,
 ) -> (Rect, Rect, Rect) {
     let footer_h = u16::from(show_footer && area.height > bottom_h);
     let max_body_h = area
@@ -437,11 +430,7 @@ fn main_layout_areas(
         .saturating_sub(footer_h);
     let body_h = (body_len as u16).min(max_body_h);
     // The composer is always pinned to the bottom of the terminal; the
-    // optional footer is the very last row. The body either sits at the
-    // top with a flex spacer pushing the composer down (welcome / setup),
-    // or sits at the bottom just above the composer with the spacer
-    // above it so it grows downward toward the composer as content
-    // arrives (active sessions).
+    // optional footer is the very last row.
     let chunks = if pin_bottom {
         Layout::default()
             .direction(Direction::Vertical)
@@ -449,16 +438,6 @@ fn main_layout_areas(
                 Constraint::Fill(1),
                 Constraint::Length(body_h),
                 Constraint::Length(bottom_h),
-                Constraint::Length(footer_h),
-            ])
-            .split(area)
-    } else if attach_bottom_to_body {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(body_h),
-                Constraint::Length(bottom_h),
-                Constraint::Fill(1),
                 Constraint::Length(footer_h),
             ])
             .split(area)
@@ -473,18 +452,11 @@ fn main_layout_areas(
             ])
             .split(area)
     };
-    if attach_bottom_to_body && !pin_bottom {
-        (chunks[0], chunks[1], chunks[3])
-    } else {
-        let body_idx = if pin_bottom { 1 } else { 0 };
-        (chunks[body_idx], chunks[2], chunks[3])
-    }
+    let body_idx = if pin_bottom { 1 } else { 0 };
+    (chunks[body_idx], chunks[2], chunks[3])
 }
 
-fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
-    if native_scrollback_active {
-        return false;
-    }
+fn should_pin_main_bottom(product_state: ProductState) -> bool {
     matches!(
         product_state,
         ProductState::Running

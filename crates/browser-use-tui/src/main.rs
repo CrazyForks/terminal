@@ -14406,7 +14406,10 @@ wire_api = "responses"
 
         let grown_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert_eq!(grown_desired, initial_desired);
+        assert_eq!(
+            grown_desired,
+            dock_height.saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
+        );
 
         let state = app.session_render_state();
         let model = transcript::transcript_model(&app, &state).expect("model");
