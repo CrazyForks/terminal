@@ -1566,15 +1566,22 @@ fn browser_connect_command_for_mode(
     profile_id: Option<&str>,
 ) -> anyhow::Result<String> {
     match normalize_browser_preference_mode(mode).unwrap_or("local") {
-        "cloud" => Ok(profile_id.filter(|value| !value.is_empty()).map_or_else(
-            || "browser remote start".to_string(),
-            |profile_id| {
-                format!(
-                    "browser remote start --profile-id {}",
+        "cloud" => {
+            let mut command = "browser remote start".to_string();
+            if let Some(profile_id) = profile_id.filter(|value| !value.is_empty()) {
+                command.push_str(&format!(
+                    " --profile-id {}",
                     shell_quote_browser_arg(profile_id)
-                )
-            },
-        )),
+                ));
+            }
+            if let Some(country) = env_trimmed("BU_BROWSER_PROXY_COUNTRY_CODE") {
+                command.push_str(&format!(
+                    " --proxy-country {}",
+                    shell_quote_browser_arg(&country)
+                ));
+            }
+            Ok(command)
+        }
         "managed-headless" => Ok("browser connect managed --headless".to_string()),
         "managed-headed" => Ok("browser connect managed --headed".to_string()),
         "remote-cdp" => remote_cdp_connect_command(),

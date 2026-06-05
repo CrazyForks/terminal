@@ -448,6 +448,10 @@ pub struct BrowserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_country_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_headers: Option<String>,
@@ -459,6 +463,14 @@ pub struct BrowserConfig {
     pub storage_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_viewport: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
