@@ -155,6 +155,27 @@ def _runtime_evaluate(expression, session_id=None, await_promise=False, return_b
     return _runtime_value(response, expression)
 
 
+def _is_anonymous_function_expression(expression):
+    source = expression.lstrip()
+    return source.startswith("function(") or source.startswith("function (")
+
+
+def _is_async_anonymous_function_expression(expression):
+    source = expression.lstrip()
+    return source.startswith("async function(") or source.startswith("async function (")
+
+
+def _asyncify_parenthesized_function_iife(expression):
+    source = expression.lstrip()
+    leading = expression[: len(expression) - len(source)]
+    if not source.startswith("(function"):
+        return expression
+    after_function = source[len("(function") :]
+    if not (after_function.startswith("(") or after_function.startswith(" (")):
+        return expression
+    return f"{leading}(async function{after_function}"
+
+
 def _has_return_statement(expression):
     i = 0
     n = len(expression)
@@ -282,8 +303,17 @@ def js(expression, *args, target_id=None, returnByValue=True):
   return await fn(...args);
 }})()
 """
-    elif _has_return_statement(expression) and not expression.strip().startswith("("):
-        expression = f"(function(){{{expression}}})()"
+    else:
+        source = expression.strip().rstrip(";")
+        if _is_anonymous_function_expression(source) or _is_async_anonymous_function_expression(source):
+            expression = f"({source})()"
+        elif source.startswith("(function") and "await " in source:
+            expression = _asyncify_parenthesized_function_iife(expression)
+        elif _has_return_statement(expression) and not expression.strip().startswith("("):
+            if "await " in expression:
+                expression = f"(async function(){{{expression}}})()"
+            else:
+                expression = f"(function(){{{expression}}})()"
     session_id = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
     return _runtime_evaluate(
         expression,

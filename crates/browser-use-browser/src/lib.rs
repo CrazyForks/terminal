@@ -10774,6 +10774,73 @@ print("js args ok")
     }
 
     #[test]
+    fn browser_script_js_accepts_anonymous_function_snippets() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-anonymous-function",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    assert message["kind"] == "cdp", message
+    assert message["method"] == "Runtime.evaluate", message
+    params = message["params"]
+    expression = params["expression"]
+    assert expression == "(function() { return 42; })()", expression
+    assert params["awaitPromise"] is True, params
+    return {"result": {"value": 42}}
+
+result = js("function() { return 42; }")
+assert result == 42, result
+assert len(events) == 1, events
+print("anonymous js snippet ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("anonymous js snippet ok"));
+    }
+
+    #[test]
+    fn browser_script_js_asyncifies_parenthesized_function_iife_with_await() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-asyncify-iife",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+events = []
+
+def _bridge(message):
+    events.append(message)
+    assert message["kind"] == "cdp", message
+    assert message["method"] == "Runtime.evaluate", message
+    params = message["params"]
+    expression = params["expression"]
+    assert expression.startswith("(async function(){"), expression
+    assert "await Promise.resolve()" in expression, expression
+    assert params["awaitPromise"] is True, params
+    return {"result": {"value": "done"}}
+
+result = js("(function(){ await Promise.resolve(); return 'done'; })()")
+assert result == "done", result
+assert len(events) == 1, events
+print("async iife js snippet ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("async iife js snippet ok"));
+    }
+
+    #[test]
     fn browser_script_js_rejects_invalid_options_before_cdp() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
