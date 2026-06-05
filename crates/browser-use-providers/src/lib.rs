@@ -102,6 +102,7 @@ impl ProviderError {
                 | ProviderErrorKind::InternalServerError
                 | ProviderErrorKind::UnexpectedStatus
                 | ProviderErrorKind::RequestTimeout
+                | ProviderErrorKind::ServerOverloaded
         )
     }
 
@@ -11282,8 +11283,6 @@ mod tests {
             ("invalid_prompt", ProviderErrorKind::InvalidRequest),
             ("invalid_image", ProviderErrorKind::InvalidImage),
             ("cyber_policy", ProviderErrorKind::CyberPolicy),
-            ("server_is_overloaded", ProviderErrorKind::ServerOverloaded),
-            ("slow_down", ProviderErrorKind::ServerOverloaded),
         ] {
             let error = response_failed_error(&json!({
                 "type": "response.failed",
@@ -11300,7 +11299,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_failed_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+    fn responses_failed_server_overloaded_is_retryable_for_transient_capacity() -> Result<()> {
         for code in ["server_is_overloaded", "slow_down"] {
             let sse = format!(
                 "data: {}\n\n",
@@ -11334,13 +11333,13 @@ mod tests {
                 .downcast_ref::<ProviderError>()
                 .expect("typed provider error");
             assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
-            assert!(!provider_error.is_retryable());
+            assert!(provider_error.is_retryable());
         }
         Ok(())
     }
 
     #[test]
-    fn responses_http_503_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+    fn responses_http_503_server_overloaded_is_retryable_for_transient_capacity() -> Result<()> {
         let body = json!({
             "error": {
                 "code": "server_is_overloaded",
@@ -11371,7 +11370,7 @@ mod tests {
             .downcast_ref::<ProviderError>()
             .expect("typed provider error");
         assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
-        assert!(!provider_error.is_retryable());
+        assert!(provider_error.is_retryable());
         Ok(())
     }
 
