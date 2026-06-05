@@ -1051,6 +1051,43 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
 }
 
 #[tokio::test]
+async fn fused_browser_script_dispatch_emits_runtime_tool_output_event() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner,
+        /* model_supports */ true,
+        vec![tool_def("browser_script")],
+    ));
+    let (transport, _seen) = RecordingTransport::new(vec![
+        tool_call("browser_script"),
+        finish(FinishReason::Stop),
+    ]);
+    let sink = Arc::new(RecordingSink::default());
+    let sink_for_driver: Arc<dyn EventSink> = sink.clone();
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let driver = ModelSamplingDriver::new(transport, sink_for_driver, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let outcome = driver
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert!(outcome.model_needs_follow_up);
+    let events = sink.drain();
+    let output = events
+        .iter()
+        .find(|event| event.event_type == names::TOOL_OUTPUT)
+        .expect("browser_script dispatch must emit a runtime tool.output event");
+    assert_eq!(output.payload["name"], "browser_script");
+    assert_eq!(output.payload["tool_call_id"], "call-1");
+    assert_eq!(output.payload["text"], "noop");
+}
+
+#[tokio::test]
 async fn fused_done_result_becomes_final_message_without_follow_up() {
     use crate::turn::dispatch::ToolDispatcher;
     use crate::turn::sampling::FusionRecorder;
