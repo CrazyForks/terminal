@@ -483,13 +483,6 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     fn emit_tool_result(&self, call: &ContentPart, output: &Message) {
         let (tool_call_id, name) = tool_call_identity(call);
         let (text, is_error) = tool_result_text_and_status(output);
-        if name == "browser_script" {
-            // Browser script calls persist rich tool.output/tool.failed events
-            // from the handler itself (summary, artifacts, images, diagnosis).
-            // Emitting the generic text-only event here would duplicate the TUI
-            // row and lose the structured browser contract.
-            return;
-        }
         let mut payload = serde_json::json!({
             "name": name,
             "tool_call_id": tool_call_id,

@@ -613,9 +613,11 @@ pub fn provider_messages_from_event_slice(
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
-                    messages.push(tool_message_from_output_event(&event.payload, call_id));
-                    emitted_tool_messages.insert(call_id.to_string());
-                    turn_open = true;
+                    if !emitted_tool_messages.contains(call_id) {
+                        messages.push(tool_message_from_output_event(&event.payload, call_id));
+                        emitted_tool_messages.insert(call_id.to_string());
+                        turn_open = true;
+                    }
                 }
             }
             "tool.failed" => {

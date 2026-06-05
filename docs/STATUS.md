@@ -2,6 +2,22 @@
 
 _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
 
+## 2026-06-05 browser-use Rust SDK eval integration
+
+- [x] Runtime prompt replay now receives `browser_script` tool results through the
+  normal `tool.output` event path. This fixes eval traces where the first
+  `browser_script` page probe or navigation was replayed to the model as
+  `aborted`, causing repeated navigate/status/recover loops before the agent
+  could interact with the browser.
+- [x] Provider-message reconstruction now de-duplicates multiple
+  `tool.output` events with the same `tool_call_id`, preserving the first rich
+  browser result when both the browser handler and generic dispatcher emit an
+  output for the same call.
+- Proof:
+  - `cargo fmt --all --check`
+  - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
+  - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
+
 ## Trust rule
 Only commits **made and test-verified in the working session** are trusted. A separate
 agent ran on similarly-named branches (`sanfrancisco-*`) and the branch namespace got
