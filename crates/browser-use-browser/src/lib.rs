@@ -565,6 +565,97 @@ fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_browser_recovery_command(argv: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("recover")
+}
+
+fn busy_recovery_status_json(
+    session_id: &str,
+    argv: &[String],
+    mut status: Value,
+    script_registry: &BrowserScriptRunRegistry,
+) -> Value {
+    let requested_command = format!("browser {}", argv.join(" "));
+    let live_active_scripts =
+        active_browser_script_runs_json_with_registry(session_id, script_registry);
+    let active_scripts = if live_active_scripts
+        .as_array()
+        .is_some_and(|scripts| !scripts.is_empty())
+    {
+        live_active_scripts
+    } else {
+        status
+            .get("active_scripts")
+            .cloned()
+            .unwrap_or(live_active_scripts)
+    };
+    let next_step = busy_recovery_next_step(&active_scripts, &requested_command);
+
+    if let Some(object) = status.as_object_mut() {
+        object.insert("status".to_string(), Value::String("busy".to_string()));
+        object.insert("busy".to_string(), Value::Bool(true));
+        object.insert("recovery_deferred".to_string(), Value::Bool(true));
+        object.insert(
+            "reason".to_string(),
+            Value::String(
+                "Browser recovery was requested while an active browser_script owned the browser session."
+                    .to_string(),
+            ),
+        );
+        object.insert(
+            "requested_command".to_string(),
+            Value::String(requested_command.clone()),
+        );
+        object.insert("active_scripts".to_string(), active_scripts);
+        object.insert("next_step".to_string(), Value::String(next_step.clone()));
+        object.insert(
+            "model_instruction".to_string(),
+            Value::String(format!(
+                "The browser session is busy, not failed. Follow next_step, then retry {requested_command}."
+            )),
+        );
+        return status;
+    }
+
+    json!({
+        "status": "busy",
+        "busy": true,
+        "recovery_deferred": true,
+        "reason": "Browser recovery was requested while an active browser_script owned the browser session.",
+        "requested_command": requested_command,
+        "active_scripts": active_scripts,
+        "next_step": next_step,
+        "model_instruction": format!(
+            "The browser session is busy, not failed. Follow next_step, then retry {requested_command}."
+        ),
+    })
+}
+
+fn busy_recovery_next_step(active_scripts: &Value, requested_command: &str) -> String {
+    let Some(script) = active_scripts
+        .as_array()
+        .and_then(|scripts| scripts.first())
+    else {
+        return format!(
+            "Wait for the in-flight browser_script to return, run browser status --json, then retry {requested_command}."
+        );
+    };
+    let Some(run_id) = script.get("run_id").and_then(Value::as_str) else {
+        return format!(
+            "Wait for the in-flight browser_script to return, run browser status --json, then retry {requested_command}."
+        );
+    };
+    let status = script
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    if matches!(status, "finished" | "timed_out") {
+        format!("browser_script action=observe run_id={run_id}; then retry {requested_command}.")
+    } else {
+        format!("browser_script action=observe run_id={run_id}; if it is still stuck without progress, browser_script action=cancel run_id={run_id}; then retry {requested_command}.")
+    }
+}
+
 pub fn run_browser_command(
     session_id: &str,
     cwd: impl AsRef<Path>,
@@ -663,6 +754,12 @@ pub fn run_browser_command_with_options_and_registries(
             return Ok(BrowserCommandOutput {
                 events: Vec::new(),
                 content,
+            });
+        }
+        if is_browser_recovery_command(&argv) {
+            return Ok(BrowserCommandOutput {
+                events: Vec::new(),
+                content: busy_recovery_status_json(session_id, &argv, content, script_registry),
             });
         }
         bail!(
@@ -9207,6 +9304,57 @@ mod tests {
         registry.return_session(session_id, session);
         assert_eq!(registry.checked_out_session_count(), 0);
         assert_eq!(registry.active_session_count(), 1);
+    }
+
+    #[test]
+    fn browser_recovery_while_checked_out_returns_busy_guidance() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserSessionRegistry::new();
+        let script_registry = BrowserScriptRunRegistry::new();
+        let session_id = "checked-out-recover";
+        registry
+            .checked_out_statuses
+            .lock()
+            .expect("browser checked-out session registry poisoned")
+            .insert(
+                session_id.to_string(),
+                json!({
+                    "mode": "remote-cloud",
+                    "connection": "connected",
+                    "active_scripts": [{
+                        "run_id": "script-1",
+                        "status": "running",
+                        "next_step": "browser_script action=observe run_id=script-1"
+                    }],
+                    "page": {
+                        "target_id": "target-1",
+                        "session_id": "session-1"
+                    }
+                }),
+            );
+
+        let output = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser recover reconnect-websocket",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect("busy recovery should return structured guidance");
+
+        assert_eq!(output.content["status"], "busy");
+        assert_eq!(output.content["busy"], true);
+        assert_eq!(output.content["recovery_deferred"], true);
+        assert_eq!(
+            output.content["requested_command"],
+            "browser recover reconnect-websocket"
+        );
+        assert_eq!(output.content["active_scripts"][0]["run_id"], "script-1");
+        let next_step = output.content["next_step"].as_str().unwrap();
+        assert!(next_step.contains("browser_script action=observe run_id=script-1"));
+        assert!(next_step.contains("retry browser recover reconnect-websocket"));
     }
 
     #[test]
