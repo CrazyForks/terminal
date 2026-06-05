@@ -1365,9 +1365,10 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
 
     // Codex-style collaboration exposure: v2 is gated by
-    // `features.multi_agent_v2`, while legacy v1 tools are exposed only when
-    // the legacy collaboration feature is enabled.
-    if config.options.multi_agent_v2.enabled {
+    // `features.multi_agent_v2`, but only advertise the subagent tools when this
+    // run actually has a child runner. Otherwise the model can burn turns on an
+    // unsupported tool that can never succeed.
+    if subagent_tools_enabled_for_run(config) {
         register_subagent_tools(
             &mut reg,
             config,
@@ -1375,7 +1376,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
             &tool_cwd,
             runtime_handle.clone(),
         );
-    } else if config.options.collab_enabled {
+    } else if legacy_subagent_tools_enabled_for_run(config) {
         register_legacy_subagent_tools(
             &mut reg,
             config,
@@ -1497,6 +1498,16 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     Ok(Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
     )))
+}
+
+fn subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    config.options.multi_agent_v2.enabled && config.options.child_agent_runner.is_some()
+}
+
+fn legacy_subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    !config.options.multi_agent_v2.enabled
+        && config.options.collab_enabled
+        && config.options.child_agent_runner.is_some()
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -3240,11 +3251,14 @@ mod tests {
         );
     }
 
-    /// The production dispatcher advertises the Codex MultiAgentV2 orchestration
-    /// tools while the feature is enabled; a spawn still fails honestly when no
-    /// child runner is wired.
+    fn test_child_agent_runner() -> crate::config_overrides::ChildAgentRunner {
+        crate::config_overrides::ChildAgentRunner::new(|_req| Ok(()))
+    }
+
+    /// The production dispatcher does not advertise subagent tools when there is
+    /// no child runner wired for the run.
     #[test]
-    fn subagent_tools_are_registered_by_default_in_the_dispatcher() {
+    fn subagent_tools_are_hidden_without_child_runner() {
         let options = crate::config_overrides::AgentRunOptions::default();
         let config =
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
@@ -3263,19 +3277,16 @@ mod tests {
             "close_agent",
         ] {
             assert!(
-                names.contains(&tool),
-                "{tool} must be registered by default in the production dispatcher; got {names:?}"
+                !names.contains(&tool),
+                "{tool} must be hidden without a configured child runner; got {names:?}"
             );
         }
-        assert!(
-            !names.contains(&"send_input"),
-            "send_input is a v1 tool and must not be exposed in the default Codex-v2 flat tool surface"
-        );
     }
 
     #[test]
     fn subagent_tools_are_registered_in_the_dispatcher() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 ..Default::default()
@@ -3311,8 +3322,12 @@ mod tests {
 
     #[test]
     fn spawn_agent_agent_type_guidance_discourages_default_override() {
-        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model")
-            .with_options(crate::config_overrides::AgentRunOptions::default());
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(
+            crate::config_overrides::AgentRunOptions {
+                child_agent_runner: Some(test_child_agent_runner()),
+                ..crate::config_overrides::AgentRunOptions::default()
+            },
+        );
         let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
         let spawn = dispatcher
             .tool_specs()
@@ -3367,6 +3382,7 @@ mod tests {
     #[test]
     fn legacy_subagent_tools_are_exposed_when_collab_enabled() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: false,
                 ..Default::default()
@@ -3399,6 +3415,7 @@ mod tests {
     #[test]
     fn subagent_tools_apply_multi_agent_v2_definition_options() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),
@@ -3444,6 +3461,7 @@ mod tests {
     #[test]
     fn subagent_namespace_is_only_applied_for_responses_backends() {
         let options = crate::config_overrides::AgentRunOptions {
+            child_agent_runner: Some(test_child_agent_runner()),
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
                 enabled: true,
                 tool_namespace: Some("agents".to_string()),
