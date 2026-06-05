@@ -605,6 +605,13 @@ fn stream_idle_timeout_error(timeout: Duration) -> LlmError {
     ))
 }
 
+fn model_request_timeout_error(timeout: Duration) -> LlmError {
+    LlmError::transport(format!(
+        "model request timeout after {}ms",
+        timeout.as_millis()
+    ))
+}
+
 // Compile-time guard: the streaming state must stay `Send` so the event stream
 // can cross task/thread boundaries (the public `stream` future is `Send`).
 const _: fn() = || {
@@ -622,6 +629,8 @@ pub struct ModelClient {
     http: reqwest::Client,
     /// Retry/backoff configuration.
     retry: RetryPolicy,
+    /// Optional timeout for opening the provider response stream.
+    request_timeout: Option<Duration>,
     /// Optional max idle gap between streamed HTTP byte chunks.
     stream_idle_timeout: Option<Duration>,
 }
@@ -630,6 +639,7 @@ impl fmt::Debug for ModelClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelClient")
             .field("retry", &self.retry)
+            .field("request_timeout", &self.request_timeout)
             .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish_non_exhaustive()
     }
@@ -647,6 +657,7 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry: RetryPolicy::default(),
+            request_timeout: None,
             stream_idle_timeout: None,
         }
     }
@@ -656,6 +667,7 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry,
+            request_timeout: None,
             stream_idle_timeout: None,
         }
     }
@@ -665,6 +677,7 @@ impl ModelClient {
         Self {
             http,
             retry,
+            request_timeout: None,
             stream_idle_timeout: None,
         }
     }
@@ -672,6 +685,23 @@ impl ModelClient {
     /// The retry policy in effect.
     pub fn retry_policy(&self) -> &RetryPolicy {
         &self.retry
+    }
+
+    /// Bound how long a request may wait for the provider response stream to open.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable provider response-open timeout enforcement.
+    pub fn without_request_timeout(mut self) -> Self {
+        self.request_timeout = None;
+        self
+    }
+
+    /// The provider response-open timeout in effect.
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// Bound the idle gap between streamed response byte chunks.
@@ -783,9 +813,14 @@ impl ModelClient {
         req: &LlmRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + Send>>, LlmError> {
         let (body, headers) = self.prepare(route, req)?;
-        let resp = self
-            .send_with_retry(&route.endpoint.url(), &headers, &body)
-            .await?;
+        let url = route.endpoint.url();
+        let send = self.send_with_retry(&url, &headers, &body);
+        let resp = match self.request_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send)
+                .await
+                .map_err(|_| model_request_timeout_error(timeout))??,
+            None => send.await?,
+        };
 
         let state = StreamState {
             byte_stream: Box::pin(resp.bytes_stream()),
@@ -1339,6 +1374,58 @@ mod tests {
             thread::sleep(Duration::from_millis(200));
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    fn spawn_no_response_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_open_timeout_yields_retryable_transport_error() {
+        let (base_url, handle) = spawn_no_response_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        })
+        .with_request_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let err = match client.stream(&route, &req).await {
+            Ok(_) => panic!("request-open timeout should fail before stream opens"),
+            Err(err) => err,
+        };
+        handle.join().expect("idle server thread");
+
+        assert_eq!(err.reason, LlmErrorReason::Transport);
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("model request timeout after 20ms"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
