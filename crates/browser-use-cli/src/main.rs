@@ -4107,12 +4107,18 @@ fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> 
             .get("profile_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        profile: sdk_string_param(params, "profile"),
+        proxy_country_code: sdk_string_param(params, "proxy_country_code"),
         cdp_url: sdk_string_param(params, "cdp_url"),
         cdp_headers: sdk_json_env_param(params, "cdp_headers"),
         user_agent: sdk_string_param(params, "user_agent"),
         viewport: sdk_json_env_param(params, "viewport"),
         storage_state: sdk_json_env_param(params, "storage_state"),
         downloads_path: sdk_string_param(params, "downloads_path"),
+        allowed_domains: sdk_json_env_param(params, "allowed_domains"),
+        blocked_domains: sdk_json_env_param(params, "blocked_domains"),
+        window_size: sdk_json_env_param(params, "window_size"),
+        state_dir: sdk_string_param(params, "state_dir"),
         no_viewport: sdk_bool_param(params, "no_viewport"),
         accept_downloads: sdk_bool_param(params, "accept_downloads"),
     };
@@ -5178,6 +5184,30 @@ fn sdk_python_env_from_params(
         sdk_string_param(browser, "downloads_path")
             .or_else(|| sdk_string_param(params, "downloads_path"))
             .or_else(|| snapshot_config.and_then(|config| config.downloads_path.clone())),
+    );
+    push(
+        "BU_BROWSER_ALLOWED_DOMAINS",
+        sdk_json_env_param(browser, "allowed_domains")
+            .or_else(|| sdk_json_env_param(params, "allowed_domains"))
+            .or_else(|| snapshot_config.and_then(|config| config.allowed_domains.clone())),
+    );
+    push(
+        "BU_BROWSER_PROHIBITED_DOMAINS",
+        sdk_json_env_param(browser, "blocked_domains")
+            .or_else(|| sdk_json_env_param(params, "blocked_domains"))
+            .or_else(|| snapshot_config.and_then(|config| config.blocked_domains.clone())),
+    );
+    push(
+        "BU_BROWSER_WINDOW_SIZE",
+        sdk_json_env_param(browser, "window_size")
+            .or_else(|| sdk_json_env_param(params, "window_size"))
+            .or_else(|| snapshot_config.and_then(|config| config.window_size.clone())),
+    );
+    push(
+        "BU_BROWSER_PROXY_COUNTRY_CODE",
+        sdk_string_param(browser, "proxy_country_code")
+            .or_else(|| sdk_string_param(params, "proxy_country_code"))
+            .or_else(|| snapshot_config.and_then(|config| config.proxy_country_code.clone())),
     );
     if let Some(value) = sdk_bool_param(browser, "no_viewport")
         .or_else(|| sdk_bool_param(params, "no_viewport"))
@@ -7866,12 +7896,18 @@ command = "test-mcp"
                 "keep_alive": true,
                 "headless": false,
                 "profile_id": "profile-a",
+                "profile": "local-profile-a",
+                "proxy_country_code": "US",
                 "cdp_url": "wss://browser.example.test/cdp",
                 "cdp_headers": {"Authorization": "Bearer test"},
                 "user_agent": "BrowserUseTest/1.0",
                 "viewport": {"width": 1280, "height": 720},
+                "window_size": {"width": 1440, "height": 900},
                 "storage_state": {"cookies": []},
                 "downloads_path": "/tmp/browser-use-downloads",
+                "allowed_domains": ["example.com"],
+                "blocked_domains": ["*.tracking.example"],
+                "state_dir": "/tmp/browser-use-state",
                 "no_viewport": true,
                 "accept_downloads": true
             }
@@ -7889,6 +7925,8 @@ command = "test-mcp"
         assert!(snapshot.config.keep_alive);
         assert_eq!(snapshot.config.headless, Some(false));
         assert_eq!(snapshot.config.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(snapshot.config.profile.as_deref(), Some("local-profile-a"));
+        assert_eq!(snapshot.config.proxy_country_code.as_deref(), Some("US"));
         assert_eq!(
             snapshot.config.cdp_url.as_deref(),
             Some("wss://browser.example.test/cdp")
@@ -7900,6 +7938,10 @@ command = "test-mcp"
         assert_eq!(
             snapshot.config.downloads_path.as_deref(),
             Some("/tmp/browser-use-downloads")
+        );
+        assert_eq!(
+            snapshot.config.state_dir.as_deref(),
+            Some("/tmp/browser-use-state")
         );
         assert_eq!(snapshot.config.no_viewport, Some(true));
         assert_eq!(snapshot.config.accept_downloads, Some(true));
@@ -7913,6 +7955,21 @@ command = "test-mcp"
             .viewport
             .as_deref()
             .is_some_and(|value| value.contains("1280")));
+        assert!(snapshot
+            .config
+            .window_size
+            .as_deref()
+            .is_some_and(|value| value.contains("1440")));
+        assert!(snapshot
+            .config
+            .allowed_domains
+            .as_deref()
+            .is_some_and(|value| value.contains("example.com")));
+        assert!(snapshot
+            .config
+            .blocked_domains
+            .as_deref()
+            .is_some_and(|value| value.contains("tracking.example")));
         assert!(snapshot
             .config
             .storage_state
@@ -7934,8 +7991,12 @@ command = "test-mcp"
                 "cdp_headers": {"Authorization": "Bearer test"},
                 "user_agent": "BrowserUseTest/1.0",
                 "viewport": {"width": 1365, "height": 768},
+                "window_size": {"width": 1440, "height": 900},
                 "storage_state": {"origins": []},
                 "downloads_path": "/tmp/downloads",
+                "allowed_domains": ["example.com"],
+                "blocked_domains": ["*.tracking.example"],
+                "proxy_country_code": "DE",
                 "no_viewport": true,
                 "accept_downloads": true
             },
@@ -7968,6 +8029,22 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| { key == "BU_BROWSER_VIEWPORT" && value.contains("1365") }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_BROWSER_WINDOW_SIZE" && value.contains("1440") }));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == "BU_BROWSER_ALLOWED_DOMAINS" && value.contains("example.com")
+        }));
+        assert!(config.options.python_env.iter().any(|(key, value)| {
+            key == "BU_BROWSER_PROHIBITED_DOMAINS" && value.contains("tracking.example")
+        }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_BROWSER_PROXY_COUNTRY_CODE" && value == "DE"));
         assert!(config
             .options
             .python_env

@@ -632,6 +632,34 @@ async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
 }
 
 #[tokio::test]
+async fn stored_cloud_profile_uses_sdk_proxy_country_env_when_connecting() {
+    let _guard = EnvVarGuard::set("BU_BROWSER_PROXY_COUNTRY_CODE", "DE");
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "profile with space")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command(
+            "browser remote start --profile-id 'profile with space' --proxy-country DE".to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn stored_local_profile_is_opened_before_plain_local_connect_when_reachable_profiles_are_ambiguous(
 ) {
     let backend = Arc::new(FakeBackend::default());
