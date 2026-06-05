@@ -1159,6 +1159,35 @@ class _HttpGetBytes(bytes):
         return json.loads(self.text)
 
 
+class _HttpErrorRecord(dict):
+    def __init__(self, url=None, error=None, status_code=None, headers=None):
+        super().__init__(
+            ok=False,
+            url=url,
+            error=error or "request failed",
+            status_code=status_code,
+            status=status_code,
+            headers=headers or {},
+        )
+        self.ok = False
+        self.url = url
+        self.error = error or "request failed"
+        self.status_code = status_code
+        self.status = status_code
+        self.headers = headers or {}
+
+    @property
+    def text(self):
+        return ""
+
+    @property
+    def content(self):
+        return b""
+
+    def json(self):
+        raise ValueError(f"request failed for {self.url}: {self.error}")
+
+
 def http_get(url, headers=None, timeout=20.0, binary=None):
     """Pure HTTP fetch for static pages and APIs.
 
@@ -1267,7 +1296,7 @@ def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, 
                 request_url = item.get("url") if isinstance(item, dict) else str(item)
                 if not return_errors:
                     raise
-                results[index] = {"ok": False, "url": request_url, "error": str(exc)}
+                results[index] = _HttpErrorRecord(url=request_url, error=str(exc))
     return results
 
 
@@ -1305,15 +1334,16 @@ def _normalize_browser_fetch_request(
 def _browser_fetch_response(result, return_error=False):
     if not isinstance(result, dict):
         if return_error:
-            return {"ok": False, "url": None, "error": f"invalid browser_fetch result: {result!r}"}
+            return _HttpErrorRecord(url=None, error=f"invalid browser_fetch result: {result!r}")
         raise RuntimeError(f"invalid browser_fetch result: {result!r}")
     if not result.get("ok"):
         if return_error:
-            return {
-                "ok": False,
-                "url": result.get("url"),
-                "error": result.get("error", "browser_fetch failed"),
-            }
+            return _HttpErrorRecord(
+                url=result.get("url"),
+                error=result.get("error", "browser_fetch failed"),
+                status_code=result.get("status"),
+                headers=result.get("headers") or {},
+            )
         raise RuntimeError(f"browser_fetch failed for {result.get('url')}: {result.get('error')}")
     headers = result.get("headers") or {}
     status = result.get("status")
