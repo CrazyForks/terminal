@@ -4593,6 +4593,7 @@ fn sdk_provider_run_config(
     }
     if let Some(timeout) = llm.get("timeout").and_then(Value::as_u64) {
         options.python_tool_timeout_seconds = timeout;
+        options.model_stream_idle_timeout_ms = Some(timeout.saturating_mul(1000));
     }
     options.python_env.extend(sdk_python_env_from_params(
         params,
@@ -5928,6 +5929,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         compact_prompt: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
+        model_stream_idle_timeout_ms: None,
         python_tool_timeout_seconds: config.python_timeout_seconds,
         python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
         child_agent_runner: None,
@@ -7478,6 +7480,7 @@ command = "test-mcp"
             params.get("output_schema").cloned()
         );
         assert_eq!(config.options.python_tool_timeout_seconds, 45);
+        assert_eq!(config.options.model_stream_idle_timeout_ms, Some(45_000));
         assert!(config
             .options
             .python_env

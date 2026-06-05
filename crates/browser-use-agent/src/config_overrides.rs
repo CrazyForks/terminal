@@ -290,6 +290,7 @@ pub struct AgentRunOptions {
     pub compact_prompt: Option<String>,
     pub model_provider_id: Option<String>,
     pub model_provider_id_source: RunConfigValueSource,
+    pub model_stream_idle_timeout_ms: Option<u64>,
     pub python_tool_timeout_seconds: u64,
     pub python_env: Vec<(String, String)>,
     pub child_agent_runner: Option<ChildAgentRunner>,
@@ -355,6 +356,7 @@ impl Default for AgentRunOptions {
             compact_prompt: None,
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
+            model_stream_idle_timeout_ms: None,
             python_tool_timeout_seconds: 120,
             python_env: Vec::new(),
             child_agent_runner: None,
@@ -764,6 +766,9 @@ pub fn apply_runtime_config_overrides(
     }
     if let Some(value) = config_override_u64(overrides, "python_tool_timeout_seconds") {
         options.python_tool_timeout_seconds = value;
+    }
+    if let Some(value) = config_override_u64(overrides, "model_stream_idle_timeout_ms") {
+        options.model_stream_idle_timeout_ms = Some(value);
     }
     if let Some(value) = config_override_bool(overrides, "model_compaction_enabled") {
         options.model_compaction_enabled = value;

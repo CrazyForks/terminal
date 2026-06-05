@@ -563,6 +563,8 @@ struct StreamState {
     ready: VecDeque<Result<LlmEvent, LlmError>>,
     /// Lifecycle phase.
     phase: Phase,
+    /// Optional max idle gap between provider stream chunks.
+    idle_timeout: Option<Duration>,
 }
 
 impl StreamState {
@@ -582,6 +584,27 @@ impl StreamState {
     }
 }
 
+async fn next_byte_chunk(
+    byte_stream: &mut ByteStream,
+    idle_timeout: Option<Duration>,
+) -> Option<Result<bytes::Bytes, LlmError>> {
+    let next = match idle_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, byte_stream.next()).await {
+            Ok(next) => next,
+            Err(_) => return Some(Err(stream_idle_timeout_error(timeout))),
+        },
+        None => byte_stream.next().await,
+    };
+    next.map(|chunk| chunk.map_err(|e| LlmError::transport(scrub(&e.to_string()))))
+}
+
+fn stream_idle_timeout_error(timeout: Duration) -> LlmError {
+    LlmError::transport(format!(
+        "model stream idle timeout after {}ms",
+        timeout.as_millis()
+    ))
+}
+
 // Compile-time guard: the streaming state must stay `Send` so the event stream
 // can cross task/thread boundaries (the public `stream` future is `Send`).
 const _: fn() = || {
@@ -599,12 +622,15 @@ pub struct ModelClient {
     http: reqwest::Client,
     /// Retry/backoff configuration.
     retry: RetryPolicy,
+    /// Optional max idle gap between streamed HTTP byte chunks.
+    stream_idle_timeout: Option<Duration>,
 }
 
 impl fmt::Debug for ModelClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModelClient")
             .field("retry", &self.retry)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -621,6 +647,7 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry: RetryPolicy::default(),
+            stream_idle_timeout: None,
         }
     }
 
@@ -629,17 +656,39 @@ impl ModelClient {
         Self {
             http: reqwest::Client::new(),
             retry,
+            stream_idle_timeout: None,
         }
     }
 
     /// Construct a client from an existing `reqwest::Client` and retry policy.
     pub fn from_parts(http: reqwest::Client, retry: RetryPolicy) -> Self {
-        Self { http, retry }
+        Self {
+            http,
+            retry,
+            stream_idle_timeout: None,
+        }
     }
 
     /// The retry policy in effect.
     pub fn retry_policy(&self) -> &RetryPolicy {
         &self.retry
+    }
+
+    /// Bound the idle gap between streamed response byte chunks.
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable stream idle timeout enforcement.
+    pub fn without_stream_idle_timeout(mut self) -> Self {
+        self.stream_idle_timeout = None;
+        self
+    }
+
+    /// The stream idle timeout in effect.
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        self.stream_idle_timeout
     }
 
     /// Build the prepared request body and header list for a route + request.
@@ -744,6 +793,7 @@ impl ModelClient {
             protocol_stream: route.protocol.decoder(),
             ready: VecDeque::new(),
             phase: Phase::Streaming,
+            idle_timeout: self.stream_idle_timeout,
         };
 
         // Drive the byte stream through the same SSE → protocol pipeline as
@@ -754,17 +804,19 @@ impl ModelClient {
                     return Some((ev, st));
                 }
                 match st.phase {
-                    Phase::Streaming => match st.byte_stream.next().await {
-                        Some(Ok(chunk)) => {
-                            let frames = st.sse.push(chunk.as_ref());
-                            st.decode_frames(frames);
+                    Phase::Streaming => {
+                        match next_byte_chunk(&mut st.byte_stream, st.idle_timeout).await {
+                            Some(Ok(chunk)) => {
+                                let frames = st.sse.push(chunk.as_ref());
+                                st.decode_frames(frames);
+                            }
+                            Some(Err(e)) => {
+                                st.phase = Phase::Done;
+                                return Some((Err(e), st));
+                            }
+                            None => st.phase = Phase::Flushing,
                         }
-                        Some(Err(e)) => {
-                            st.phase = Phase::Done;
-                            return Some((Err(LlmError::transport(scrub(&e.to_string()))), st));
-                        }
-                        None => st.phase = Phase::Flushing,
-                    },
+                    }
                     Phase::Flushing => {
                         st.phase = Phase::Done;
                         match st.protocol_stream.finish() {
@@ -810,6 +862,9 @@ fn header_map(headers: &reqwest::header::HeaderMap) -> BTreeMap<String, String> 
 mod tests {
     use super::*;
     use crate::protocols::OpenAiResponsesProtocol;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     // --- decode_chunks: end-to-end OpenAI Responses SSE -----------------
 
@@ -1260,6 +1315,63 @@ mod tests {
     }
 
     // --- async path smoke test (no live provider call) ------------------
+
+    fn spawn_idle_sse_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .expect("write headers");
+            thread::sleep(Duration::from_millis(200));
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_yields_retryable_transport_error() {
+        let (base_url, handle) = spawn_idle_sse_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 1,
+            ..RetryPolicy::default()
+        })
+        .with_stream_idle_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let mut stream = client.stream(&route, &req).await.expect("open stream");
+        let err = stream
+            .next()
+            .await
+            .expect("idle stream should yield an error")
+            .expect_err("idle stream should fail");
+        handle.join().expect("idle server thread");
+
+        assert_eq!(err.reason, LlmErrorReason::Transport);
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("model stream idle timeout after 20ms"),
+            "{err}"
+        );
+    }
 
     /// Exercises the real async stack — the tokio runtime, `generate`, the
     /// `send_with_retry` → `send_once` path, and transport-error mapping —
