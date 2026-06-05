@@ -28,7 +28,7 @@ use tungstenite::{connect, Message, WebSocket};
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
-const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 7_000;
+const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 15_000;
 const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -10777,13 +10777,13 @@ print("bridge retry ok")
     }
 
     #[test]
-    fn browser_script_initial_wait_defaults_to_seven_seconds_and_clamps_env() {
+    fn browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env() {
         {
             let _env = EnvRestore::unset(&[
                 "BU_BROWSER_SCRIPT_INITIAL_WAIT_MS",
                 "BROWSER_SCRIPT_INITIAL_WAIT_MS",
             ]);
-            assert_eq!(browser_script_initial_wait_ms(), 7_000);
+            assert_eq!(browser_script_initial_wait_ms(), 15_000);
         }
         {
             let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "1500")]);

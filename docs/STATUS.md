@@ -13,10 +13,16 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   `tool.output` events with the same `tool_call_id`, preserving the first rich
   browser result when both the browser handler and generic dispatcher emit an
   output for the same call.
+- [x] `browser_script` now waits up to 15s before detaching into
+  observe/run-id mode. This keeps normal navigation/screenshot/page-info scripts
+  attached long enough to return direct page state, reducing traces where the
+  model immediately observes, repeats navigation, or burns steps checking browser
+  status after a slow page load.
 - Proof:
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
   - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env -- --nocapture`
 
 ## Trust rule
 Only commits **made and test-verified in the working session** are trusted. A separate
