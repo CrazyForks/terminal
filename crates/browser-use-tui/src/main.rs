@@ -9262,7 +9262,7 @@ fn apply_native_live_stream_plan(
     if plan.lines.is_empty() {
         return Ok(());
     }
-    insert_native_lines(terminal, plan.lines)?;
+    insert_native_live_stream_lines(terminal, plan.lines)?;
     app.native_history.set_live_stream_emitted_lines(
         &plan.session_id,
         plan.width,
@@ -9359,10 +9359,27 @@ fn insert_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     lines: Vec<Line<'static>>,
 ) -> Result<()> {
+    insert_native_lines_with_clear(terminal, lines, true)
+}
+
+fn insert_native_live_stream_lines(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    lines: Vec<Line<'static>>,
+) -> Result<()> {
+    insert_native_lines_with_clear(terminal, lines, false)
+}
+
+fn insert_native_lines_with_clear(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    lines: Vec<Line<'static>>,
+    clear_before_insert: bool,
+) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
-    clear_inline_viewport_for_native_insert(terminal)?;
+    if clear_before_insert {
+        clear_inline_viewport_for_native_insert(terminal)?;
+    }
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
     let hyperlinks = collect_native_hyperlink_segments(&lines);
     terminal.insert_before(height, |buf| {
@@ -14262,6 +14279,87 @@ wire_api = "responses"
         let grown_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
         assert_eq!(grown_desired.saturating_add(1), initial_desired);
+        Ok(())
+    }
+
+    #[test]
+    fn long_followup_stream_keeps_only_live_tail_in_active_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "continue".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        let streamed = (1..=80)
+            .map(|idx| format!("stream line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": streamed}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let width = native_scrollback_width(120);
+        let state = app.session_render_state();
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, width, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> continue"), "{prompt_text}");
+        assert!(!prompt_text.contains("stream line 01"), "{prompt_text}");
+
+        let live_stream = native_live_stream_plan(&app, &model, width);
+        assert!(
+            live_stream.emit_count >= 79,
+            "long streams should emit stable rows instead of keeping them all active"
+        );
+        let emitted_text = lines_plain_text(&live_stream.lines);
+        assert!(emitted_text.contains("stream line 01"), "{emitted_text}");
+        app.native_history.set_live_stream_emitted_lines(
+            &session.id,
+            width,
+            live_stream.emit_count,
+            live_stream.emitted_text_lines,
+        );
+
+        let active_lines = transcript::active_viewport_lines_with_stream_skip(
+            Some(&model),
+            width,
+            u16::MAX,
+            app.native_history
+                .live_stream_emitted_lines_for(&session.id, width),
+        );
+        let active_text = lines_plain_text(&active_lines);
+        assert!(!active_text.contains("stream line 01"), "{active_text}");
+        assert!(!active_text.contains("stream line 40"), "{active_text}");
+        assert!(
+            active_lines.len() <= 3,
+            "active viewport should contain only the mutable live tail/status, not the full stream\n{active_text}"
+        );
         Ok(())
     }
 
