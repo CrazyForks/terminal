@@ -469,6 +469,13 @@ def current_tab():
     return tab
 
 
+def _is_agent_startup_placeholder(title, url):
+    url = str(url or "")
+    return str(title or "").startswith("Starting agent ") and (
+        url in ("", "about:blank") or url.startswith("about:blank#")
+    )
+
+
 def list_tabs(include_chrome=True, include_other_contexts=False):
     out = []
     current_context = None if include_other_contexts else _current_target_browser_context_id()
@@ -478,6 +485,8 @@ def list_tabs(include_chrome=True, include_other_contexts=False):
         if current_context and target.get("browserContextId") != current_context:
             continue
         url = target.get("url", "")
+        if _is_agent_startup_placeholder(target.get("title", ""), url):
+            continue
         if not include_chrome and PROFILE_MARKER in url:
             continue
         if not include_chrome and url.startswith(INTERNAL):
