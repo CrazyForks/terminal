@@ -911,9 +911,31 @@ fn resolve_browser_command_for_selected_mode(
             profile_id.as_deref(),
         ))
     } else {
-        enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
+        let configured_mode = configured_browser_mode_for_command_guard(store)?;
+        enforce_browser_command_matches_selected_mode(
+            &args,
+            selected_browser_mode.or(configured_mode),
+        )?;
         Ok(cmd.to_string())
     }
+}
+
+fn configured_browser_mode_for_command_guard(
+    store: Option<&Store>,
+) -> anyhow::Result<Option<&'static str>> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let mode = store.get_setting(BROWSER_PREF_MODE)?.or_else(|| {
+        store
+            .get_setting("browser")
+            .ok()
+            .flatten()
+            .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+    });
+    mode.as_deref()
+        .map(normalize_browser_preference_mode)
+        .transpose()
 }
 
 fn local_connect_default_profile_preflight(
@@ -2347,5 +2369,25 @@ mod browser_mode_tests {
             Some("remote-cloud"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn stored_cloud_preference_rejects_managed_only_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.set_setting(BROWSER_PREF_MODE, "cloud").unwrap();
+
+        let err = resolve_browser_command_for_selected_mode(
+            Some(&store),
+            "browser recover restart-owned-browser",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("restart-owned-browser only applies to managed Chromium"),
+            "{err:#}"
+        );
     }
 }
