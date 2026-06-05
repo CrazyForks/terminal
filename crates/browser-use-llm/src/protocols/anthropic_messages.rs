@@ -6,7 +6,13 @@
 //!
 //! Reference: <https://docs.anthropic.com/en/api/messages>.
 
+use std::io::Cursor;
+
+use base64::{engine::general_purpose, Engine as _};
+use image::imageops::FilterType;
 use serde_json::{json, Map, Value};
+
+const ANTHROPIC_MAX_MANY_IMAGE_DIMENSION: u32 = 2_000;
 
 use crate::protocols::utils::{Lifecycle, ToolStream};
 use crate::route::framing::SseFrame;
@@ -162,7 +168,9 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             ..
         } => {
             let source = if let Some(data) = data {
-                json!({ "type": "base64", "media_type": mime_type, "data": data })
+                let (media_type, data) = anthropic_safe_inline_image(mime_type, data)
+                    .unwrap_or_else(|| (mime_type.clone(), data.clone()));
+                json!({ "type": "base64", "media_type": media_type, "data": data })
             } else if let Some(url) = url {
                 json!({ "type": "url", "url": url })
             } else {
@@ -226,6 +234,33 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             Ok(Value::Object(block))
         }
     }
+}
+
+fn anthropic_safe_inline_image(mime_type: &str, data: &str) -> Option<(String, String)> {
+    if !mime_type.starts_with("image/") {
+        return None;
+    }
+    let bytes = general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    let width = image.width();
+    let height = image.height();
+    if width <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION && height <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION {
+        return None;
+    }
+
+    let scale = (ANTHROPIC_MAX_MANY_IMAGE_DIMENSION as f32 / width as f32)
+        .min(ANTHROPIC_MAX_MANY_IMAGE_DIMENSION as f32 / height as f32);
+    let resized_width = ((width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((height as f32 * scale).round() as u32).max(1);
+    let resized = image.resize(resized_width, resized_height, FilterType::Lanczos3);
+    let mut encoded = Cursor::new(Vec::new());
+    resized
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .ok()?;
+    Some((
+        "image/png".to_string(),
+        general_purpose::STANDARD.encode(encoded.into_inner()),
+    ))
 }
 
 fn flatten_error_tool_result_content(content: &[ContentPart]) -> String {
@@ -963,6 +998,41 @@ mod tests {
                 "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
             })
         );
+    }
+
+    #[test]
+    fn build_body_downsamples_oversized_inline_media_for_anthropic() {
+        let oversized = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2400,
+            1200,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut png = Cursor::new(Vec::new());
+        oversized
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let original_data = general_purpose::STANDARD.encode(png.into_inner());
+
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::Media {
+                mime_type: "image/png".into(),
+                data: Some(original_data.clone()),
+                url: None,
+                detail: None,
+            }],
+        ));
+
+        let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
+        let source = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(source["media_type"], "image/png");
+        let data = source["data"].as_str().expect("base64 image data");
+        assert_ne!(data, original_data);
+        let bytes = general_purpose::STANDARD.decode(data).unwrap();
+        let resized = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(resized.width(), 2000);
+        assert_eq!(resized.height(), 1000);
     }
 
     #[test]
