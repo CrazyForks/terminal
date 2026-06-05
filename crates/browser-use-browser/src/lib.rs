@@ -9683,15 +9683,16 @@ print("time shadow ok")
     }
 
     #[test]
-    fn browser_script_navigation_helpers_do_not_auto_wait() {
+    fn browser_script_navigation_helpers_wait_for_page_state() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
-            "script-navigation-no-auto-wait",
+            "script-navigation-page-state",
             temp.path(),
             temp.path().join("artifacts"),
             r#"
 calls = []
 last_url = None
+wait_calls = []
 
 def cdp(method, session_id=None, **params):
     global last_url
@@ -9704,7 +9705,16 @@ def cdp(method, session_id=None, **params):
     raise AssertionError(method)
 
 def wait_for_load(*args, **kwargs):
-    raise AssertionError("navigation helpers should not wait implicitly")
+    wait_calls.append(kwargs.get("timeout"))
+    return True
+
+def page_info():
+    return {
+        "url": last_url or "about:blank",
+        "title": "Example loaded",
+        "readyState": "complete",
+        "target": current_tab(),
+    }
 
 def _current_target_url():
     return "https://already-open.test"
@@ -9726,14 +9736,17 @@ def switch_tab(target):
 goto_url("https://example.test/one")
 new_tab("https://example.test/two")
 assert [call[0] for call in calls].count("Page.navigate") == 2, calls
-print("navigation helpers do not auto wait")
+assert len(wait_calls) == 2, wait_calls
+print("navigation helpers wait for page state")
 "#,
             10,
         )
         .unwrap();
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("navigation helpers do not auto wait"));
+        assert!(output
+            .text
+            .contains("navigation helpers wait for page state"));
         let navigations = output
             .outputs
             .iter()
@@ -9744,7 +9757,7 @@ print("navigation helpers do not auto wait")
             navigations[0]
                 .pointer("/value/status")
                 .and_then(Value::as_str),
-            Some("navigation_sent")
+            Some("navigation_ready")
         );
         assert_eq!(
             navigations[0].pointer("/value/url").and_then(Value::as_str),
@@ -9754,7 +9767,19 @@ print("navigation helpers do not auto wait")
             navigations[0]
                 .pointer("/value/waited_for_load")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true)
+        );
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/page_info/url")
+                .and_then(Value::as_str),
+            Some("https://example.test/one")
+        );
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/page_info/readyState")
+                .and_then(Value::as_str),
+            Some("complete")
         );
         assert_eq!(
             navigations[0]
