@@ -4105,17 +4105,7 @@ impl BrowserSession {
         } else {
             let targets = self.targets()?;
             let launched_profile_id = self.preferred_profile_id.take();
-            let target_info = if launched_profile_id.is_some() {
-                targets
-                    .iter()
-                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
-                    .cloned()
-            } else {
-                targets
-                    .iter()
-                    .find(|target| is_real_page_target(target))
-                    .cloned()
-            };
+            let target_info = select_attach_page_target(&targets);
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
                 attached_browser_context_id = target_info
@@ -4223,17 +4213,7 @@ impl BrowserSession {
         } else {
             let targets = self.targets_with_deadline(deadline)?;
             let launched_profile_id = self.preferred_profile_id.take();
-            let target_info = if launched_profile_id.is_some() {
-                targets
-                    .iter()
-                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
-                    .cloned()
-            } else {
-                targets
-                    .iter()
-                    .find(|target| is_real_page_target(target))
-                    .cloned()
-            };
+            let target_info = select_attach_page_target(&targets);
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
                 attached_browser_context_id = target_info
@@ -8560,6 +8540,33 @@ fn is_real_page_target(target: &Value) -> bool {
     true
 }
 
+fn is_blank_page_attach_target(target: &Value) -> bool {
+    if !is_page_target(target)
+        || is_profile_marker_target(target)
+        || is_remote_debugging_setup_target(target)
+    {
+        return false;
+    }
+    let url = target
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    url.is_empty() || url == "about:blank" || url.starts_with("about:blank#")
+}
+
+fn select_attach_page_target(targets: &[Value]) -> Option<Value> {
+    targets
+        .iter()
+        .find(|target| is_real_page_target(target))
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|target| is_blank_page_attach_target(target))
+        })
+        .cloned()
+}
+
 fn is_internal_browser_url(url: &str) -> bool {
     let url = url.trim().to_ascii_lowercase();
     url == "about:blank"
@@ -10043,6 +10050,52 @@ print("navigation helpers wait for page state")
                     && message.contains("https://example.test/one")),
             "{:?}",
             navigation_summaries[0]
+        );
+    }
+
+    #[test]
+    fn remote_cdp_attach_reuses_existing_blank_page_before_creating_target() {
+        let targets = vec![
+            json!({
+                "targetId": "blank-target",
+                "type": "page",
+                "title": "",
+                "url": "about:blank",
+            }),
+            json!({
+                "targetId": "extension-target",
+                "type": "page",
+                "title": "Extension",
+                "url": "chrome-extension://example/background.html",
+            }),
+        ];
+
+        let selected =
+            select_attach_page_target(&targets).expect("existing blank page should be reusable");
+        assert_eq!(
+            selected.get("targetId").and_then(Value::as_str),
+            Some("blank-target")
+        );
+
+        let targets_with_real_page = vec![
+            json!({
+                "targetId": "blank-target",
+                "type": "page",
+                "title": "",
+                "url": "about:blank",
+            }),
+            json!({
+                "targetId": "real-target",
+                "type": "page",
+                "title": "Loaded",
+                "url": "https://example.com/",
+            }),
+        ];
+        let selected = select_attach_page_target(&targets_with_real_page)
+            .expect("real page should be selected");
+        assert_eq!(
+            selected.get("targetId").and_then(Value::as_str),
+            Some("real-target")
         );
     }
 
