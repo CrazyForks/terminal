@@ -290,6 +290,10 @@ pub(crate) fn spawn_tui_agent_run(
     notifier: Option<StoreNotifier>,
 ) -> Result<()> {
     let selected_browser = browser.clone();
+    let local_chrome_cloud_promo_user_turn_seq = {
+        let store = Store::open(&state_dir)?;
+        local_chrome_cloud_promo_user_turn_seq(&store, &session_id, &selected_browser)?
+    };
     let (executor, config) = prepare_tui_agent_run(
         state_dir.clone(),
         &session_id,
@@ -311,7 +315,12 @@ pub(crate) fn spawn_tui_agent_run(
                 return;
             }
             if let Err(error) = Store::open(&state_dir).and_then(|store| {
-                maybe_append_local_chrome_cloud_promo(&store, &session_id, &selected_browser)
+                maybe_append_local_chrome_cloud_promo(
+                    &store,
+                    &session_id,
+                    &selected_browser,
+                    local_chrome_cloud_promo_user_turn_seq,
+                )
             }) {
                 eprintln!("tui local Chrome cloud promo append failed: {error:#}");
             }
@@ -396,24 +405,42 @@ fn maybe_append_local_chrome_cloud_promo(
     store: &Store,
     session_id: &str,
     browser: &str,
+    user_turn_seq: Option<i64>,
 ) -> Result<()> {
-    if browser != BROWSER_LOCAL_CHROME || browser_use_cloud_api_key(store)?.is_some() {
+    if browser != BROWSER_LOCAL_CHROME {
         return Ok(());
     }
+    let Some(user_turn_seq) = user_turn_seq else {
+        return Ok(());
+    };
     let events = store.events_for_session(session_id)?;
-    if !should_append_local_chrome_cloud_promo(&events) {
+    if !should_append_local_chrome_cloud_promo(&events, user_turn_seq) {
         return Ok(());
     }
-    let qualified_count = increment_local_chrome_cloud_promo_qualified_task_count(store)?;
-    if qualified_count % 5 != 1 {
-        return Ok(());
-    }
+    increment_local_chrome_cloud_promo_qualified_task_count(store)?;
     store.append_event(
         session_id,
         LOCAL_CHROME_CLOUD_PROMO_EVENT,
         serde_json::json!({ "text": LOCAL_CHROME_CLOUD_PROMO_TEXT }),
     )?;
     Ok(())
+}
+
+fn local_chrome_cloud_promo_user_turn_seq(
+    store: &Store,
+    session_id: &str,
+    browser: &str,
+) -> Result<Option<i64>> {
+    if browser != BROWSER_LOCAL_CHROME {
+        return Ok(None);
+    }
+    let events = store.events_for_session(session_id)?;
+    let latest_user_turn = events.iter().rev().find(|event| {
+        event.event_type == "session.input" || event.event_type.starts_with("session.followup")
+    });
+    Ok(latest_user_turn
+        .filter(|event| event.event_type == "session.input")
+        .map(|event| event.seq))
 }
 
 fn increment_local_chrome_cloud_promo_qualified_task_count(store: &Store) -> Result<u64> {
@@ -429,20 +456,33 @@ fn increment_local_chrome_cloud_promo_qualified_task_count(store: &Store) -> Res
     Ok(next)
 }
 
-fn should_append_local_chrome_cloud_promo(events: &[browser_use_protocol::EventRecord]) -> bool {
-    let has_initial_input = events
+fn should_append_local_chrome_cloud_promo(
+    events: &[browser_use_protocol::EventRecord],
+    user_turn_seq: i64,
+) -> bool {
+    let Some(user_turn_index) = events.iter().position(|event| event.seq == user_turn_seq) else {
+        return false;
+    };
+    if events[user_turn_index].event_type != "session.input" {
+        return false;
+    }
+    let next_user_turn_index = events
         .iter()
-        .any(|event| event.event_type == "session.input");
-    let has_followup = events
+        .enumerate()
+        .skip(user_turn_index + 1)
+        .find(|(_, event)| {
+            event.event_type == "session.input" || event.event_type.starts_with("session.followup")
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(events.len());
+    let current_user_message_events = &events[user_turn_index..next_user_turn_index];
+    let has_browser_connection = current_user_message_events
         .iter()
-        .any(|event| event.event_type.starts_with("session.followup"));
-    let has_browser_connection = events
-        .iter()
-        .any(|event| event.event_type == "browser.connected");
-    let has_success = events
+        .any(event_indicates_browser_connected);
+    let has_success = current_user_message_events
         .iter()
         .any(|event| event.event_type == "session.done");
-    let has_terminal_failure = events.iter().any(|event| {
+    let has_terminal_failure = current_user_message_events.iter().any(|event| {
         matches!(
             event.event_type.as_str(),
             "session.failed" | "session.cancelled"
@@ -451,12 +491,43 @@ fn should_append_local_chrome_cloud_promo(events: &[browser_use_protocol::EventR
     let already_prompted = events
         .iter()
         .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
-    has_initial_input
-        && !has_followup
-        && has_browser_connection
-        && has_success
-        && !has_terminal_failure
-        && !already_prompted
+    has_browser_connection && has_success && !has_terminal_failure && !already_prompted
+}
+
+fn event_indicates_browser_connected(event: &browser_use_protocol::EventRecord) -> bool {
+    if event.event_type == "browser.connected" {
+        return true;
+    }
+    if event.event_type != "tool.output" {
+        return false;
+    }
+    if event
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        != Some("browser")
+    {
+        return false;
+    }
+    if event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return false;
+    }
+    let Some(text) = event
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("connection")
+                .and_then(serde_json::Value::as_str)
+                .map(|connection| connection == "connected")
+        })
+        .unwrap_or(false)
 }
 
 fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
@@ -998,14 +1069,30 @@ mod tests {
     }
 
     fn event(seq: i64, event_type: &str) -> EventRecord {
+        event_with_payload(seq, event_type, serde_json::json!({}))
+    }
+
+    fn event_with_payload(seq: i64, event_type: &str, payload: serde_json::Value) -> EventRecord {
         EventRecord {
             seq,
             id: format!("event-{seq}"),
             session_id: "session-1".to_string(),
             ts_ms: seq,
             event_type: event_type.to_string(),
-            payload: serde_json::json!({}),
+            payload,
         }
+    }
+
+    fn browser_status_connected_event(seq: i64) -> EventRecord {
+        event_with_payload(
+            seq,
+            "tool.output",
+            serde_json::json!({
+                "name": "browser",
+                "ok": true,
+                "text": "{\"connection\":\"connected\"}"
+            }),
+        )
     }
 
     #[test]
@@ -1109,26 +1196,57 @@ mod tests {
     #[test]
     fn local_chrome_cloud_promo_requires_browser_connection() {
         let no_browser_events = vec![event(1, "session.input"), event(2, "session.done")];
-        assert!(!should_append_local_chrome_cloud_promo(&no_browser_events));
+        assert!(!should_append_local_chrome_cloud_promo(
+            &no_browser_events,
+            1
+        ));
 
         let events = vec![
             event(1, "session.input"),
             event(2, "browser.connected"),
             event(3, "session.done"),
         ];
-        assert!(should_append_local_chrome_cloud_promo(&events));
+        assert!(should_append_local_chrome_cloud_promo(&events, 1));
+
+        let tool_output_events = vec![
+            event(1, "session.input"),
+            browser_status_connected_event(2),
+            event(3, "session.done"),
+        ];
+        assert!(should_append_local_chrome_cloud_promo(
+            &tool_output_events,
+            1
+        ));
     }
 
     #[test]
-    fn local_chrome_cloud_promo_skips_followups_and_existing_promos() {
-        let followup_events = vec![
+    fn local_chrome_cloud_promo_requires_browser_connection_before_followup_and_skips_existing_promos(
+    ) {
+        let browser_connected_before_followup = vec![
             event(1, "session.input"),
             event(2, "browser.connected"),
             event(3, "session.done"),
-            event(4, "session.done"),
-            event(5, "session.followup"),
+            event(4, "session.followup"),
         ];
-        assert!(!should_append_local_chrome_cloud_promo(&followup_events));
+        assert!(should_append_local_chrome_cloud_promo(
+            &browser_connected_before_followup,
+            1
+        ));
+
+        let browser_connected_after_followup = vec![
+            event(1, "session.input"),
+            event(2, "session.followup"),
+            event(3, "browser.connected"),
+            event(4, "session.done"),
+        ];
+        assert!(!should_append_local_chrome_cloud_promo(
+            &browser_connected_after_followup,
+            1
+        ));
+        assert!(!should_append_local_chrome_cloud_promo(
+            &browser_connected_after_followup,
+            2
+        ));
 
         let already_prompted = vec![
             event(1, "session.input"),
@@ -1136,12 +1254,14 @@ mod tests {
             event(3, "session.done"),
             event(4, LOCAL_CHROME_CLOUD_PROMO_EVENT),
         ];
-        assert!(!should_append_local_chrome_cloud_promo(&already_prompted));
+        assert!(!should_append_local_chrome_cloud_promo(
+            &already_prompted,
+            1
+        ));
     }
 
     #[test]
-    fn local_chrome_cloud_promo_appends_on_first_and_every_fifth_browser_connected_initial_success(
-    ) -> Result<()> {
+    fn local_chrome_cloud_promo_appends_on_every_browser_connected_initial_success() -> Result<()> {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -1154,13 +1274,19 @@ mod tests {
         let result = (|| -> Result<()> {
             let temp = tempfile::tempdir()?;
             let store = Store::open(temp.path())?;
-            for idx in 1..=6 {
+            for idx in 1..=3 {
                 let session = store.create_session(None, std::env::current_dir()?)?;
                 store.append_event(
                     &session.id,
                     "session.input",
                     serde_json::json!({"text": format!("task {idx}")}),
                 )?;
+                let user_turn_seq = local_chrome_cloud_promo_user_turn_seq(
+                    &store,
+                    &session.id,
+                    BROWSER_LOCAL_CHROME,
+                )?;
+                assert!(user_turn_seq.is_some(), "expected user turn at task {idx}");
                 store.append_event(
                     &session.id,
                     "browser.connected",
@@ -1172,23 +1298,74 @@ mod tests {
                     serde_json::json!({"result": "done"}),
                 )?;
 
-                maybe_append_local_chrome_cloud_promo(&store, &session.id, BROWSER_LOCAL_CHROME)?;
+                maybe_append_local_chrome_cloud_promo(
+                    &store,
+                    &session.id,
+                    BROWSER_LOCAL_CHROME,
+                    user_turn_seq,
+                )?;
                 let events = store.events_for_session(&session.id)?;
                 let prompted = events
                     .iter()
                     .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT);
-                assert_eq!(
-                    prompted,
-                    idx == 1 || idx == 6,
-                    "unexpected prompt state at task {idx}"
-                );
+                assert!(prompted, "expected prompt at task {idx}");
             }
+
+            let profile_session = store.create_session(None, std::env::current_dir()?)?;
+            store.append_event(
+                &profile_session.id,
+                "session.input",
+                serde_json::json!({"text": "use Hacker News"}),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.done",
+                serde_json::json!({"result": "Which browser profile should I use?"}),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.followup",
+                serde_json::json!({"text": "1"}),
+            )?;
+            let profile_user_turn_seq = local_chrome_cloud_promo_user_turn_seq(
+                &store,
+                &profile_session.id,
+                BROWSER_LOCAL_CHROME,
+            )?;
+            assert!(
+                profile_user_turn_seq.is_none(),
+                "profile selection follow-up should not qualify"
+            );
+            store.append_event(
+                &profile_session.id,
+                "tool.output",
+                serde_json::json!({
+                    "name": "browser",
+                    "ok": true,
+                    "text": "{\"connection\":\"connected\"}"
+                }),
+            )?;
+            store.append_event(
+                &profile_session.id,
+                "session.done",
+                serde_json::json!({"result": "done"}),
+            )?;
+            maybe_append_local_chrome_cloud_promo(
+                &store,
+                &profile_session.id,
+                BROWSER_LOCAL_CHROME,
+                profile_user_turn_seq,
+            )?;
+            assert!(!store
+                .events_for_session(&profile_session.id)?
+                .iter()
+                .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT));
 
             assert_eq!(
                 store
                     .get_setting(LOCAL_CHROME_CLOUD_PROMO_QUALIFIED_TASK_COUNT_SETTING)?
                     .as_deref(),
-                Some("6")
+                Some("3")
             );
             Ok(())
         })();
@@ -1199,6 +1376,44 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn local_chrome_cloud_promo_appends_even_when_cloud_key_is_stored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test")?;
+        let session = store.create_session(None, std::env::current_dir()?)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "research Hacker News"}),
+        )?;
+        let user_turn_seq =
+            local_chrome_cloud_promo_user_turn_seq(&store, &session.id, BROWSER_LOCAL_CHROME)?;
+        store.append_event(
+            &session.id,
+            "browser.connected",
+            serde_json::json!({"status": "connected"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+
+        maybe_append_local_chrome_cloud_promo(
+            &store,
+            &session.id,
+            BROWSER_LOCAL_CHROME,
+            user_turn_seq,
+        )?;
+
+        assert!(store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| event.event_type == LOCAL_CHROME_CLOUD_PROMO_EVENT));
+        Ok(())
     }
 
     #[test]

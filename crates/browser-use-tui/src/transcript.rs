@@ -250,6 +250,7 @@ enum TranscriptKind {
 enum NodeStyle {
     Normal,
     Muted,
+    Promo,
     Failed,
     Thought,
 }
@@ -921,7 +922,7 @@ fn committed_node_for_event(
             if text.trim().is_empty() {
                 return None;
             }
-            Some(timeline_node(event, "tip", vec![text], NodeStyle::Muted))
+            Some(timeline_node(event, "tip", vec![text], NodeStyle::Promo))
         }
         "session.done" => {
             if let Some(result_file) = session_done_result_file(event, state) {
@@ -2683,14 +2684,35 @@ fn grouped_lines(
     lines
 }
 
-fn styled_value_spans(_group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
+fn styled_value_spans(group: &str, text: &str, fallback: Style) -> Vec<Span<'static>> {
     if text.starts_with("https://") || text.starts_with("http://") {
         return vec![Span::styled(text.to_string(), link())];
+    }
+    if group == "tip" {
+        return styled_tip_value_spans(text, fallback);
     }
     if let Some(spans) = styled_activity_line_spans(text, fallback) {
         return spans;
     }
     styled_path_tokens(text, fallback)
+}
+
+fn styled_tip_value_spans(text: &str, fallback: Style) -> Vec<Span<'static>> {
+    let Some(start) = text.find("[cloud.browser-use.com]") else {
+        return styled_path_tokens(text, fallback);
+    };
+    let end = start + "[cloud.browser-use.com]".len();
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.extend(styled_path_tokens(&text[..start], fallback));
+    }
+    spans.push(Span::styled("[".to_string(), fallback));
+    spans.push(Span::styled("cloud.browser-use.com".to_string(), link()));
+    spans.push(Span::styled("]".to_string(), fallback));
+    if end < text.len() {
+        spans.extend(styled_path_tokens(&text[end..], fallback));
+    }
+    spans
 }
 
 fn styled_activity_line_spans(text: &str, fallback: Style) -> Option<Vec<Span<'static>>> {
@@ -2940,6 +2962,7 @@ fn group_style(style: NodeStyle) -> Style {
     match style {
         NodeStyle::Normal => activity_group(),
         NodeStyle::Muted => muted(),
+        NodeStyle::Promo => activity_task(),
         NodeStyle::Failed => failed(),
         NodeStyle::Thought => thought(),
     }
@@ -2949,6 +2972,7 @@ fn body_style(style: NodeStyle) -> Style {
     match style {
         NodeStyle::Normal => text_style(),
         NodeStyle::Muted => muted(),
+        NodeStyle::Promo => activity_task(),
         NodeStyle::Failed => failed(),
         NodeStyle::Thought => muted(),
     }
@@ -4477,5 +4501,23 @@ mod tests {
             group_label_style("run", NodeStyle::Normal),
             group_label_style("explored", NodeStyle::Normal)
         );
+        assert_eq!(group_label_style("tip", NodeStyle::Promo), activity_task());
+        assert_eq!(body_style(NodeStyle::Promo), activity_task());
+    }
+
+    #[test]
+    fn cloud_promo_tip_body_and_link_are_colored() {
+        let spans = styled_value_spans(
+            "tip",
+            "Cloud browser: no local Chrome prompts, auto-solves captchas. [cloud.browser-use.com]",
+            body_style(NodeStyle::Promo),
+        );
+
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "Cloud" && span.style == activity_task()));
+        assert!(spans
+            .iter()
+            .any(|span| span.content.as_ref() == "cloud.browser-use.com" && span.style == link()));
     }
 }
