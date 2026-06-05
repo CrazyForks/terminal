@@ -31,8 +31,8 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ModelSearchEntry,
-    ProductState, ProductionTaskScale, SetupResultKind, Surface,
+    CookieSyncStatus, DefaultProfileStatus, FeedbackCategory, FeedbackStep, MessageActionKind,
+    ModelSearchEntry, ProductState, ProductionTaskScale, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -523,7 +523,7 @@ fn main_bottom_height_for(
         Surface::Model | Surface::History | Surface::Messages => {
             area.height.saturating_sub(2).max(6)
         }
-        Surface::BrowserSelect | Surface::CookieSync => 22,
+        Surface::BrowserSelect | Surface::DefaultProfile | Surface::CookieSync => 22,
         _ => 18,
     };
     // Add room for the surface header, footer, borders, and content margins.
@@ -946,7 +946,9 @@ fn render_surface_popup_box(
     }
     // For text-input popups, position the terminal cursor at the end of the
     // masked secret line so the user sees a blinking caret in the input field.
-    let cursor_pos: Option<Position> = if surface.is_text_input_popup() {
+    let cursor_pos: Option<Position> = if surface.is_text_input_popup()
+        && (surface != Surface::ModelSearch || app.model_search_has_filter_input())
+    {
         let masked = match surface {
             Surface::Telemetry => masked_secret(app.composer.input()),
             Surface::ApiKey => {
@@ -1376,6 +1378,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::DefaultProfile => ("Profile", "Choose the default local Chrome profile"),
         Surface::CookieSync => (
             "Cookie Sync",
             "Import local browser cookies to Browser Use Cloud",
@@ -1399,7 +1402,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
 /// one-line description — the shared chrome for every dropdown/settings view.
 fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
     let (title, description) = surface_heading(surface);
-    let indent = if surface == Surface::CookieSync {
+    let indent = if matches!(surface, Surface::CookieSync | Surface::DefaultProfile) {
         String::new()
     } else {
         " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize)
@@ -1488,6 +1491,7 @@ fn surface_lines(
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
+        Surface::DefaultProfile => default_profile_lines(app, width),
         Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::GoToProduction => go_to_production_lines(app),
         Surface::Context => context_lines(app, state, width),
@@ -1653,7 +1657,8 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     }
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
-    let browser = app.browser.trim();
+    let browser = app.browser_status_label();
+    let browser = browser.trim();
     if !browser.is_empty() {
         // ` browser ` with one cell of dash padding on each side, so the
         // background dashes hug right up to the spaces around the tag.
@@ -1734,11 +1739,12 @@ fn composer_status_line(
         spans.push(status_separator());
         spans.push(Span::styled(goal, muted()));
     }
-    spans.push(status_separator());
-    spans.extend(context_bar_spans(
-        usage.context_tokens.unwrap_or(0),
-        usage.context_budget_tokens,
-    ));
+    if let (Some(context_tokens), Some(context_budget_tokens)) =
+        (usage.context_tokens, usage.context_budget_tokens)
+    {
+        spans.push(status_separator());
+        spans.extend(context_bar_spans(context_tokens, context_budget_tokens));
+    }
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
@@ -1812,8 +1818,8 @@ fn slash_palette_item_description(_app: &App, item: &palette::PaletteItem) -> &'
     item.description
 }
 
-/// Fallback budget for older sessions that predate Codex-style `token_count`
-/// events with model context-window metadata.
+/// Fallback budget for context-surface attribution in older sessions that
+/// predate Codex-style `token_count` events with model context-window metadata.
 const FALLBACK_CONTEXT_BUDGET_TOKENS: i64 = 60_000;
 
 /// Width, in cells, of the filled/empty context bar.
@@ -1822,11 +1828,9 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 /// A plain context bar — solid `█` fill over a `░` track — followed by the
 /// `used/budget` token counts. Turns red as the conversation nears the
 /// compaction budget.
-fn context_bar_spans(used_tokens: i64, budget_tokens: Option<i64>) -> Vec<Span<'static>> {
+fn context_bar_spans(used_tokens: i64, budget_tokens: i64) -> Vec<Span<'static>> {
     let used_tokens = used_tokens.max(0);
-    let budget_tokens = budget_tokens
-        .filter(|tokens| *tokens > 0)
-        .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS);
+    let budget_tokens = budget_tokens.max(1);
     let ratio = (used_tokens as f64 / budget_tokens as f64).clamp(0.0, 1.0);
     let fill_style = if ratio >= 0.9 { failed() } else { accent() };
 
@@ -1862,8 +1866,8 @@ fn spans_text_width(spans: &[Span<'_>]) -> usize {
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the
-/// source of truth for context occupancy; legacy `model.usage` remains a
-/// fallback for old sessions and the cost source.
+/// source of truth for context occupancy; legacy `model.usage` remains only
+/// the cost source.
 struct SessionUsage {
     /// Prompt tokens of the most recent model turn — i.e. current context occupancy.
     context_tokens: Option<i64>,
@@ -1881,19 +1885,18 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
     let Some(session) = state.current_session.as_ref() else {
         return usage;
     };
-    let mut legacy_context_tokens = None;
     for event in app.cached_events_for_session(&session.id) {
         match event.event_type.as_str() {
             "token_count" => {
                 let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
                     continue;
                 };
-                if let Some(total_tokens) = info
+                if let Some(input_tokens) = info
                     .get("last_token_usage")
-                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(|usage| usage.get("input_tokens"))
                     .and_then(serde_json::Value::as_i64)
                 {
-                    usage.context_tokens = Some(total_tokens);
+                    usage.context_tokens = Some(input_tokens.max(0));
                 }
                 if let Some(model_context_window) = info
                     .get("model_context_window")
@@ -1904,13 +1907,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
                 }
             }
             "model.usage" => {
-                if let Some(input_tokens) = event
-                    .payload
-                    .get("input_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                {
-                    legacy_context_tokens = Some(input_tokens);
-                }
                 if let Some(cost) = event
                     .payload
                     .get("cost_usd")
@@ -1921,9 +1917,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
             }
             _ => {}
         }
-    }
-    if usage.context_tokens.is_none() {
-        usage.context_tokens = legacy_context_tokens;
     }
     usage
 }
@@ -2206,8 +2199,20 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled("PROVIDERS", muted())));
     lines.push(Line::from(""));
 
-    for (idx, label) in ACCOUNT_CHOICES.iter().enumerate() {
-        lines.push(setup_account_row(label, idx, app.selected_row));
+    for (idx, account) in app
+        .setup_account_choices()
+        .unwrap_or_else(|_| {
+            vec![
+                ACCOUNT_OPENAI,
+                ACCOUNT_ANTHROPIC,
+                ACCOUNT_OPENROUTER,
+                ACCOUNT_DEEPSEEK,
+            ]
+        })
+        .iter()
+        .enumerate()
+    {
+        lines.push(setup_account_row(account, idx, app.selected_row));
     }
     lines.extend([
         Line::from(""),
@@ -2218,14 +2223,26 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
 
 fn setup_account_row(label: &str, idx: usize, selected_row: usize) -> Line<'static> {
     let is_selected = idx == selected_row;
+    let detected_codex = label == ACCOUNT_CODEX;
+    let display = if detected_codex {
+        "Continue with Codex login"
+    } else {
+        label
+    };
     Line::from(vec![
         Span::styled(
             if is_selected { "> " } else { "  " },
             if is_selected { accent() } else { dim() },
         ),
         Span::styled(
-            label.to_string(),
-            if is_selected { bold() } else { text_style() },
+            display.to_string(),
+            if detected_codex {
+                done()
+            } else if is_selected {
+                bold()
+            } else {
+                text_style()
+            },
         ),
     ])
 }
@@ -2235,14 +2252,16 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         .setup_pending_account
         .as_deref()
         .unwrap_or(ACCOUNT_CODEX);
-    let mut lines = vec![
-        Line::from(Span::styled(format!("Use {account}?"), bold())),
-        Line::from(""),
-    ];
+    let title = if account == ACCOUNT_CODEX {
+        "Continue with Codex login?".to_string()
+    } else {
+        format!("Use {account}?")
+    };
+    let mut lines = vec![Line::from(Span::styled(title, bold())), Line::from("")];
     if account == ACCOUNT_CODEX {
         lines.extend([
-            Line::from("  Imports your local Codex auth."),
-            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
+            Line::from("  A local Codex login is already available."),
+            Line::from("  Continue to choose a model for this login."),
             Line::from("  No API key is required."),
         ]);
     } else if is_claude_code_account(account) {
@@ -2265,7 +2284,7 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
         if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
             "Open sign-in"
         } else if account == ACCOUNT_CODEX {
-            "Use Codex auth"
+            "Continue"
         } else {
             "Continue"
         };
@@ -2304,13 +2323,23 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     if is_success {
         let next_message = if app.pending_model_after_auth.is_some() {
             "  Continue applies the selected model."
+        } else if app.setup_complete {
+            "  Continue keeps your current model."
         } else {
-            "  A default model will be selected automatically."
+            "  Continue to choose a model."
         };
         lines.extend([
             Line::from(Span::styled(next_message, muted())),
             Line::from(""),
-            selected("Continue", 0, app.selected_row),
+            selected(
+                if app.setup_complete {
+                    "Continue"
+                } else {
+                    "Choose model"
+                },
+                0,
+                app.selected_row,
+            ),
         ]);
     } else if is_pending {
         if result.account == ACCOUNT_CODEX {
@@ -2651,21 +2680,27 @@ fn model_custom_row(is_selected: bool) -> Line<'static> {
 /// suggestions (and the raw typed id as the first row when not an exact match).
 fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
-    // Query input line; the popup cursor logic positions the caret at its end.
-    lines.push((None, Line::from(format!("  {}", app.composer.input()))));
-    lines.push((None, Line::from("")));
+    if app.model_search_has_filter_input() {
+        // Query input line; the popup cursor logic positions the caret at its end.
+        lines.push((None, Line::from(format!("  {}", app.composer.input()))));
+        lines.push((None, Line::from("")));
+    }
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
         lines.push((None, Line::from("")));
     }
     let entries = app.model_search_entries();
     if entries.is_empty() {
+        let empty_message = if !app.model_search_has_filter_input() {
+            "  No models available"
+        } else if app.selected_provider == Some(ACCOUNT_OPENROUTER) {
+            "  Type a model id, e.g. moonshotai/kimi-k2.5"
+        } else {
+            "  No matching models"
+        };
         lines.push((
             None,
-            Line::from(Span::styled(
-                "  Type a model id, e.g. moonshotai/kimi-k2.5".to_string(),
-                muted(),
-            )),
+            Line::from(Span::styled(empty_message.to_string(), muted())),
         ));
     }
     // Items carry a running selectable index (matching `model_search_rows`);
@@ -2699,8 +2734,10 @@ fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    // Pin the query-input line (index 0) so the caret stays visible.
-    crop_model_lines(lines, app.selected_row, height, 1)
+    // Pin the query-input line (index 0) only when the provider has one, so
+    // plain curated lists scroll every row normally.
+    let pinned_head = usize::from(app.model_search_has_filter_input());
+    crop_model_lines(lines, app.selected_row, height, pinned_head)
 }
 
 /// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
@@ -3356,6 +3393,61 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(selected("Close", 0, app.selected_row));
         }
         CookieSyncStatus::Failed(error) => {
+            lines.push(Line::from(Span::styled("Failed", bold())));
+            lines.push(Line::from(""));
+            push_wrapped_cookie_sync_message(&mut lines, error, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+    }
+    lines
+}
+
+pub(crate) fn default_profile_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = cookie_sync_body_width(width);
+    let mut lines = vec![
+        Line::from(Span::styled("LOCAL CHROME", muted())),
+        Line::from(""),
+    ];
+    match &app.default_profile.status {
+        DefaultProfileStatus::Loading => {
+            lines.push(Line::from("  Scanning local Chromium profiles..."));
+        }
+        DefaultProfileStatus::Ready => {
+            let current = app
+                .default_profile
+                .current_profile_id
+                .as_deref()
+                .and_then(|current| {
+                    app.default_profile
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == current)
+                        .map(crate::human_profile_label)
+                })
+                .unwrap_or_else(|| "not set".to_string());
+            lines.push(kv_line("default", &current));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
+            lines.push(Line::from(""));
+            if app.default_profile.profiles.is_empty() {
+                lines.push(Line::from("  No local Chromium profiles found."));
+            } else {
+                for (idx, profile) in app.default_profile.profiles.iter().enumerate() {
+                    let mut label = truncate(&crate::human_profile_label(profile), body_width);
+                    if app
+                        .default_profile
+                        .current_profile_id
+                        .as_deref()
+                        .is_some_and(|current| current == profile.id)
+                    {
+                        label.push_str("  current");
+                    }
+                    lines.push(selected(&label, idx, app.selected_row));
+                }
+            }
+        }
+        DefaultProfileStatus::Failed(error) => {
             lines.push(Line::from(Span::styled("Failed", bold())));
             lines.push(Line::from(""));
             push_wrapped_cookie_sync_message(&mut lines, error, body_width);

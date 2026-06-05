@@ -3,6 +3,7 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    DefaultProfile,
     GoToProduction,
     Context,
     Goal,
@@ -22,7 +23,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 9] = [
+const VISIBLE_ITEMS: [PaletteItem; 10] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -37,6 +38,11 @@ const VISIBLE_ITEMS: [PaletteItem; 9] = [
         command: "/browser",
         description: "change browser backend",
         action: PaletteAction::ChangeBrowser,
+    },
+    PaletteItem {
+        command: "/profile",
+        description: "set default Chrome profile",
+        action: PaletteAction::DefaultProfile,
     },
     PaletteItem {
         command: "/context",
@@ -148,6 +154,14 @@ mod tests {
         assert_eq!(
             selected_action("/production", 0),
             Some(PaletteAction::GoToProduction)
+        );
+    }
+
+    #[test]
+    fn profile_is_available_from_palette() {
+        assert_eq!(
+            selected_action("/profile", 0),
+            Some(PaletteAction::DefaultProfile)
         );
     }
 }
