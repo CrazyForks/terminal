@@ -2854,7 +2854,7 @@ fn table_holdback_start(source: &str) -> Option<usize> {
     let mut offset = 0usize;
     let mut previous_header: Option<usize> = None;
     let mut pending_header: Option<usize> = None;
-    let mut confirmed_table: Option<usize> = None;
+    let mut active_table: Option<usize> = None;
     let mut in_fence = false;
 
     for raw_line in source.split_inclusive('\n') {
@@ -2863,6 +2863,7 @@ fn table_holdback_start(source: &str) -> Option<usize> {
             in_fence = !in_fence;
             previous_header = None;
             pending_header = None;
+            active_table = None;
             offset = offset.saturating_add(raw_line.len());
             continue;
         }
@@ -2870,18 +2871,29 @@ fn table_holdback_start(source: &str) -> Option<usize> {
         if !in_fence {
             let is_header = is_table_header_line(line);
             let is_delimiter = is_table_delimiter_line(line);
-            if confirmed_table.is_none() && previous_header.is_some() && is_delimiter {
-                confirmed_table = previous_header;
+            let is_table_row = is_header || is_delimiter;
+            if active_table.is_some() {
+                if !is_table_row {
+                    active_table = None;
+                }
                 pending_header = None;
-            } else if confirmed_table.is_none() && !line.trim().is_empty() {
+                previous_header = is_header.then_some(offset);
+            } else if previous_header.is_some() && is_delimiter {
+                active_table = previous_header;
+                pending_header = None;
+                previous_header = None;
+            } else if !line.trim().is_empty() {
                 pending_header = is_header.then_some(offset);
+                previous_header = pending_header;
+            } else {
+                pending_header = None;
+                previous_header = None;
             }
-            previous_header = is_header.then_some(offset);
         }
         offset = offset.saturating_add(raw_line.len());
     }
 
-    confirmed_table.or(pending_header)
+    active_table.or(pending_header)
 }
 
 fn is_table_header_line(line: &str) -> bool {
