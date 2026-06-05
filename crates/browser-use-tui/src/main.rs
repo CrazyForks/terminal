@@ -155,6 +155,7 @@ const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up 
 You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
 free — or add your own key with /auth.";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_READY_INPUT_EVENTS: usize = 32;
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
@@ -8348,6 +8349,19 @@ enum TerminalRunOutcome {
     Reexec,
 }
 
+enum ReadyEventDrain {
+    Continue {
+        input_changed: bool,
+        plain_composer_input: bool,
+    },
+    Quit,
+}
+
+enum HandledTerminalEvent {
+    Continue { plain_composer_input: bool },
+    Quit,
+}
+
 fn run_terminal(mut app: App) -> Result<()> {
     let reload_requested = install_reexec_signal_handler()?;
     let mut viewport_height = desired_terminal_viewport_height(&mut app)?;
@@ -8379,6 +8393,22 @@ fn run_terminal(mut app: App) -> Result<()> {
             {
                 break Ok(TerminalRunOutcome::Reexec);
             }
+            let input_only_draw = match drain_ready_terminal_events(
+                &mut app,
+                &mut terminal_driver,
+                &mut pending_resize_at,
+            )? {
+                ReadyEventDrain::Continue {
+                    input_changed,
+                    plain_composer_input,
+                } => {
+                    if input_changed {
+                        draw_needed = true;
+                    }
+                    input_changed && plain_composer_input
+                }
+                ReadyEventDrain::Quit => break Ok(TerminalRunOutcome::Quit),
+            };
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
             draw_needed |= app.drain_codex_login_notifications()?;
@@ -8399,8 +8429,14 @@ fn run_terminal(mut app: App) -> Result<()> {
                 }
             }
             if pending_resize_at.is_none() && draw_needed {
-                viewport_height = terminal_driver.resize_if_needed(&mut app, viewport_height)?;
-                terminal_driver.draw(&mut app)?;
+                let next_height = terminal_driver.resize_if_needed(&mut app, viewport_height)?;
+                let resized = next_height != viewport_height;
+                viewport_height = next_height;
+                if input_only_draw && !resized {
+                    terminal_driver.draw_without_native_emit(&mut app)?;
+                } else {
+                    terminal_driver.draw(&mut app)?;
+                }
                 draw_needed = false;
             }
             let mut poll_interval = pending_resize_at
@@ -8471,10 +8507,21 @@ fn run_terminal(mut app: App) -> Result<()> {
                 pending_resize_at = Some(Instant::now());
                 continue;
             }
-            if handle_terminal_event(event, &mut app, &mut terminal_driver)? {
+            let input_event =
+                handle_terminal_event_with_draw_hint(event, &mut app, &mut terminal_driver)?;
+            let HandledTerminalEvent::Continue {
+                plain_composer_input,
+            } = input_event
+            else {
                 break Ok(TerminalRunOutcome::Quit);
-            }
-            draw_needed = true;
+            };
+            draw_after_input_event(
+                &mut app,
+                &mut terminal_driver,
+                &mut viewport_height,
+                plain_composer_input,
+            )?;
+            draw_needed = false;
         }
     })();
     let restore_result = terminal_driver.restore_terminal_state();
@@ -8485,6 +8532,55 @@ fn run_terminal(mut app: App) -> Result<()> {
         TerminalRunOutcome::Quit => Ok(()),
         TerminalRunOutcome::Reexec => reexec_terminal_process(),
     }
+}
+
+fn draw_after_input_event(
+    app: &mut App,
+    terminal_driver: &mut TerminalDriver,
+    viewport_height: &mut u16,
+    plain_composer_input: bool,
+) -> Result<()> {
+    let next_height = terminal_driver.resize_if_needed(app, *viewport_height)?;
+    let resized = next_height != *viewport_height;
+    *viewport_height = next_height;
+    if plain_composer_input && !resized {
+        terminal_driver.draw_without_native_emit(app)
+    } else {
+        terminal_driver.draw(app)
+    }
+}
+
+fn drain_ready_terminal_events(
+    app: &mut App,
+    terminal_driver: &mut TerminalDriver,
+    pending_resize_at: &mut Option<Instant>,
+) -> Result<ReadyEventDrain> {
+    let mut input_changed = false;
+    let mut plain_composer_input = true;
+    for _ in 0..MAX_READY_INPUT_EVENTS {
+        if pending_resize_at.is_some() || !event::poll(Duration::ZERO)? {
+            break;
+        }
+        let event = event::read()?;
+        if matches!(event, TermEvent::Resize(_, _)) {
+            *pending_resize_at = Some(Instant::now());
+            plain_composer_input = false;
+            break;
+        }
+        match handle_terminal_event_with_draw_hint(event, app, terminal_driver)? {
+            HandledTerminalEvent::Continue {
+                plain_composer_input: event_plain_composer_input,
+            } => {
+                input_changed = true;
+                plain_composer_input &= event_plain_composer_input;
+            }
+            HandledTerminalEvent::Quit => return Ok(ReadyEventDrain::Quit),
+        }
+    }
+    Ok(ReadyEventDrain::Continue {
+        input_changed,
+        plain_composer_input,
+    })
 }
 
 #[cfg(unix)]
@@ -8570,6 +8666,14 @@ impl TerminalDriver {
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
+        self.draw_with_native_emit(app, true)
+    }
+
+    fn draw_without_native_emit(&mut self, app: &mut App) -> Result<()> {
+        self.draw_with_native_emit(app, false)
+    }
+
+    fn draw_with_native_emit(&mut self, app: &mut App, emit_native: bool) -> Result<()> {
         let manual_overlay_active = should_draw_manual_modal_overlay(app);
         let manual_overlay = if manual_overlay_active {
             let state = app.modal_overlay_state();
@@ -8597,7 +8701,9 @@ impl TerminalDriver {
         if self.manual_modal_overlay_rect.is_some() && !manual_overlay_active {
             app.native_history.reset_with_clear();
         }
-        maybe_emit_native_transcript(&mut self.terminal, app)?;
+        if emit_native {
+            maybe_emit_native_transcript(&mut self.terminal, app)?;
+        }
         self.terminal.draw(|frame| render(frame, app))?;
         draw_live_link_overlay(self.terminal.backend_mut(), app)?;
         if let Some(overlay) = manual_overlay.as_ref() {
@@ -8962,6 +9068,26 @@ fn handle_terminal_event(
         TermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
+}
+
+fn handle_terminal_event_with_draw_hint(
+    event: TermEvent,
+    app: &mut App,
+    terminal_driver: &mut TerminalDriver,
+) -> Result<HandledTerminalEvent> {
+    let was_plain_composer = is_plain_composer_input_surface(app);
+    if handle_terminal_event(event, app, terminal_driver)? {
+        return Ok(HandledTerminalEvent::Quit);
+    }
+    Ok(HandledTerminalEvent::Continue {
+        plain_composer_input: was_plain_composer && is_plain_composer_input_surface(app),
+    })
+}
+
+fn is_plain_composer_input_surface(app: &App) -> bool {
+    app.surface == Surface::Main
+        && !app.is_slash_palette_active()
+        && app.prompt_history.search.is_none()
 }
 
 fn mouse_event_kind_label(kind: MouseEventKind) -> &'static str {

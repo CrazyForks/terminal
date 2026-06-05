@@ -1433,6 +1433,25 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
             "Type to steer the agent",
             "streaming should keep composer docked below the transcript body",
         )
+        tmux_send_literal(session, "typing during stream")
+        typed_visible = wait_for(
+            session,
+            "> typing during stream",
+            "transcript-scroll-typing-during-stream",
+            timeout=1.5,
+        )
+        assert_count(
+            typed_visible,
+            STATUS_BAR_PREFIX,
+            1,
+            "typing during streaming should not duplicate app screens",
+        )
+        assert_no_legacy_dashboard_chrome(
+            typed_visible,
+            "typing during streaming should keep the modern composer",
+        )
+        tmux_send(session, "C-c")
+        wait_for(session, "Type to steer the agent", "transcript-scroll-typing-cleared")
         append_store_event(
             state_dir,
             session_id,

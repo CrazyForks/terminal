@@ -1977,7 +1977,7 @@ fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &W
             .wrap(Wrap { trim: false }),
         area,
     );
-    if palette_owns_input {
+    if palette_owns_input || app.composer.is_empty() {
         return;
     }
     if area.width > 0 && area.height > 0 {
