@@ -1510,8 +1510,10 @@ fn runtime_status_overlay_for_store_status(
 ) -> Option<SessionStatus> {
     match runtime_status {
         browser_use_runtime::AgentThreadStatus::Queued
-        | browser_use_runtime::AgentThreadStatus::Running
-        | browser_use_runtime::AgentThreadStatus::Cancelling => Some(SessionStatus::Running),
+        | browser_use_runtime::AgentThreadStatus::Running => Some(SessionStatus::Running),
+        browser_use_runtime::AgentThreadStatus::Cancelling => {
+            store_status.is_active().then_some(SessionStatus::Running)
+        }
         browser_use_runtime::AgentThreadStatus::Completed => Some(SessionStatus::Done),
         browser_use_runtime::AgentThreadStatus::Failed => Some(SessionStatus::Failed),
         browser_use_runtime::AgentThreadStatus::Cancelled => Some(SessionStatus::Cancelled),
@@ -10379,6 +10381,8 @@ mod redesign_tests {
             "model.stream_delta",
             serde_json::json!({"text": "Working..."}),
         )?;
+        app.store
+            .append_event(&session.id, "model.turn.request", serde_json::json!({}))?;
         app.selected_session_id = Some(session.id.clone());
         app.refresh_state_cache_from_store()?;
         let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
@@ -10411,6 +10415,11 @@ mod redesign_tests {
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
+        app.refresh_state_cache_from_store()?;
+        assert!(!app.current_task_is_active()?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("stopped"), "{screen}");
+        assert!(!screen.contains("Thinking..."), "{screen}");
         Ok(())
     }
 
