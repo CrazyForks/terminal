@@ -9964,6 +9964,50 @@ print("list_tabs filters to current browser context")
     }
 
     #[test]
+    fn browser_script_list_tabs_hides_agent_startup_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-list-tabs-agent-placeholder",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+def cdp(method, session_id=None, **params):
+    if method == "Target.getTargets":
+        return {"targetInfos": [
+            {
+                "targetId": "real-target",
+                "type": "page",
+                "title": "Real",
+                "url": "https://real.example",
+                "browserContextId": "ctx-selected-profile",
+            },
+            {
+                "targetId": "startup-target",
+                "type": "page",
+                "title": "Starting agent 839f...",
+                "url": "about:blank",
+                "browserContextId": "ctx-selected-profile",
+            },
+        ]}
+    raise AssertionError((method, params))
+
+def _send_meta(meta, **params):
+    assert meta == "current_tab", (meta, params)
+    return {"targetId": "real-target", "sessionId": "session-current", "url": "https://real.example"}
+
+tabs = list_tabs()
+assert [tab["targetId"] for tab in tabs] == ["real-target"], tabs
+print("list_tabs hides startup placeholder")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("list_tabs hides startup placeholder"));
+    }
+
+    #[test]
     fn browser_script_current_tab_tolerates_target_list_errors() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
