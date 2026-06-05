@@ -193,6 +193,46 @@ fn tool_output_event_uses_structured_browser_script_fallback_text() {
 }
 
 #[test]
+fn running_browser_script_output_uses_run_id_fallback_text() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "open page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({
+                "id": "call_browser",
+                "name": "browser_script",
+                "arguments": { "code": "wait_for_load(30)" }
+            }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "status": "running",
+                "run_id": "bs-123",
+                "next_observe_ms": 7000,
+                "text": ""
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let content = messages[2]
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("running browser_script content");
+    assert!(content.contains("browser_script is still running."));
+    assert!(content.contains("run_id: bs-123"));
+    assert!(content.contains("action=\"observe\""));
+    assert!(content.contains("observe_timeout_ms=7000"));
+}
+
+#[test]
 fn tool_output_event_preserves_image_content() {
     let events = vec![
         event(1, "session.input", json!({ "text": "load image" })),
