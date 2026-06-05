@@ -9711,6 +9711,28 @@ print("navigation helpers do not auto wait")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("navigation helpers do not auto wait"));
+        let navigations = output
+            .outputs
+            .iter()
+            .filter(|output| output.get("label").and_then(Value::as_str) == Some("navigation"))
+            .collect::<Vec<_>>();
+        assert_eq!(navigations.len(), 2, "{:?}", output.outputs);
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/status")
+                .and_then(Value::as_str),
+            Some("navigation_sent")
+        );
+        assert_eq!(
+            navigations[0].pointer("/value/url").and_then(Value::as_str),
+            Some("https://example.test/one")
+        );
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/waited_for_load")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

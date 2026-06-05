@@ -18,11 +18,16 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   attached long enough to return direct page state, reducing traces where the
   model immediately observes, repeats navigation, or burns steps checking browser
   status after a slow page load.
+- [x] `goto_url(...)` now emits a compact structured `navigation` observation
+  even when the model calls it as a bare statement and discards the Python return
+  value. This gives the next turn explicit evidence that navigation was sent,
+  without adding an implicit load wait or screenshots.
 - Proof:
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
   - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
   - `cargo test -p browser-use-browser browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_navigation_helpers_do_not_auto_wait -- --nocapture`
 
 ## Trust rule
 Only commits **made and test-verified in the working session** are trusted. A separate
