@@ -306,9 +306,15 @@ impl MarkdownWriter {
             }
             return;
         }
-        for (idx, line) in text.lines().enumerate() {
+        let mut parts = text.split('\n').peekable();
+        let mut idx = 0usize;
+        while let Some(line) = parts.next() {
             if idx > 0 {
                 self.flush_current();
+            }
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() && parts.peek().is_none() && text.ends_with('\n') {
+                break;
             }
             let style = self.current_style();
             if looks_like_bare_link(line) {
@@ -318,6 +324,7 @@ impl MarkdownWriter {
             } else {
                 self.push_span(Span::styled(line.to_string(), style));
             }
+            idx += 1;
         }
     }
 
@@ -1145,6 +1152,18 @@ mod tests {
         assert!(text.contains("- Example (https://example.com)"));
         assert!(!text.contains("**important**"));
         assert!(!text.contains("`coupon.json`"));
+    }
+
+    #[test]
+    fn html_block_trailing_newline_does_not_join_next_row() {
+        let lines = render_markdown_lines(
+            "<p>\n  <img src=\"static/banner.png\" alt=\"Browser Use Terminal\">\n</p>\n[workspace]\nmembers = [",
+            120,
+        );
+        let text = plain(&lines);
+        assert!(text.contains("</p>\n[workspace]"), "{text}");
+        assert!(text.contains("[workspace]\nmembers = ["), "{text}");
+        assert!(!text.contains("</p>[workspace]"), "{text}");
     }
 
     #[test]

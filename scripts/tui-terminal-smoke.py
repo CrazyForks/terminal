@@ -1482,6 +1482,94 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def smoke_initial_stream_scrolls_past_submitted_prompt(binary: Path) -> None:
+    session = f"but-smoke-initial-stream-scroll-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-initial-stream-scroll-"))
+    try:
+        start_session(session, binary, state_dir, seed_demo="running")
+        wait_for(session, "Type to steer the agent", "initial-stream-scroll-running")
+        session_id = latest_session_id(state_dir)
+        stream_prefix = [
+            ".",
+            ".github",
+            ".github/workflows",
+            "... +43 lines",
+            "total 968",
+            "drwxr-xr-x  32 reagan  staff      1024 Jun  4 17:43 .",
+            "drwxr-xr-x  11 reagan  staff       352 Jun  4 16:27 ..",
+            "... +30 lines",
+            '<p align="center">',
+            '  <img src="static/browser-use-terminal-banner.png" alt="Browser Use Terminal banner with a very long description that wraps across the terminal width">',
+            "</p>",
+            "... +121 lines",
+            "[workspace]",
+            "members = [",
+            '    "crates/browser-use-agent",',
+            "... +64 lines",
+            "[build-system]",
+            'requires = ["setuptools>=68"]',
+            'build-backend = "setuptools.build_meta"',
+            "... +193 lines",
+            "--- crates/browser-use-agent/Cargo.toml",
+            "[package]",
+            'name = "browser-use-agent"',
+            "... +63 lines",
+            '[{"type":"text","text":""}]',
+            "python/browser_use/__init__.py",
+            "python/browser_use/__pycache__/__init__.cpython-313.pyc",
+            "python/browser_use/__pycache__/agent.cpython-313.pyc",
+            "... +28 lines",
+        ]
+        long_stream = "\n".join(
+            stream_prefix + [f"initial stream line {idx:02}" for idx in range(1, 31)]
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.stream_delta",
+            {"text": long_stream},
+        )
+        wait_for(session, "initial stream line 30", "initial-stream-scroll-streaming")
+        visible = capture_after_idle(
+            session,
+            "initial-stream-scroll-visible",
+            visible_only=True,
+        )
+        full = capture_after_idle(
+            session,
+            "initial-stream-scroll-full",
+            visible_only=False,
+        )
+        assert_contains(
+            full,
+            "> Find the top 5 Hacker News posts",
+            "initial streaming should keep submitted prompt in terminal scrollback",
+        )
+        assert_contains(
+            full,
+            "initial stream line 01",
+            "initial streaming should preserve early live rows in terminal scrollback",
+        )
+        assert_contains(
+            visible,
+            "initial stream line 30",
+            "initial streaming should show the latest live row",
+        )
+        assert_contains(
+            visible,
+            "Type to steer the agent",
+            "initial streaming should keep composer below the transcript body",
+        )
+        assert_not_contains(
+            visible,
+            "> Find the top 5 Hacker News posts",
+            "long initial streaming should scroll the submitted prompt out of the visible tail",
+        )
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
     session = f"but-smoke-prompt-only-followup-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-prompt-only-followup-"))
@@ -2035,6 +2123,7 @@ def main() -> int:
     smoke_escape_reclaims_queued_followup(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_streaming_transcript_scrolls_above_composer(binary)
+    smoke_initial_stream_scrolls_past_submitted_prompt(binary)
     smoke_prompt_only_followup_keeps_completed_transcript(binary)
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
