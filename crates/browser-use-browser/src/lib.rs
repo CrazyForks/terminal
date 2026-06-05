@@ -46,7 +46,7 @@ pub struct BrowserCommandOptions {
     pub browser_use_api_key: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BrowserScriptOutput {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,6 +245,8 @@ static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new()
 static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
     OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
+const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 10 * 60 * 1_000;
+const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 128;
 
 struct BrowserScriptRun {
     id: String,
@@ -266,9 +268,23 @@ struct BrowserScriptRun {
     deadline: Instant,
 }
 
+enum BrowserScriptRunLookup {
+    Run(BrowserScriptRun),
+    Cached(BrowserScriptOutput),
+    Unknown,
+}
+
 #[derive(Clone, Default)]
 pub struct BrowserScriptRunRegistry {
     runs: Arc<Mutex<HashMap<String, BrowserScriptRun>>>,
+    completed: Arc<Mutex<HashMap<String, BrowserScriptCompletedOutput>>>,
+}
+
+#[derive(Clone)]
+struct BrowserScriptCompletedOutput {
+    session_id: String,
+    completed_at_ms: u128,
+    output: BrowserScriptOutput,
 }
 
 impl std::fmt::Debug for BrowserScriptRunRegistry {
@@ -304,6 +320,70 @@ impl BrowserScriptRunRegistry {
 
     fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, HashMap<String, BrowserScriptRun>>> {
         self.runs.lock()
+    }
+
+    fn remember_completed_output(&self, session_id: &str, output: &BrowserScriptOutput) {
+        let Some(run_id) = output.run_id.as_deref().filter(|run_id| !run_id.is_empty()) else {
+            return;
+        };
+        let mut completed = self
+            .completed
+            .lock()
+            .expect("browser_script completed registry poisoned");
+        prune_completed_browser_script_outputs(&mut completed);
+        completed.insert(
+            run_id.to_string(),
+            BrowserScriptCompletedOutput {
+                session_id: session_id.to_string(),
+                completed_at_ms: unix_time_ms(),
+                output: output.clone(),
+            },
+        );
+        prune_completed_browser_script_outputs(&mut completed);
+    }
+
+    fn completed_output_for(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<BrowserScriptOutput>> {
+        let mut completed = self
+            .completed
+            .lock()
+            .expect("browser_script completed registry poisoned");
+        prune_completed_browser_script_outputs(&mut completed);
+        let Some(cached) = completed.get(run_id) else {
+            return Ok(None);
+        };
+        if cached.session_id != session_id {
+            bail!(
+                "browser_script run {run_id} belongs to a different session ({})",
+                cached.session_id
+            );
+        }
+        Ok(Some(cached.output.clone()))
+    }
+}
+
+fn prune_completed_browser_script_outputs(
+    completed: &mut HashMap<String, BrowserScriptCompletedOutput>,
+) {
+    let now = unix_time_ms();
+    completed.retain(|_, entry| {
+        now.saturating_sub(entry.completed_at_ms) <= BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS
+    });
+    if completed.len() <= BROWSER_SCRIPT_COMPLETED_CACHE_MAX {
+        return;
+    }
+
+    let mut oldest: Vec<(String, u128)> = completed
+        .iter()
+        .map(|(run_id, entry)| (run_id.clone(), entry.completed_at_ms))
+        .collect();
+    oldest.sort_by_key(|(_, completed_at_ms)| *completed_at_ms);
+    let remove_count = completed.len() - BROWSER_SCRIPT_COMPLETED_CACHE_MAX;
+    for (run_id, _) in oldest.into_iter().take(remove_count) {
+        completed.remove(&run_id);
     }
 }
 
@@ -899,10 +979,18 @@ pub fn start_browser_script_with_registries(
     let initial_deadline = Instant::now() + Duration::from_millis(browser_script_initial_wait_ms());
     loop {
         if run.child.try_wait()?.is_some() {
-            return finish_browser_script_run(run, false);
+            let result = finish_browser_script_run(run, false);
+            if let Ok(output) = &result {
+                script_registry.remember_completed_output(session_id, output);
+            }
+            return result;
         }
         if Instant::now() >= run.deadline {
-            return finish_browser_script_run(run, true);
+            let result = finish_browser_script_run(run, true);
+            if let Ok(output) = &result {
+                script_registry.remember_completed_output(session_id, output);
+            }
+            return result;
         }
         if Instant::now() >= initial_deadline {
             let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
@@ -980,11 +1068,24 @@ pub fn observe_browser_script_with_registry(
     observe_timeout_ms: u64,
     registry: &BrowserScriptRunRegistry,
 ) -> Result<BrowserScriptOutput> {
-    let mut run = registry
-        .lock()
-        .expect("browser_script run registry poisoned")
-        .remove(run_id)
-        .ok_or_else(|| anyhow!("unknown browser_script run_id {run_id:?}"))?;
+    let lookup = {
+        let active_run = registry
+            .lock()
+            .expect("browser_script run registry poisoned")
+            .remove(run_id);
+        match active_run {
+            Some(run) => BrowserScriptRunLookup::Run(run),
+            None => registry
+                .completed_output_for(session_id, run_id)?
+                .map(BrowserScriptRunLookup::Cached)
+                .unwrap_or(BrowserScriptRunLookup::Unknown),
+        }
+    };
+    let mut run = match lookup {
+        BrowserScriptRunLookup::Run(run) => run,
+        BrowserScriptRunLookup::Cached(output) => return Ok(output),
+        BrowserScriptRunLookup::Unknown => bail!("unknown browser_script run_id {run_id:?}"),
+    };
     if run.session_id != session_id {
         let owner = run.session_id.clone();
         registry
@@ -1017,6 +1118,9 @@ pub fn observe_browser_script_with_registry(
                 .lock()
                 .expect("browser_script observing registry poisoned")
                 .remove(&run_id);
+            if let Ok(output) = &result {
+                registry.remember_completed_output(session_id, output);
+            }
             return result;
         }
         if Instant::now() >= run.deadline {
@@ -1026,6 +1130,9 @@ pub fn observe_browser_script_with_registry(
                 .lock()
                 .expect("browser_script observing registry poisoned")
                 .remove(&run_id);
+            if let Ok(output) = &result {
+                registry.remember_completed_output(session_id, output);
+            }
             return result;
         }
         let delta = drain_browser_script_delta(&mut run).unwrap_or_default();
@@ -10957,6 +11064,38 @@ print("bridge retry ok")
             "internal stream file leaked as artifact: {:?}",
             finished.artifacts
         );
+    }
+
+    #[test]
+    fn browser_script_observe_is_idempotent_after_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-observe-idempotent";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
+        let started = start_browser_script(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('chunk one')\ntime.sleep(1.0)\nprint('chunk two')",
+            5,
+        )
+        .unwrap();
+
+        assert!(started.ok);
+        assert_eq!(started.status.as_deref(), Some("running"));
+        let run_id = started.run_id.as_deref().unwrap().to_string();
+
+        let mut finished = observe_browser_script(session_id, &run_id, 2_500).unwrap();
+        if finished.status.as_deref() == Some("running") {
+            finished = observe_browser_script(session_id, &run_id, 2_500).unwrap();
+        }
+        assert!(finished.ok);
+        assert_eq!(finished.status.as_deref(), Some("finished"));
+        assert!(finished.text.contains("chunk two"));
+
+        let repeated = observe_browser_script(session_id, &run_id, 50).unwrap();
+        assert!(repeated.ok);
+        assert_eq!(repeated.status.as_deref(), Some("finished"));
+        assert!(repeated.text.contains("chunk two"));
     }
 
     #[test]
