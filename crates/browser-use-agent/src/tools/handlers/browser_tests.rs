@@ -663,7 +663,7 @@ async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable(
 }
 
 #[tokio::test]
-async fn local_connect_does_not_connect_before_profile_choice_when_profile_discovery_errors() {
+async fn local_connect_falls_back_to_connect_when_profile_discovery_errors() {
     let backend = Arc::new(FakeBackend {
         fail_local_profiles: true,
         ..Default::default()
@@ -679,22 +679,18 @@ async fn local_connect_does_not_connect_before_profile_choice_when_profile_disco
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(out.exit_code, 0);
-    assert!(out.stdout.contains("\"status\":\"needs-user-action\""));
-    assert!(
-        out.stdout
-            .contains("No default local Chrome profile is set."),
-        "{}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("\"status\":\"connected\""));
     assert_eq!(
         backend.commands(),
-        vec!["browser local profiles --json".to_string()]
+        vec![
+            "browser local profiles --json".to_string(),
+            "browser connect local".to_string(),
+        ]
     );
 }
 
 #[tokio::test]
-async fn local_connect_does_not_connect_before_profile_choice_when_profile_discovery_reports_failed(
-) {
+async fn local_connect_falls_back_to_connect_when_profile_discovery_reports_failed() {
     let backend = Arc::new(FakeBackend::default());
     *backend.local_profiles.lock().unwrap() = Some(json!({
         "status": "failed",
@@ -712,16 +708,13 @@ async fn local_connect_does_not_connect_before_profile_choice_when_profile_disco
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(out.exit_code, 0);
-    assert!(out.stdout.contains("\"status\":\"needs-user-action\""));
-    assert!(
-        out.stdout
-            .contains("No default local Chrome profile is set."),
-        "{}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("\"status\":\"connected\""));
     assert_eq!(
         backend.commands(),
-        vec!["browser local profiles --json".to_string()]
+        vec![
+            "browser local profiles --json".to_string(),
+            "browser connect local".to_string(),
+        ]
     );
 }
 
