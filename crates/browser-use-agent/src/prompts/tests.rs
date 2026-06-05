@@ -97,7 +97,9 @@ fn browser_mode_instruction_guides_remote_cdp_to_direct_page_work() {
     let prompt = browser_mode_instruction("remote-cdp");
     assert!(prompt.contains("Selected browser mode: Remote CDP"));
     assert!(prompt.contains("already provides the browser endpoint"));
-    assert!(prompt.contains("Start page work directly with `browser_script`"));
+    assert!(prompt.contains("already open at the start URL"));
+    assert!(prompt.contains("first inspect the current page"));
+    assert!(prompt.contains("trust its `navigation_ready` page_info result"));
     assert!(prompt.contains("Do not call `browser connect managed`"));
 }
 
@@ -131,6 +133,8 @@ fn prompts_avoid_screenshots_for_text_heavy_extraction() {
         "For text-heavy research, document reading, search, pricing, tables, and list extraction"
     ));
     assert!(script.contains("screenshots add latency"));
+    assert!(script.contains("navigation_ready"));
+    assert!(script.contains("trust it and inspect/extract from the current page"));
 }
 
 #[test]

@@ -47,8 +47,15 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   Browser Use Cloud CDP evals start Rust on the already-loaded task URL and pass
   a "continue from current page" task context instead of making the model spend
   its first turns repeatedly calling `navigate`/browser-status recovery.
+- [x] Remote-CDP browser prompts and `browser_script` tool documentation now
+  match the loaded-page contract: preloaded task URLs should be inspected first,
+  and `navigation_ready` + `page_info` results from `goto_url(...)`/`new_tab(...)`
+  should be trusted instead of repeating the same navigation. The Python wrapper
+  task context also tells the Rust agent to inspect current page state before
+  any repeat navigation.
 - Proof:
   - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session or run_pre_navigates_cdp_session_before_sdk_by_default'`
+  - `cargo test -p browser-use-agent prompts::tests`
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-providers anthropic_messages_downsamples_oversized_tool_images -- --nocapture`
   - `cargo test -p browser-use-providers anthropic_messages -- --nocapture`

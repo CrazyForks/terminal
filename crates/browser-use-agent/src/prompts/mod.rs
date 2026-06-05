@@ -212,7 +212,8 @@ pub fn browser_mode_instruction(mode: &str) -> String {
         "remote-cdp" | "cdp" => concat!(
             "Selected browser mode: Remote CDP. The evaluation harness already provides the browser endpoint. ",
             "Do not call `browser connect managed`, `browser connect local`, or `browser remote start`. ",
-            "Start page work directly with `browser_script` using `goto_url(...)`, then call explicit waits such as `wait_for_load(...)` only when the next page state matters. ",
+            "If the task says the browser session is already open at the start URL, first inspect the current page with `browser_script` using `page_info()` and extraction/screenshot as needed; do not navigate to that same URL again unless the current page URL is wrong. ",
+            "Otherwise start page work directly with `browser_script` using `goto_url(...)`; trust its `navigation_ready` page_info result when the URL is correct, then inspect/extract instead of repeating the same navigation. ",
             "Use `browser status --json` only if you need to inspect the current connection."
         )
         .to_string(),
