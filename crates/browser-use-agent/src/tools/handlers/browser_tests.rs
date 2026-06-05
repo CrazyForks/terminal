@@ -23,8 +23,8 @@ use serde_json::json;
 
 use super::browser::{
     browser_command_is_passive, desired_browser_connect_command, BrowserAction, BrowserBackend,
-    BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
-    MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES,
+    BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX, DEFAULT_OBSERVE_TIMEOUT_MS,
+    MAX_INLINE_BROWSER_SCRIPT_STDOUT_BYTES, MAX_OBSERVE_TIMEOUT_MS,
 };
 use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
@@ -61,6 +61,7 @@ struct FakeBackend {
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     last_timeout_secs: Mutex<Option<u64>>,
+    last_observe_timeout_ms: Mutex<Option<u64>>,
     script_text: Mutex<Option<String>>,
     script_outputs: Mutex<Vec<serde_json::Value>>,
     script_summary: Mutex<Vec<serde_json::Value>>,
@@ -122,6 +123,10 @@ impl FakeBackend {
 
     fn last_timeout_secs(&self) -> Option<u64> {
         *self.last_timeout_secs.lock().unwrap()
+    }
+
+    fn last_observe_timeout_ms(&self) -> Option<u64> {
+        *self.last_observe_timeout_ms.lock().unwrap()
     }
 
     fn set_script_text(&self, text: impl Into<String>) {
@@ -314,9 +319,10 @@ impl BrowserBackend for FakeBackend {
         &self,
         session_id: &str,
         run_id: &str,
-        _observe_timeout_ms: u64,
+        observe_timeout_ms: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
+        *self.last_observe_timeout_ms.lock().unwrap() = Some(observe_timeout_ms);
         *self.last.lock().unwrap() = LastCall::Observe(run_id.to_string());
         if self.fail {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
@@ -1137,7 +1143,42 @@ async fn observe_routes_to_observe_script() {
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(backend.last(), LastCall::Observe("run-1".to_string()));
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(DEFAULT_OBSERVE_TIMEOUT_MS)
+    );
     assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+async fn observe_timeout_is_clamped_to_coarse_poll_window() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend));
+
+    let mut req = BrowserRequest {
+        action: BrowserAction::Observe {
+            run_id: "run-1".to_string(),
+        },
+        session_id: "sess-1".to_string(),
+        cwd: None,
+        artifact_dir: None,
+        timeout_secs: None,
+        observe_timeout_ms: Some(5_000),
+    };
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(DEFAULT_OBSERVE_TIMEOUT_MS)
+    );
+
+    req.observe_timeout_ms = Some(180_000);
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last_observe_timeout_ms(),
+        Some(MAX_OBSERVE_TIMEOUT_MS)
+    );
 }
 
 // (2) Cancel routes to cancel_script.

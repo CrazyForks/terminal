@@ -64,8 +64,10 @@ pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 120;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
-/// Mirrors the legacy default observe window used by the browser_script runtime.
-pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
+/// Long browser_script runs should be observed in coarse windows so the agent
+/// does not burn many LLM turns polling the same run_id while work is ongoing.
+pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 
 /// Appended to `browser_script` stdout when the response carries image parts.
 ///
@@ -197,6 +199,7 @@ impl BrowserRequest {
     fn effective_observe_ms(&self) -> u64 {
         self.observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
+            .clamp(DEFAULT_OBSERVE_TIMEOUT_MS, MAX_OBSERVE_TIMEOUT_MS)
     }
 }
 
