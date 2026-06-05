@@ -411,6 +411,23 @@ def last_domain_skills(include_content=False):
     return __last_domain_skills
 
 
+def _emit_navigation(action, url, result):
+    """Record navigation commands even when callers discard helper return values."""
+    try:
+        emit_output(
+            {
+                "action": action,
+                "url": url,
+                "status": "navigation_sent",
+                "waited_for_load": False,
+                "result": result,
+            },
+            label="navigation",
+        )
+    except Exception:
+        pass
+
+
 def goto_url(url):
     global __last_domain_skills
     result = cdp("Page.navigate", url=url)
@@ -420,6 +437,7 @@ def goto_url(url):
         if skills:
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
+    _emit_navigation("goto_url", url, result)
     return result
 
 
