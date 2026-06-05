@@ -27,8 +27,14 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   URL), and mutable `browser status --json` paths enrich `page` with URL/title
   when probing is available. This gives repeated status/recovery loops concrete
   page evidence without forcing a full load wait.
+- [x] Provider image normalization now downsamples oversized data-URL screenshots
+  before they are sent to Anthropic. This keeps visual context attached while
+  avoiding Claude's many-image request limit where any image dimension above
+  2000px causes an HTTP 400 and collapses the eval result to `None`.
 - Proof:
   - `cargo fmt --all --check`
+  - `cargo test -p browser-use-providers anthropic_messages_downsamples_oversized_tool_images -- --nocapture`
+  - `cargo test -p browser-use-providers anthropic_messages -- --nocapture`
   - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
   - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
   - `cargo test -p browser-use-browser browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env -- --nocapture`

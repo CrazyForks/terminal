@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,7 @@ const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const PROVIDER_MAX_IMAGE_DIMENSION: u32 = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -5957,7 +5958,8 @@ fn anthropic_user_content(message: &Value) -> Vec<Value> {
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
                 Some("input_image") => {
                     let image_url = part.get("image_url").and_then(Value::as_str)?;
-                    data_url_source(image_url).map(|(media_type, data)| {
+                    let safe_image_url = provider_safe_image_url(image_url);
+                    data_url_source(&safe_image_url).map(|(media_type, data)| {
                         json!({
                             "type": "image",
                             "source": {
@@ -6104,6 +6106,39 @@ fn data_url_source(image_url: &str) -> Option<(String, String)> {
     Some((media_type, data.to_string()))
 }
 
+fn provider_safe_image_url(image_url: &str) -> String {
+    downsample_oversized_data_url_image(image_url).unwrap_or_else(|| image_url.to_string())
+}
+
+fn downsample_oversized_data_url_image(image_url: &str) -> Option<String> {
+    let (media_type, data) = data_url_source(image_url)?;
+    if !media_type.starts_with("image/") {
+        return None;
+    }
+    let bytes = general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    let width = image.width();
+    let height = image.height();
+    if width <= PROVIDER_MAX_IMAGE_DIMENSION && height <= PROVIDER_MAX_IMAGE_DIMENSION {
+        return None;
+    }
+
+    let scale = (PROVIDER_MAX_IMAGE_DIMENSION as f32 / width as f32)
+        .min(PROVIDER_MAX_IMAGE_DIMENSION as f32 / height as f32);
+    let resized_width = ((width as f32 * scale).round() as u32).max(1);
+    let resized_height = ((height as f32 * scale).round() as u32).max(1);
+    let resized = image.resize(
+        resized_width,
+        resized_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    resized.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    let encoded = general_purpose::STANDARD.encode(out.into_inner());
+    Some(format!("data:image/png;base64,{encoded}"))
+}
+
 fn input_text_type_for_role(role: &str) -> &'static str {
     if role == "assistant" {
         "output_text"
@@ -6136,7 +6171,7 @@ fn normalize_content_part(part: &Value, role: &str) -> Option<Value> {
             let image_url = part.get("image_url").and_then(Value::as_str)?;
             let mut out = json!({
                 "type": "input_image",
-                "image_url": image_url,
+                "image_url": provider_safe_image_url(image_url),
             });
             if let Some(detail) = part.get("detail").and_then(Value::as_str) {
                 out["detail"] = json!(detail);
@@ -6235,7 +6270,7 @@ fn normalize_tool_image_part(part: &Value) -> Option<Value> {
     let image_url = part.get("image_url").and_then(Value::as_str)?;
     let mut out = json!({
         "type": "input_image",
-        "image_url": image_url,
+        "image_url": provider_safe_image_url(image_url),
     });
     if let Some(detail) = part.get("detail").and_then(Value::as_str) {
         out["detail"] = json!(detail);
@@ -8269,6 +8304,64 @@ mod tests {
             .unwrap_or_default()
             .contains("Developer context:\n<permissions instructions>"));
         assert!(messages_to_anthropic_messages(&[developer], false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_downsamples_oversized_tool_images() -> Result<()> {
+        let image = image::RgbImage::new(10, PROVIDER_MAX_IMAGE_DIMENSION + 500);
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image).write_to(&mut png, image::ImageFormat::Png)?;
+        let image_url = format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(png.into_inner())
+        );
+
+        let messages = messages_to_anthropic_messages(
+            &[
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_screenshot",
+                        "name": "browser_script",
+                        "arguments": {"code": "screenshot('tall')"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_screenshot",
+                    "name": "browser_script",
+                    "content": [
+                        {"type": "output_text", "text": "captured"},
+                        {"type": "input_image", "image_url": image_url, "detail": "auto"}
+                    ]
+                }),
+            ],
+            false,
+        )?;
+
+        let visual_image = messages
+            .iter()
+            .flat_map(|message| message.get("content").and_then(Value::as_array).into_iter())
+            .flatten()
+            .find(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+            .expect("visual image block");
+        let data = visual_image
+            .pointer("/source/data")
+            .and_then(Value::as_str)
+            .expect("base64 image data");
+        let bytes = general_purpose::STANDARD.decode(data)?;
+        let resized = image::load_from_memory(&bytes)?;
+
+        assert_eq!(
+            visual_image
+                .pointer("/source/media_type")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert!(resized.width() <= PROVIDER_MAX_IMAGE_DIMENSION);
+        assert!(resized.height() <= PROVIDER_MAX_IMAGE_DIMENSION);
+        assert_eq!(resized.height(), PROVIDER_MAX_IMAGE_DIMENSION);
         Ok(())
     }
 
