@@ -4243,7 +4243,15 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let browser_id_value = browser_id
         .as_ref()
         .map(|browser_id| browser_id.as_str().to_string());
-    sdk_run_agent_with_runtime(context, &agent_id, &session_id, browser_id, config)?;
+    let initial_input = sdk_initial_input_from_events(context, &session_id)?;
+    sdk_run_agent_with_runtime(
+        context,
+        &agent_id,
+        &session_id,
+        browser_id,
+        initial_input,
+        config,
+    )?;
 
     let events = context.runtime.events_for_session(&session_id)?;
     let output = session_result_from_events(&events);
@@ -4317,6 +4325,7 @@ fn sdk_run_agent_with_runtime(
     agent_id: &AgentId,
     session_id: &SessionId,
     browser_id: Option<BrowserId>,
+    initial_input: Option<Value>,
     config: ProviderRunConfig,
 ) -> Result<()> {
     let runtime = context.runtime.clone();
@@ -4346,6 +4355,9 @@ fn sdk_run_agent_with_runtime(
     if let Some(browser_id) = browser_id {
         request = request.with_browser_id(browser_id);
     }
+    if let Some(initial_input) = initial_input {
+        request = request.with_initial_input(initial_input);
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -4368,6 +4380,31 @@ fn sdk_run_agent_with_runtime(
             .await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+fn sdk_initial_input_from_events(
+    context: &SdkServerContext,
+    session_id: &SessionId,
+) -> Result<Option<Value>> {
+    Ok(context
+        .runtime
+        .events_for_session(session_id)?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup" | "agent.mailbox_input"
+            )
+        })
+        .map(|event| {
+            serde_json::json!({
+                "source": "durable_prompt_input",
+                "event_type": event.event_type,
+                "source_event_seq": event.seq,
+                "payload": event.payload,
+            })
+        }))
 }
 
 fn sdk_final_projected_event(
@@ -7587,6 +7624,16 @@ command = "test-mcp"
             result["history"]["output"],
             serde_json::Value::String("Fake result for: summarize the loaded page".to_string())
         );
+        let session_id = result["session_id"].as_str().context("session id")?;
+        let events = context
+            .runtime
+            .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"agent.input.accepted"));
+        assert!(event_types.contains(&"agent.input.consumed"));
         assert!(result["history"]["events"]
             .as_array()
             .is_some_and(|events| !events.is_empty()));
