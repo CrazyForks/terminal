@@ -406,3 +406,16 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   - Proof: `cargo test -q -p browser-use-browser browser_status`
   - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
   - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Browser-script start single-flight guard — starting a second
+  `browser_script` while a previous run is active now returns model-visible
+  observe/cancel guidance for the existing `run_id` instead of spawning another
+  CDP script against the same browser session. Navigation helper summaries also
+  promote `navigation_ready`, URL, title, readyState, and next step into the
+  compact summary that appears before large/truncated structured outputs. This
+  targets repeated navigate/status/recovery loops where the agent did not attach
+  the first navigation result to the next step.
+  - Proof: `cargo test -q -p browser-use-browser browser_script_start_defers_when_session_has_active_run`
+  - Proof: `cargo test -q -p browser-use-browser browser_script_navigation_helpers_wait_for_page_state`
+  - Proof: `cargo test -q -p browser-use-agent prompts::tests::prompts_avoid_screenshots_for_text_heavy_extraction`
+  - Proof: `cargo fmt --all --check && git diff --check`
