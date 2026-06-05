@@ -14607,6 +14607,39 @@ wire_api = "responses"
     }
 
     #[test]
+    fn native_live_stream_plan_defers_header_only_markdown_table() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a table"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Rendered:\n\n| ID | Name | Role |"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+
+        let plan = native_live_stream_plan(&app, &model, 100);
+        let emitted = plain_text_lines(&plan.lines).join("\n");
+
+        assert!(emitted.contains("Rendered:"), "{emitted}");
+        assert!(!emitted.contains("| ID | Name | Role |"), "{emitted}");
+        Ok(())
+    }
+
+    #[test]
     fn native_live_stream_plan_emits_closed_table_before_live_tail() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

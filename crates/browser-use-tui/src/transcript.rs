@@ -580,7 +580,7 @@ impl TranscriptNode {
                 style,
             } => grouped_lines(group, lines, *style, width),
             TranscriptKind::StreamingAssistant { markdown } => {
-                let mut lines = markdown_cell_lines(markdown, width, DisplayMode::Active);
+                let mut lines = streaming_markdown_cell_lines(markdown, width, DisplayMode::Active);
                 if let Some(stream_skip_lines) = stream_skip_lines {
                     let max_skip = if allow_empty_stream {
                         lines.len()
@@ -3760,6 +3760,19 @@ fn native_markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> 
     plain_native_lines(markdown_cell_lines(markdown, width, mode))
 }
 
+fn streaming_markdown_cell_lines(
+    markdown: &str,
+    width: u16,
+    mode: DisplayMode,
+) -> Vec<Line<'static>> {
+    let prefix = markdown_stream_commit_prefix(markdown);
+    if prefix.trim().is_empty() {
+        Vec::new()
+    } else {
+        markdown_cell_lines(prefix, width, mode)
+    }
+}
+
 fn markdown_stream_commit_prefix(markdown: &str) -> &str {
     let lines = markdown_line_spans(markdown);
     let mut idx = 0usize;
@@ -3796,6 +3809,9 @@ fn markdown_stream_commit_prefix(markdown: &str) -> &str {
         if is_markdown_table_header(line)
             && next_line.is_some_and(is_markdown_table_delimiter_prefix)
         {
+            return markdown[..lines[idx].start].trim_end();
+        }
+        if is_pending_markdown_table_header(line) && next_line.is_none() {
             return markdown[..lines[idx].start].trim_end();
         }
         idx += 1;
@@ -3849,6 +3865,14 @@ fn markdown_fence_marker(line: &str) -> Option<&'static str> {
 fn is_markdown_table_header(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty() && trimmed.contains('|') && !is_markdown_table_delimiter(trimmed)
+}
+
+fn is_pending_markdown_table_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed.matches('|').count() >= 2
+        && is_markdown_table_header(trimmed)
 }
 
 fn is_markdown_table_body_row(line: &str) -> bool {
@@ -5898,6 +5922,38 @@ mod tests {
         assert!(commit_text.contains("Intro."), "{commit_text}");
         assert!(!commit_text.contains("Name"), "{commit_text}");
         assert!(!commit_text.contains("Apples"), "{commit_text}");
+    }
+
+    #[test]
+    fn streaming_table_header_alone_waits_before_native_commit() {
+        let model = streaming_model_for("Rendered:\n\n| ID | Name | Role |");
+
+        let commit_text = native_lines_text(&active_streaming_native_commit_prefix_lines(
+            Some(&model),
+            80,
+        ));
+        assert!(commit_text.contains("Rendered:"), "{commit_text}");
+        assert!(
+            !commit_text.contains("| ID | Name | Role |"),
+            "{commit_text}"
+        );
+    }
+
+    #[test]
+    fn incomplete_streaming_table_header_is_hidden_from_active_viewport() {
+        let model = streaming_model_for("Rendered:\n\n| ID | Name | Role |");
+
+        let active_text = active_viewport_lines(Some(&model), 80, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(active_text.contains("Rendered:"), "{active_text}");
+        assert!(
+            !active_text.contains("| ID | Name | Role |"),
+            "{active_text}"
+        );
     }
 
     #[test]
