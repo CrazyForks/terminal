@@ -27,6 +27,11 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   URL), and mutable `browser status --json` paths enrich `page` with URL/title
   when probing is available. This gives repeated status/recovery loops concrete
   page evidence without forcing a full load wait.
+- [x] Navigation helpers now perform a bounded readiness wait and return
+  `navigation_ready` with `page_info` in the same `browser_script` result when
+  the target page is inspectable. This addresses traces where the model sent
+  `navigate`, saw only a "navigation sent" placeholder on the next turn, and
+  repeated navigation/status calls instead of inspecting the page.
 - [x] Provider image normalization now downsamples oversized data-URL screenshots
   before they are sent to Anthropic. This keeps visual context attached while
   avoiding Claude's many-image request limit where any image dimension above
@@ -38,7 +43,8 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
   - `cargo test -p browser-use-agent fused_browser_script_dispatch_emits_runtime_tool_output_event -- --nocapture`
   - `cargo test -p browser-use-browser browser_script_initial_wait_defaults_to_fifteen_seconds_and_clamps_env -- --nocapture`
-  - `cargo test -p browser-use-browser browser_script_navigation_helpers_do_not_auto_wait -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_navigation_helpers_wait_for_page_state -- --nocapture`
+  - `cargo test -p browser-use-browser browser_script_start_observe_finishes_slow_scripts -- --test-threads=1 --nocapture`
 
 ## Trust rule
 Only commits **made and test-verified in the working session** are trusted. A separate

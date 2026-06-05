@@ -449,23 +449,63 @@ def _navigation_target_state(requested_url, timeout=3.0):
     return state
 
 
+def _navigation_wait_timeout_seconds():
+    raw = os.environ.get("BU_NAVIGATION_READY_WAIT_SECONDS")
+    if raw is None:
+        return 8.0
+    try:
+        return max(0.0, min(float(raw), 30.0))
+    except Exception:
+        return 8.0
+
+
 def _emit_navigation(action, url, result):
     """Record navigation commands even when callers discard helper return values."""
+    waited_for_load = False
+    load_error = None
+    wait_timeout = _navigation_wait_timeout_seconds()
+    if wait_timeout > 0:
+        try:
+            waited_for_load = bool(wait_for_load(timeout=wait_timeout))
+        except Exception as exc:
+            load_error = str(exc)
     page_state = _navigation_target_state(url)
+    page_snapshot = None
+    page_info_error = None
     try:
-        emit_output(
-            {
-                "action": action,
-                "url": url,
-                "status": "navigation_sent",
-                "waited_for_load": False,
-                "page_state": page_state,
-                "result": result,
-            },
-            label="navigation",
-        )
+        page_snapshot = page_info()
+    except Exception as exc:
+        page_info_error = str(exc)
+    page_url = page_snapshot.get("url") if isinstance(page_snapshot, dict) else None
+    ready_state = page_snapshot.get("readyState") if isinstance(page_snapshot, dict) else None
+    target_ready = _target_matches_requested_url(page_url, url) and ready_state in (
+        "interactive",
+        "complete",
+    )
+    status = "navigation_ready" if waited_for_load or target_ready else "navigation_sent"
+    output = {
+        "action": action,
+        "url": url,
+        "status": status,
+        "waited_for_load": waited_for_load,
+        "page_state": page_state,
+        "page_info": page_snapshot,
+        "result": result,
+        "next_step": (
+            "Inspect the current page before navigating again unless the URL is wrong."
+            if status == "navigation_ready"
+            else "The navigation was sent; wait or inspect page state before repeating it."
+        ),
+    }
+    if load_error:
+        output["load_error"] = load_error
+    if page_info_error:
+        output["page_info_error"] = page_info_error
+    try:
+        emit_output(output, label="navigation")
     except Exception:
         pass
+    return output
 
 
 def goto_url(url):
@@ -477,8 +517,10 @@ def goto_url(url):
         if skills:
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
-    _emit_navigation("goto_url", url, result)
-    return result
+    navigation = _emit_navigation("goto_url", url, result)
+    if isinstance(result, dict):
+        return {**result, "navigation": navigation}
+    return {"result": result, "navigation": navigation}
 
 
 def page_info():
