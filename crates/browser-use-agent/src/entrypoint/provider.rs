@@ -166,13 +166,33 @@ impl RuntimeBrowserBackend {
             return Ok(());
         };
         let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        let text = if response.text.trim().is_empty()
+            && response.ok
+            && response.status.as_deref() != Some("running")
+            && response.outputs.is_empty()
+            && response.summary.is_empty()
+            && response.data.is_null()
+            && response.images.is_empty()
+            && response.artifacts.is_empty()
+        {
+            "browser_script completed".to_string()
+        } else {
+            response.text.clone()
+        };
         let base_payload = serde_json::json!({
+            "name": "browser_script",
             "run_id": run_id,
             "ok": response.ok,
             "status": response.status.clone(),
             "next_observe_ms": response.next_observe_ms,
-            "text": response.text.clone(),
+            "text": text,
             "error": response.error.clone(),
+            "data": response.data.clone(),
+            "outputs": response.outputs.clone(),
+            "summary": response.summary.clone(),
+            "images": response.images.clone(),
+            "artifacts": response.artifacts.clone(),
+            "diagnosis": response.diagnosis.clone(),
         });
 
         if synthesize_start {
@@ -2977,7 +2997,10 @@ mod tests {
                 ok: true,
                 status: Some("finished".to_string()),
                 run_id: Some("script-1".to_string()),
-                text: "done".to_string(),
+                outputs: vec![serde_json::json!({
+                    "label": "page_info",
+                    "value": { "url": "https://example.com", "title": "Example" }
+                })],
                 ..Default::default()
             })
         }
@@ -3138,15 +3161,29 @@ mod tests {
             .events_for_session(root.session_id())?
             .into_iter()
             .filter(|event| event.event_type.starts_with("browser_script."))
-            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        let script_event_types = script_events
+            .iter()
+            .map(|event| event.event_type.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            script_events,
+            script_event_types,
             vec![
                 "browser_script.started".to_string(),
                 "browser_script.output_delta".to_string(),
                 "browser_script.completed".to_string(),
             ]
+        );
+        let completed = script_events
+            .iter()
+            .find(|event| event.event_type == "browser_script.completed")
+            .expect("completed browser_script event");
+        assert_eq!(completed.payload["name"], "browser_script");
+        assert_eq!(completed.payload["text"], "");
+        assert_eq!(completed.payload["outputs"][0]["label"], "page_info");
+        assert_eq!(
+            completed.payload["outputs"][0]["value"]["url"],
+            "https://example.com"
         );
         Ok(())
     }
