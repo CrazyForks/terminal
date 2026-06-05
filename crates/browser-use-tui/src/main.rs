@@ -179,6 +179,8 @@ pub(crate) const SESSION_PAUSED_REASON: &str = "session paused";
 pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
 pub(crate) const PENDING_FOLLOWUP_INTERRUPT_REASON: &str = "pending follow-up interrupt";
+const ACTIVE_STREAM_STABLE_RESERVE_LINES: usize = 2;
+const ACTIVE_STREAM_VIEWPORT_LINES: u16 = 8;
 const IMAGE_PASTE_PENDING_NOTICE: &str = "Reading pasted image from clipboard.";
 const IMAGE_PASTE_MATERIALIZING_NOTICE: &str = "Preparing pasted image.";
 
@@ -8772,31 +8774,19 @@ fn desired_terminal_viewport_height_for(
 
     let state = app.session_render_state();
     let body_width = app_width.saturating_sub(4).max(1);
-    let stream_skip_lines = state
-        .current_session
-        .as_ref()
-        .map(|session| {
-            app.native_history
-                .live_stream_emitted_lines_for(&session.id, body_width)
+    if app.native_scrollback_is_active() {
+        let has_live_stream = transcript::with_transcript_model(app, &state, |model| {
+            transcript::active_streaming_has_content(Some(model))
         })
-        .unwrap_or(0);
+        .unwrap_or(false);
+        if has_live_stream {
+            return Ok(dock_height
+                .saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
+                .min(full_height));
+        }
+    }
     let active_lines = transcript::with_transcript_model(app, &state, |model| {
-        let active_streaming_lines = transcript::active_streaming_lines(Some(model), body_width);
-        let estimated_stream_skip_lines =
-            if transcript::active_streaming_can_commit_all(Some(model))
-                && active_streaming_lines.len() > 1
-            {
-                active_streaming_lines.len()
-            } else {
-                active_streaming_lines.len().saturating_sub(1)
-            };
-        let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
-        transcript::active_viewport_lines_with_stream_skip(
-            Some(model),
-            body_width,
-            u16::MAX,
-            stream_skip_lines,
-        )
+        transcript::active_viewport_lines(Some(model), body_width, u16::MAX)
     })
     .unwrap_or_default();
     let active_line_count = if app.selected_session_id.is_some() && app.surface.uses_main_view() {
@@ -9250,8 +9240,7 @@ fn maybe_emit_native_transcript(
     };
     let Some(plan) = transcript::with_transcript_model(app, &state, |model| {
         debug_assert_eq!(model.session_id, session_id);
-        let has_live_streaming_output =
-            !transcript::active_streaming_lines(Some(model), width).is_empty();
+        let has_live_streaming_output = transcript::active_streaming_has_content(Some(model));
         let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
         let live_stream = native_live_stream_plan(app, model, width);
 
@@ -9341,18 +9330,19 @@ fn native_live_stream_plan(
     model: &transcript::TranscriptModel,
     width: u16,
 ) -> NativeLiveStreamPlan {
-    let lines = transcript::active_streaming_lines(Some(model), width);
-    let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
-    {
-        lines.len()
-    } else {
-        lines.len().saturating_sub(1)
-    };
-    if emit_count == 0 {
+    if !transcript::active_streaming_has_content(Some(model)) {
         return NativeLiveStreamPlan {
             clear_live_stream: true,
             ..NativeLiveStreamPlan::default()
         };
+    }
+
+    let lines = transcript::active_streaming_stable_lines(Some(model), width);
+    let emit_count = lines
+        .len()
+        .saturating_sub(ACTIVE_STREAM_STABLE_RESERVE_LINES);
+    if emit_count == 0 {
+        return NativeLiveStreamPlan::default();
     }
     let already = app
         .native_history
@@ -9361,6 +9351,7 @@ fn native_live_stream_plan(
     if emit_count <= already {
         return NativeLiveStreamPlan::default();
     }
+
     let mut emitted_lines = lines[already..emit_count].to_vec();
     if already == 0 {
         emitted_lines.insert(0, Line::from(""));
@@ -14359,7 +14350,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn active_streaming_viewport_moves_separator_to_native_scrollback() -> Result<()> {
+    fn active_streaming_pins_viewport_and_commits_only_complete_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14373,22 +14364,33 @@ wire_api = "responses"
             "model.turn.request",
             serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
         )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
         app.store.append_event(
             &session.id,
             "model.stream_delta",
             serde_json::json!({"text": "line 01"}),
         )?;
         app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), committed_seq);
         app.drain_store_notifications()?;
 
         let terminal_width = 120_u16;
         let terminal_height = 80_u16;
-        let full_height = terminal_height.max(app.live_viewport_height());
         let initial_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert!(
-            initial_desired < full_height,
-            "live stream rows should move to native scrollback instead of expanding the widget to full height"
+        let dock_height = main_viewport_height(
+            &app,
+            terminal_width.saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2)),
+        );
+        assert_eq!(
+            initial_desired,
+            dock_height.saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
         );
 
         let streamed = (1..=18)
@@ -14404,7 +14406,12 @@ wire_api = "responses"
 
         let grown_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert_eq!(grown_desired.saturating_add(1), initial_desired);
+        assert_eq!(grown_desired, initial_desired);
+
+        let state = app.session_render_state();
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let live_stream = native_live_stream_plan(&app, &model, native_scrollback_width(120));
+        assert_eq!(live_stream.emit_count, 15);
         Ok(())
     }
 
@@ -14460,7 +14467,7 @@ wire_api = "responses"
 
         let live_stream = native_live_stream_plan(&app, &model, width);
         assert!(
-            live_stream.emit_count >= 79,
+            live_stream.emit_count >= 77,
             "long streams should emit stable rows instead of keeping them all active"
         );
         let emitted_text = lines_plain_text(&live_stream.lines);
@@ -14472,7 +14479,7 @@ wire_api = "responses"
             live_stream.emitted_text_lines,
         );
 
-        let active_lines = transcript::active_viewport_lines_with_stream_skip(
+        let active_lines = transcript::active_viewport_lines_after_stream_prefix(
             Some(&model),
             width,
             u16::MAX,
@@ -14482,8 +14489,9 @@ wire_api = "responses"
         let active_text = lines_plain_text(&active_lines);
         assert!(!active_text.contains("stream line 01"), "{active_text}");
         assert!(!active_text.contains("stream line 40"), "{active_text}");
+        assert!(active_text.contains("stream line 80"), "{active_text}");
         assert!(
-            active_lines.len() <= 3,
+            active_lines.len() <= 5,
             "active viewport should contain only the mutable live tail/status, not the full stream\n{active_text}"
         );
         Ok(())
@@ -15899,11 +15907,12 @@ wire_api = "responses"
             .reset_for_session(session.id, committed_seq);
 
         let screen = render_dump(&mut app)?;
+        let browser_row = row_containing(&screen, "• browser");
         let live_row = row_containing(&screen, "Reading the page and preparing");
         let composer_row = row_containing(&screen, "Type to steer the agent");
         assert!(
-            live_row <= 2,
-            "live reasoning should render directly under native scrollback, not after a large gap\n{screen}"
+            browser_row <= live_row && live_row.saturating_sub(browser_row) <= 4,
+            "live browser status and reasoning should stay grouped together\n{screen}"
         );
         assert!(
             composer_row > live_row,
@@ -16143,7 +16152,14 @@ wire_api = "responses"
         )?;
         app.drain_store_notifications()?;
         let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(streaming, prompt_only);
+        assert_eq!(
+            streaming,
+            main_viewport_height(
+                &app,
+                120_u16.saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2)),
+            )
+            .saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
+        );
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
         assert!(!streaming_screen.contains("Thinking..."));
@@ -16358,7 +16374,6 @@ wire_api = "responses"
         app.native_history
             .reset_for_session(session.id.clone(), last_seq);
 
-        let docked = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
         app.dispatch(AppCommand::SendFollowup {
             session_id: session.id.clone(),
             text: "tell me more".to_string(),
@@ -16376,7 +16391,14 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
-        assert_eq!(measured, docked);
+        assert_eq!(
+            measured,
+            main_viewport_height(
+                &app,
+                80_u16.saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2)),
+            )
+            .saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
+        );
         app.args.width = 80;
         app.args.height = measured;
         let screen = render_dump(&mut app)?;
@@ -16415,7 +16437,6 @@ wire_api = "responses"
         app.native_history
             .reset_for_session(session.id.clone(), last_seq);
 
-        let docked = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
         app.dispatch(AppCommand::SendFollowup {
             session_id: session.id.clone(),
             text: "continue".to_string(),
@@ -16433,7 +16454,14 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let initial = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(initial, docked.saturating_add(1));
+        assert_eq!(
+            initial,
+            main_viewport_height(
+                &app,
+                100_u16.saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2)),
+            )
+            .saturating_add(ACTIVE_STREAM_VIEWPORT_LINES)
+        );
 
         let streamed = (1..=24)
             .map(|idx| format!("live output line {idx:02}"))
@@ -16447,7 +16475,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let grown = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(grown.saturating_add(1), initial);
+        assert_eq!(grown, initial);
         app.args.width = 100;
         app.args.height = grown;
         let screen = render_dump(&mut app)?;
@@ -16710,8 +16738,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
-        let has_live_streaming_output =
-            !transcript::active_streaming_lines(Some(&model), 120).is_empty();
+        let has_live_streaming_output = transcript::active_streaming_has_content(Some(&model));
         let stream_emission = transcript::terminal_scrollback_emission_since(
             &model,
             app.native_history.last_seq,

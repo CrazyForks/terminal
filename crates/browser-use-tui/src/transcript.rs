@@ -518,6 +518,133 @@ impl TranscriptNode {
         }
     }
 
+    #[cfg(test)]
+    fn active_tail_display_lines(
+        &self,
+        width: u16,
+        shimmer_phase: usize,
+        allow_empty_stream: bool,
+    ) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => {
+                let mut out = Vec::new();
+                let mut previous_kind = None;
+                for (idx, node) in nodes.iter().enumerate() {
+                    let _ = (node.id(), node.revision());
+                    let child_allow_empty_stream =
+                        matches!(node.kind, TranscriptKind::StreamingAssistant { .. })
+                            && nodes[idx + 1..].iter().any(|node| {
+                                matches!(node.kind, TranscriptKind::PendingStatus { .. })
+                            });
+                    let child_lines = node.active_tail_display_lines(
+                        width,
+                        shimmer_phase,
+                        child_allow_empty_stream,
+                    );
+                    if child_lines.is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        let gap = previous_kind
+                            .map(|previous| gap_lines_between(previous, &node.kind))
+                            .unwrap_or(0);
+                        out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+                    }
+                    out.extend(child_lines);
+                    previous_kind = Some(&node.kind);
+                }
+                out
+            }
+            TranscriptKind::PendingStatus { status, detail } => pending_status_lines(
+                status,
+                detail.as_deref(),
+                ShimmerMode::AnimatedAt(shimmer_phase),
+            ),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                let tail = streaming_mutable_markdown_tail(markdown);
+                if tail.trim().is_empty() {
+                    if allow_empty_stream {
+                        vec![Line::from("")]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    markdown_cell_lines(tail, width, DisplayMode::Active)
+                }
+            }
+            _ => self.display_lines(width, DisplayMode::Active),
+        }
+    }
+
+    fn active_display_lines_after_stream_prefix(
+        &self,
+        width: u16,
+        shimmer_phase: usize,
+        emitted_stable_stream_lines: &mut usize,
+        allow_empty_stream: bool,
+    ) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => {
+                let mut out = Vec::new();
+                let mut previous_kind = None;
+                for (idx, node) in nodes.iter().enumerate() {
+                    let _ = (node.id(), node.revision());
+                    let child_allow_empty_stream =
+                        matches!(node.kind, TranscriptKind::StreamingAssistant { .. })
+                            && nodes[idx + 1..].iter().any(|node| {
+                                matches!(node.kind, TranscriptKind::PendingStatus { .. })
+                            });
+                    let child_lines = node.active_display_lines_after_stream_prefix(
+                        width,
+                        shimmer_phase,
+                        emitted_stable_stream_lines,
+                        child_allow_empty_stream,
+                    );
+                    if child_lines.is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        let gap = previous_kind
+                            .map(|previous| gap_lines_between(previous, &node.kind))
+                            .unwrap_or(0);
+                        out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+                    }
+                    out.extend(child_lines);
+                    previous_kind = Some(&node.kind);
+                }
+                out
+            }
+            TranscriptKind::PendingStatus { status, detail } => pending_status_lines(
+                status,
+                detail.as_deref(),
+                ShimmerMode::AnimatedAt(shimmer_phase),
+            ),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                let mut out = Vec::new();
+                let stable = streaming_stable_markdown_prefix(markdown);
+                if !stable.trim().is_empty() {
+                    let stable_lines = markdown_cell_lines(stable, width, DisplayMode::Active);
+                    let skip = (*emitted_stable_stream_lines).min(stable_lines.len());
+                    *emitted_stable_stream_lines =
+                        (*emitted_stable_stream_lines).saturating_sub(skip);
+                    out.extend(stable_lines.into_iter().skip(skip));
+                }
+                let tail = streaming_mutable_markdown_tail(markdown);
+                if !tail.trim().is_empty() {
+                    out.extend(markdown_cell_lines(tail, width, DisplayMode::Active));
+                }
+                if out.is_empty() && allow_empty_stream {
+                    out.push(Line::from(""));
+                }
+                out
+            }
+            _ => self.display_lines(width, DisplayMode::Active),
+        }
+    }
+
+    #[cfg(test)]
     fn streaming_display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = width.max(1);
         match &self.kind {
@@ -532,14 +659,29 @@ impl TranscriptNode {
         }
     }
 
-    fn can_commit_full_live_stream(&self) -> bool {
+    fn streaming_stable_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
         match &self.kind {
-            TranscriptKind::Stack { nodes } => nodes.iter().enumerate().any(|(idx, node)| {
-                matches!(node.kind, TranscriptKind::StreamingAssistant { .. })
-                    && nodes[idx + 1..]
-                        .iter()
-                        .any(|node| matches!(node.kind, TranscriptKind::PendingStatus { .. }))
-            }),
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .flat_map(|node| node.streaming_stable_display_lines(width))
+                .collect(),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                let stable = streaming_stable_markdown_prefix(markdown);
+                if stable.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    markdown_cell_lines(stable, width, DisplayMode::Active)
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn has_streaming(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes.iter().any(TranscriptNode::has_streaming),
+            TranscriptKind::StreamingAssistant { markdown } => !markdown.trim().is_empty(),
             _ => false,
         }
     }
@@ -724,11 +866,11 @@ pub(crate) fn active_viewport_lines(
     lines
 }
 
-pub(crate) fn active_viewport_lines_with_stream_skip(
+#[cfg(test)]
+pub(crate) fn active_viewport_tail_lines(
     model: Option<&TranscriptModel>,
     width: u16,
     height: u16,
-    stream_skip_lines: usize,
 ) -> Vec<Line<'static>> {
     let Some(active) = model.and_then(|model| model.active.as_ref()) else {
         return Vec::new();
@@ -736,15 +878,12 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
     if active.is_active_viewport_placeholder() {
         return Vec::new();
     }
-    let mut skip = stream_skip_lines;
-    let mut lines = active.active_display_lines(
+    let mut lines = active.active_tail_display_lines(
         width,
         model.map(|model| model.live_phase).unwrap_or(0),
-        Some(&mut skip),
         false,
     );
-    let consumed_stream_lines = stream_skip_lines > skip;
-    if active.needs_leading_status_padding() && !lines.is_empty() && !consumed_stream_lines {
+    if active.needs_leading_status_padding() && !lines.is_empty() {
         lines.insert(0, Line::from(""));
     }
     if lines.len() > height as usize {
@@ -754,6 +893,38 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
     lines
 }
 
+pub(crate) fn active_viewport_lines_after_stream_prefix(
+    model: Option<&TranscriptModel>,
+    width: u16,
+    height: u16,
+    emitted_stable_stream_lines: usize,
+) -> Vec<Line<'static>> {
+    let Some(active) = model.and_then(|model| model.active.as_ref()) else {
+        return Vec::new();
+    };
+    if active.is_active_viewport_placeholder() {
+        return Vec::new();
+    }
+    let requested_stream_prefix = emitted_stable_stream_lines;
+    let mut emitted_stable_stream_lines = emitted_stable_stream_lines;
+    let mut lines = active.active_display_lines_after_stream_prefix(
+        width,
+        model.map(|model| model.live_phase).unwrap_or(0),
+        &mut emitted_stable_stream_lines,
+        false,
+    );
+    let consumed_stream_prefix = emitted_stable_stream_lines < requested_stream_prefix;
+    if active.needs_leading_status_padding() && !lines.is_empty() && !consumed_stream_prefix {
+        lines.insert(0, Line::from(""));
+    }
+    if lines.len() > height as usize {
+        let start = lines.len().saturating_sub(height as usize);
+        lines = lines.into_iter().skip(start).collect();
+    }
+    lines
+}
+
+#[cfg(test)]
 pub(crate) fn active_streaming_lines(
     model: Option<&TranscriptModel>,
     width: u16,
@@ -764,10 +935,20 @@ pub(crate) fn active_streaming_lines(
         .unwrap_or_default()
 }
 
-pub(crate) fn active_streaming_can_commit_all(model: Option<&TranscriptModel>) -> bool {
+pub(crate) fn active_streaming_stable_lines(
+    model: Option<&TranscriptModel>,
+    width: u16,
+) -> Vec<Line<'static>> {
     model
         .and_then(|model| model.active.as_ref())
-        .is_some_and(TranscriptNode::can_commit_full_live_stream)
+        .map(|active| active.streaming_stable_display_lines(width))
+        .unwrap_or_default()
+}
+
+pub(crate) fn active_streaming_has_content(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::has_streaming)
 }
 
 #[cfg(test)]
@@ -1549,6 +1730,12 @@ fn active_node_for_session(
     let mut active_nodes = Vec::new();
     let live_status = live_status_for_session(active_child_count, live_thinking_text, live_events);
 
+    if app.native_scrollback_is_active() && live_streaming_text.is_some() {
+        if let Some(node) = active_browser_tail_node(root, events, live_events) {
+            active_nodes.push(node);
+        }
+    }
+
     if let Some(text) = live_streaming_text {
         let seq = events.last().map(|event| event.seq).unwrap_or_default();
         if !text.trim().is_empty() {
@@ -1729,6 +1916,18 @@ fn active_timeline_tail_node(
         push_committed_node(&mut tail, node);
     }
     tail.into_iter().next()
+}
+
+fn active_browser_tail_node(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    live_events: &[EventRecord],
+) -> Option<TranscriptNode> {
+    live_events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event_type.as_str(), "browser.page" | "browser.state"))
+        .and_then(|event| active_node_for_event(root, events, event))
 }
 
 fn is_open_timeline_node(node: &TranscriptNode) -> bool {
@@ -2595,6 +2794,122 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn streaming_stable_markdown_prefix(markdown: &str) -> &str {
+    let Some(mut commit_end) = markdown.rfind('\n').map(|idx| idx + 1) else {
+        return "";
+    };
+    if let Some(holdback_start) = streaming_holdback_start(&markdown[..commit_end]) {
+        commit_end = holdback_start;
+    }
+    &markdown[..commit_end]
+}
+
+fn streaming_mutable_markdown_tail(markdown: &str) -> &str {
+    let stable_len = streaming_stable_markdown_prefix(markdown).len();
+    &markdown[stable_len..]
+}
+
+fn streaming_holdback_start(source: &str) -> Option<usize> {
+    [unclosed_fence_start(source), table_holdback_start(source)]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn unclosed_fence_start(source: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut open: Option<(char, usize, usize)> = None;
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n');
+        if let Some((marker, len)) = fence_marker(line) {
+            match open {
+                Some((open_marker, open_len, _)) if marker == open_marker && len >= open_len => {
+                    open = None;
+                }
+                None => {
+                    open = Some((marker, len, offset));
+                }
+                _ => {}
+            }
+        }
+        offset = offset.saturating_add(raw_line.len());
+    }
+    open.map(|(_, _, start)| start)
+}
+
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let marker = chars.next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let len = 1 + chars.take_while(|ch| *ch == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+fn table_holdback_start(source: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut previous_header: Option<usize> = None;
+    let mut pending_header: Option<usize> = None;
+    let mut confirmed_table: Option<usize> = None;
+    let mut in_fence = false;
+
+    for raw_line in source.split_inclusive('\n') {
+        let line = raw_line.trim_end_matches('\n');
+        if fence_marker(line).is_some() {
+            in_fence = !in_fence;
+            previous_header = None;
+            pending_header = None;
+            offset = offset.saturating_add(raw_line.len());
+            continue;
+        }
+
+        if !in_fence {
+            let is_header = is_table_header_line(line);
+            let is_delimiter = is_table_delimiter_line(line);
+            if confirmed_table.is_none() && previous_header.is_some() && is_delimiter {
+                confirmed_table = previous_header;
+                pending_header = None;
+            } else if confirmed_table.is_none() && !line.trim().is_empty() {
+                pending_header = is_header.then_some(offset);
+            }
+            previous_header = is_header.then_some(offset);
+        }
+        offset = offset.saturating_add(raw_line.len());
+    }
+
+    confirmed_table.or(pending_header)
+}
+
+fn is_table_header_line(line: &str) -> bool {
+    let Some(cells) = table_cells(line) else {
+        return false;
+    };
+    !is_table_delimiter_cells(&cells) && cells.iter().any(|cell| !cell.trim().is_empty())
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    table_cells(line).is_some_and(|cells| is_table_delimiter_cells(&cells))
+}
+
+fn table_cells(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let body = trimmed.trim_matches('|');
+    let cells = body.split('|').collect::<Vec<_>>();
+    (cells.len() >= 2).then_some(cells)
+}
+
+fn is_table_delimiter_cells(cells: &[&str]) -> bool {
+    cells.iter().all(|cell| {
+        let cell = cell.trim();
+        cell.contains('-') && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+    })
 }
 
 fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
@@ -3895,7 +4210,7 @@ mod tests {
     }
 
     #[test]
-    fn active_streaming_moves_separator_with_emitted_prefix() {
+    fn active_streaming_splits_stable_prefix_from_mutable_tail() {
         fn model_for(markdown: &str) -> TranscriptModel {
             TranscriptModel {
                 session_id: "session".to_string(),
@@ -3915,10 +4230,10 @@ mod tests {
         }
 
         let first = model_for("Not much. I'm ready to work.");
-        let first_native_stream = active_streaming_lines(Some(&first), 80);
-        assert_eq!(first_native_stream.len(), 1);
+        let first_stable = active_streaming_stable_lines(Some(&first), 80);
+        assert!(first_stable.is_empty());
 
-        let first_viewport = active_viewport_lines_with_stream_skip(Some(&first), 80, 100, 0);
+        let first_viewport = active_viewport_tail_lines(Some(&first), 80, 100);
         assert_eq!(line_text(&first_viewport[0]), "");
         assert_eq!(
             line_text(&first_viewport[1]),
@@ -3926,12 +4241,12 @@ mod tests {
         );
 
         let second = model_for("Not much. I'm ready to work.\n\nSend me the command.");
-        let second_native_stream = active_streaming_lines(Some(&second), 80);
-        let emitted_lines = second_native_stream.len().saturating_sub(1);
-        let second_viewport =
-            active_viewport_lines_with_stream_skip(Some(&second), 80, 100, emitted_lines);
+        let second_stable = active_streaming_stable_lines(Some(&second), 80);
+        assert_eq!(line_text(&second_stable[0]), "Not much. I'm ready to work.");
+        let second_viewport = active_viewport_tail_lines(Some(&second), 80, 100);
 
-        assert_eq!(line_text(&second_viewport[0]), "Send me the command.");
+        assert_eq!(line_text(&second_viewport[0]), "");
+        assert_eq!(line_text(&second_viewport[1]), "Send me the command.");
     }
 
     #[test]

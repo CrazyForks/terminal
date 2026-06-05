@@ -287,7 +287,7 @@ fn render_main(
     let (body, reserve_live_status_row) = if native_scrollback_active {
         let (mut lines, reserve_live_status_row) =
             transcript::with_transcript_model(app, state, |model| {
-                let stream_skip_lines = state
+                let emitted_stream_lines = state
                     .current_session
                     .as_ref()
                     .map(|session| {
@@ -295,11 +295,11 @@ fn render_main(
                             .live_stream_emitted_lines_for(&session.id, body_width)
                     })
                     .unwrap_or(0);
-                let lines = transcript::active_viewport_lines_with_stream_skip(
+                let lines = transcript::active_viewport_lines_after_stream_prefix(
                     Some(model),
                     body_width,
                     max_body_h,
-                    stream_skip_lines,
+                    emitted_stream_lines,
                 );
                 (
                     lines,
