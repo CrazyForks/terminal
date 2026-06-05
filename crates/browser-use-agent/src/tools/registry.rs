@@ -952,8 +952,8 @@ pub mod definitions {
                     "observe_timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 10000,
-                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
+                        "maximum": 120000,
+                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 30000. Use longer windows, up to 120000, for long-running extraction or navigation scripts instead of repeatedly polling the same run_id."
                     }
                 },
                 "additionalProperties": false
