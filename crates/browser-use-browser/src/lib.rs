@@ -1151,10 +1151,11 @@ pub fn observe_browser_script_with_registry(
 
     let timeout = Duration::from_millis(observe_timeout_ms.max(1));
     let observe_deadline = Instant::now() + timeout;
+    let mut accumulated_delta = BrowserScriptDelta::default();
     loop {
         if run.child.try_wait()?.is_some() {
             let run_id = run.id.clone();
-            let result = finish_browser_script_run(run, false);
+            let result = finish_browser_script_run_with_prefix(run, false, accumulated_delta);
             browser_script_observing()
                 .lock()
                 .expect("browser_script observing registry poisoned")
@@ -1166,7 +1167,7 @@ pub fn observe_browser_script_with_registry(
         }
         if Instant::now() >= run.deadline {
             let run_id = run.id.clone();
-            let result = finish_browser_script_run(run, true);
+            let result = finish_browser_script_run_with_prefix(run, true, accumulated_delta);
             browser_script_observing()
                 .lock()
                 .expect("browser_script observing registry poisoned")
@@ -1179,22 +1180,11 @@ pub fn observe_browser_script_with_registry(
         let delta = drain_browser_script_delta(&mut run).unwrap_or_default();
         if delta.has_content() {
             mark_output_seen_if_needed(&mut run, &delta);
-            let mut output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
-            attach_inline_window_stitch(&mut run, &mut output);
-            attach_browser_script_timing(&run, &mut output);
-            let run_id = run.id.clone();
-            registry
-                .lock()
-                .expect("browser_script run registry poisoned")
-                .insert(run_id.clone(), run);
-            browser_script_observing()
-                .lock()
-                .expect("browser_script observing registry poisoned")
-                .remove(&run_id);
-            return Ok(output);
+            accumulated_delta.append(delta);
         }
         if Instant::now() >= observe_deadline {
-            let mut output = browser_script_running_output(&run, None, observe_timeout_ms);
+            let delta = accumulated_delta.has_content().then_some(accumulated_delta);
+            let mut output = browser_script_running_output(&run, delta, observe_timeout_ms);
             attach_inline_window_stitch(&mut run, &mut output);
             attach_browser_script_timing(&run, &mut output);
             let run_id = run.id.clone();
@@ -1333,8 +1323,16 @@ fn spawn_browser_script_with_session_registry(
 }
 
 fn finish_browser_script_run(
+    run: BrowserScriptRun,
+    timed_out: bool,
+) -> Result<BrowserScriptOutput> {
+    finish_browser_script_run_with_prefix(run, timed_out, BrowserScriptDelta::default())
+}
+
+fn finish_browser_script_run_with_prefix(
     mut run: BrowserScriptRun,
     timed_out: bool,
+    mut prefix_delta: BrowserScriptDelta,
 ) -> Result<BrowserScriptOutput> {
     if timed_out {
         let _ = run.child.kill();
@@ -1359,6 +1357,10 @@ fn finish_browser_script_run(
     let stdout = join_reader(run.stdout_reader.take());
     let stderr = join_reader(run.stderr_reader.take());
     let mut delta = drain_browser_script_delta(&mut run).unwrap_or_default();
+    if prefix_delta.has_content() {
+        prefix_delta.append(delta);
+        delta = prefix_delta;
+    }
     mark_output_seen_if_needed(&mut run, &delta);
 
     if timed_out {
@@ -1602,6 +1604,16 @@ impl BrowserScriptDelta {
             || !self.artifacts.is_empty()
             || !self.images.is_empty()
             || !self.browser_events.is_empty()
+    }
+
+    fn append(&mut self, mut next: BrowserScriptDelta) {
+        self.text.push_str(&next.text);
+        self.outputs.append(&mut next.outputs);
+        self.summary.append(&mut next.summary);
+        self.artifacts.append(&mut next.artifacts);
+        self.images.append(&mut next.images);
+        self.browser_events.append(&mut next.browser_events);
+        self.consumed_bytes = self.consumed_bytes.saturating_add(next.consumed_bytes);
     }
 }
 
@@ -11150,6 +11162,37 @@ print("bridge retry ok")
             "internal stream file leaked as artifact: {:?}",
             finished.artifacts
         );
+    }
+
+    #[test]
+    fn browser_script_observe_waits_for_completion_after_partial_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-observe-partial-then-finish";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
+        let started = start_browser_script(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\ntime.sleep(0.4)\nprint('observe chunk')\ntime.sleep(0.4)\nprint('observe done')",
+            5,
+        )
+        .unwrap();
+
+        assert!(started.ok);
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert!(
+            !started.text.contains("observe chunk"),
+            "partial output should arrive during observe, not start: {}",
+            started.text
+        );
+        let run_id = started.run_id.as_deref().unwrap();
+
+        let observed = observe_browser_script(session_id, run_id, 1_500).unwrap();
+
+        assert!(observed.ok);
+        assert_eq!(observed.status.as_deref(), Some("finished"));
+        assert!(observed.text.contains("observe chunk"), "{}", observed.text);
+        assert!(observed.text.contains("observe done"), "{}", observed.text);
     }
 
     #[test]
