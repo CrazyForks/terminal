@@ -607,7 +607,7 @@ impl TranscriptNode {
                 .flat_map(|node| node.streaming_display_lines(width))
                 .collect(),
             TranscriptKind::StreamingAssistant { markdown } => {
-                markdown_cell_lines(markdown, width, DisplayMode::Active)
+                streaming_markdown_cell_lines(markdown, width, DisplayMode::Active)
             }
             _ => Vec::new(),
         }
@@ -621,7 +621,7 @@ impl TranscriptNode {
                 .flat_map(|node| node.streaming_native_display_lines(width))
                 .collect(),
             TranscriptKind::StreamingAssistant { markdown } => {
-                native_markdown_cell_lines(markdown, width, DisplayMode::Active)
+                native_markdown_stream_lines(markdown, width, DisplayMode::Active)
             }
             _ => Vec::new(),
         }
@@ -635,12 +635,7 @@ impl TranscriptNode {
                 .flat_map(|node| node.streaming_native_commit_prefix_lines(width))
                 .collect(),
             TranscriptKind::StreamingAssistant { markdown } => {
-                let prefix = markdown_stream_commit_prefix(markdown);
-                if prefix.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    native_markdown_cell_lines(prefix, width, DisplayMode::Active)
-                }
+                native_markdown_stable_prefix_lines(markdown, width, DisplayMode::Active)
             }
             _ => Vec::new(),
         }
@@ -671,6 +666,18 @@ impl TranscriptNode {
                     || nodes
                         .iter()
                         .any(TranscriptNode::has_streaming_without_pending_status)
+            }
+            _ => false,
+        }
+    }
+
+    fn has_streaming_table_holdback(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .any(TranscriptNode::has_streaming_table_holdback),
+            TranscriptKind::StreamingAssistant { markdown } => {
+                markdown_table_holdback_state(markdown).is_some()
             }
             _ => false,
         }
@@ -901,11 +908,12 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
         return Vec::new();
     }
     let mut skip = stream_skip_lines;
+    let allow_empty_stream = active.has_streaming_table_holdback();
     let mut lines = active.active_display_lines(
         width,
         model.map(|model| model.live_phase).unwrap_or(0),
         Some(&mut skip),
-        false,
+        allow_empty_stream,
     );
     let consumed_stream_lines = stream_skip_lines > skip;
     if active.needs_leading_status_padding() && !lines.is_empty() && !consumed_stream_lines {
@@ -952,6 +960,12 @@ pub(crate) fn active_streaming_can_commit_all(model: Option<&TranscriptModel>) -
     model
         .and_then(|model| model.active.as_ref())
         .is_some_and(TranscriptNode::can_commit_full_live_stream)
+}
+
+pub(crate) fn active_streaming_has_table_holdback(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::has_streaming_table_holdback)
 }
 
 #[cfg(test)]
@@ -3765,59 +3779,145 @@ fn streaming_markdown_cell_lines(
     width: u16,
     mode: DisplayMode,
 ) -> Vec<Line<'static>> {
-    let prefix = markdown_stream_commit_prefix(markdown);
-    if prefix.trim().is_empty() {
+    let Some(holdback_start) = markdown_table_holdback_start(markdown) else {
+        return markdown_cell_lines(markdown, width, mode);
+    };
+
+    let mut lines = markdown_stream_stable_prefix_lines(markdown, holdback_start, width, mode);
+    lines.extend(raw_markdown_cell_lines(
+        &markdown[holdback_start.min(markdown.len())..],
+        width,
+    ));
+    lines
+}
+
+fn native_markdown_stream_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<NativeLine> {
+    plain_native_lines(streaming_markdown_cell_lines(markdown, width, mode))
+}
+
+fn native_markdown_stable_prefix_lines(
+    markdown: &str,
+    width: u16,
+    mode: DisplayMode,
+) -> Vec<NativeLine> {
+    let Some(holdback_start) = markdown_table_holdback_start(markdown) else {
+        return native_markdown_cell_lines(markdown, width, mode);
+    };
+
+    plain_native_lines(markdown_stream_stable_prefix_lines(
+        markdown,
+        holdback_start,
+        width,
+        mode,
+    ))
+}
+
+fn markdown_stream_stable_prefix_lines(
+    markdown: &str,
+    holdback_start: usize,
+    width: u16,
+    mode: DisplayMode,
+) -> Vec<Line<'static>> {
+    let stable_source = &markdown[..holdback_start.min(markdown.len())];
+    if stable_source.trim().is_empty() {
         Vec::new()
     } else {
-        markdown_cell_lines(prefix, width, mode)
+        markdown_cell_lines(stable_source, width, mode)
     }
 }
 
-fn markdown_stream_commit_prefix(markdown: &str) -> &str {
-    let lines = markdown_line_spans(markdown);
-    let mut idx = 0usize;
-    let mut in_fence: Option<&'static str> = None;
-
-    while idx < lines.len() {
-        let line = lines[idx].text;
-        if let Some(marker) = markdown_fence_marker(line) {
-            if in_fence == Some(marker) {
-                in_fence = None;
-            } else if in_fence.is_none() {
-                in_fence = Some(marker);
-            }
-            idx += 1;
-            continue;
-        }
-        if in_fence.is_some() {
-            idx += 1;
-            continue;
-        }
-        let next_line = lines.get(idx + 1).map(|line| line.text);
-        if is_markdown_table_header(line) && next_line.is_some_and(is_markdown_table_delimiter) {
-            let table_start = lines[idx].start;
-            let mut end = idx + 2;
-            while end < lines.len() && is_markdown_table_body_row(lines[end].text) {
-                end += 1;
-            }
-            if end >= lines.len() {
-                return markdown[..table_start].trim_end();
-            }
-            idx = end + 1;
-            continue;
-        }
-        if is_markdown_table_header(line)
-            && next_line.is_some_and(is_markdown_table_delimiter_prefix)
-        {
-            return markdown[..lines[idx].start].trim_end();
-        }
-        if is_pending_markdown_table_header(line) && next_line.is_none() {
-            return markdown[..lines[idx].start].trim_end();
-        }
-        idx += 1;
+fn raw_markdown_cell_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    let source = markdown.trim_end();
+    if source.is_empty() {
+        return Vec::new();
     }
 
-    markdown
+    let mut lines = Vec::new();
+    for raw_line in source.split('\n') {
+        let raw_line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        for (_, wrapped) in wrap_plain(raw_line, width) {
+            lines.push(Line::from(vec![Span::styled(wrapped, text_style())]));
+        }
+    }
+    lines
+}
+
+fn markdown_table_holdback_start(markdown: &str) -> Option<usize> {
+    markdown_table_holdback_state(markdown).map(|state| match state {
+        MarkdownTableHoldbackState::PendingHeader { header_start } => header_start,
+        MarkdownTableHoldbackState::Confirmed { table_start } => table_start,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownTableHoldbackState {
+    PendingHeader { header_start: usize },
+    Confirmed { table_start: usize },
+}
+
+fn markdown_table_holdback_state(markdown: &str) -> Option<MarkdownTableHoldbackState> {
+    let lines = markdown_line_spans(markdown);
+    let mut fence_tracker = MarkdownFenceTracker::new();
+    let mut previous_line: Option<PreviousMarkdownLine> = None;
+    let mut pending_header_start = None;
+
+    for line in lines {
+        let fence_kind = fence_tracker.kind();
+        let candidate = if fence_kind == MarkdownFenceKind::Other {
+            None
+        } else {
+            markdown_table_candidate_text(line.text)
+        };
+        let is_header = candidate.is_some_and(is_markdown_table_header);
+        let is_delimiter = candidate.is_some_and(is_markdown_table_delimiter);
+        let is_delimiter_prefix = candidate.is_some_and(is_markdown_table_delimiter_prefix);
+
+        if let Some(previous) = previous_line {
+            if previous.fence_kind != MarkdownFenceKind::Other
+                && fence_kind != MarkdownFenceKind::Other
+                && previous.is_header
+                && is_delimiter
+            {
+                return Some(MarkdownTableHoldbackState::Confirmed {
+                    table_start: previous.start,
+                });
+            }
+        }
+
+        if !line.text.trim().is_empty() {
+            pending_header_start = if fence_kind != MarkdownFenceKind::Other && is_header {
+                if is_delimiter_prefix {
+                    previous_line
+                        .filter(|previous| {
+                            previous.fence_kind != MarkdownFenceKind::Other && previous.is_header
+                        })
+                        .map(|previous| previous.start)
+                        .or(Some(line.start))
+                } else {
+                    Some(line.start)
+                }
+            } else {
+                None
+            };
+        }
+
+        previous_line = Some(PreviousMarkdownLine {
+            start: line.start,
+            fence_kind,
+            is_header,
+        });
+        fence_tracker.advance(line.text);
+    }
+
+    pending_header_start
+        .map(|header_start| MarkdownTableHoldbackState::PendingHeader { header_start })
+}
+
+#[derive(Clone, Copy)]
+struct PreviousMarkdownLine {
+    start: usize,
+    fence_kind: MarkdownFenceKind,
+    is_header: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3851,45 +3951,140 @@ fn markdown_line_spans(markdown: &str) -> Vec<MarkdownLineSpan<'_>> {
     spans
 }
 
-fn markdown_fence_marker(line: &str) -> Option<&'static str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("```") {
-        Some("```")
-    } else if trimmed.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownFenceKind {
+    Outside,
+    Markdown,
+    Other,
+}
+
+struct MarkdownFenceTracker {
+    state: Option<(char, usize, MarkdownFenceKind)>,
+}
+
+impl MarkdownFenceTracker {
+    fn new() -> Self {
+        Self { state: None }
     }
+
+    fn kind(&self) -> MarkdownFenceKind {
+        self.state
+            .map_or(MarkdownFenceKind::Outside, |(_, _, kind)| kind)
+    }
+
+    fn advance(&mut self, raw_line: &str) {
+        let leading_spaces = raw_line
+            .as_bytes()
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        if leading_spaces > 3 {
+            return;
+        }
+
+        let trimmed = &raw_line[leading_spaces..];
+        let fence_scan_text = strip_markdown_blockquote_prefix(trimmed);
+        let Some((marker, len)) = parse_markdown_fence_marker(fence_scan_text) else {
+            return;
+        };
+
+        if let Some((open_marker, open_len, _)) = self.state {
+            if marker == open_marker && len >= open_len && fence_scan_text[len..].trim().is_empty()
+            {
+                self.state = None;
+            }
+            return;
+        }
+
+        let kind = if is_markdown_fence_info(fence_scan_text, len) {
+            MarkdownFenceKind::Markdown
+        } else {
+            MarkdownFenceKind::Other
+        };
+        self.state = Some((marker, len, kind));
+    }
+}
+
+fn parse_markdown_fence_marker(line: &str) -> Option<(char, usize)> {
+    let first = line.as_bytes().first().copied()?;
+    if first != b'`' && first != b'~' {
+        return None;
+    }
+    let len = line.bytes().take_while(|byte| *byte == first).count();
+    (len >= 3).then_some((first as char, len))
+}
+
+fn is_markdown_fence_info(trimmed_line: &str, marker_len: usize) -> bool {
+    let info = trimmed_line[marker_len..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    info.eq_ignore_ascii_case("md") || info.eq_ignore_ascii_case("markdown")
+}
+
+fn markdown_table_candidate_text(line: &str) -> Option<&str> {
+    let stripped = strip_markdown_blockquote_prefix(line).trim();
+    parse_markdown_table_segments(stripped).map(|_| stripped)
+}
+
+fn strip_markdown_blockquote_prefix(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    loop {
+        let Some(stripped) = rest.strip_prefix('>') else {
+            return rest;
+        };
+        rest = stripped.strip_prefix(' ').unwrap_or(stripped).trim_start();
+    }
+}
+
+fn parse_markdown_table_segments(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let has_outer_pipe = trimmed.starts_with('|') || trimmed.ends_with('|');
+    let content = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let content = content.strip_suffix('|').unwrap_or(content);
+    let raw_segments = split_unescaped_markdown_pipe(content);
+    if !has_outer_pipe && raw_segments.len() <= 1 {
+        return None;
+    }
+
+    let segments: Vec<&str> = raw_segments.into_iter().map(str::trim).collect();
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn split_unescaped_markdown_pipe(content: &str) -> Vec<&str> {
+    let mut segments = Vec::with_capacity(8);
+    let mut start = 0;
+    let bytes = content.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\\' {
+            idx += 2;
+        } else if bytes[idx] == b'|' {
+            segments.push(&content[start..idx]);
+            start = idx + 1;
+            idx += 1;
+        } else {
+            idx += 1;
+        }
+    }
+    segments.push(&content[start..]);
+    segments
 }
 
 fn is_markdown_table_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.is_empty() && trimmed.contains('|') && !is_markdown_table_delimiter(trimmed)
-}
-
-fn is_pending_markdown_table_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with('|')
-        && trimmed.ends_with('|')
-        && trimmed.matches('|').count() >= 2
-        && is_markdown_table_header(trimmed)
-}
-
-fn is_markdown_table_body_row(line: &str) -> bool {
-    let trimmed = line.trim();
-    !trimmed.is_empty() && trimmed.contains('|')
+    parse_markdown_table_segments(line)
+        .is_some_and(|segments| segments.iter().any(|segment| !segment.trim().is_empty()))
 }
 
 fn is_markdown_table_delimiter(line: &str) -> bool {
-    let trimmed = line.trim().trim_matches('|').trim();
-    if trimmed.is_empty() || !trimmed.contains('-') {
-        return false;
-    }
-    trimmed.split('|').all(|cell| {
-        let cell = cell.trim();
-        let inner = cell.strip_prefix(':').unwrap_or(cell);
-        let inner = inner.strip_suffix(':').unwrap_or(inner);
-        inner.len() >= 3 && inner.chars().all(|ch| ch == '-')
+    parse_markdown_table_segments(line).is_some_and(|segments| {
+        segments
+            .into_iter()
+            .all(is_markdown_table_delimiter_segment)
     })
 }
 
@@ -3900,6 +4095,16 @@ fn is_markdown_table_delimiter_prefix(line: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch == '|' || ch == ':' || ch == '-' || ch.is_whitespace())
+}
+
+fn is_markdown_table_delimiter_segment(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let inner = trimmed.strip_prefix(':').unwrap_or(trimmed);
+    let inner = inner.strip_suffix(':').unwrap_or(inner);
+    inner.len() >= 3 && inner.chars().all(|ch| ch == '-')
 }
 
 fn notice_lines(text: &str, width: u16) -> Vec<Line<'static>> {
@@ -5909,7 +6114,7 @@ mod tests {
     #[test]
     fn streaming_table_waits_for_block_boundary_before_native_commit() {
         let model =
-            streaming_model_for("Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |");
+            streaming_model_for("Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n");
 
         let full_text = native_lines_text(&active_streaming_native_lines(Some(&model), 80));
         assert!(full_text.contains("Name"), "{full_text}");
@@ -5940,23 +6145,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_streaming_table_header_is_hidden_from_active_viewport() {
-        let model = streaming_model_for("Rendered:\n\n| ID | Name | Role |");
-
-        let active_text = active_viewport_lines(Some(&model), 80, 20)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(active_text.contains("Rendered:"), "{active_text}");
-        assert!(
-            !active_text.contains("| ID | Name | Role |"),
-            "{active_text}"
-        );
-    }
-
-    #[test]
     fn streaming_table_header_waits_while_delimiter_is_partial() {
         let model = streaming_model_for("Intro.\n\n| Name | Count |\n| --");
 
@@ -5969,9 +6157,9 @@ mod tests {
     }
 
     #[test]
-    fn closed_streaming_table_can_commit_before_following_live_tail() {
+    fn confirmed_streaming_table_stays_mutable_before_following_live_tail() {
         let model = streaming_model_for(
-            "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph",
+            "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph\n",
         );
 
         let commit_text = native_lines_text(&active_streaming_native_commit_prefix_lines(
@@ -5979,9 +6167,9 @@ mod tests {
             80,
         ));
         assert!(commit_text.contains("Intro."), "{commit_text}");
-        assert!(commit_text.contains("Name"), "{commit_text}");
-        assert!(commit_text.contains("Apples"), "{commit_text}");
-        assert!(commit_text.contains("Next paragraph"), "{commit_text}");
+        assert!(!commit_text.contains("Name"), "{commit_text}");
+        assert!(!commit_text.contains("Apples"), "{commit_text}");
+        assert!(!commit_text.contains("Next paragraph"), "{commit_text}");
         assert!(!commit_text.contains("| Name | Count |"), "{commit_text}");
     }
 

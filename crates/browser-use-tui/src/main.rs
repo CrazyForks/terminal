@@ -8747,14 +8747,12 @@ fn desired_terminal_viewport_height_for(
         .unwrap_or(0);
     let active_lines = transcript::with_transcript_model(app, &state, |model| {
         let active_streaming_lines = transcript::active_streaming_lines(Some(model), body_width);
+        let commit_prefix_len =
+            transcript::active_streaming_native_commit_prefix_lines(Some(model), body_width)
+                .len()
+                .min(active_streaming_lines.len());
         let estimated_stream_skip_lines =
-            if transcript::active_streaming_can_commit_all(Some(model))
-                && active_streaming_lines.len() > 1
-            {
-                active_streaming_lines.len()
-            } else {
-                active_streaming_lines.len().saturating_sub(1)
-            };
+            native_live_stream_emit_count(model, active_streaming_lines.len(), commit_prefix_len);
         let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
         transcript::active_viewport_lines_with_stream_skip(
             Some(model),
@@ -9320,13 +9318,7 @@ fn native_live_stream_plan(
     let commit_prefix_lines =
         transcript::active_streaming_native_commit_prefix_lines(Some(model), width);
     let commit_prefix_len = commit_prefix_lines.len().min(lines.len());
-    let emit_count = if commit_prefix_len < lines.len()
-        || (transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1)
-    {
-        commit_prefix_len
-    } else {
-        commit_prefix_len.saturating_sub(1)
-    };
+    let emit_count = native_live_stream_emit_count(model, lines.len(), commit_prefix_len);
     if emit_count == 0 {
         return NativeLiveStreamPlan {
             clear_live_stream: true,
@@ -9358,6 +9350,21 @@ fn native_live_stream_plan(
         emit_count,
         lines: emitted_lines,
         emitted_text_lines,
+    }
+}
+
+fn native_live_stream_emit_count(
+    model: &transcript::TranscriptModel,
+    stream_len: usize,
+    commit_prefix_len: usize,
+) -> usize {
+    if commit_prefix_len < stream_len
+        || transcript::active_streaming_has_table_holdback(Some(model))
+        || (transcript::active_streaming_can_commit_all(Some(model)) && stream_len > 1)
+    {
+        commit_prefix_len
+    } else {
+        commit_prefix_len.saturating_sub(1)
     }
 }
 
@@ -14640,7 +14647,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn native_live_stream_plan_emits_closed_table_before_live_tail() -> Result<()> {
+    fn native_live_stream_plan_defers_confirmed_table_until_final() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14657,7 +14664,7 @@ wire_api = "responses"
         app.store.append_event(
             &session.id,
             "model.stream_delta",
-            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph"}),
+            serde_json::json!({"text": "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph\n"}),
         )?;
         app.selected_session_id = Some(session.id);
         app.drain_store_notifications()?;
@@ -14668,8 +14675,8 @@ wire_api = "responses"
         let emitted = plain_text_lines(&plan.lines).join("\n");
 
         assert!(emitted.contains("Intro."), "{emitted}");
-        assert!(emitted.contains("Name"), "{emitted}");
-        assert!(emitted.contains("Apples"), "{emitted}");
+        assert!(!emitted.contains("Name"), "{emitted}");
+        assert!(!emitted.contains("Apples"), "{emitted}");
         assert!(!emitted.contains("| Name | Count |"), "{emitted}");
         assert!(!emitted.contains("Next paragraph"), "{emitted}");
         Ok(())
