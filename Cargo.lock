@@ -288,8 +288,10 @@ dependencies = [
 name = "browser-use-llm"
 version = "0.1.2"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
+ "image",
  "reqwest",
  "serde",
  "serde_json",
