@@ -87,6 +87,9 @@ const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
+const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
+const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -3913,6 +3916,7 @@ fn sdk_server_stdio() -> Result<()> {
         .spawn(move || -> Result<()> {
             let mut stdout = io::BufWriter::new(io::stdout().lock());
             for response in response_rx {
+                let response = sdk_transport_frame_value(&response);
                 writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
                 stdout.flush()?;
             }
@@ -4045,10 +4049,11 @@ fn sdk_server_stdio() -> Result<()> {
 }
 
 fn handle_sdk_json_rpc_line(context: &SdkServerContext, line: &str) -> Value {
-    match serde_json::from_str::<JsonRpcRequest>(line) {
+    let response = match serde_json::from_str::<JsonRpcRequest>(line) {
         Ok(request) => handle_sdk_json_rpc_request(context, request),
         Err(error) => json_rpc_error(None, -32700, format!("Parse error: {error}")),
-    }
+    };
+    sdk_transport_frame_value(&response)
 }
 
 fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcRequest) -> Value {
@@ -4307,6 +4312,275 @@ fn sdk_transport_event_value(event: &browser_use_protocol::EventRecord) -> Value
         "event_type": event.event_type,
         "payload": sdk_transport_value(&event.payload),
     })
+}
+
+fn sdk_transport_frame_value(value: &Value) -> Value {
+    let mut frame = sdk_transport_value(value);
+    if sdk_json_value_len(&frame) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+        return frame;
+    }
+
+    sdk_compact_final_projected_snapshot(&mut frame);
+    let mut tail_count = SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT;
+    loop {
+        sdk_compact_response_history_events(&mut frame, tail_count);
+        if sdk_json_value_len(&frame) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+            return frame;
+        }
+        if tail_count == 0 {
+            break;
+        }
+        tail_count /= 2;
+    }
+
+    let emergency = sdk_emergency_compact_json_rpc_frame(&frame);
+    if sdk_json_value_len(&emergency) <= SDK_JSON_RPC_FRAME_LIMIT_BYTES {
+        return emergency;
+    }
+    sdk_minimal_json_rpc_frame(&frame)
+}
+
+fn sdk_json_value_len(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn sdk_compact_response_history_events(frame: &mut Value, tail_count: usize) -> bool {
+    let Some(history) = frame
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("history"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(events) = history.get_mut("events").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let original_len = events.len();
+    let head_count = if tail_count == 0 {
+        0
+    } else {
+        SDK_HISTORY_EVENTS_HEAD_COUNT.min(original_len)
+    };
+    let tail_count = tail_count.min(original_len.saturating_sub(head_count));
+    if original_len <= head_count + tail_count + 1 {
+        return false;
+    }
+
+    let omitted = original_len.saturating_sub(head_count + tail_count);
+    let mut compacted = Vec::with_capacity(head_count + tail_count + 1);
+    compacted.extend(events.iter().take(head_count).cloned());
+    compacted.push(serde_json::json!({
+        "event_type": "sdk.transport.truncated",
+        "payload": {
+            "omitted_events": omitted,
+            "reason": "SDK JSON-RPC frame exceeded transport limit",
+            "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+        },
+    }));
+    if tail_count > 0 {
+        compacted.extend(events.iter().skip(original_len - tail_count).cloned());
+    }
+    *events = compacted;
+    history.insert(
+        "events_truncated_for_sdk_transport".to_string(),
+        Value::Bool(true),
+    );
+    history.insert(
+        "events_omitted_for_sdk_transport".to_string(),
+        Value::Number(serde_json::Number::from(omitted)),
+    );
+    true
+}
+
+fn sdk_compact_final_projected_snapshot(frame: &mut Value) -> bool {
+    let Some(projected) = frame
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .and_then(|result| result.get_mut("final_projected_event"))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    if !projected.contains_key("snapshot") {
+        return false;
+    }
+    projected.insert(
+        "snapshot".to_string(),
+        serde_json::json!({
+            "truncated_for_sdk_transport": true,
+            "reason": "SDK JSON-RPC frame exceeded transport limit",
+        }),
+    );
+    true
+}
+
+fn sdk_emergency_compact_json_rpc_frame(frame: &Value) -> Value {
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "jsonrpc".to_string(),
+        frame
+            .get("jsonrpc")
+            .cloned()
+            .unwrap_or_else(|| Value::String("2.0".to_string())),
+    );
+    if let Some(id) = frame.get("id") {
+        output.insert("id".to_string(), id.clone());
+    }
+    if let Some(method) = frame.get("method") {
+        output.insert("method".to_string(), method.clone());
+        output.insert(
+            "params".to_string(),
+            sdk_emergency_compact_notification_params(frame.get("params")),
+        );
+        return sdk_transport_value(&Value::Object(output));
+    }
+    if let Some(error) = frame.get("error") {
+        output.insert("error".to_string(), sdk_transport_value(error));
+        return sdk_transport_value(&Value::Object(output));
+    }
+    output.insert(
+        "result".to_string(),
+        sdk_emergency_compact_result(frame.get("result")),
+    );
+    sdk_transport_value(&Value::Object(output))
+}
+
+fn sdk_emergency_compact_notification_params(params: Option<&Value>) -> Value {
+    let Some(params) = params.and_then(Value::as_object) else {
+        return serde_json::json!({
+            "transport_truncated": true,
+            "reason": "SDK JSON-RPC notification exceeded transport limit",
+        });
+    };
+    let mut output = serde_json::Map::new();
+    for key in ["run_id", "session_id", "agent_id"] {
+        if let Some(value) = params.get(key) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(event) = params.get("event").and_then(Value::as_object) {
+        let mut compact_event = serde_json::Map::new();
+        for key in ["seq", "id", "event_type", "kind"] {
+            if let Some(value) = event.get(key) {
+                compact_event.insert(key.to_string(), value.clone());
+            }
+        }
+        compact_event.insert(
+            "payload".to_string(),
+            serde_json::json!({
+                "truncated_for_sdk_transport": true,
+                "reason": "SDK JSON-RPC notification exceeded transport limit",
+            }),
+        );
+        output.insert("event".to_string(), Value::Object(compact_event));
+    }
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_emergency_compact_result(result: Option<&Value>) -> Value {
+    let Some(result) = result.and_then(Value::as_object) else {
+        return serde_json::json!({
+            "transport_truncated": true,
+            "reason": "SDK JSON-RPC result exceeded transport limit",
+        });
+    };
+    let mut output = serde_json::Map::new();
+    for key in ["agent_id", "session_id", "browser_id"] {
+        if let Some(value) = result.get(key) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(history) = result.get("history").and_then(Value::as_object) {
+        output.insert(
+            "history".to_string(),
+            sdk_emergency_compact_history(history),
+        );
+    }
+    if let Some(projected) = result
+        .get("final_projected_event")
+        .and_then(Value::as_object)
+    {
+        let mut compact_projected = serde_json::Map::new();
+        for key in ["source_event_id", "kind", "session_id", "payload"] {
+            if let Some(value) = projected.get(key) {
+                compact_projected.insert(key.to_string(), sdk_transport_value(value));
+            }
+        }
+        compact_projected.insert("transport_truncated".to_string(), Value::Bool(true));
+        output.insert(
+            "final_projected_event".to_string(),
+            Value::Object(compact_projected),
+        );
+    }
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_emergency_compact_history(history: &serde_json::Map<String, Value>) -> Value {
+    let mut output = serde_json::Map::new();
+    for key in ["output", "success", "done", "errors", "usage", "files"] {
+        if let Some(value) = history.get(key) {
+            output.insert(key.to_string(), sdk_transport_value(value));
+        }
+    }
+    let tail_events = history
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| {
+            events
+                .iter()
+                .rev()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut events = Vec::with_capacity(tail_events.len() + 1);
+    events.push(serde_json::json!({
+        "event_type": "sdk.transport.truncated",
+        "payload": {
+            "reason": "SDK JSON-RPC result exceeded transport limit",
+            "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+        },
+    }));
+    events.extend(tail_events);
+    output.insert("events".to_string(), Value::Array(events));
+    output.insert("transport_truncated".to_string(), Value::Bool(true));
+    Value::Object(output)
+}
+
+fn sdk_minimal_json_rpc_frame(frame: &Value) -> Value {
+    let mut output = serde_json::Map::new();
+    output.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    if let Some(id) = frame.get("id") {
+        output.insert("id".to_string(), id.clone());
+    }
+    output.insert(
+        "result".to_string(),
+        serde_json::json!({
+            "transport_truncated": true,
+            "history": {
+                "success": false,
+                "done": true,
+                "errors": ["SDK JSON-RPC result exceeded transport limit"],
+                "events": [{
+                    "event_type": "sdk.transport.truncated",
+                    "payload": {
+                        "reason": "SDK JSON-RPC result exceeded transport limit",
+                        "frame_limit_bytes": SDK_JSON_RPC_FRAME_LIMIT_BYTES,
+                    }
+                }],
+            },
+        }),
+    );
+    Value::Object(output)
 }
 
 fn sdk_transport_value(value: &Value) -> Value {
@@ -7891,6 +8165,60 @@ command = "test-mcp"
         assert!(text.contains("truncated"));
         assert!(text.contains("SDK transport"));
         assert_eq!(value["event_type"], "tool.output");
+    }
+
+    #[test]
+    fn sdk_transport_frame_value_caps_oversized_history_response() {
+        let large_text = "x".repeat(SDK_EVENT_STRING_LIMIT_BYTES);
+        let events = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "seq": index,
+                    "id": format!("event-{index}"),
+                    "event_type": "tool.output",
+                    "payload": {
+                        "text": large_text.clone(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "agent_id": "agent-1",
+                "session_id": "session-1",
+                "history": {
+                    "output": "final answer",
+                    "success": true,
+                    "done": true,
+                    "errors": [],
+                    "events": events,
+                    "usage": null,
+                    "files": [],
+                },
+                "final_projected_event": {
+                    "kind": "turn_completed",
+                    "snapshot": {
+                        "huge": "y".repeat(SDK_EVENT_STRING_LIMIT_BYTES),
+                    },
+                },
+            },
+        });
+
+        let bounded = sdk_transport_frame_value(&response);
+        let serialized = serde_json::to_string(&bounded).expect("bounded response serializes");
+
+        assert!(serialized.len() <= SDK_JSON_RPC_FRAME_LIMIT_BYTES);
+        assert_eq!(bounded["result"]["history"]["output"], "final answer");
+        assert_eq!(
+            bounded["result"]["history"]["events"][0]["event_type"],
+            "sdk.transport.truncated"
+        );
+        assert_eq!(
+            bounded["result"]["final_projected_event"]["snapshot"]["truncated_for_sdk_transport"],
+            true
+        );
     }
 
     #[test]
