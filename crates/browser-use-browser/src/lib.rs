@@ -10636,6 +10636,65 @@ print("browser_fetch single structured error ok")
     }
 
     #[test]
+    fn browser_script_bridge_retries_transient_busy_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-bridge-retry-busy",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+attempts = {"n": 0}
+
+class FakeSock:
+    def __init__(self, payload):
+        self.payload = bytearray(payload)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def sendall(self, data):
+        pass
+
+    def recv(self, n):
+        if not self.payload:
+            return b""
+        chunk = self.payload[:n]
+        del self.payload[:n]
+        return bytes(chunk)
+
+original_create_connection = socket.create_connection
+
+def fake_create_connection(*args, **kwargs):
+    attempts["n"] += 1
+    if attempts["n"] < 3:
+        return FakeSock(b'{"ok":false,"error":"browser is not connected or is busy; run `browser status --json`"}\n')
+    return FakeSock(b'{"ok":true,"result":{"targetInfos":[]}}\n')
+
+socket.create_connection = fake_create_connection
+try:
+    result = cdp("Target.getTargets")
+finally:
+    socket.create_connection = original_create_connection
+
+assert result == {"targetInfos": []}, result
+assert attempts["n"] == 3, attempts
+print("bridge retry ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("bridge retry ok"));
+        assert!(output
+            .text
+            .contains("browser_script bridge retry 2/4 after transient error"));
+    }
+
+    #[test]
     fn browser_script_timeout_returns_tool_failure() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

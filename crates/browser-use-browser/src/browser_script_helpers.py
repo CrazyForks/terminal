@@ -12,6 +12,7 @@ import math
 import os
 import pathlib
 import sys
+import threading
 import time as _time
 import urllib.error
 import urllib.request
@@ -24,13 +25,50 @@ PROFILE_MARKER = "browser-use-profile-target"
 __last_domain_skills = []
 
 
+_bridge_call_lock = threading.RLock()
+_TRANSIENT_BRIDGE_ERRORS = (
+    "browser is not connected or is busy",
+    "browser session is busy",
+    "browser bridge closed before response",
+    "cdp runtime.evaluate timed out",
+    "runtime.evaluate timed out",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_bridge_error(exc):
+    message = str(exc).lower()
+    return any(part in message for part in _TRANSIENT_BRIDGE_ERRORS)
+
+
+def _bridge_with_retry(payload, *, attempts=4):
+    delay = 0.25
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            with _bridge_call_lock:
+                return _bridge(payload)
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            last_exc = exc
+            if attempt + 1 >= attempts or not _is_transient_bridge_error(exc):
+                raise
+            print(
+                f"browser_script bridge retry {attempt + 2}/{attempts} after transient error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            _time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+    raise last_exc
+
+
 def _send_meta(meta, **params):
-    return _bridge({"kind": "meta", "meta": meta, **params})
+    return _bridge_with_retry({"kind": "meta", "meta": meta, **params})
 
 
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
-    return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
+    return _bridge_with_retry({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
 def cdp_batch(calls):
