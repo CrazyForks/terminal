@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use super::search::{
     classify_response, extract_real_url, format_results, normalize_whitespace, parse_lite_results,
-    SearchBackend, SearchError, SearchRequest, SearchResult, SearchTool, SEARCH_TOOL_NAME,
+    SearchBackend, SearchError, SearchRequest, SearchResult, SearchTool, SEARCH_PARALLEL_SAFE,
+    SEARCH_TOOL_NAME,
 };
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -461,9 +462,13 @@ fn approval_accessors() {
 }
 
 #[test]
-fn search_is_parallel_safe() {
+fn search_is_serial_to_avoid_rate_limit_blocks() {
     let tool = SearchTool::with_backend(Arc::new(HtmlBackend(String::new())));
-    assert!(tool.parallel_safe(&SearchRequest::new("rust")));
+    assert_eq!(
+        tool.parallel_safe(&SearchRequest::new("rust")),
+        SEARCH_PARALLEL_SAFE
+    );
+    assert!(!SEARCH_PARALLEL_SAFE);
 }
 
 #[test]

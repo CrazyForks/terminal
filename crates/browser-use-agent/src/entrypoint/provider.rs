@@ -1209,7 +1209,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
-    use crate::tools::handlers::search::{SearchRequest, SearchTool};
+    use crate::tools::handlers::search::{SearchRequest, SearchTool, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
         WriteStdinTool,
@@ -1296,8 +1296,13 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     );
     // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
     // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Read-only, so parallel_safe = true.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    // `web_search` above). Serial to avoid DuckDuckGo Lite rate-limit blocks.
+    reg.register::<_, SearchRequest>(
+        "search",
+        definitions::search(),
+        SEARCH_PARALLEL_SAFE,
+        SearchTool::new(),
+    );
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
         runtime_handle.as_ref(),

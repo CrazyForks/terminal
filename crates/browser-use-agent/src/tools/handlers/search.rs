@@ -54,6 +54,12 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// The tool name surfaced to the model.
 pub const SEARCH_TOOL_NAME: &str = "search";
 
+/// Whether search calls may run concurrently with other parallel-safe tools.
+///
+/// Keep DuckDuckGo Lite requests serial: concurrent searches from the same
+/// client are more likely to trigger rate limits or challenge pages.
+pub const SEARCH_PARALLEL_SAFE: bool = false;
+
 /// The DuckDuckGo Lite search endpoint the real backend fetches.
 const DDG_LITE_BASE_URL: &str = "https://lite.duckduckgo.com/lite/";
 
@@ -306,10 +312,7 @@ impl Sandboxable for SearchTool {
 #[async_trait::async_trait]
 impl ToolRuntime<SearchRequest, ExecOutput> for SearchTool {
     fn parallel_safe(&self, _req: &SearchRequest) -> bool {
-        // A read-only HTTP GET + pure parse mutates no shared state, so it is safe
-        // to run concurrently with other tools — matching the parallel-safe
-        // stance of `tool_search` / `web_search`.
-        true
+        SEARCH_PARALLEL_SAFE
     }
 
     async fn run(

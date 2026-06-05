@@ -28,7 +28,9 @@ use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
 use crate::tools::handlers::python::{PythonBackend, PythonRequest, PythonTool};
-use crate::tools::handlers::search::{SearchBackend, SearchError, SearchTool};
+use crate::tools::handlers::search::{
+    SearchBackend, SearchError, SearchTool, SEARCH_PARALLEL_SAFE,
+};
 use crate::tools::handlers::shell::{ShellRequest, ShellTool};
 use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
 use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
@@ -577,12 +579,34 @@ fn default_registry_registers_all_tools() {
 }
 
 #[test]
+fn search_definition_guides_model_away_from_browser_search_engines() {
+    let desc = definitions::search().description;
+    assert!(
+        desc.contains("local DuckDuckGo Lite request"),
+        "search description should explain the local search backend: {desc}"
+    );
+    assert!(
+        desc.contains("does not use or require a browser connection or browser session"),
+        "search description should make clear no browser connection is needed: {desc}"
+    );
+    assert!(
+        desc.contains("instead of navigating a browser"),
+        "search description should prefer this tool over browser search-engine navigation: {desc}"
+    );
+    assert!(
+        desc.contains("token-efficient"),
+        "search description should call out the token-efficiency reason: {desc}"
+    );
+}
+
+#[test]
 fn parallel_safe_flags_match_registration() {
     let reg = full_registry();
     // Pure / read-only tools are parallel-safe.
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
-    assert_eq!(reg.parallel_safe("search"), Some(true));
+    assert_eq!(reg.parallel_safe("search"), Some(SEARCH_PARALLEL_SAFE));
+    assert!(!SEARCH_PARALLEL_SAFE);
     // Everything else is serial.
     for name in [
         "shell",
@@ -591,6 +615,7 @@ fn parallel_safe_flags_match_registration() {
         "browser",
         "python",
         "mcp",
+        "search",
         "update_plan",
         "done",
     ] {
