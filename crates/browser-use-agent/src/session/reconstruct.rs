@@ -1496,6 +1496,9 @@ fn tool_output_event_text(payload: &Value) -> String {
             return text;
         }
     }
+    if let Some(text) = browser_script_running_tool_text(payload) {
+        return text;
+    }
     let mut parts = Vec::new();
     for key in ["summary", "data", "outputs"] {
         let Some(value) = payload.get(key) else {
@@ -1507,6 +1510,28 @@ fn tool_output_event_text(payload: &Value) -> String {
         parts.push(format!("{key}: {}", value_to_tool_output_text(value)));
     }
     parts.join("\n")
+}
+
+fn browser_script_running_tool_text(payload: &Value) -> Option<String> {
+    let name = payload.get("name").and_then(Value::as_str)?;
+    if name != "browser_script" {
+        return None;
+    }
+    if payload.get("status").and_then(Value::as_str) != Some("running") {
+        return None;
+    }
+    let mut parts = vec!["browser_script is still running.".to_string()];
+    if let Some(run_id) = payload.get("run_id").and_then(Value::as_str) {
+        parts.push(format!("run_id: {run_id}"));
+        let observe_ms = payload
+            .get("next_observe_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_000);
+        parts.push(format!(
+            "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={observe_ms}."
+        ));
+    }
+    Some(parts.join("\n"))
 }
 
 fn synthetic_tool_result_text(name: &str) -> String {
