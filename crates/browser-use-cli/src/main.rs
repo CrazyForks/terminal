@@ -4279,6 +4279,9 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     )?;
 
     let events = context.runtime.events_for_session(&session_id)?;
+    let child_events = sdk_child_events_for_session(context, &session_id)?;
+    let mut usage_events = events.clone();
+    usage_events.extend(child_events.iter().cloned());
     let output = session_result_from_events(&events);
     let error = failure_from_events(&events);
     let final_projected_event = sdk_final_projected_event(
@@ -4293,6 +4296,14 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         .iter()
         .map(sdk_transport_event_value)
         .collect::<Vec<_>>();
+    let child_event_values = child_events
+        .iter()
+        .map(sdk_transport_event_value)
+        .collect::<Vec<_>>();
+    let usage_event_values = usage_events
+        .iter()
+        .map(sdk_transport_event_value)
+        .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "agent_id": agent_id.as_str(),
         "session_id": session_id.as_str(),
@@ -4303,17 +4314,48 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
             "done": true,
             "errors": error.into_iter().collect::<Vec<_>>(),
             "events": event_values,
-            "usage": sdk_usage_from_events(&events),
-            "files": sdk_files_from_events(&events),
+            "child_events": child_event_values,
+            "usage_events": usage_event_values,
+            "usage": sdk_usage_from_events(&usage_events),
+            "files": sdk_files_from_events(&usage_events),
         },
         "final_projected_event": final_projected_event,
     }))
+}
+
+fn sdk_child_events_for_session(
+    context: &SdkServerContext,
+    session_id: &SessionId,
+) -> Result<Vec<browser_use_protocol::EventRecord>> {
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut events = Vec::new();
+    sdk_collect_child_events(&store, session_id.as_str(), &mut seen, &mut events)?;
+    Ok(events)
+}
+
+fn sdk_collect_child_events(
+    store: &Store,
+    parent_session_id: &str,
+    seen: &mut std::collections::BTreeSet<String>,
+    events: &mut Vec<browser_use_protocol::EventRecord>,
+) -> Result<()> {
+    for child in store.list_child_agents(parent_session_id)? {
+        if !seen.insert(child.child_session_id.clone()) {
+            continue;
+        }
+        events.extend(store.events_for_session(&child.child_session_id)?);
+        sdk_collect_child_events(store, &child.child_session_id, seen, events)?;
+    }
+    Ok(())
 }
 
 fn sdk_transport_event_value(event: &browser_use_protocol::EventRecord) -> Value {
     serde_json::json!({
         "seq": event.seq,
         "id": event.id,
+        "session_id": event.session_id,
+        "ts_ms": event.ts_ms,
         "event_type": event.event_type,
         "payload": sdk_transport_value(&event.payload),
     })
@@ -8104,6 +8146,85 @@ command = "test-mcp"
             browser_use_runtime::BrowserStatus::Released
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_returns_child_usage_events_separately() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let agent = handle_sdk_json_rpc_line(
+            &context,
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"task":"inspect","cwd":"/tmp"}}"#,
+        );
+        let agent_id = agent["result"]["agent_id"].as_str().context("agent id")?;
+        let session_id = agent["result"]
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session id")?;
+        let child = {
+            let store = context.store.lock().expect("sdk store mutex poisoned");
+            let child = store.create_child_session(
+                session_id,
+                "/tmp",
+                Some("/root/research"),
+                None,
+                None,
+            )?;
+            store.append_event(
+                &child.id,
+                "token_count",
+                serde_json::json!({
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "total_tokens": 6
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 4,
+                            "output_tokens": 2,
+                            "total_tokens": 6
+                        }
+                    }
+                }),
+            )?;
+            child
+        };
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "agent.run",
+            "params": {
+                "agent_id": agent_id,
+                "max_steps": 2,
+                "llm": {"provider": "fake", "model": "fake"}
+            }
+        });
+
+        let result = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert_eq!(result["result"]["history"]["success"], true);
+        let events = result["result"]["history"]["events"]
+            .as_array()
+            .context("parent events")?;
+        assert!(events
+            .iter()
+            .all(|event| event["session_id"].as_str() == Some(session_id)));
+        let child_events = result["result"]["history"]["child_events"]
+            .as_array()
+            .context("child events")?;
+        assert!(child_events.iter().any(|event| {
+            event["session_id"].as_str() == Some(child.id.as_str())
+                && event["event_type"] == "token_count"
+        }));
+        let usage_events = result["result"]["history"]["usage_events"]
+            .as_array()
+            .context("usage events")?;
+        assert!(usage_events.iter().any(|event| {
+            event["session_id"].as_str() == Some(child.id.as_str())
+                && event["event_type"] == "token_count"
+        }));
+        assert_eq!(result["result"]["history"]["usage"]["total_tokens"], 6);
         Ok(())
     }
 
