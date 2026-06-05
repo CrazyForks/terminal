@@ -839,9 +839,10 @@ async fn search_dispatches_to_the_fake_backend() {
         .expect("search should dispatch");
     assert_eq!(out.exit_code, 0);
     // The fake backend's canned HTML yields one result whose title echoes the
-    // query, its unwrapped destination URL, and the snippet.
+    // query (truncated to 15 chars in the output), its unwrapped destination
+    // URL (kept intact), and the snippet.
     assert!(
-        out.stdout.contains("Result for rust lang"),
+        out.stdout.contains("Result for rus…"),
         "search stdout: {:?}",
         out.stdout
     );
