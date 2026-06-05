@@ -41,7 +41,14 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   request construction. This covers the live Rust model-transport path that
   bypasses provider JSON normalization and previously still hit
   `messages.*.content.*.image.source.base64.data` 2000px rejections.
+- [x] The Python `browser_use.rust.Agent` wrapper now pre-navigates CDP-backed
+  browser sessions by default before starting the Rust SDK run, while retaining
+  `BROWSER_USE_RUST_DIRECT_INITIAL_NAVIGATION=0` as an opt-out. This means
+  Browser Use Cloud CDP evals start Rust on the already-loaded task URL and pass
+  a "continue from current page" task context instead of making the model spend
+  its first turns repeatedly calling `navigate`/browser-status recovery.
 - Proof:
+  - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session'`
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-providers anthropic_messages_downsamples_oversized_tool_images -- --nocapture`
   - `cargo test -p browser-use-providers anthropic_messages -- --nocapture`
