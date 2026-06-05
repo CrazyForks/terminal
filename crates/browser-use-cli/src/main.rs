@@ -4359,10 +4359,7 @@ fn sdk_run_agent_with_runtime(
         request = request.with_initial_input(initial_input);
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .context("build sdk run runtime")?;
+    let rt = build_sdk_run_runtime()?;
     rt.block_on(async move {
         runtime
             .run_agent(request, async move {
@@ -4380,6 +4377,15 @@ fn sdk_run_agent_with_runtime(
             .await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+fn build_sdk_run_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("browser-use-sdk-run")
+        .build()
+        .context("build sdk run runtime")
 }
 
 fn sdk_initial_input_from_events(
@@ -7511,6 +7517,23 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_run_runtime_supports_model_transport_blocking_bridge() -> Result<()> {
+        let rt = build_sdk_run_runtime()?;
+
+        let value = rt.block_on(async {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    7
+                })
+            })
+        });
+
+        assert_eq!(value, 7);
         Ok(())
     }
 
