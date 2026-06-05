@@ -756,7 +756,57 @@ fn dispatch_browser_preference_command_for_mode(
                 selected_browser_mode,
             )?))
         }
+        "secrets" | "secret" => Ok(Some(dispatch_secrets_command(store, &args)?)),
+        "domains" | "domain" => Ok(Some(dispatch_domains_command(store, &args)?)),
         _ => Ok(None),
+    }
+}
+
+/// Model-facing `browser secrets …`. Read-only: the agent can discover which
+/// placeholders exist (so it can call `secret("name")`), but setting/removing a
+/// secret carries a value and must be done by the human via the CLI/TUI so the
+/// value never enters the model context.
+fn dispatch_secrets_command(store: &Store, args: &[String]) -> anyhow::Result<Value> {
+    use super::secrets_admin as sa;
+    match args.get(1).map(String::as_str) {
+        None | Some("list") | Some("--json") | Some("show") => {
+            let secrets = sa::list_secrets(store)?
+                .into_iter()
+                .map(|meta| {
+                    json!({
+                        "domain": meta.domain,
+                        "name": meta.placeholder,
+                        "kind": meta.kind.as_str(),
+                        "allowed_domains": meta.allowed_domains,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "status": "ok", "secrets": secrets }))
+        }
+        Some("set" | "add" | "remove" | "rm" | "delete") => bail!(
+            "Secrets must be set or removed by the user so the value never enters the agent's \
+             context. Ask the user to run `browser-use-terminal secrets set --domain <domain> \
+             --name <name>` (add `--totp` for 2FA), or `secrets remove --domain <domain> \
+             --name <name>`."
+        ),
+        Some(other) => bail!("unknown browser secrets command: {other}"),
+    }
+}
+
+/// Model-facing `browser domains …`. Read-only for the same reason the
+/// navigation guard exists: the agent must not be able to widen its own policy.
+fn dispatch_domains_command(store: &Store, args: &[String]) -> anyhow::Result<Value> {
+    use super::secrets_admin as sa;
+    match args.get(1).map(String::as_str) {
+        None | Some("list") | Some("--json") | Some("show") => {
+            let (allowed, denied) = sa::list_domains(store)?;
+            Ok(json!({ "status": "ok", "allowed": allowed, "denied": denied }))
+        }
+        Some("allow" | "deny" | "clear") => bail!(
+            "The navigation allow/deny policy must be changed by the user. Ask them to run \
+             `browser-use-terminal domains allow <domain>` or `domains deny <domain>`."
+        ),
+        Some(other) => bail!("unknown browser domains command: {other}"),
     }
 }
 
@@ -2688,6 +2738,20 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                             default_profile_id.as_deref(),
                         )
                         .map_err(ToolError::Other)?;
+                    }
+                    // Re-resolve the secrets + nav policy on every run (fail closed)
+                    // so secret/domain changes take effect mid-session. Cheap now
+                    // that values live in an encrypted file, not the OS keychain.
+                    if let Some(persistence) = &persistence {
+                        let store = persistence.store.lock().map_err(|_| {
+                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
+                        })?;
+                        super::secrets_admin::install_script_security(&store, &session_id)
+                            .map_err(|error| {
+                                ToolError::Other(anyhow::anyhow!(
+                                    "failed to apply browser security policy: {error:#}"
+                                ))
+                            })?;
                     }
                     let out = backend
                         .start_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)

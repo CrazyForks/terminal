@@ -307,6 +307,19 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Manage domain-scoped secrets (passwords + TOTP 2FA) for browser logins.
+    ///
+    /// Values are stored in the OS keychain; only metadata (domain, name, kind)
+    /// is kept in the app database. The agent only ever sees placeholder names.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
+    /// Manage the navigation allow/deny policy enforced during browser tasks.
+    Domains {
+        #[command(subcommand)]
+        command: DomainsCommand,
+    },
     Diagnostics,
     SdkServer {
         #[arg(long, value_enum, default_value_t = SdkTransportArg::Stdio)]
@@ -558,6 +571,72 @@ enum AuthCommand {
     Logout {
         account: AuthAccount,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretsCommand {
+    /// Store a secret. Prompts for the value with no echo (or reads --stdin).
+    Set {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+        /// Treat the value as a base32 TOTP seed (2FA), generating codes at fill time.
+        #[arg(long)]
+        totp: bool,
+        /// Extra domains this secret may also be used on (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Read the value from stdin instead of prompting (for scripted use).
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List configured secrets (metadata only — never values).
+    List,
+    /// Remove a secret.
+    Remove {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Import saved logins (passwords + 2FA) live from 1Password.
+    ///
+    /// Reads Login items via the `op` CLI, which must be installed and signed in
+    /// (`op signin`). Each login becomes username/password/otp secrets.
+    Import,
+    /// Configure email one-time-code (2FA / verification) via AgentMail.
+    Email {
+        #[command(subcommand)]
+        action: EmailCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EmailCommand {
+    /// Store your AgentMail API token (prompts with no echo, or reads --stdin).
+    SetToken {
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show whether email-2FA is configured and the inbox address.
+    Status,
+    /// Provision (if needed) and print the agent's inbox email address.
+    Address,
+    /// Remove the AgentMail token and cached inbox.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainsCommand {
+    /// Allow navigation to a domain (and its subdomains). Supports `*.example.com`.
+    Allow { domain: String },
+    /// Block navigation to a domain (checked before the allow-list).
+    Deny { domain: String },
+    /// Show the current allow/deny lists.
+    List,
+    /// Clear both allow and deny lists.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -836,6 +915,8 @@ fn main() -> Result<()> {
             &config_overrides,
         ),
         Command::Auth { command } => auth(&store, command),
+        Command::Secrets { command } => secrets(&store, command),
+        Command::Domains { command } => domains(&store, command),
         Command::Diagnostics => diagnostics(&store),
         Command::SdkServer { .. } => unreachable!("sdk-server is handled before Store bootstrap"),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
@@ -1087,6 +1168,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Import { .. } => "import",
         Command::Config { .. } => "config",
         Command::Auth { .. } => "auth",
+        Command::Secrets { .. } => "secrets",
+        Command::Domains { .. } => "domains",
         Command::Diagnostics => "diagnostics",
         Command::SdkServer { .. } => "sdk_server",
         Command::Trace { .. } => "trace",
@@ -3171,6 +3254,180 @@ fn is_secret_setting(key: &str) -> bool {
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
+
+fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        SecretsCommand::Set {
+            domain,
+            name,
+            totp,
+            allow,
+            stdin,
+        } => {
+            let kind = if totp {
+                sa::Kind::Totp
+            } else {
+                sa::Kind::Password
+            };
+            let value = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim_end_matches(['\n', '\r']).to_string()
+            } else {
+                let prompt = if totp {
+                    format!("Base32 TOTP seed for {name} @ {domain} (hidden): ")
+                } else {
+                    format!("Value for {name} @ {domain} (hidden): ")
+                };
+                rpassword::prompt_password(prompt)?
+            };
+            let meta = sa::set_secret_active(store, &domain, &name, kind, allow, &value)?;
+            println!(
+                "Stored {} secret {:?} for {} (encrypted file).",
+                meta.kind.as_str(),
+                meta.placeholder,
+                meta.domain
+            );
+            Ok(())
+        }
+        SecretsCommand::List => {
+            let metas = sa::list_secrets(store)?;
+            if metas.is_empty() {
+                println!(
+                    "No secrets configured. Add one with `secrets set --domain <d> --name <n>`."
+                );
+                return Ok(());
+            }
+            println!("{:<28} {:<18} {}", "DOMAIN", "NAME", "KIND");
+            for meta in metas {
+                let extra = if meta.allowed_domains.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (+{})", meta.allowed_domains.join(", "))
+                };
+                println!(
+                    "{:<28} {:<18} {}{}",
+                    meta.domain,
+                    meta.placeholder,
+                    meta.kind.as_str(),
+                    extra
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Remove { domain, name } => {
+            if sa::remove_secret_active(store, &domain, &name)? {
+                println!("Removed secret {name:?} for {domain}.");
+            } else {
+                println!("No secret {name:?} found for {domain}.");
+            }
+            Ok(())
+        }
+        SecretsCommand::Import => {
+            use browser_use_agent::tools::handlers::secrets_import as si;
+            let stats = si::import_1password(store)?;
+            if stats.changed_logins() == 0 {
+                println!(
+                    "Already up to date — {} login(s) from 1Password, nothing new.",
+                    stats.unchanged_logins
+                );
+            } else {
+                println!(
+                    "Synced 1Password: {} new, {} updated ({} unchanged).",
+                    stats.new_logins, stats.updated_logins, stats.unchanged_logins
+                );
+            }
+            Ok(())
+        }
+        SecretsCommand::Email { action } => secrets_email(store, action),
+    }
+}
+
+fn secrets_email(store: &Store, command: EmailCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        EmailCommand::SetToken { stdin } => {
+            let token = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf.trim().to_string()
+            } else {
+                rpassword::prompt_password("AgentMail API token (hidden): ")?
+            };
+            sa::set_agentmail_token(store, &token)?;
+            println!("Saved AgentMail token. Run `secrets email address` to provision the inbox.");
+            Ok(())
+        }
+        EmailCommand::Status => {
+            if sa::email_2fa_configured(store) {
+                match store.get_setting(sa::AGENTMAIL_INBOX_KEY)? {
+                    Some(inbox) if !inbox.is_empty() => {
+                        println!("Email 2FA: configured (AgentMail). Inbox: {inbox}")
+                    }
+                    _ => println!(
+                        "Email 2FA: configured (AgentMail). Inbox not provisioned yet — run `secrets email address`."
+                    ),
+                }
+            } else {
+                println!("Email 2FA: not configured. Set a token with `secrets email set-token`.");
+            }
+            Ok(())
+        }
+        EmailCommand::Address => {
+            let inbox = sa::agentmail_inbox_address(store)?;
+            println!("{inbox}");
+            Ok(())
+        }
+        EmailCommand::Clear => {
+            sa::clear_agentmail_token(store)?;
+            println!("Removed AgentMail token and cached inbox.");
+            Ok(())
+        }
+    }
+}
+
+fn domains(store: &Store, command: DomainsCommand) -> Result<()> {
+    use browser_use_agent::tools::handlers::secrets_admin as sa;
+    match command {
+        DomainsCommand::Allow { domain } => {
+            let list = sa::add_domain(store, &domain, true)?;
+            println!("Allowed domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::Deny { domain } => {
+            let list = sa::add_domain(store, &domain, false)?;
+            println!("Denied domains: {}", list.join(", "));
+            Ok(())
+        }
+        DomainsCommand::List => {
+            let (allow, deny) = sa::list_domains(store)?;
+            println!(
+                "Allowed: {}",
+                if allow.is_empty() {
+                    "(none — navigation is unrestricted until you allow or deny a domain)"
+                        .to_string()
+                } else {
+                    allow.join(", ")
+                }
+            );
+            println!(
+                "Denied:  {}",
+                if deny.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    deny.join(", ")
+                }
+            );
+            Ok(())
+        }
+        DomainsCommand::Clear => {
+            sa::clear_domains(store)?;
+            println!("Cleared the navigation allow/deny lists.");
+            Ok(())
+        }
+    }
+}
 
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
     match command {

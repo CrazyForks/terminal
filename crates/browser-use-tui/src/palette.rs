@@ -9,6 +9,9 @@ pub(crate) enum PaletteAction {
     ChooseModel,
     Authenticate,
     SyncCookies,
+    ManageSecrets,
+    ImportPasswords,
+    ManageDomains,
     Reload,
     Update,
     Exit,
@@ -22,7 +25,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 9] = [
+const VISIBLE_ITEMS: [PaletteItem; 12] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -62,6 +65,21 @@ const VISIBLE_ITEMS: [PaletteItem; 9] = [
         command: "/sync-cookies",
         description: "sync local cookies",
         action: PaletteAction::SyncCookies,
+    },
+    PaletteItem {
+        command: "/secrets",
+        description: "save passwords & 2FA for logins",
+        action: PaletteAction::ManageSecrets,
+    },
+    PaletteItem {
+        command: "/import-passwords",
+        description: "import logins from 1Password",
+        action: PaletteAction::ImportPasswords,
+    },
+    PaletteItem {
+        command: "/domains",
+        description: "allow/block which sites the agent can visit",
+        action: PaletteAction::ManageDomains,
     },
     PaletteItem {
         command: "/feedback",
@@ -136,6 +154,23 @@ mod tests {
     #[test]
     fn goal_is_available_from_palette() {
         assert_eq!(selected_action("/goal", 0), Some(PaletteAction::Goal));
+    }
+
+    #[test]
+    fn secrets_and_domains_are_visible_commands() {
+        // Both appear in the default (unfiltered) palette so users discover them.
+        let defaults = items_filtered("");
+        assert!(defaults.iter().any(|item| item.command == "/secrets"));
+        assert!(defaults.iter().any(|item| item.command == "/domains"));
+        // And resolve from a short filter.
+        assert_eq!(
+            selected_action("/sec", 0),
+            Some(PaletteAction::ManageSecrets)
+        );
+        assert_eq!(
+            selected_action("/dom", 0),
+            Some(PaletteAction::ManageDomains)
+        );
     }
 
     #[test]

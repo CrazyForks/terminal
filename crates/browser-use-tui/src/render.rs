@@ -30,8 +30,9 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, DefaultProfileStatus, FeedbackCategory, FeedbackStep, MessageActionKind,
-    ModelSearchEntry, ProductState, SetupResultKind, Surface,
+    CookieSyncStatus, DefaultProfileStatus, DomainFocus, DomainMode, FeedbackCategory,
+    FeedbackStep, MessageActionKind, ModelSearchEntry, ProductState, SecretField, SecretFocus,
+    SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -387,6 +388,7 @@ fn render_main(
             ProductState::Ready => Some(crate::welcome::logo_screen_rect(
                 body_content_rect,
                 app.status_notice.is_some(),
+                cloud_home_banner_lines(app, body_width).map_or(0, |lines| lines.len()),
             )),
             ProductState::SetupNeeded => Some(setup_logo_screen_rect(body_content_rect)),
             ProductState::Running
@@ -523,6 +525,7 @@ fn main_bottom_height_for(
             area.height.saturating_sub(2).max(6)
         }
         Surface::BrowserSelect | Surface::DefaultProfile | Surface::CookieSync => 22,
+        Surface::Secrets | Surface::Domains => 24,
         _ => 18,
     };
     // Add room for the surface header, footer, borders, and content margins.
@@ -956,6 +959,8 @@ fn render_surface_popup_box(
             }
             // The model search field is not a secret — show the raw query.
             Surface::ModelSearch => app.composer.input().to_string(),
+            Surface::Secrets => secrets_input_field(app),
+            Surface::Domains => domains_input_field(app),
             _ => String::new(),
         };
         let target = format!("  {masked}");
@@ -1390,6 +1395,11 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Edit submitted prompts or cancel queued follow-ups",
         ),
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
+        Surface::Secrets => (
+            "Secrets",
+            "Save passwords & 2FA codes the agent uses to log in",
+        ),
+        Surface::Domains => ("Domains", "Allow or block which sites the agent may visit"),
         Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
         Surface::FeedbackThanks => ("Feedback", ""),
         Surface::Main => ("", ""),
@@ -1432,6 +1442,8 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Context => "Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
+        Surface::Secrets => "Enter:next | Esc:close",
+        Surface::Domains => "Enter:apply | Esc:close",
         Surface::Feedback => "Enter:next | Esc:back",
         Surface::FeedbackThanks => "",
         _ => "Enter:select | Esc:back",
@@ -1495,6 +1507,8 @@ fn surface_lines(
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
+        Surface::Secrets => secrets_lines(app),
+        Surface::Domains => domains_lines(app),
         Surface::Feedback => feedback_lines(app),
         Surface::FeedbackThanks => Vec::new(),
         Surface::Main => Vec::new(),
@@ -3006,6 +3020,9 @@ struct ContextComponent {
 #[derive(Debug, Default, Clone)]
 struct ContextUsageSummary {
     latest_input_tokens: Option<i64>,
+    latest_cached_input_tokens: Option<i64>,
+    total_input_tokens: Option<i64>,
+    total_cached_input_tokens: Option<i64>,
     context_window: Option<i64>,
 }
 
@@ -3088,6 +3105,15 @@ fn context_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'s
         lines.push(Line::from(spans));
     }
 
+    let cache_lines = prompt_cache_lines(&usage);
+    if !cache_lines.is_empty() {
+        // ---- Provider prompt cache ----
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Prompt cache", bold())));
+        lines.push(Line::from(""));
+        lines.extend(cache_lines);
+    }
+
     // ---- What's in it ----
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("What's using it", bold())));
@@ -3117,12 +3143,23 @@ fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
         let Some(info) = event.payload.get("info").filter(|info| info.is_object()) else {
             continue;
         };
-        if let Some(input) = info
+        if let Some(usage) = info
             .get("last_token_usage")
-            .and_then(|usage| usage.get("input_tokens"))
-            .and_then(Value::as_i64)
+            .filter(|usage| usage.is_object())
         {
-            summary.latest_input_tokens = Some(input.max(0));
+            if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                summary.latest_input_tokens = Some(input.max(0));
+            }
+            summary.latest_cached_input_tokens = cached_input_from_usage(usage);
+        }
+        if let Some(usage) = info
+            .get("total_token_usage")
+            .filter(|usage| usage.is_object())
+        {
+            if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                summary.total_input_tokens = Some(input.max(0));
+            }
+            summary.total_cached_input_tokens = cached_input_from_usage(usage);
         }
         if let Some(context_window) = info
             .get("model_context_window")
@@ -3133,6 +3170,49 @@ fn context_usage_from_events(events: &[EventRecord]) -> ContextUsageSummary {
         }
     }
     summary
+}
+
+fn cached_input_from_usage(usage: &Value) -> Option<i64> {
+    usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("input_cached_tokens"))
+        .and_then(Value::as_i64)
+        .map(|cached| cached.max(0))
+}
+
+fn prompt_cache_lines(usage: &ContextUsageSummary) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let (Some(input), Some(cached)) =
+        (usage.latest_input_tokens, usage.latest_cached_input_tokens)
+    {
+        lines.push(prompt_cache_line("last turn", cached, input));
+    }
+    if let (Some(input), Some(cached)) = (usage.total_input_tokens, usage.total_cached_input_tokens)
+    {
+        lines.push(prompt_cache_line("session total", cached, input));
+    }
+    lines
+}
+
+fn prompt_cache_line(label: &str, cached: i64, input: i64) -> Line<'static> {
+    let cached = cached.max(0);
+    let input = input.max(0);
+    let percent = context_percent(cached, input);
+    let uncached = input.saturating_sub(cached);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{label:<12}"), muted()),
+        Span::styled(format!("{percent:>4}"), accent()),
+        Span::raw("  "),
+        Span::styled(format_token_count(cached), text_style()),
+        Span::styled(" cached", muted()),
+        Span::styled(" / ", dim()),
+        Span::styled(format_token_count(input), text_style()),
+        Span::styled(" input", muted()),
+        Span::styled("  ", muted()),
+        Span::styled(format_token_count(uncached), dim()),
+        Span::styled(" uncached", dim()),
+    ])
 }
 
 fn context_composition_from_events(events: &[EventRecord]) -> ContextComposition {
@@ -3554,6 +3634,7 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
+    let banner = cloud_home_banner_lines(app, width);
     // Pass the remaining body height to the welcome renderer so it can
     // balance the gap above the logo with the gap below the menu.
     let remaining = max_h.saturating_sub(lines.len() as u16);
@@ -3562,8 +3643,62 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16, max_h: u16) -> Vec
         &app.welcome_anim,
         app.selected_row,
         remaining,
+        banner,
     ));
     let _ = state;
+    lines
+}
+
+fn cloud_home_banner_lines(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    if width == 0 || app.surface != Surface::Main || app.is_slash_palette_active() {
+        return None;
+    }
+    if app.browser_use_cloud_key_ready().unwrap_or(true) {
+        return None;
+    }
+
+    let wrap_width = (width as usize).saturating_sub(8).clamp(16, 64);
+    let words = [
+        ("Use", text_style()),
+        ("a", text_style()),
+        ("Cloud", text_style()),
+        ("browser", text_style()),
+        ("to", text_style()),
+        ("avoid", text_style()),
+        ("manual", text_style()),
+        ("permissions", text_style()),
+        ("and", text_style()),
+        ("get", text_style()),
+        ("automatic", text_style()),
+        ("captcha-solving!", text_style()),
+        ("[cloud.browser-use.com]", link()),
+    ];
+    Some(wrap_styled_words(&words, wrap_width))
+}
+
+fn wrap_styled_words(words: &[(&'static str, Style)], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+
+    for (word, style) in words {
+        let word_width = word.chars().count();
+        let separator_width = usize::from(current_width > 0);
+        if current_width > 0 && current_width + separator_width + word_width > max_width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            current_width = 0;
+        }
+        if current_width > 0 {
+            spans.push(Span::styled(" ", text_style()));
+            current_width += 1;
+        }
+        spans.push(Span::styled(*word, *style));
+        current_width += word_width;
+    }
+
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
     lines
 }
 
@@ -4097,6 +4232,463 @@ fn masked_secret_for_account(account: &str, value: &str) -> String {
     } else {
         masked_secret(value)
     }
+}
+
+fn help_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), muted()))
+}
+
+/// A "label  example  trailing" instruction row. None of these start with two
+/// spaces, so the only `"  …"` line stays the input field (where the caret goes).
+fn secret_field_label(field: SecretField) -> &'static str {
+    match field {
+        SecretField::Domain => "Domain",
+        SecretField::Name => "Name",
+        SecretField::Value => "Value",
+    }
+}
+
+/// The rendered content of a form field WITHOUT the leading two-space indent:
+/// `"Label   <value>"` (value masked for the Value field). The focused field
+/// uses the live composer text; the others use their parked text.
+fn secret_field_content(app: &App, field: SecretField) -> String {
+    let form = app.secret_form.as_ref();
+    let focused = form.is_some_and(|f| f.focused_field() == Some(field));
+    let raw = if focused {
+        app.composer.input().to_string()
+    } else {
+        form.map(|f| f.field(field).to_string()).unwrap_or_default()
+    };
+    let display = if matches!(field, SecretField::Value) {
+        "•".repeat(raw.chars().count())
+    } else {
+        raw
+    };
+    format!("{:<8}{display}", secret_field_label(field))
+}
+
+/// The focused field's content — the string `render_surface_popup_box` uses to
+/// place the caret (it looks for the line starting with `"  " + this`). Returns a
+/// non-matching sentinel while a saved row is selected, so no caret is shown.
+pub(crate) fn secrets_input_field(app: &App) -> String {
+    match app.secret_form.as_ref().map(|form| form.focus) {
+        Some(SecretFocus::Field(field)) => secret_field_content(app, field),
+        _ => "\u{0}".to_string(),
+    }
+}
+
+/// Braille spinner frames — same visual family as the BU logo.
+const IMPORT_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Render the password-import banner (animated while running, result on finish).
+fn import_banner_lines(import: &crate::SecretImport) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match &import.outcome {
+        None => {
+            let ms = import.started.elapsed().as_millis();
+            let frame = IMPORT_SPINNER[(ms / 90) as usize % IMPORT_SPINNER.len()];
+            let dots = ".".repeat(1 + (ms / 350) as usize % 3);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{frame} "), accent()),
+                Span::styled(format!("Importing from {}{dots}", import.label), accent()),
+                Span::styled(format!("   {}s", ms / 1000), muted()),
+            ]));
+        }
+        Some(Ok(stats)) => {
+            let message = if stats.changed_logins() == 0 {
+                format!(
+                    "Already up to date — {} login{} from {}, nothing new",
+                    stats.unchanged_logins,
+                    plural(stats.unchanged_logins),
+                    import.label,
+                )
+            } else {
+                format!(
+                    "Synced {} — {} new, {} updated ({} unchanged)",
+                    import.label, stats.new_logins, stats.updated_logins, stats.unchanged_logins,
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "✓ ".to_string(),
+                    Style::default().fg(crate::theme::palette().done),
+                ),
+                Span::styled(message, Style::default().fg(text())),
+            ]));
+            if stats.skipped > 0 {
+                lines.push(help_line(&format!(
+                    "{} entr{} skipped (no domain or credentials).",
+                    stats.skipped,
+                    if stats.skipped == 1 { "y" } else { "ies" }
+                )));
+            }
+        }
+        Some(Err(message)) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "✗ ".to_string(),
+                    Style::default().fg(crate::theme::palette().failed),
+                ),
+                Span::styled(
+                    format!("Import failed: {message}"),
+                    Style::default().fg(crate::theme::palette().failed),
+                ),
+            ]));
+        }
+    }
+    lines
+}
+
+fn secret_field_line(app: &App, field: SecretField) -> Line<'static> {
+    let focused = app
+        .secret_form
+        .as_ref()
+        .is_some_and(|f| f.focused_field() == Some(field));
+    let content = secret_field_content(app, field);
+    let style = if focused {
+        accent()
+    } else {
+        Style::default().fg(text())
+    };
+    // Exactly one rendered line starts with two spaces — the focused field, where
+    // the caret lands (its full content is the caret needle).
+    Line::from(vec![Span::raw("  "), Span::styled(content, style)])
+}
+
+pub(crate) fn secrets_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    // Guidance specific to why a 1Password import can't run.
+    if let Some(issue) = app.op_setup_hint {
+        let url = browser_use_agent::tools::handlers::secrets_import::OP_DOWNLOAD_URL;
+        match issue {
+            crate::OpSetupIssue::NotInstalled => {
+                lines.push(Line::from(Span::styled(
+                    "1Password CLI not installed".to_string(),
+                    accent(),
+                )));
+                lines.push(Line::from(""));
+                lines.push(help_line(
+                    "Importing from 1Password needs the `op` command-line tool. Install it:",
+                ));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        url.to_string(),
+                        Style::default().fg(crate::theme::palette().link),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+                lines.push(help_line(
+                    "Then sign in with `op signin` and run /import-passwords again.    Esc: back",
+                ));
+            }
+            crate::OpSetupIssue::NotSignedIn => {
+                lines.push(Line::from(Span::styled(
+                    "1Password CLI not signed in".to_string(),
+                    accent(),
+                )));
+                lines.push(Line::from(""));
+                lines.push(help_line(
+                    "`op` is installed but can't read your vault non-interactively. Enable one:",
+                ));
+                lines.push(Line::from(vec![
+                    Span::styled("  • ".to_string(), muted()),
+                    Span::styled(
+                        "1Password app → Settings → Developer → Integrate with 1Password CLI"
+                            .to_string(),
+                        Style::default().fg(text()),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  • or set ".to_string(), muted()),
+                    Span::styled(
+                        "OP_SERVICE_ACCOUNT_TOKEN".to_string(),
+                        Style::default().fg(text()),
+                    ),
+                    Span::styled(" before launching".to_string(), muted()),
+                ]));
+                lines.push(Line::from(""));
+                lines.push(help_line(
+                    "Verify with `op item list`, then run /import-passwords again.    Esc: back",
+                ));
+            }
+        }
+        return lines;
+    }
+
+    lines.push(help_line(
+        "Logins the agent can use. Stored in an encrypted file; masked from the agent.",
+    ));
+
+    // Animated import banner (running) or its result.
+    if let Some(import) = &app.secret_import {
+        lines.push(Line::from(""));
+        lines.extend(import_banner_lines(import));
+    }
+    lines.push(Line::from(""));
+
+    let header = if app.secrets_list.is_empty() {
+        "Saved secrets:".to_string()
+    } else {
+        format!("Saved secrets ({}):", app.secrets_list.len())
+    };
+    lines.push(Line::from(Span::styled(header, accent())));
+
+    // Search box once the list is long enough (or a query is active).
+    if app.secrets_search_active() {
+        let focused = matches!(
+            app.secret_form.as_ref().map(|f| f.focus),
+            Some(SecretFocus::Search)
+        );
+        let label_style = if focused { accent() } else { muted() };
+        let mut spans = vec![Span::styled("Search: ".to_string(), label_style)];
+        if app.secrets_search.is_empty() && !focused {
+            spans.push(Span::styled("(type to filter)".to_string(), muted()));
+        } else {
+            spans.push(Span::styled(
+                app.secrets_search.clone(),
+                Style::default().fg(text()),
+            ));
+            if focused {
+                spans.push(Span::styled("▌".to_string(), accent()));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let view = app.secrets_view();
+    if app.secrets_list.is_empty() {
+        lines.push(help_line("(none yet)"));
+    } else if view.is_empty() {
+        lines.push(help_line("(no matches)"));
+    } else {
+        // Window the list, keeping the highlighted row in view.
+        let visible = crate::SECRETS_VISIBLE_ROWS;
+        let total = view.len();
+        let selected_idx = match app.secret_form.as_ref().map(|f| f.focus) {
+            Some(SecretFocus::Saved(i)) => Some(i),
+            _ => None,
+        };
+        let start = match selected_idx {
+            Some(i) if i >= visible => i + 1 - visible,
+            _ => 0,
+        };
+        let end = (start + visible).min(total);
+
+        if start > 0 {
+            lines.push(help_line(&format!("  ⋯ {} more above", start)));
+        }
+        for (offset, meta) in view[start..end].iter().enumerate() {
+            let idx = start + offset;
+            let selected = selected_idx == Some(idx);
+            let extra = if meta.allowed_domains.is_empty() {
+                String::new()
+            } else {
+                format!("  also: {}", meta.allowed_domains.join(", "))
+            };
+            // Markers avoid a two-space prefix so they can't collide with the
+            // focused-field caret.
+            let (marker, domain_style) = if selected {
+                ("▶ ", accent())
+            } else {
+                ("· ", Style::default().fg(text()))
+            };
+            // Fixed-length dots (don't reveal length); "(2FA)" tags TOTP secrets.
+            let value_label = if meta.kind.as_str() == "totp" {
+                "•••••• (2FA)"
+            } else {
+                "••••••"
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<22}", meta.domain), domain_style),
+                Span::raw("  "),
+                Span::styled(format!("{:<12}", meta.placeholder), accent()),
+                Span::raw("  "),
+                Span::styled(format!("{value_label}{extra}"), muted()),
+            ]));
+        }
+        if end < total {
+            lines.push(help_line(&format!("  ⋯ {} more below", total - end)));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // The add form: three separate labeled fields (only the focused one is
+    // double-indented, so the caret lands there).
+    lines.push(Line::from(Span::styled(
+        "Add a secret:".to_string(),
+        accent(),
+    )));
+    lines.push(secret_field_line(app, SecretField::Domain));
+    lines.push(secret_field_line(app, SecretField::Name));
+    lines.push(secret_field_line(app, SecretField::Value));
+    lines.push(Line::from(""));
+    let move_hint = if app.secrets_search_active() {
+        "↑/↓ Tab: move   type: search   Enter: edit/save   Del: remove   Esc: close"
+    } else {
+        "↑/↓ Tab: move   Enter: edit row / save form   Del: remove   Esc: close"
+    };
+    lines.push(help_line(move_hint));
+    lines.push(help_line(
+        "Ctrl-O: import logins from 1Password (or run /import-passwords)",
+    ));
+    lines.push(help_line(
+        "Tip: name it \"otp\" for a 2FA code (paste the authenticator setup key).",
+    ));
+    if let Some(notice) = app.status_notice.as_deref() {
+        lines.push(Line::from(Span::styled(notice.to_string(), accent())));
+    }
+    lines
+}
+
+/// Caret target for the `/domains` panel: the domain input line (label + text)
+/// only when focused, so the cursor lands at the end of the typed domain.
+pub(crate) fn domains_input_field(app: &App) -> String {
+    if matches!(
+        app.domain_form.as_ref().map(|form| form.focus),
+        Some(DomainFocus::Input)
+    ) {
+        format!("{:<8}{}", "Domain", app.composer.input())
+    } else {
+        "\u{0}".to_string()
+    }
+}
+
+pub(crate) fn domains_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    lines.push(help_line(
+        "The agent may visit ONLY allowed sites (+ subdomains, + any site you've",
+    ));
+    lines.push(help_line(
+        "saved a secret for). Empty allowed = every site. Blocked always takes precedence.",
+    ));
+    lines.push(Line::from(""));
+
+    let rows = app.domain_rows();
+    let header = if rows.is_empty() {
+        "Rules:".to_string()
+    } else {
+        format!("Rules ({}):", rows.len())
+    };
+    lines.push(Line::from(Span::styled(header, accent())));
+    if rows.is_empty() {
+        lines.push(help_line("(none — every site allowed)"));
+    } else {
+        // Window the list, keeping the highlighted row in view.
+        let visible = crate::SECRETS_VISIBLE_ROWS;
+        let selected_idx = match app.domain_form.as_ref().map(|f| f.focus) {
+            Some(DomainFocus::Saved(i)) => Some(i),
+            _ => None,
+        };
+        let start = match selected_idx {
+            Some(i) if i >= visible => i + 1 - visible,
+            _ => 0,
+        };
+        let end = (start + visible).min(rows.len());
+        if start > 0 {
+            lines.push(help_line(&format!("  ⋯ {} more above", start)));
+        }
+        for (offset, (domain, is_allow)) in rows[start..end].iter().enumerate() {
+            let idx = start + offset;
+            let selected = selected_idx == Some(idx);
+            let (marker, domain_style) = if selected {
+                ("▶ ", accent())
+            } else {
+                ("· ", Style::default().fg(text()))
+            };
+            let (tag, tag_style) = if *is_allow {
+                ("Allowed", Style::default().fg(crate::theme::palette().done))
+            } else {
+                (
+                    "Blocked",
+                    Style::default().fg(crate::theme::palette().failed),
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<28}", domain), domain_style),
+                Span::raw("  "),
+                Span::styled(tag.to_string(), tag_style),
+            ]));
+        }
+        if end < rows.len() {
+            lines.push(help_line(&format!("  ⋯ {} more below", rows.len() - end)));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Add-rule form: a Mode toggle + a Domain input (mirrors the secrets form).
+    lines.push(Line::from(Span::styled(
+        "Add a rule:".to_string(),
+        accent(),
+    )));
+    let mode_focused = matches!(
+        app.domain_form.as_ref().map(|f| f.focus),
+        Some(DomainFocus::Mode)
+    );
+    let allow_mode = matches!(
+        app.domain_form.as_ref().map(|f| f.mode),
+        Some(DomainMode::Allow)
+    );
+    let mode_text = if allow_mode {
+        "‹ Allow ›"
+    } else {
+        "‹ Block ›"
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<8}{}", "Mode", mode_text),
+            if mode_focused {
+                accent()
+            } else {
+                Style::default().fg(text())
+            },
+        ),
+        Span::styled("   (←/→ to switch)".to_string(), muted()),
+    ]));
+    // The Domain input line carries the caret when focused (matches
+    // `domains_input_field`, so the cursor lands at the end of the text).
+    let input_focused = matches!(
+        app.domain_form.as_ref().map(|f| f.focus),
+        Some(DomainFocus::Input)
+    );
+    let input_text = if input_focused {
+        app.composer.input().to_string()
+    } else {
+        app.domain_form
+            .as_ref()
+            .map(|f| f.input.clone())
+            .unwrap_or_default()
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<8}{}", "Domain", input_text),
+            if input_focused {
+                accent()
+            } else {
+                Style::default().fg(text())
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(help_line(
+        "↑/↓ Tab: move   ←/→: Allow/Block   Enter: add / toggle   Del: remove   Esc: close",
+    ));
+    if let Some(notice) = app.status_notice.as_deref() {
+        lines.push(Line::from(Span::styled(notice.to_string(), accent())));
+    }
+    lines
 }
 
 fn auth_secret_label(account: &str) -> &'static str {

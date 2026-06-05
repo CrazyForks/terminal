@@ -35,6 +35,13 @@ const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
 const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod secrets_runtime;
+pub use secrets_runtime::{
+    clear_script_security, has_email_resolver, has_script_security, has_secret_resolver,
+    set_email_resolver, set_script_security, set_secret_resolver, EmailResolver, ScriptSecret,
+    ScriptSecurity, SecretResolver,
+};
+
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
     pub content: Value,
@@ -762,13 +769,16 @@ pub fn run_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    run_browser_script_with_session_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_sessions(),
+        run_browser_script_with_session_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_sessions(),
+        ),
     )
 }
 
@@ -806,13 +816,16 @@ pub fn start_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    start_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_script_runs(),
+        start_browser_script_with_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -906,11 +919,14 @@ pub fn observe_browser_script(
     run_id: &str,
     observe_timeout_ms: u64,
 ) -> Result<BrowserScriptOutput> {
-    observe_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        run_id,
-        observe_timeout_ms,
-        browser_script_runs(),
+        observe_browser_script_with_registry(
+            session_id,
+            run_id,
+            observe_timeout_ms,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -1005,7 +1021,10 @@ pub fn observe_browser_script_with_registry(
 }
 
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    cancel_browser_script_with_registry(session_id, run_id, browser_script_runs())
+    secrets_runtime::finish_with_redaction(
+        session_id,
+        cancel_browser_script_with_registry(session_id, run_id, browser_script_runs()),
+    )
 }
 
 pub fn cancel_browser_script_with_registry(
@@ -1071,6 +1090,8 @@ fn spawn_browser_script_with_session_registry(
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
     let frames_dir = artifact_dir.as_ref().join(format!(".{run_id}.frames"));
+    let security = secrets_runtime::script_security_for(session_id);
+    let security_blob = security.stdin_blob();
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -1086,11 +1107,20 @@ fn spawn_browser_script_with_session_registry(
         .arg("-c")
         .arg(prelude)
         .current_dir(cwd.as_ref())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn browser_script python")?;
+    // Hand the secrets + nav policy to the child over stdin (one JSON line) so
+    // secret values never appear in the `-c` argv (process listings) or on disk.
+    // The Rust-side nav guard is authoritative regardless, so a write failure
+    // here only means the child runs without secrets — never without the guard.
+    if let Some(mut child_stdin) = child.stdin.take() {
+        let _ = child_stdin.write_all(security_blob.as_bytes());
+        let _ = child_stdin.write_all(b"\n");
+        // Dropping the handle closes stdin -> EOF for the child's readline.
+    }
     let stdout_reader = child.stdout.take().map(read_browser_script_stdout);
     let stderr_reader = child.stderr.take().map(read_browser_script_stderr);
     Ok(BrowserScriptRun {
@@ -6856,6 +6886,17 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                     }
                 }
             }
+            // Navigation guard (Cloud `allowed_domains`): every CDP call funnels here.
+            if method == "Page.navigate" {
+                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                    if let Some(script_session) = session.session_id.as_deref() {
+                        let security = secrets_runtime::script_security_for(script_session);
+                        if let Some(reason) = secrets_runtime::nav_denied_reason(url, &security) {
+                            bail!("{reason}");
+                        }
+                    }
+                }
+            }
             let session_id = request.get("session_id").and_then(Value::as_str);
             let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
             let current_session = session.current_session_id.clone();
@@ -6901,10 +6942,29 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
             }
         }
         "status" => Ok(session.status_json()),
+        // Lazy, on-demand secret fetch. The script asks for a value only when it
+        // is about to fill a field, so the OS keychain (and its prompt) is read
+        // exactly then — not eagerly at spawn — and at most once per secret.
+        "secret" => {
+            let domain = request.get("domain").and_then(Value::as_str).unwrap_or("");
+            let name = request.get("name").and_then(Value::as_str).unwrap_or("");
+            let session_id = session.session_id.clone().unwrap_or_default();
+            let value = secrets_runtime::fetch_secret_for_session(&session_id, domain, name)?;
+            Ok(json!({ "value": value }))
+        }
+        // Email-OTP 2FA: `op` is "address" (the agent's inbox) or "code" (poll for
+        // the latest one-time code). Returns `value: null` when not yet available.
+        "email" => {
+            let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+            let session_id = session.session_id.clone().unwrap_or_default();
+            let value = secrets_runtime::email_for_session(&session_id, op);
+            Ok(json!({ "value": value }))
+        }
         other => bail!("unknown browser_script bridge request: {other}"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browser_script_prelude(
     bridge_port: u16,
     cwd: &Path,
@@ -6941,6 +7001,21 @@ FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
+# Secret METADATA + navigation policy are handed over on stdin (one JSON line).
+# Only metadata is sent — which placeholders exist per domain and whether each is
+# a TOTP — NEVER values. The actual value is fetched on demand via the `secret`
+# bridge request when secret()/totp() is called, so the OS keychain is read only
+# when the agent is on the page and filling a field. Shape:
+# {{meta:{{domain:{{name:{{totp:bool}}}}}}, nav_allow:[...], nav_deny:[...]}}.
+try:
+    _security = json.loads(sys.stdin.readline() or "{{}}")
+except Exception:
+    _security = {{}}
+_SECRET_META = _security.get("meta") or {{}}
+# Enforced in Rust on Page.navigate; also checked here after load to catch redirects.
+_NAV_ALLOW = _security.get("nav_allow") or []
+_NAV_DENY = _security.get("nav_deny") or []
+_EMAIL_AVAILABLE = bool(_security.get("email_available"))
 
 # 2fps screen capture (observability prototype). Polls Page.captureScreenshot on
 # a fixed cadence so frames land even when the page is visually static. Frames
@@ -7519,6 +7594,12 @@ const GIF_MIN_DELAY_MS: u32 = 400;
 const GIF_MAX_DELAY_MS: u32 = 2500;
 const GIF_SPEED: i32 = 12; // image crate GifEncoder speed 1..=30 (higher = faster encode, coarser palette)
 
+fn gif_generation_enabled() -> bool {
+    // Temporarily disable all GIF generation while keeping frame capture and
+    // JPEG contact-sheet helpers available for debugging/inspection.
+    false
+}
+
 /// One frame to include in the summary GIF: its file and how long to dwell on it.
 pub struct GifFrame {
     pub path: PathBuf,
@@ -7720,6 +7801,9 @@ pub fn build_captioned_gif(
     selection: &[CaptionedFrame],
     out_path: &Path,
 ) -> Result<usize> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     use image::codecs::gif::{GifEncoder, Repeat};
     let frames_dir = latest_frames_dir(artifact_root)
         .ok_or_else(|| anyhow!("no capture frames under {}", artifact_root.display()))?;
@@ -7777,6 +7861,9 @@ pub fn build_captioned_gif(
 /// Build an animated GIF from the given (already curated) frames, dwelling on
 /// each for a clamped function of its hold_ms. Writes to `out_path`.
 pub fn build_summary_gif(frames: &[GifFrame], out_path: &Path) -> Result<()> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     use image::codecs::gif::{GifEncoder, Repeat};
     if frames.is_empty() {
         bail!("build_summary_gif: no frames provided");
@@ -7887,6 +7974,9 @@ pub fn build_curated_gif(
     selection: &[CurationSelection],
     confirmation_seq: Option<u32>,
 ) -> Result<CurationResult> {
+    if !gif_generation_enabled() {
+        bail!("GIF generation is temporarily disabled");
+    }
     let frames_dir = latest_frames_dir(artifact_root)
         .ok_or_else(|| anyhow!("no capture frames found under {}", artifact_root.display()))?;
     let manifest = read_frame_manifest(&frames_dir)?;
@@ -7963,8 +8053,12 @@ pub fn capture_contact_sheet(artifact_root: &Path, caps: StitchCaps) -> Result<O
 /// Deterministic fallback recording: a summary GIF of ALL unique frames (seq
 /// order, dwell from hold_ms) from the latest capture under `artifact_root`.
 /// Used when LLM curation didn't run (non-vision model, or the model didn't call
-/// submit_capture_curation) so a recording always exists. Ok(None) with no frames.
+/// submit_capture_curation). While GIF generation is disabled, this returns
+/// Ok(None) without producing an artifact.
 pub fn build_uncurated_summary_gif(artifact_root: &Path) -> Result<Option<PathBuf>> {
+    if !gif_generation_enabled() {
+        return Ok(None);
+    }
     let Some(frames_dir) = latest_frames_dir(artifact_root) else {
         return Ok(None);
     };
@@ -8592,6 +8686,18 @@ mod tests {
             }
             None => println!("\nno frames found under {}", root.display()),
         }
+    }
+
+    #[test]
+    fn gif_generation_is_temporarily_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("summary.gif");
+
+        assert_eq!(build_uncurated_summary_gif(temp.path()).unwrap(), None);
+
+        let err = build_summary_gif(&[], &out).unwrap_err().to_string();
+        assert!(err.contains("GIF generation is temporarily disabled"));
+        assert!(!out.exists());
     }
 
     #[test]

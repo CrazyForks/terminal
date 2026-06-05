@@ -11,6 +11,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import sys
 import time as _time
 import urllib.error
@@ -381,6 +382,25 @@ def goto_url(url):
         if skills:
             __last_domain_skills = [{"url": url, **skill} for skill in skills]
             result = {**result, "domain_skills": __last_domain_skills}
+    # Catch a redirect to a blocked domain (mirrors browser-use's
+    # SecurityWatchdog forcing about:blank). The Rust bridge already blocked the
+    # initial navigate; this covers server/JS redirects that land elsewhere.
+    # Only runs when a policy is configured (so the common case stays as fast as
+    # upstream), and waits for the navigation to settle first so a redirect
+    # isn't missed by checking the URL before it has happened.
+    if _NAV_ALLOW or _NAV_DENY:
+        try:
+            wait_for_load(timeout=15)
+        except Exception:
+            pass
+        try:
+            final = current_tab().get("url", "") or ""
+        except Exception:
+            final = ""
+        reason = _nav_blocked_reason(final)
+        if reason:
+            cdp("Page.navigate", url="about:blank")
+            raise RuntimeError(reason)
     return result
 
 
@@ -711,9 +731,263 @@ def click_at_xy(x, y, button="left", clicks=1):
     return True
 
 
+_SECRET_TAG_RE = re.compile(r"<secret>(.*?)</secret>")
+
+
 def type_text(text):
-    cdp("Input.insertText", text=text)
+    cdp("Input.insertText", text=_substitute_secrets(str(text)))
     return True
+
+
+# Domain-scoped secrets, the same way browser-use's `sensitive_data` works: the
+# model writes the placeholder name (ideally wrapped as `<secret>name</secret>`);
+# the real value is fetched on demand from the OS keychain (via the Rust bridge)
+# only when we're about to fill a field, gated on the current page domain, and
+# never reaches the model (Rust redacts any value that leaks back into output).
+# `_SECRET_META` is injected by the prelude as { domain: { name: {"totp": bool} } }
+# — names only, never values. A name ending in `bu_2fa_code` is also TOTP.
+try:
+    _SECRET_META
+except NameError:  # standalone import / older prelude
+    _SECRET_META = {}
+try:
+    _NAV_ALLOW
+except NameError:
+    _NAV_ALLOW = []
+try:
+    _NAV_DENY
+except NameError:
+    _NAV_DENY = []
+
+
+def _nav_pattern_matches(host, pattern):
+    pattern = pattern.strip().lstrip("*").lstrip(".").lower()
+    if not pattern or not host:
+        return False
+    return host == pattern or host.endswith("." + pattern)
+
+
+def _nav_blocked_reason(url):
+    """Mirror of the Rust nav guard for post-load redirect checks: deny wins,
+    empty policy never restricts, only http(s) hosts are gated."""
+    if not _NAV_ALLOW and not _NAV_DENY:
+        return None
+    parsed = urlparse(url or "")
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if any(_nav_pattern_matches(host, p) for p in _NAV_DENY):
+        return (
+            f"navigation to {host} is blocked by the user's /domains block-list. Tell the user "
+            f"they can unblock {host} in /domains if they want you to visit it."
+        )
+    if _NAV_ALLOW and not any(_nav_pattern_matches(host, p) for p in _NAV_ALLOW):
+        return (
+            f"navigation to {host} is blocked: it isn't in the user's /domains allow-list. Tell the "
+            f"user they can allow {host} by running /domains if they want you to visit it."
+        )
+    return None
+
+
+def _secret_current_domain():
+    try:
+        url = current_tab().get("url", "") or ""
+    except Exception:
+        url = ""
+    host = (urlparse(url).hostname or "").lower()
+    return host
+
+
+def _secret_domain_matches(domain, pattern):
+    pattern = pattern.strip().lstrip("*").lstrip(".").lower()
+    if not pattern or not domain:
+        return False
+    return domain == pattern or domain.endswith("." + pattern)
+
+
+def _applicable_meta():
+    """{ name: (is_totp, configured_domain_pattern) } for the current page domain
+    only — the gate that keeps domain A's credentials off domain B. Values are NOT
+    here; they are fetched on demand by `_fetch_secret_value`."""
+    domain = _secret_current_domain()
+    out = {}
+    for pattern, names in _SECRET_META.items():
+        if _secret_domain_matches(domain, pattern):
+            for name, info in names.items():
+                is_totp = bool(info.get("totp")) if isinstance(info, dict) else False
+                out[name] = (is_totp or name.endswith("bu_2fa_code"), pattern)
+    return out
+
+
+def _fetch_secret_value(name, applicable=None):
+    """Fetch the real value for `name` from the OS keychain (lazily, via the Rust
+    bridge) — this is the only point the keychain is read, so the access prompt
+    happens here, while filling the field. TOTP secrets return a live code."""
+    applicable = _applicable_meta() if applicable is None else applicable
+    if name not in applicable:
+        where = _secret_current_domain() or "this page"
+        raise RuntimeError(
+            f"no secret named {name!r} is configured for {where}. Add one in the terminal with /secrets."
+        )
+    is_totp, pattern = applicable[name]
+    result = _bridge({"kind": "secret", "domain": pattern, "name": name})
+    value = result.get("value") if isinstance(result, dict) else None
+    if value is None:
+        raise RuntimeError(f"secret {name!r} could not be read")
+    return _totp_now(value) if is_totp else value
+
+
+def _substitute_secrets(text):
+    """Replace `<secret>name</secret>` (and a bare string that is exactly a
+    placeholder name) with the real value for the current domain. Unknown /
+    wrong-domain placeholders are left untouched (never cross-filled), matching
+    browser-use's behavior. No-op (and no bridge call) when no secrets exist."""
+    if not text or not _SECRET_META:
+        return text
+    applicable = _applicable_meta()
+    if "<secret>" in text:
+        def _repl(match):
+            name = match.group(1)
+            return _fetch_secret_value(name, applicable) if name in applicable else match.group(0)
+
+        return _SECRET_TAG_RE.sub(_repl, text)
+    if text.strip() in applicable:
+        return _fetch_secret_value(text.strip(), applicable)
+    return text
+
+
+def secret(name):
+    """Resolve a configured secret for the current page domain. The model writes
+    the placeholder name; the real value is fetched here and never appears in
+    output. Example: fill_input("#password", secret("password")). You can also
+    pass the placeholder inline: fill_input("#password", "<secret>password</secret>")."""
+    return _fetch_secret_value(name)
+
+
+def available_secrets():
+    """Placeholder names configured for the current page domain (no values)."""
+    return sorted(_applicable_meta().keys())
+
+
+def _totp_now(seed, digits=6, period=30):
+    import hashlib
+    import hmac
+    import struct
+
+    cleaned = "".join(seed.split()).upper().rstrip("=")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    bits = 0
+    value = 0
+    key = bytearray()
+    for ch in cleaned:
+        idx = alphabet.find(ch)
+        if idx < 0:
+            raise RuntimeError("TOTP seed is not valid base32")
+        value = (value << 5) | idx
+        bits += 5
+        if bits >= 8:
+            bits -= 8
+            key.append((value >> bits) & 0xFF)
+    counter = int(_time.time()) // period
+    mac = hmac.new(bytes(key), struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    binary = struct.unpack(">I", mac[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
+
+
+def totp(name):
+    """Generate the live 6-digit TOTP code for a configured 2FA secret on the
+    current page domain. Example: type_text(totp("otp"))."""
+    applicable = _applicable_meta()
+    if name not in applicable or not applicable[name][0]:
+        where = _secret_current_domain() or "this page"
+        raise RuntimeError(f"no TOTP secret named {name!r} is configured for {where}.")
+    return _fetch_secret_value(name, applicable)
+
+
+try:
+    _EMAIL_AVAILABLE
+except NameError:
+    _EMAIL_AVAILABLE = False
+
+
+def email_address():
+    """Return the agent's email inbox address (for email verification / 2FA).
+
+    Type this into an email/username field at signup or login, then read the
+    arriving code with email_code(). Raises if no inbox is configured."""
+    if not _EMAIL_AVAILABLE:
+        raise RuntimeError(
+            "No email inbox is configured. Set one up with `secrets email set-token`."
+        )
+    resp = _bridge({"kind": "email", "op": "address"})
+    address = resp.get("value")
+    if not address:
+        raise RuntimeError("failed to provision an email inbox (check the AgentMail token).")
+    return address
+
+
+def email_code(timeout=120):
+    """Poll the agent's email inbox for the latest one-time / verification code,
+    returning the digits. Waits up to `timeout` seconds for the email to arrive.
+
+    Call this AFTER triggering the email (submitting the form). Example:
+        type_text(email_address()); click(submit)
+        fill_input("#code", email_code())"""
+    if not _EMAIL_AVAILABLE:
+        raise RuntimeError(
+            "No email inbox is configured. Set one up with `secrets email set-token`."
+        )
+    deadline = _time.time() + max(1, int(timeout))
+    while _time.time() < deadline:
+        resp = _bridge({"kind": "email", "op": "code"})
+        code = resp.get("value")
+        if code:
+            return code
+        _time.sleep(3)
+    raise RuntimeError(f"no email code arrived within {int(timeout)}s.")
+
+
+_LOGIN_URL_MARKERS = ("login", "signin", "sign-in", "sign_in", "/auth", "sso", "logon")
+
+
+def is_logged_out():
+    """Heuristic logout/session-expiry check for the current page.
+
+    There is no Cloud API for this; we infer it. Returns a dict with `logged_out`
+    (bool), the current `domain`, whether we `have_credentials` configured for it,
+    and a short `reason`. Useful after navigating to a site that should already be
+    authenticated (via a reused profile/cookies) to decide whether to log in
+    again with secret()/totp()."""
+    domain = _secret_current_domain()
+    have_credentials = any(_secret_domain_matches(domain, p) for p in _SECRET_META)
+    try:
+        url = (current_tab().get("url", "") or "").lower()
+    except Exception:
+        url = ""
+    looks_login = any(marker in url for marker in _LOGIN_URL_MARKERS)
+    password_fields = 0
+    try:
+        password_fields = int(
+            _runtime_evaluate("document.querySelectorAll('input[type=\"password\"]').length") or 0
+        )
+    except Exception:
+        password_fields = 0
+    logged_out = looks_login or password_fields > 0
+    if looks_login:
+        reason = "url looks like a login page"
+    elif password_fields > 0:
+        reason = "a password field is present"
+    else:
+        reason = "no login indicators"
+    return {
+        "logged_out": logged_out,
+        "domain": domain,
+        "have_credentials": have_credentials,
+        "reason": reason,
+    }
 
 
 _KEYS = {
