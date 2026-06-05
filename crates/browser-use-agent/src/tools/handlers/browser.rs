@@ -59,8 +59,9 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// Default per-script timeout (seconds) when a request omits one.
 ///
 /// The `browser-use-browser` script fns take a `timeout_seconds`; we default to
-/// a generous 120s so a single page interaction has room to complete.
-pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 120;
+/// a generous 300s so a single page interaction has room to complete while the
+/// run-level task timebox remains responsible for bounding the whole agent.
+pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 300;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
