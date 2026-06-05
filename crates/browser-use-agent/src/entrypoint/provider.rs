@@ -45,6 +45,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
@@ -1052,7 +1053,11 @@ fn resolve_provider_with_python(
     //     message vec — the turn loop threads the real prompt through
     //     `run_sampling_request`, which rebuilds the request per attempt from
     //     `ctx` + the loop's input (the shape `build_transport` documents).
-    let client = Arc::new(ModelClient::default());
+    let mut client = ModelClient::default();
+    if let Some(timeout_ms) = config.options.model_stream_idle_timeout_ms {
+        client = client.with_stream_idle_timeout(Duration::from_millis(timeout_ms.max(1)));
+    }
+    let client = Arc::new(client);
     let transport = build_transport(client, route, &ctx, Vec::new());
 
     // (3a) Resolve the Python backend for the run's `python` tool. Real path:
