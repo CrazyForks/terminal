@@ -448,6 +448,7 @@ fn browser_backend_for_runtime_or_config(
                             keep_alive: true,
                             headless: None,
                             profile_id: Some(session_id.as_str().to_string()),
+                            ..RuntimeBrowserConfig::default()
                         },
                     )?;
                     let browser_registries = handle.browser_physical_registries(&browser_id)?;

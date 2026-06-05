@@ -4048,6 +4048,7 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
         "agent.create" => sdk_agent_create(context, &request.params),
         "agent.snapshot" => sdk_agent_snapshot(context, &request.params),
+        "agent.run_task" => sdk_agent_run_task(context, &request.params),
         "agent.run" => sdk_agent_run(context, &request.params),
         "agent.stop" => sdk_agent_stop(context, &request.params),
         "agent.close" => sdk_agent_close(context, &request.params),
@@ -4081,6 +4082,14 @@ fn sdk_browser_create(runtime: &RuntimeHandle, params: &Value) -> Result<Value> 
             .get("profile_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        cdp_url: sdk_string_param(params, "cdp_url"),
+        cdp_headers: sdk_json_env_param(params, "cdp_headers"),
+        user_agent: sdk_string_param(params, "user_agent"),
+        viewport: sdk_json_env_param(params, "viewport"),
+        storage_state: sdk_json_env_param(params, "storage_state"),
+        downloads_path: sdk_string_param(params, "downloads_path"),
+        no_viewport: sdk_bool_param(params, "no_viewport"),
+        accept_downloads: sdk_bool_param(params, "accept_downloads"),
     };
     let browser_id = runtime.create_browser(config);
     Ok(serde_json::json!({ "browser_id": browser_id.as_str() }))
@@ -4227,7 +4236,13 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
 
     let events_before_run = context.runtime.events_for_session(&session_id)?;
     let task = task_from_events(&events_before_run).unwrap_or_else(|| "task".to_string());
-    let config = sdk_provider_run_config(params, Some(&task))?;
+    let browser_snapshot = browser_id
+        .as_ref()
+        .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
+    let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
+    let browser_id_value = browser_id
+        .as_ref()
+        .map(|browser_id| browser_id.as_str().to_string());
     sdk_run_agent_with_runtime(context, &agent_id, &session_id, browser_id, config)?;
 
     let events = context.runtime.events_for_session(&session_id)?;
@@ -4253,15 +4268,48 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
+        "agent_id": agent_id.as_str(),
+        "session_id": session_id.as_str(),
+        "browser_id": browser_id_value,
         "history": {
             "output": output,
             "success": error.is_none(),
             "done": true,
             "errors": error.into_iter().collect::<Vec<_>>(),
             "events": event_values,
+            "usage": sdk_usage_from_events(&events),
+            "files": sdk_files_from_events(&events),
         },
         "final_projected_event": final_projected_event,
     }))
+}
+
+fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    let mut run_params = params.clone();
+    if let Value::Object(map) = &mut run_params {
+        if !map.contains_key("browser_id") {
+            if let Some(browser) = params.get("browser").filter(|value| value.is_object()) {
+                let created_browser = sdk_browser_create(&context.runtime, browser)?;
+                if let Some(browser_id) = created_browser.get("browser_id").and_then(Value::as_str)
+                {
+                    map.insert(
+                        "browser_id".to_string(),
+                        Value::String(browser_id.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    let created = sdk_agent_create(context, &run_params)?;
+    let agent_id = created
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .context("agent.run_task could not create agent")?
+        .to_string();
+    if let Value::Object(map) = &mut run_params {
+        map.insert("agent_id".to_string(), Value::String(agent_id));
+    }
+    sdk_agent_run(context, &run_params)
 }
 
 fn sdk_run_agent_with_runtime(
@@ -4467,7 +4515,11 @@ fn sdk_agent_close(context: &SdkServerContext, params: &Value) -> Result<Value> 
     Ok(serde_json::json!({ "ok": true }))
 }
 
-fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<ProviderRunConfig> {
+fn sdk_provider_run_config(
+    params: &Value,
+    task: Option<&str>,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<ProviderRunConfig> {
     let llm = params.get("llm").unwrap_or(&Value::Null);
     let provider = llm
         .get("provider")
@@ -4483,13 +4535,10 @@ fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<Provide
         .unwrap_or("gpt-5.5");
     let backend = sdk_provider_backend(provider, model)?;
     let provider_id = sdk_provider_id(provider, backend);
+    let browser = params.get("browser").unwrap_or(&Value::Null);
+    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
     let mut options = AgentRunOptions::default()
-        .with_browser_mode(
-            params
-                .get("browser_mode")
-                .and_then(Value::as_str)
-                .unwrap_or("local"),
-        )
+        .with_browser_mode(browser_mode)
         .with_model_compaction(true)
         .with_analytics_source("sdk")
         .with_model_provider_id(provider_id.clone());
@@ -4508,12 +4557,241 @@ fn sdk_provider_run_config(params: &Value, task: Option<&str>) -> Result<Provide
     if let Some(timeout) = llm.get("timeout").and_then(Value::as_u64) {
         options.python_tool_timeout_seconds = timeout;
     }
+    options.python_env.extend(sdk_python_env_from_params(
+        params,
+        browser,
+        browser_snapshot,
+    )?);
 
     let mut config = ProviderRunConfig::new(backend, model).with_options(options);
     if backend == ProviderBackend::Fake {
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_browser_mode_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> String {
+    if let Some(mode) = params
+        .get("browser_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return mode.to_string();
+    }
+    if sdk_string_param(browser, "cdp_url").is_some()
+        || sdk_string_param(params, "cdp_url").is_some()
+    {
+        return "remote-cdp".to_string();
+    }
+    if let Some(snapshot) = browser_snapshot {
+        if snapshot
+            .config
+            .cdp_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return "remote-cdp".to_string();
+        }
+        if snapshot.config.headless == Some(false) {
+            return "managed-headed".to_string();
+        }
+        if snapshot.config.headless == Some(true) {
+            return "managed-headless".to_string();
+        }
+    }
+    "managed-headless".to_string()
+}
+
+fn sdk_python_env_from_params(
+    params: &Value,
+    browser: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<Vec<(String, String)>> {
+    let mut env = Vec::new();
+    let mut push = |key: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            env.push((key.to_string(), value));
+        }
+    };
+    let snapshot_config = browser_snapshot.map(|snapshot| &snapshot.config);
+    push(
+        "BU_CDP_URL",
+        sdk_string_param(browser, "cdp_url")
+            .or_else(|| sdk_string_param(params, "cdp_url"))
+            .or_else(|| snapshot_config.and_then(|config| config.cdp_url.clone())),
+    );
+    push(
+        "BU_CDP_HEADERS",
+        sdk_json_env_param(browser, "cdp_headers")
+            .or_else(|| sdk_json_env_param(params, "cdp_headers"))
+            .or_else(|| snapshot_config.and_then(|config| config.cdp_headers.clone())),
+    );
+    push(
+        "BU_BROWSER_USER_AGENT",
+        sdk_string_param(browser, "user_agent")
+            .or_else(|| sdk_string_param(params, "user_agent"))
+            .or_else(|| snapshot_config.and_then(|config| config.user_agent.clone())),
+    );
+    push(
+        "BU_BROWSER_VIEWPORT",
+        sdk_json_env_param(browser, "viewport")
+            .or_else(|| sdk_json_env_param(params, "viewport"))
+            .or_else(|| snapshot_config.and_then(|config| config.viewport.clone())),
+    );
+    push(
+        "BU_BROWSER_STORAGE_STATE",
+        sdk_json_env_param(browser, "storage_state")
+            .or_else(|| sdk_json_env_param(params, "storage_state"))
+            .or_else(|| snapshot_config.and_then(|config| config.storage_state.clone())),
+    );
+    push(
+        "BU_BROWSER_DOWNLOADS_PATH",
+        sdk_string_param(browser, "downloads_path")
+            .or_else(|| sdk_string_param(params, "downloads_path"))
+            .or_else(|| snapshot_config.and_then(|config| config.downloads_path.clone())),
+    );
+    if let Some(value) = sdk_bool_param(browser, "no_viewport")
+        .or_else(|| sdk_bool_param(params, "no_viewport"))
+        .or_else(|| snapshot_config.and_then(|config| config.no_viewport))
+    {
+        env.push(("BU_BROWSER_NO_VIEWPORT".to_string(), value.to_string()));
+    }
+    if let Some(value) = sdk_bool_param(browser, "accept_downloads")
+        .or_else(|| sdk_bool_param(params, "accept_downloads"))
+        .or_else(|| snapshot_config.and_then(|config| config.accept_downloads))
+    {
+        env.push(("BU_BROWSER_ACCEPT_DOWNLOADS".to_string(), value.to_string()));
+    }
+    if params.get("calculate_cost").and_then(Value::as_bool) == Some(true) {
+        env.push(("BU_USE_CALCULATE_COST".to_string(), "true".to_string()));
+    }
+    if let Some(extra) = params.get("python_env") {
+        match extra {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if let Some(text) = value.as_str() {
+                        env.push((key.to_string(), text.to_string()));
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    let Some(key) = item.get("key").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(value) = item.get("value").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    env.push((key.to_string(), value.to_string()));
+                }
+            }
+            _ => bail!("python_env must be an object or array of key/value records"),
+        }
+    }
+    Ok(env)
+}
+
+fn sdk_string_param(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn sdk_bool_param(value: &Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(Value::as_bool)
+}
+
+fn sdk_json_env_param(value: &Value, key: &str) -> Option<String> {
+    let raw = value.get(key)?;
+    if raw.is_null() {
+        return None;
+    }
+    if let Some(text) = raw.as_str() {
+        return Some(text.to_string());
+    }
+    Some(serde_json::to_string(raw).ok()?)
+}
+
+fn sdk_usage_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {
+    for event in events.iter().rev() {
+        let payload = &event.payload;
+        if event.event_type == "token_count" {
+            if let Some(info) = payload.get("info") {
+                if let Some(total) = info.get("total_token_usage") {
+                    return total.clone();
+                }
+                if let Some(last) = info.get("last_token_usage") {
+                    return last.clone();
+                }
+            }
+        }
+        if let Some(usage) = payload.get("usage") {
+            return usage.clone();
+        }
+    }
+    Value::Null
+}
+
+fn sdk_files_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {
+    let mut files = Vec::new();
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    for event in events {
+        let payload = &event.payload;
+        if event.event_type == "artifact.created" {
+            if let Some(artifact) = payload.get("artifact") {
+                sdk_push_file(&mut files, &mut seen, artifact);
+            }
+        }
+        if matches!(event.event_type.as_str(), "tool.output" | "tool.failed") {
+            if let Some(artifacts) = payload.get("artifacts").and_then(Value::as_array) {
+                for artifact in artifacts {
+                    sdk_push_file(&mut files, &mut seen, artifact);
+                }
+            }
+        }
+    }
+    Value::Array(files)
+}
+
+fn sdk_push_file(
+    files: &mut Vec<Value>,
+    seen: &mut std::collections::BTreeSet<String>,
+    artifact: &Value,
+) {
+    let Some(path) = artifact
+        .get("path")
+        .or_else(|| artifact.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let mime = artifact
+        .get("mime")
+        .or_else(|| artifact.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if mime.starts_with("image/") {
+        return;
+    }
+    if !seen.insert(path.to_string()) {
+        return;
+    }
+    files.push(serde_json::json!({
+        "path": path,
+        "kind": artifact.get("kind").and_then(Value::as_str).unwrap_or("file"),
+        "mime": mime,
+        "bytes": artifact.get("bytes").cloned().unwrap_or(Value::Null),
+    }));
 }
 
 fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> {
@@ -7067,6 +7345,136 @@ command = "test-mcp"
     }
 
     #[test]
+    fn sdk_json_rpc_browser_create_preserves_browser_use_settings() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "browser.create",
+            "params": {
+                "keep_alive": true,
+                "headless": false,
+                "profile_id": "profile-a",
+                "cdp_url": "wss://browser.example.test/cdp",
+                "cdp_headers": {"Authorization": "Bearer test"},
+                "user_agent": "BrowserUseTest/1.0",
+                "viewport": {"width": 1280, "height": 720},
+                "storage_state": {"cookies": []},
+                "downloads_path": "/tmp/browser-use-downloads",
+                "no_viewport": true,
+                "accept_downloads": true
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        let browser_id = response["result"]["browser_id"]
+            .as_str()
+            .context("browser id")?;
+        let snapshot = context
+            .runtime
+            .browsers()
+            .snapshot(&BrowserId::from_string(browser_id.to_string())?)?;
+        assert!(snapshot.config.keep_alive);
+        assert_eq!(snapshot.config.headless, Some(false));
+        assert_eq!(snapshot.config.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(
+            snapshot.config.cdp_url.as_deref(),
+            Some("wss://browser.example.test/cdp")
+        );
+        assert_eq!(
+            snapshot.config.user_agent.as_deref(),
+            Some("BrowserUseTest/1.0")
+        );
+        assert_eq!(
+            snapshot.config.downloads_path.as_deref(),
+            Some("/tmp/browser-use-downloads")
+        );
+        assert_eq!(snapshot.config.no_viewport, Some(true));
+        assert_eq!(snapshot.config.accept_downloads, Some(true));
+        assert!(snapshot
+            .config
+            .cdp_headers
+            .as_deref()
+            .is_some_and(|value| value.contains("Authorization")));
+        assert!(snapshot
+            .config
+            .viewport
+            .as_deref()
+            .is_some_and(|value| value.contains("1280")));
+        assert!(snapshot
+            .config
+            .storage_state
+            .as_deref()
+            .is_some_and(|value| value.contains("cookies")));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_maps_browser_use_options_to_rust_core() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "max_steps": 12,
+            "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+            "calculate_cost": true,
+            "llm": {"provider": "anthropic", "model": "claude-sonnet-4-6", "timeout": 45},
+            "browser": {
+                "cdp_url": "wss://browser.example.test/cdp",
+                "cdp_headers": {"Authorization": "Bearer test"},
+                "user_agent": "BrowserUseTest/1.0",
+                "viewport": {"width": 1365, "height": 768},
+                "storage_state": {"origins": []},
+                "downloads_path": "/tmp/downloads",
+                "no_viewport": true,
+                "accept_downloads": true
+            },
+            "python_env": {"CUSTOM_ENV": "custom-value"}
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        assert_eq!(config.model, "claude-sonnet-4-6");
+        assert_eq!(config.options.max_turns, 12);
+        assert_eq!(config.options.browser_mode.as_deref(), Some("remote-cdp"));
+        assert_eq!(
+            config.options.final_output_json_schema,
+            params.get("output_schema").cloned()
+        );
+        assert_eq!(config.options.python_tool_timeout_seconds, 45);
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_CDP_URL" && value == "wss://browser.example.test/cdp"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_CDP_HEADERS" && value.contains("Authorization") }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| { key == "BU_BROWSER_VIEWPORT" && value.contains("1365") }));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_BROWSER_NO_VIEWPORT" && value == "true"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "BU_USE_CALCULATE_COST" && value == "true"));
+        assert!(config
+            .options
+            .python_env
+            .iter()
+            .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
     fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
         let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
         let context = SdkServerContext::memory()?;
@@ -7142,6 +7550,66 @@ command = "test-mcp"
         assert_eq!(
             browser_snapshot.status,
             browser_use_runtime::BrowserStatus::Released
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_json_rpc_agent_run_task_executes_fake_backend_with_normalized_history() -> Result<()> {
+        let temp = unique_cli_test_dir("sdk-json-rpc-run-task-fake")?;
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "agent.run_task",
+            "params": {
+                "task": "summarize the loaded page",
+                "cwd": "/tmp",
+                "max_steps": 3,
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser": {"cdp_url": "wss://browser.example.test/cdp"},
+                "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}}}
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        assert!(response.get("error").is_none(), "{response}");
+        let result = response.get("result").context("run_task result")?;
+        assert!(result["agent_id"].as_str().is_some());
+        assert!(result["session_id"].as_str().is_some());
+        assert!(result["browser_id"].as_str().is_some());
+        assert_eq!(result["history"]["done"], true);
+        assert_eq!(result["history"]["success"], true);
+        assert_eq!(
+            result["history"]["output"],
+            serde_json::Value::String("Fake result for: summarize the loaded page".to_string())
+        );
+        assert!(result["history"]["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()));
+        assert!(result["history"]["usage"].is_null() || result["history"]["usage"].is_object());
+        assert!(result["history"]["files"].as_array().is_some());
+        assert_eq!(
+            result["final_projected_event"]["kind"],
+            serde_json::Value::String("turn_completed".to_string())
+        );
+        let browser_snapshot = context
+            .runtime
+            .browsers()
+            .snapshots()
+            .into_iter()
+            .next()
+            .context("run_task browser snapshot")?;
+        assert_eq!(
+            browser_snapshot.config.cdp_url.as_deref(),
+            Some("wss://browser.example.test/cdp")
+        );
+        assert!(
+            !temp.join("state.db").exists(),
+            "SDK memory runs must not create Store-backed SQLite state"
         );
 
         std::fs::remove_dir_all(temp)?;
