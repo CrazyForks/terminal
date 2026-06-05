@@ -21,7 +21,8 @@ use browser_use_store::Store;
 use serde_json::json;
 
 use super::browser::{
-    browser_command_is_passive, desired_browser_connect_command, BrowserAction, BrowserBackend,
+    browser_command_is_passive, desired_browser_connect_command,
+    enrich_local_connect_recovery_with_default_profile, BrowserAction, BrowserBackend,
     BrowserRequest, BrowserTool, BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
 };
 use crate::session::SharedStore;
@@ -61,6 +62,7 @@ struct FakeBackend {
     last_timeout_secs: Mutex<Option<u64>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
+    fail_local_profiles: bool,
 }
 
 impl FakeBackend {
@@ -220,6 +222,9 @@ impl BrowserBackend for FakeBackend {
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
         self.commands.lock().unwrap().push(command.to_string());
         self.record_paths(cwd, artifact_dir);
+        if self.fail_local_profiles && command == "browser local profiles --json" {
+            anyhow::bail!("profile discovery failed");
+        }
         if self.fail {
             anyhow::bail!("boom");
         }
@@ -373,6 +378,39 @@ async fn run_direct_with_ctx(
     tool.run(req, &attempt, ctx).await
 }
 
+#[test]
+fn permission_blocked_default_profile_recovery_opens_selected_profile_first() {
+    let output = BrowserCommandOutput {
+        content: json!({
+            "status": "blocked",
+            "state": "permission-blocked",
+            "reason": "Chrome rejected CDP control.",
+            "next_step": "Ask the user to click Allow",
+        }),
+        events: vec![],
+    };
+
+    let output = enrich_local_connect_recovery_with_default_profile(
+        output,
+        "browser connect local",
+        Some("google-chrome:Profile 1"),
+    );
+
+    assert_eq!(
+        output.content["profile_recovery_command"],
+        "browser local open --profile 'google-chrome:Profile 1' --no-marker"
+    );
+    let next_step = output.content["next_step"].as_str().unwrap();
+    assert!(
+        next_step.contains("browser local open --profile 'google-chrome:Profile 1' --no-marker"),
+        "{next_step}"
+    );
+    assert!(
+        next_step.contains("immediately run `browser connect local` again"),
+        "{next_step}"
+    );
+}
+
 // (1) A browser command request routes to the backend and maps output->ExecOutput.
 #[tokio::test]
 async fn command_routes_and_maps_output() {
@@ -519,6 +557,80 @@ async fn stored_local_profile_is_opened_before_plain_local_connect_when_reachabl
 }
 
 #[tokio::test]
+async fn local_connect_blocks_if_default_profile_context_is_not_active_after_connect() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.local_profiles.lock().unwrap() = Some(json!({
+        "status": "ok",
+        "profiles": [
+            {
+                "id": "google-chrome:Profile 1",
+                "profile_name": "Laith",
+                "profile_dir": "Profile 1"
+            }
+        ],
+    }));
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("\"status\":\"blocked\""),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("\"state\":\"profile-target-missing\""),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("browser local open --profile"),
+        "{}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn local_profiles_response_warns_model_not_to_ask_when_default_exists() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Profile 1")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser local profiles --json");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout
+            .contains("\"default_profile_id\":\"google-chrome:Profile 1\""),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("Do not ask the user which profile"),
+        "{}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
 async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable() {
     let backend = Arc::new(FakeBackend::default());
     backend.set_local_list(json!({
@@ -547,6 +659,70 @@ async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable(
             "browser local list --json".to_string(),
             "browser connect local".to_string(),
         ]
+    );
+}
+
+#[tokio::test]
+async fn local_connect_blocks_without_default_when_profile_discovery_errors() {
+    let backend = Arc::new(FakeBackend {
+        fail_local_profiles: true,
+        ..Default::default()
+    });
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"status\":\"blocked\""));
+    assert!(out
+        .stdout
+        .contains("\"state\":\"profile-discovery-failed\""));
+    assert!(out.stdout.contains("profile discovery failed"));
+    assert!(
+        out.stdout
+            .contains("Do not run browser connect local without a selected default profile"),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(
+        backend.commands(),
+        vec!["browser local profiles --json".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn local_connect_blocks_without_default_when_profile_discovery_reports_failed() {
+    let backend = Arc::new(FakeBackend::default());
+    *backend.local_profiles.lock().unwrap() = Some(json!({
+        "status": "failed",
+        "error": "profile discovery failed",
+        "profiles": [],
+    }));
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect local");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"status\":\"blocked\""));
+    assert!(out
+        .stdout
+        .contains("\"state\":\"profile-discovery-failed\""));
+    assert!(out.stdout.contains("profile discovery failed"));
+    assert_eq!(
+        backend.commands(),
+        vec!["browser local profiles --json".to_string()]
     );
 }
 
@@ -664,6 +840,37 @@ async fn script_start_routes_to_start_script() {
 }
 
 #[tokio::test]
+async fn script_start_without_default_local_profile_prompts_before_connecting() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("\"status\":\"needs-user-action\""));
+    assert!(
+        out.stdout
+            .contains("No default local Chrome profile is set."),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(
+        backend.commands(),
+        vec!["browser local profiles --json".to_string()]
+    );
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser local profiles --json".to_string())
+    );
+}
+
+#[tokio::test]
 async fn script_start_switches_to_changed_default_local_profile_before_running() {
     let backend = Arc::new(FakeBackend::default());
     *backend.active_local_profile_id.lock().unwrap() = Some("google-chrome:Profile 1".to_string());
@@ -749,10 +956,7 @@ async fn script_start_reuses_ready_matching_local_profile_after_live_probe() {
     assert_eq!(out.exit_code, 0);
     assert_eq!(
         backend.commands(),
-        vec![
-            "browser status --json".to_string(),
-            "browser recover reattach-same-target".to_string(),
-        ]
+        vec!["browser status --json".to_string()]
     );
     assert_eq!(
         backend.last(),
@@ -1039,7 +1243,16 @@ async fn empty_request_session_uses_context_session_id() {
 #[tokio::test]
 async fn configured_session_id_keeps_tool_call_id_for_persistence() {
     let backend = Arc::new(FakeBackend::default());
+    *backend.active_local_profile_id.lock().unwrap() = Some("google-chrome:Default".to_string());
+    backend.set_browser_page_ready(true);
     let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store.set_setting("browser", "Local Chrome").unwrap();
+        store
+            .set_setting("browser.preference.profile", "google-chrome:Default")
+            .unwrap();
+    }
     let tool = tool_with(Arc::clone(&backend))
         .with_session_id("agent-session")
         .with_persistence(store.clone(), session.clone());
