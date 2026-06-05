@@ -4176,11 +4176,6 @@ fn sdk_agent_create(context: &SdkServerContext, params: &Value) -> Result<Value>
                 agent.session_id().as_str().to_string(),
             )?;
         }
-        store.append_event(
-            agent.session_id().as_str(),
-            "session.input",
-            input_payload.clone(),
-        )?;
     }
     context.runtime.append_observed_session_event(
         agent.session_id().clone(),
@@ -8200,6 +8195,14 @@ command = "test-mcp"
         let events = context
             .runtime
             .events_for_session(&SessionId::from_string(session_id.to_string())?)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.input")
+                .count(),
+            1,
+            "SDK agent creation should persist the initial task input exactly once"
+        );
         assert!(events
             .iter()
             .any(|event| event.event_type == "mailbox.enqueued"));
@@ -8342,6 +8345,14 @@ command = "test-mcp"
             .iter()
             .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| **event_type == "session.input")
+                .count(),
+            1,
+            "SDK run_task should not duplicate the initial task input"
+        );
         assert!(event_types.contains(&"agent.input.accepted"));
         assert!(event_types.contains(&"agent.input.consumed"));
         assert!(result["history"]["events"]
