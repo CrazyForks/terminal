@@ -9360,6 +9360,7 @@ fn native_live_stream_emit_count(
 ) -> usize {
     if commit_prefix_len < stream_len
         || transcript::active_streaming_has_table_holdback(Some(model))
+        || transcript::active_streaming_ends_on_line_boundary(Some(model))
         || (transcript::active_streaming_can_commit_all(Some(model)) && stream_len > 1)
     {
         commit_prefix_len
@@ -14647,7 +14648,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn native_live_stream_plan_defers_confirmed_table_until_final() -> Result<()> {
+    fn native_live_stream_plan_releases_closed_table_before_final() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14675,10 +14676,10 @@ wire_api = "responses"
         let emitted = plain_text_lines(&plan.lines).join("\n");
 
         assert!(emitted.contains("Intro."), "{emitted}");
-        assert!(!emitted.contains("Name"), "{emitted}");
-        assert!(!emitted.contains("Apples"), "{emitted}");
+        assert!(emitted.contains("Name"), "{emitted}");
+        assert!(emitted.contains("Apples"), "{emitted}");
         assert!(!emitted.contains("| Name | Count |"), "{emitted}");
-        assert!(!emitted.contains("Next paragraph"), "{emitted}");
+        assert!(emitted.contains("Next paragraph"), "{emitted}");
         Ok(())
     }
 

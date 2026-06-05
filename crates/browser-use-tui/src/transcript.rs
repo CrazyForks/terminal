@@ -653,6 +653,23 @@ impl TranscriptNode {
         }
     }
 
+    fn streaming_ends_on_line_boundary(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes
+                .iter()
+                .rev()
+                .find_map(|node| match &node.kind {
+                    TranscriptKind::StreamingAssistant { .. } => {
+                        Some(node.streaming_ends_on_line_boundary())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false),
+            TranscriptKind::StreamingAssistant { markdown } => markdown.ends_with('\n'),
+            _ => false,
+        }
+    }
+
     fn has_streaming_without_pending_status(&self) -> bool {
         match &self.kind {
             TranscriptKind::Stack { nodes } => {
@@ -960,6 +977,12 @@ pub(crate) fn active_streaming_can_commit_all(model: Option<&TranscriptModel>) -
     model
         .and_then(|model| model.active.as_ref())
         .is_some_and(TranscriptNode::can_commit_full_live_stream)
+}
+
+pub(crate) fn active_streaming_ends_on_line_boundary(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::streaming_ends_on_line_boundary)
 }
 
 pub(crate) fn active_streaming_has_table_holdback(model: Option<&TranscriptModel>) -> bool {
@@ -1853,8 +1876,8 @@ fn active_node_for_session(
         .transcript
         .last()
         .and_then(|turn| turn.streaming_text.as_deref())
-        .map(str::trim_end)
         .filter(|text| !text.is_empty())
+        .filter(|text| !text.trim().is_empty())
         .filter(|_| !live_stream_has_committed_successor(live_events));
     let live_turn_is_followup = state.transcript.last().is_some_and(|turn| turn.is_followup);
 
@@ -3860,36 +3883,46 @@ fn markdown_table_holdback_state(markdown: &str) -> Option<MarkdownTableHoldback
     let mut fence_tracker = MarkdownFenceTracker::new();
     let mut previous_line: Option<PreviousMarkdownLine> = None;
     let mut pending_header_start = None;
+    let mut active_table_start = None;
 
     for line in lines {
         let fence_kind = fence_tracker.kind();
-        let candidate = if fence_kind == MarkdownFenceKind::Other {
-            None
-        } else {
+        let can_scan_table = fence_kind == MarkdownFenceKind::Outside
+            && !is_markdown_table_block_interrupt(line.text);
+        let candidate = if can_scan_table {
             markdown_table_candidate_text(line.text)
+        } else {
+            None
         };
         let is_header = candidate.is_some_and(is_markdown_table_header);
         let is_delimiter = candidate.is_some_and(is_markdown_table_delimiter);
         let is_delimiter_prefix = candidate.is_some_and(is_markdown_table_delimiter_prefix);
+        let continues_active_table =
+            active_table_start.is_some() && !line.text.trim().is_empty() && candidate.is_some();
+
+        if active_table_start.is_some() && !continues_active_table {
+            active_table_start = None;
+        }
 
         if let Some(previous) = previous_line {
-            if previous.fence_kind != MarkdownFenceKind::Other
-                && fence_kind != MarkdownFenceKind::Other
+            if previous.fence_kind == MarkdownFenceKind::Outside
+                && fence_kind == MarkdownFenceKind::Outside
+                && can_scan_table
                 && previous.is_header
                 && is_delimiter
             {
-                return Some(MarkdownTableHoldbackState::Confirmed {
-                    table_start: previous.start,
-                });
+                active_table_start = Some(previous.start);
             }
         }
 
-        if !line.text.trim().is_empty() {
-            pending_header_start = if fence_kind != MarkdownFenceKind::Other && is_header {
+        if active_table_start.is_some() {
+            pending_header_start = None;
+        } else if !line.text.trim().is_empty() {
+            pending_header_start = if can_scan_table && is_header {
                 if is_delimiter_prefix {
                     previous_line
                         .filter(|previous| {
-                            previous.fence_kind != MarkdownFenceKind::Other && previous.is_header
+                            previous.fence_kind == MarkdownFenceKind::Outside && previous.is_header
                         })
                         .map(|previous| previous.start)
                         .or(Some(line.start))
@@ -3899,6 +3932,8 @@ fn markdown_table_holdback_state(markdown: &str) -> Option<MarkdownTableHoldback
             } else {
                 None
             };
+        } else {
+            pending_header_start = None;
         }
 
         previous_line = Some(PreviousMarkdownLine {
@@ -3909,8 +3944,12 @@ fn markdown_table_holdback_state(markdown: &str) -> Option<MarkdownTableHoldback
         fence_tracker.advance(line.text);
     }
 
-    pending_header_start
-        .map(|header_start| MarkdownTableHoldbackState::PendingHeader { header_start })
+    if let Some(table_start) = active_table_start {
+        Some(MarkdownTableHoldbackState::Confirmed { table_start })
+    } else {
+        pending_header_start
+            .map(|header_start| MarkdownTableHoldbackState::PendingHeader { header_start })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4095,6 +4134,22 @@ fn is_markdown_table_delimiter_prefix(line: &str) -> bool {
         && trimmed
             .chars()
             .all(|ch| ch == '|' || ch == ':' || ch == '-' || ch.is_whitespace())
+}
+
+fn is_markdown_table_block_interrupt(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    is_markdown_heading_start(trimmed)
+        || trimmed.starts_with('>')
+        || parse_markdown_fence_marker(trimmed).is_some()
+}
+
+fn is_markdown_heading_start(trimmed: &str) -> bool {
+    let marker_len = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&marker_len)
+        && trimmed
+            .as_bytes()
+            .get(marker_len)
+            .is_some_and(u8::is_ascii_whitespace)
 }
 
 fn is_markdown_table_delimiter_segment(segment: &str) -> bool {
@@ -6157,7 +6212,35 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_streaming_table_stays_mutable_before_following_live_tail() {
+    fn markdown_code_fence_table_does_not_trigger_streaming_holdback() {
+        let model = streaming_model_for("```markdown\n| Name | Count |\n| --- | ---: |\n");
+
+        let full_text = native_lines_text(&active_streaming_native_lines(Some(&model), 80));
+        let commit_text = native_lines_text(&active_streaming_native_commit_prefix_lines(
+            Some(&model),
+            80,
+        ));
+
+        assert!(full_text.contains("| Name | Count |"), "{full_text}");
+        assert!(commit_text.contains("| Name | Count |"), "{commit_text}");
+        assert!(commit_text.contains("| --- | ---: |"), "{commit_text}");
+    }
+
+    #[test]
+    fn blank_line_clears_pending_streaming_table_header() {
+        let model = streaming_model_for("Intro.\n\n| Name | Count |\n\n");
+
+        let commit_text = native_lines_text(&active_streaming_native_commit_prefix_lines(
+            Some(&model),
+            80,
+        ));
+
+        assert!(commit_text.contains("Intro."), "{commit_text}");
+        assert!(commit_text.contains("| Name | Count |"), "{commit_text}");
+    }
+
+    #[test]
+    fn closed_streaming_table_releases_following_paragraph() {
         let model = streaming_model_for(
             "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n\nNext paragraph\n",
         );
@@ -6167,9 +6250,27 @@ mod tests {
             80,
         ));
         assert!(commit_text.contains("Intro."), "{commit_text}");
-        assert!(!commit_text.contains("Name"), "{commit_text}");
-        assert!(!commit_text.contains("Apples"), "{commit_text}");
-        assert!(!commit_text.contains("Next paragraph"), "{commit_text}");
+        assert!(commit_text.contains("Name"), "{commit_text}");
+        assert!(commit_text.contains("Apples"), "{commit_text}");
+        assert!(commit_text.contains("Next paragraph"), "{commit_text}");
+        assert!(!commit_text.contains("| Name | Count |"), "{commit_text}");
+    }
+
+    #[test]
+    fn block_start_after_streaming_table_releases_holdback() {
+        let model = streaming_model_for(
+            "Intro.\n\n| Name | Count |\n| --- | ---: |\n| Apples | 12 |\n# Details\nMore text\n",
+        );
+
+        let commit_text = native_lines_text(&active_streaming_native_commit_prefix_lines(
+            Some(&model),
+            80,
+        ));
+        assert!(commit_text.contains("Intro."), "{commit_text}");
+        assert!(commit_text.contains("Name"), "{commit_text}");
+        assert!(commit_text.contains("Apples"), "{commit_text}");
+        assert!(commit_text.contains("Details"), "{commit_text}");
+        assert!(commit_text.contains("More text"), "{commit_text}");
         assert!(!commit_text.contains("| Name | Count |"), "{commit_text}");
     }
 
