@@ -11291,6 +11291,11 @@ try:
     assert results[1].url.endswith("/one")
     assert results[2]["ok"] is False, results[2]
     assert results[2]["url"].endswith("/missing"), results[2]
+    assert results[2].ok is False, results[2]
+    assert results[2].status_code is None, results[2]
+    assert results[2].headers == {}, results[2]
+    assert results[2].text == "", results[2]
+    assert results[2].content == b"", results[2]
     try:
         http_get_many([base + "/missing"], return_errors=False)
     except RuntimeError:
@@ -11330,6 +11335,11 @@ result = browser_fetch("https://example.test/api")
 assert result["ok"] is False, result
 assert result["url"] == "https://example.test/api", result
 assert "Failed to fetch" in result["error"], result
+assert result.ok is False, result
+assert result.status_code is None, result
+assert result.headers == {}, result
+assert result.text == "", result
+assert result.content == b"", result
 
 try:
     browser_fetch("https://example.test/api", return_error=False)
