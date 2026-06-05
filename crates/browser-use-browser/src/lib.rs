@@ -651,25 +651,38 @@ fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
 fn active_browser_script_start_guard_output(
     session_id: &str,
     registry: &BrowserScriptRunRegistry,
-) -> Option<BrowserScriptOutput> {
+) -> Result<Option<BrowserScriptOutput>> {
     let active_scripts = active_browser_script_runs_json_with_registry(session_id, registry);
-    let script = active_scripts.as_array()?.first()?;
-    let run_id = script.get("run_id").and_then(Value::as_str)?.to_string();
+    let Some(script) = active_scripts
+        .as_array()
+        .and_then(|scripts| scripts.first())
+    else {
+        return Ok(None);
+    };
+    let Some(run_id) = script.get("run_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let run_id = run_id.to_string();
     let status = script
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("running");
+    if matches!(status, "finished" | "timed_out") {
+        return observe_browser_script_with_registry(
+            session_id,
+            &run_id,
+            BROWSER_SCRIPT_DEFAULT_OBSERVE_MS,
+            registry,
+        )
+        .map(Some);
+    }
     let next_step = script
         .get("next_step")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("browser_script action=observe run_id={run_id}"));
-    let state = if matches!(status, "finished" | "timed_out") {
-        "A previous browser_script has completed but its final result has not been observed yet."
-    } else {
-        "A browser_script is already active for this browser session."
-    };
-    Some(BrowserScriptOutput {
+    let state = "A browser_script is already active for this browser session.";
+    Ok(Some(BrowserScriptOutput {
         ok: true,
         status: Some("running".to_string()),
         run_id: Some(run_id.clone()),
@@ -683,7 +696,7 @@ fn active_browser_script_start_guard_output(
             "active_scripts": active_scripts,
         }),
         ..Default::default()
-    })
+    }))
 }
 
 fn is_browser_recovery_command(argv: &[String]) -> bool {
@@ -1006,7 +1019,7 @@ pub fn start_browser_script_with_registries(
     script_registry: &BrowserScriptRunRegistry,
     session_registry: &BrowserSessionRegistry,
 ) -> Result<BrowserScriptOutput> {
-    if let Some(output) = active_browser_script_start_guard_output(session_id, script_registry) {
+    if let Some(output) = active_browser_script_start_guard_output(session_id, script_registry)? {
         return Ok(output);
     }
     let mut run = spawn_browser_script_with_session_registry(
@@ -11240,6 +11253,48 @@ print("bridge retry ok")
         );
         assert_eq!(deferred.data["attempted_start_deferred"], true);
         let _ = cancel_browser_script_with_registry(session_id, &run_id, &registry);
+    }
+
+    #[test]
+    fn browser_script_start_auto_collects_finished_active_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserScriptRunRegistry::new();
+        let session_id = "script-start-auto-collect-finished";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
+        let started = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('first started')\ntime.sleep(0.45)\nprint('first done')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert!(started.ok);
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+        std::thread::sleep(Duration::from_millis(800));
+
+        let collected = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print('second should not spawn')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert!(collected.ok);
+        assert_eq!(collected.status.as_deref(), Some("finished"));
+        assert!(collected.text.contains("first done"), "{}", collected.text);
+        assert!(
+            !collected.text.contains("second should not spawn"),
+            "{}",
+            collected.text
+        );
+        assert_eq!(registry.active_run_count_for_session(session_id), 0);
     }
 
     #[test]
