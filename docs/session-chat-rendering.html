@@ -1,0 +1,1860 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session Chat Rendering Map</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef2f6;
+      --ink: #111827;
+      --muted: #5d6878;
+      --line: #c9d2df;
+      --panel: #ffffff;
+      --terminal: #0d1320;
+      --terminal-2: #111a2a;
+      --terminal-3: #162235;
+      --green: #3ecf8e;
+      --blue: #6bb6ff;
+      --orange: #f5a524;
+      --red: #ff6b6b;
+      --violet: #a98bff;
+      --cyan: #62d8f4;
+      --shadow: 0 18px 40px rgba(16, 24, 40, 0.12);
+      --ease-move: cubic-bezier(0.645, 0.045, 0.355, 1);
+      --ease-enter: cubic-bezier(0.215, 0.61, 0.355, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      min-width: 320px;
+    }
+
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgba(17, 24, 39, 0.05) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(17, 24, 39, 0.05) 1px, transparent 1px),
+        var(--bg);
+      background-size: 32px 32px;
+      font-family: Avenir Next, Segoe UI, ui-sans-serif, system-ui, -apple-system, sans-serif;
+      line-height: 1.35;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    main {
+      width: min(1260px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 24px 0 36px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+
+    .kicker {
+      margin: 0 0 4px;
+      color: #46566d;
+      font: 700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .tag,
+    .chip,
+    .mini-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.84);
+      color: #28364a;
+      font: 700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .tag {
+      padding: 4px 8px;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.8fr);
+      gap: 14px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .sim-panel {
+      overflow: hidden;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcff;
+    }
+
+    .phase-title {
+      min-width: 0;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }
+
+    .phase-subtitle {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .button-group {
+      display: inline-grid;
+      grid-auto-flow: column;
+      gap: 6px;
+    }
+
+    .control-button {
+      min-width: 38px;
+      height: 34px;
+      border: 1px solid #b8c4d5;
+      border-radius: 6px;
+      color: #172033;
+      background: #ffffff;
+      cursor: pointer;
+      transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
+    }
+
+    .control-button:hover {
+      background: #eef5ff;
+      border-color: #7aa7df;
+    }
+
+    .control-button:active {
+      transform: translateY(1px);
+    }
+
+    .phase-dots {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+
+    .phase-dot {
+      width: 14px;
+      height: 14px;
+      padding: 0;
+      border-radius: 99px;
+      border: 1px solid #96a5b8;
+      background: #dfe7f2;
+      cursor: pointer;
+      transition: transform 180ms var(--ease-enter), background 180ms ease;
+    }
+
+    .phase-dot.is-active {
+      background: var(--blue);
+      transform: scale(1.18);
+    }
+
+    .event-flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid #273449;
+      background: #121b2a;
+    }
+
+    .chip {
+      justify-content: center;
+      min-width: 0;
+      padding: 5px 7px;
+      border-color: #34455f;
+      color: #dce8f8;
+      background: #182437;
+      overflow-wrap: anywhere;
+      white-space: normal;
+      text-align: center;
+    }
+
+    .chip.is-active {
+      border-color: var(--green);
+      color: #06150f;
+      background: var(--green);
+    }
+
+    .terminal-stage {
+      position: relative;
+      display: grid;
+      grid-template-columns: 58px minmax(0, 1fr);
+      min-height: 650px;
+      padding: 12px 12px 14px;
+      background: var(--terminal);
+      color: #d7e3f2;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .ruler {
+      display: grid;
+      grid-template-rows: 126px 224px 82px 122px 44px;
+      gap: 8px;
+      padding-right: 8px;
+      color: #8795aa;
+      font-size: 10px;
+      text-align: right;
+      text-transform: uppercase;
+    }
+
+    .ruler span {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      min-width: 0;
+      padding-right: 8px;
+      border-right: 1px solid #34445d;
+      overflow-wrap: anywhere;
+    }
+
+    .terminal-grid {
+      position: relative;
+      display: grid;
+      grid-template-rows: 126px 224px 82px 122px 44px;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .zone {
+      position: relative;
+      min-width: 0;
+      overflow: hidden;
+      border: 1px solid #2c3b51;
+      border-radius: 8px;
+      background: var(--terminal-2);
+    }
+
+    .zone::before {
+      content: attr(data-label);
+      position: absolute;
+      top: 7px;
+      left: 9px;
+      z-index: 3;
+      padding: 3px 6px;
+      border-radius: 5px;
+      color: #061019;
+      background: #c8d5e6;
+      font: 800 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-transform: uppercase;
+    }
+
+    .scrollback-zone {
+      background:
+        linear-gradient(90deg, rgba(62, 207, 142, 0.1), transparent 45%),
+        var(--terminal-2);
+    }
+
+    .viewport-zone {
+      background:
+        linear-gradient(90deg, rgba(107, 182, 255, 0.13), transparent 48%),
+        var(--terminal-3);
+    }
+
+    .preview-zone {
+      background:
+        linear-gradient(90deg, rgba(245, 165, 36, 0.15), transparent 52%),
+        #171f2e;
+    }
+
+    .composer-zone {
+      background:
+        linear-gradient(90deg, rgba(169, 139, 255, 0.14), transparent 52%),
+        #151b29;
+    }
+
+    .status-zone {
+      background: #101827;
+    }
+
+    .line-stack {
+      display: grid;
+      gap: 5px;
+      padding: 34px 12px 10px;
+      min-width: 0;
+    }
+
+    .terminal-line,
+    .stream-line,
+    .preview-line,
+    .composer-line,
+    .status-line,
+    .motion-ghost {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      font-size: 13px;
+      line-height: 1.35;
+      letter-spacing: 0;
+    }
+
+    .terminal-line {
+      color: #cfe7d9;
+    }
+
+    .terminal-line.is-prompt {
+      color: #f7e2a3;
+    }
+
+    .muted-line {
+      color: #708098;
+    }
+
+    .viewport-inner {
+      display: grid;
+      grid-template-rows: 1fr auto;
+      height: 100%;
+      min-width: 0;
+      padding: 34px 12px 12px;
+      gap: 8px;
+    }
+
+    .active-frame {
+      display: grid;
+      align-content: start;
+      gap: 8px;
+      min-width: 0;
+      border: 1px solid rgba(107, 182, 255, 0.28);
+      border-radius: 6px;
+      padding: 10px;
+      background: rgba(10, 16, 27, 0.42);
+    }
+
+    .stream-line {
+      min-height: 54px;
+      color: #d7edff;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 1.1em;
+      margin-left: 2px;
+      vertical-align: -0.18em;
+      background: var(--cyan);
+      animation: blink 900ms steps(1) infinite;
+    }
+
+    .viewport-rule {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .mini-chip {
+      padding: 3px 6px;
+      border-color: #38516f;
+      color: #b9d5ff;
+      background: #101827;
+    }
+
+    .mini-chip.good {
+      border-color: rgba(62, 207, 142, 0.55);
+      color: #a8f3cf;
+    }
+
+    .mini-chip.warn {
+      border-color: rgba(245, 165, 36, 0.65);
+      color: #ffd38a;
+    }
+
+    .preview-inner {
+      display: grid;
+      height: 100%;
+      align-content: center;
+      padding: 30px 12px 10px;
+    }
+
+    .preview-line {
+      min-height: 32px;
+      padding: 8px 9px;
+      border: 1px dashed rgba(245, 165, 36, 0.72);
+      border-radius: 6px;
+      color: #ffe1a5;
+      background: rgba(245, 165, 36, 0.08);
+    }
+
+    .preview-line.is-empty {
+      color: #7e8ca3;
+      border-color: #35465e;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .composer-inner {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 100%;
+      gap: 8px;
+      padding: 32px 12px 10px;
+    }
+
+    .composer-box {
+      min-height: 70px;
+      border: 1px solid rgba(169, 139, 255, 0.52);
+      border-radius: 6px;
+      padding: 9px;
+      color: #eadfff;
+      background: rgba(169, 139, 255, 0.08);
+    }
+
+    .composer-line {
+      color: #eadfff;
+    }
+
+    .composer-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 100%;
+      padding: 10px 12px;
+      color: #b7c5d9;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 99px;
+      background: var(--green);
+      box-shadow: 0 0 0 5px rgba(62, 207, 142, 0.15);
+    }
+
+    .motion-ghost {
+      position: absolute;
+      left: 84px;
+      right: 24px;
+      top: 284px;
+      z-index: 5;
+      padding: 8px 10px;
+      border: 1px solid rgba(62, 207, 142, 0.78);
+      border-radius: 6px;
+      color: #dfffee;
+      background: rgba(34, 74, 62, 0.96);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(0);
+      will-change: transform, opacity;
+    }
+
+    .motion-ghost.is-active {
+      animation: promoteLine 1500ms var(--ease-move) infinite;
+    }
+
+    .label-pin {
+      position: absolute;
+      z-index: 6;
+      right: 18px;
+      max-width: min(260px, 45%);
+      padding: 7px 8px;
+      border: 1px solid #41536f;
+      border-radius: 6px;
+      color: #eaf2ff;
+      background: rgba(6, 11, 19, 0.86);
+      font: 700 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .label-pin.body {
+      top: 182px;
+      border-color: rgba(107, 182, 255, 0.65);
+    }
+
+    .label-pin.bottom {
+      bottom: 90px;
+      border-color: rgba(169, 139, 255, 0.65);
+    }
+
+    .legend-panel {
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+    }
+
+    .legend-block {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      overflow: hidden;
+    }
+
+    .legend-block h2 {
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      letter-spacing: 0;
+      background: #f7f9fc;
+    }
+
+    .path-list,
+    .rule-list,
+    .bounds-list {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+    }
+
+    .path {
+      display: grid;
+      grid-template-columns: 86px 1fr;
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .path-name {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      color: #081019;
+      background: #dfe8f4;
+      font: 800 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-transform: uppercase;
+    }
+
+    .path-flow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .arrow {
+      color: #68778b;
+      font: 800 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .rule,
+    .bound {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 8px;
+      align-items: center;
+      min-height: 38px;
+      border: 1px solid #e0e6ee;
+      border-radius: 8px;
+      padding: 7px;
+      background: #fbfcfe;
+    }
+
+    .rule-mark,
+    .bound-mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      color: #061019;
+      font: 900 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .rule-mark {
+      background: var(--green);
+    }
+
+    .bound-mark {
+      background: var(--blue);
+    }
+
+    .rule strong,
+    .bound strong {
+      display: block;
+      font-size: 13px;
+      line-height: 1.25;
+    }
+
+    .rule span,
+    .bound span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .source-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .source {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 8px 22px rgba(16, 24, 40, 0.07);
+    }
+
+    .source b {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+
+    .source code {
+      display: block;
+      color: #415068;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .ratatui-map {
+      display: grid;
+      gap: 12px;
+      margin: 0 0 14px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: var(--shadow);
+    }
+
+    .ratatui-map h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .ratatui-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .ratatui-card {
+      min-width: 0;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .ratatui-card h3 {
+      margin: 0;
+      padding: 8px 10px;
+      border-bottom: 1px solid #d7dee9;
+      font-size: 13px;
+      background: #eef3f9;
+    }
+
+    .mini-terminal {
+      display: grid;
+      gap: 4px;
+      padding: 10px;
+      background: #0c1422;
+      color: #dce8f7;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .term-region {
+      position: relative;
+      min-height: 38px;
+      border: 1px solid #31445f;
+      border-radius: 6px;
+      padding: 20px 8px 7px;
+      overflow: hidden;
+      background: #101b2d;
+    }
+
+    .term-region::before {
+      content: attr(data-name);
+      position: absolute;
+      top: 5px;
+      left: 6px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #081019;
+      background: #d8e3f0;
+      font-size: 9px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .term-region.history {
+      min-height: 92px;
+      background:
+        linear-gradient(180deg, rgba(62, 207, 142, 0.12), transparent),
+        #101b2d;
+    }
+
+    .term-region.screen {
+      min-height: 128px;
+      border-color: rgba(107, 182, 255, 0.68);
+      background:
+        linear-gradient(180deg, rgba(107, 182, 255, 0.15), transparent),
+        #142036;
+    }
+
+    .term-region.viewport {
+      min-height: 82px;
+      border-color: rgba(169, 139, 255, 0.72);
+      background:
+        linear-gradient(180deg, rgba(169, 139, 255, 0.18), transparent),
+        #171b2c;
+    }
+
+    .term-row {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      line-height: 1.35;
+    }
+
+    .term-row.prompt {
+      color: #ffe7a6;
+    }
+
+    .term-row.stream {
+      color: #bff7db;
+    }
+
+    .term-row.tail {
+      color: #b9dcff;
+    }
+
+    .term-row.dim {
+      color: #8190a5;
+    }
+
+    .user-window {
+      outline: 2px solid var(--orange);
+      outline-offset: -3px;
+      box-shadow: inset 0 0 0 1px rgba(245, 165, 36, 0.35);
+    }
+
+    .insert-motion .term-row.stream {
+      animation: lineRise 1800ms var(--ease-move) infinite;
+      will-change: transform, opacity;
+    }
+
+    .explain-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .explain-chip {
+      min-width: 0;
+      border: 1px solid #d8e0eb;
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcff;
+    }
+
+    .explain-chip b,
+    .explain-chip span {
+      display: block;
+    }
+
+    .explain-chip b {
+      margin-bottom: 3px;
+      font-size: 12px;
+    }
+
+    .explain-chip span {
+      color: #5d6878;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .failure-map {
+      display: grid;
+      gap: 12px;
+      margin: 0 0 14px;
+      padding: 12px;
+      border: 2px solid rgba(255, 107, 107, 0.65);
+      border-radius: 8px;
+      background: #fffafa;
+      box-shadow: var(--shadow);
+    }
+
+    .failure-map h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .compare-card {
+      min-width: 0;
+      border: 1px solid #d8c7c7;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #ffffff;
+    }
+
+    .compare-card h3 {
+      margin: 0;
+      padding: 8px 10px;
+      border-bottom: 1px solid #ead6d6;
+      font-size: 13px;
+      background: #fff0f0;
+    }
+
+    .compare-card.good h3 {
+      background: #ecfff5;
+      border-bottom-color: #c7ead6;
+    }
+
+    .screen-stack {
+      display: grid;
+      gap: 4px;
+      padding: 10px;
+      background: #0c1422;
+      color: #dce8f7;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .screen-box {
+      position: relative;
+      min-height: 32px;
+      border: 1px solid #33465f;
+      border-radius: 6px;
+      padding: 18px 8px 7px;
+      overflow: hidden;
+      background: #111b2c;
+    }
+
+    .screen-box::before {
+      content: attr(data-name);
+      position: absolute;
+      top: 5px;
+      left: 6px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      color: #081019;
+      background: #d8e3f0;
+      font-size: 9px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .screen-box.prompt-box {
+      border-color: rgba(245, 165, 36, 0.72);
+    }
+
+    .screen-box.stream-box {
+      border-color: rgba(62, 207, 142, 0.72);
+    }
+
+    .screen-box.viewport-box {
+      border-color: rgba(169, 139, 255, 0.72);
+    }
+
+    .screen-box.collision-box {
+      min-height: 96px;
+      border-color: rgba(255, 107, 107, 0.9);
+      background:
+        linear-gradient(180deg, rgba(255, 107, 107, 0.2), transparent 72%),
+        #15131f;
+    }
+
+    .collision-box .screen-line.stream {
+      position: relative;
+      top: -10px;
+      opacity: 0.42;
+      text-decoration: line-through;
+      text-decoration-color: rgba(255, 107, 107, 0.9);
+    }
+
+    .collision-box .screen-line.prompt {
+      position: relative;
+      z-index: 2;
+      padding: 3px 4px;
+      border-radius: 4px;
+      background: rgba(255, 231, 166, 0.16);
+    }
+
+    .screen-line {
+      min-width: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+
+    .screen-line.prompt {
+      color: #ffe7a6;
+    }
+
+    .screen-line.stream {
+      color: #bff7db;
+    }
+
+    .screen-line.dim {
+      color: #8291a8;
+    }
+
+    .break-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .break-chip {
+      min-width: 0;
+      border: 1px solid #ead6d6;
+      border-radius: 8px;
+      padding: 8px;
+      background: #ffffff;
+    }
+
+    .break-chip b,
+    .break-chip span {
+      display: block;
+    }
+
+    .break-chip b {
+      margin-bottom: 3px;
+      font-size: 12px;
+    }
+
+    .break-chip span {
+      color: #5d6878;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .code-map {
+      display: grid;
+      gap: 12px;
+      margin: 0 0 14px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: var(--shadow);
+    }
+
+    .code-map h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .code-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .code-card {
+      min-width: 0;
+      border: 1px solid #d8e0eb;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0d1320;
+    }
+
+    .code-card h3 {
+      margin: 0;
+      padding: 8px 10px;
+      border-bottom: 1px solid #273449;
+      color: #eaf2ff;
+      font-size: 13px;
+      background: #121b2a;
+    }
+
+    .code-card pre {
+      margin: 0;
+      padding: 10px;
+      overflow-x: auto;
+      color: #dce8f7;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      line-height: 1.45;
+    }
+
+    .code-card mark {
+      color: #081019;
+      background: #ffd38a;
+    }
+
+    .source-list {
+      display: grid;
+      gap: 6px;
+      padding: 0 10px 10px;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .source-list a {
+      color: #9fd0ff;
+      overflow-wrap: anywhere;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 2px;
+    }
+
+    @keyframes blink {
+      0%,
+      45% {
+        opacity: 1;
+      }
+
+      46%,
+      100% {
+        opacity: 0;
+      }
+    }
+
+    @keyframes lineRise {
+      0% {
+        transform: translateY(16px);
+        opacity: 0.35;
+      }
+
+      35%,
+      75% {
+        transform: translateY(0);
+        opacity: 1;
+      }
+
+      100% {
+        transform: translateY(-10px);
+        opacity: 0.65;
+      }
+    }
+
+    @keyframes promoteLine {
+      0% {
+        opacity: 0;
+        transform: translateY(0);
+      }
+
+      18% {
+        opacity: 1;
+      }
+
+      70% {
+        opacity: 1;
+        transform: translateY(-132px);
+      }
+
+      100% {
+        opacity: 0;
+        transform: translateY(-132px);
+      }
+    }
+
+    @media (max-width: 980px) {
+      .workspace,
+      .source-strip,
+      .ratatui-grid,
+      .explain-strip,
+      .compare-grid,
+      .break-strip,
+      .code-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar {
+        align-items: start;
+        flex-direction: column;
+      }
+
+      .tag-row,
+      .phase-dots {
+        justify-content: flex-start;
+      }
+    }
+
+    @media (max-width: 680px) {
+      main {
+        width: min(100vw - 18px, 1260px);
+        padding-top: 14px;
+      }
+
+      h1 {
+        font-size: 22px;
+      }
+
+      .controls {
+        grid-template-columns: 1fr;
+      }
+
+      .event-flow {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .terminal-stage {
+        grid-template-columns: 1fr;
+        min-height: 610px;
+        padding: 8px;
+      }
+
+      .ruler {
+        display: none;
+      }
+
+      .terminal-grid {
+        grid-template-rows: 118px 214px 76px 116px 42px;
+      }
+
+      .label-pin {
+        display: none;
+      }
+
+      .motion-ghost {
+        left: 18px;
+        right: 18px;
+      }
+
+      .path {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation-duration: 1ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: 1ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="topbar">
+      <div>
+        <p class="kicker">browser-use-tui session chat</p>
+        <h1>Where text lives while chat streams</h1>
+      </div>
+      <div class="tag-row" aria-label="diagram topics">
+        <span class="tag">initial message</span>
+        <span class="tag">follow-up message</span>
+        <span class="tag">streaming tail</span>
+        <span class="tag">no visual jump</span>
+      </div>
+    </header>
+
+    <section class="failure-map" aria-label="reported stream collision failure">
+      <h2>Your reported shape: stream rows collide with the latest user message and vanish</h2>
+      <div class="compare-grid">
+        <article class="compare-card good">
+          <h3>Expected while streaming</h3>
+          <div class="screen-stack">
+            <div class="screen-box prompt-box" data-name="latest user message">
+              <div class="screen-line prompt">&gt; continue</div>
+            </div>
+            <div class="screen-box stream-box" data-name="new stream rows">
+              <div class="screen-line stream">live output line 01</div>
+              <div class="screen-line stream">live output line 02</div>
+              <div class="screen-line stream">live output line 03</div>
+            </div>
+            <div class="screen-box viewport-box" data-name="ratatui viewport">
+              <div class="screen-line dim">composer fixed at bottom</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="compare-card">
+          <h3>Bad shape verified</h3>
+          <div class="screen-stack">
+            <div class="screen-box collision-box" data-name="collision / clipping">
+              <div class="screen-line prompt">&gt; continue</div>
+              <div class="screen-line stream">live output line 01</div>
+              <div class="screen-line stream">live output line 02</div>
+              <div class="screen-line dim">these rows get hidden at the prompt boundary</div>
+            </div>
+            <div class="screen-box stream-box" data-name="stream appears near viewport">
+              <div class="screen-line stream">live output line 37</div>
+              <div class="screen-line stream">live output line 38</div>
+              <div class="screen-line stream">live output line 39</div>
+            </div>
+            <div class="screen-box viewport-box" data-name="ratatui viewport">
+              <div class="screen-line stream">live output line 40</div>
+              <div class="screen-line dim">composer</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="compare-card good">
+          <h3>After tool call / done</h3>
+          <div class="screen-stack">
+            <div class="screen-box prompt-box" data-name="latest user message">
+              <div class="screen-line prompt">&gt; continue</div>
+            </div>
+            <div class="screen-box stream-box" data-name="final transcript">
+              <div class="screen-line stream">live output line 01</div>
+              <div class="screen-line stream">live output line 02</div>
+              <div class="screen-line stream">...</div>
+              <div class="screen-line stream">live output line 40</div>
+            </div>
+            <div class="screen-box viewport-box" data-name="ratatui viewport">
+              <div class="screen-line dim">composer</div>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="break-strip">
+        <div class="break-chip">
+          <b>Invariant</b>
+          <span>first stream row must sit directly under latest user message</span>
+        </div>
+        <div class="break-chip">
+          <b>Observed failure</b>
+          <span>stream rows collide with the user message and disappear</span>
+        </div>
+        <div class="break-chip">
+          <b>Verified capture</b>
+          <span>visible view loses prompt; full scrollback still has prompt + line 01</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="code-map" aria-label="exact local code lines">
+      <h2>Exact local code lines involved</h2>
+      <div class="code-grid">
+        <article class="code-card">
+          <h3>1. Render asks for active stream lines, with skipped rows</h3>
+          <pre>crates/browser-use-tui/src/render.rs
+290  let stream_skip_lines = state.current_session.as_ref().map(|session| {
+294      app.native_history
+295          .live_stream_emitted_lines_for(&amp;session.id, body_width)
+296  }).unwrap_or(0);
+298  let lines = transcript::active_viewport_lines_with_stream_skip(
+299      Some(model),
+300      body_width,
+301      max_body_h,
+302      stream_skip_lines,
+303  );</pre>
+        </article>
+
+        <article class="code-card">
+          <h3>2. Active stream is cropped to viewport height</h3>
+          <pre>crates/browser-use-tui/src/transcript.rs
+750  if lines.len() &gt; height as usize {
+751      let start = lines.len().saturating_sub(height as usize);
+752      <mark>lines = lines.into_iter().skip(start).collect();</mark>
+753  }</pre>
+        </article>
+
+        <article class="code-card">
+          <h3>3. Running body keeps the tail and drops the top</h3>
+          <pre>crates/browser-use-tui/src/render.rs
+354  if body.len() &gt; body_area.height as usize {
+355      body = visible_main_body_lines(body, body_area.height, product_state);
+356  }
+
+1286 fn visible_tail_lines(mut lines: Vec&lt;Line&lt;'static&gt;&gt;, height: u16) -&gt; Vec&lt;Line&lt;'static&gt;&gt; {
+1291     if lines.len() &gt; height {
+1292         <mark>lines = lines.split_off(lines.len() - height);</mark>
+1293     }
+1294     lines
+1295 }</pre>
+        </article>
+
+        <article class="code-card">
+          <h3>4. Closed stream rows are inserted before the app viewport</h3>
+          <pre>crates/browser-use-tui/src/main.rs
+9218 let lines = transcript::active_streaming_lines(Some(model), width);
+9219 let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) &amp;&amp; lines.len() &gt; 1 {
+9221     lines.len()
+9223 } else {
+9224     lines.len().saturating_sub(1)
+9225 };
+
+9365 clear_inline_viewport_for_native_insert(terminal)?;
+9366 let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
+9368 <mark>terminal.insert_before(height, |buf| {</mark></pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="code-map" aria-label="external streaming renderer comparison">
+      <h2>How Codex / OpenCode avoid this</h2>
+      <div class="code-grid">
+        <article class="code-card">
+          <h3>OpenAI Codex: stable rows vs mutable tail</h3>
+          <pre>Rule:
+stable completed rows -&gt; history cells
+live unfinished tail -&gt; active_cell only
+partial markdown -&gt; buffered until newline/finalize
+
+Effect:
+the growing live tail is bounded;
+old transcript rows are not rewritten by it.</pre>
+          <div class="source-list">
+            <a href="https://github.com/openai/codex/blob/0b2e7b5eb1cfa74e5807a84b291e6c900eeb197d/codex-rs/tui/src/streaming/controller.rs#L1-L10">streaming/controller.rs:1-10</a>
+            <a href="https://github.com/openai/codex/blob/0b2e7b5eb1cfa74e5807a84b291e6c900eeb197d/codex-rs/tui/src/markdown_stream.rs#L82-L96">markdown_stream.rs:82-96</a>
+            <a href="https://github.com/openai/codex/blob/0b2e7b5eb1cfa74e5807a84b291e6c900eeb197d/codex-rs/tui/src/chatwidget/streaming.rs#L296-L341">chatwidget/streaming.rs:296-341</a>
+            <a href="https://github.com/openai/codex/blob/0b2e7b5eb1cfa74e5807a84b291e6c900eeb197d/codex-rs/tui/src/chatwidget/streaming.rs#L422-L463">chatwidget/streaming.rs:422-463</a>
+            <a href="https://github.com/openai/codex/blob/0b2e7b5eb1cfa74e5807a84b291e6c900eeb197d/codex-rs/tui/src/insert_history.rs#L216-L244">insert_history.rs:216-244</a>
+          </div>
+        </article>
+
+        <article class="code-card">
+          <h3>OpenCode: scrollbox or split footer</h3>
+          <pre>Full TUI:
+messages -&gt; in-memory scrollbox
+prompt/footer -&gt; fixed sibling below
+
+Direct run:
+stable rows -&gt; append-only scrollback
+live mutable row -&gt; split footer
+last unstable row/block -&gt; withheld until done</pre>
+          <div class="source-list">
+            <a href="https://github.com/anomalyco/opencode/blob/134f4136da372fdf8f0c3cec2cea3ff81010baf8/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx#L1140-L1157">routes/session/index.tsx:1140-1157</a>
+            <a href="https://github.com/anomalyco/opencode/blob/134f4136da372fdf8f0c3cec2cea3ff81010baf8/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx#L1254-L1287">routes/session/index.tsx:1254-1287</a>
+            <a href="https://github.com/anomalyco/opencode/blob/134f4136da372fdf8f0c3cec2cea3ff81010baf8/packages/opencode/src/cli/cmd/run/types.ts#L1-L13">run/types.ts:1-13</a>
+            <a href="https://github.com/anomalyco/opencode/blob/134f4136da372fdf8f0c3cec2cea3ff81010baf8/packages/opencode/src/cli/cmd/run/types.ts#L282-L293">run/types.ts:282-293</a>
+            <a href="https://github.com/anomalyco/opencode/blob/134f4136da372fdf8f0c3cec2cea3ff81010baf8/packages/opencode/src/cli/cmd/run/scrollback.surface.ts#L198-L264">scrollback.surface.ts:198-264</a>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="ratatui-map" aria-label="Ratatui terminal scrollback explanation">
+      <h2>Ratatui draws an inline viewport inside a real terminal</h2>
+      <div class="ratatui-grid">
+        <article class="ratatui-card">
+          <h3>1. Terminal has history above the screen</h3>
+          <div class="mini-terminal">
+            <div class="term-region history" data-name="terminal scrollback">
+              <div class="term-row dim">older output</div>
+              <div class="term-row prompt">&gt; first user message</div>
+              <div class="term-row dim">completed rows</div>
+            </div>
+            <div class="term-region screen user-window" data-name="current screen">
+              <div class="term-row tail">visible terminal area</div>
+              <div class="term-row tail">Ratatui app is docked here</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="ratatui-card">
+          <h3>2. Browser-use uses Ratatui Inline</h3>
+          <div class="mini-terminal">
+            <div class="term-region history" data-name="real scrollback">
+              <div class="term-row prompt">&gt; continue</div>
+              <div class="term-row stream">stream line 01</div>
+              <div class="term-row stream">stream line 02</div>
+            </div>
+            <div class="term-region viewport" data-name="inline viewport">
+              <div class="term-row tail">live stream tail</div>
+              <div class="term-row tail">composer</div>
+              <div class="term-row dim">status row</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="ratatui-card">
+          <h3>3. insert_before pushes rows upward</h3>
+          <div class="mini-terminal insert-motion">
+            <div class="term-region history" data-name="scrollback grows">
+              <div class="term-row prompt">&gt; continue</div>
+              <div class="term-row stream">stream line 37</div>
+              <div class="term-row stream">stream line 38</div>
+              <div class="term-row stream">stream line 39</div>
+            </div>
+            <div class="term-region viewport" data-name="viewport stays fixed">
+              <div class="term-row tail">stream line 40</div>
+              <div class="term-row tail">composer</div>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="explain-strip">
+        <div class="explain-chip">
+          <b>Terminal scrollback</b>
+          <span>real terminal history above the screen</span>
+        </div>
+        <div class="explain-chip">
+          <b>Ratatui viewport</b>
+          <span>fixed app box drawn at the bottom</span>
+        </div>
+        <div class="explain-chip">
+          <b>insert_before</b>
+          <span>adds rows before the app box</span>
+        </div>
+        <div class="explain-chip">
+          <b>The jump</b>
+          <span>new rows shift the scrollback while you read it</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <article class="panel sim-panel" aria-label="animated chat rendering simulator">
+        <div class="controls">
+          <div class="button-group" aria-label="animation controls">
+            <button class="control-button" id="prevButton" type="button" aria-label="Previous phase">&lt;</button>
+            <button class="control-button" id="playButton" type="button" aria-label="Play or pause animation">Pause</button>
+            <button class="control-button" id="nextButton" type="button" aria-label="Next phase">&gt;</button>
+          </div>
+          <div>
+            <div class="phase-title" id="phaseTitle">Draft initial message</div>
+            <div class="phase-subtitle" id="phaseSubtitle">Composer owns draft text. Transcript is still empty.</div>
+          </div>
+          <div class="phase-dots" id="phaseDots" aria-label="phase picker"></div>
+        </div>
+
+        <div class="event-flow" id="eventFlow" aria-label="active event flow"></div>
+
+        <div class="terminal-stage">
+          <div class="ruler" aria-hidden="true">
+            <span>native scrollback</span>
+            <span>active body</span>
+            <span>preview reserve</span>
+            <span>composer reserve</span>
+            <span>status row</span>
+          </div>
+
+          <div class="terminal-grid">
+            <section class="zone scrollback-zone" data-label="committed rows">
+              <div class="line-stack" id="committedLines"></div>
+            </section>
+
+            <section class="zone viewport-zone" data-label="live viewport">
+              <div class="viewport-inner">
+                <div class="active-frame">
+                  <div class="stream-line" id="streamLine"><span id="streamText"></span><span class="cursor" aria-hidden="true"></span></div>
+                </div>
+                <div class="viewport-rule" id="viewportRules"></div>
+              </div>
+            </section>
+
+            <section class="zone preview-zone" data-label="follow-up preview">
+              <div class="preview-inner">
+                <div class="preview-line is-empty" id="previewLine">empty reserve</div>
+              </div>
+            </section>
+
+            <section class="zone composer-zone" data-label="composer draft">
+              <div class="composer-inner">
+                <div class="composer-box">
+                  <div class="composer-line" id="composerText">&gt; Find the cheapest nonstop flight tomorrow</div>
+                </div>
+                <div class="composer-meta" id="composerMeta"></div>
+              </div>
+            </section>
+
+            <section class="zone status-zone" data-label="footer">
+              <div class="status-line">
+                <span class="status-dot" aria-hidden="true"></span>
+                <span id="statusText">ready for Enter</span>
+              </div>
+            </section>
+          </div>
+
+          <div class="motion-ghost" id="motionGhost">completed stream line emits upward into native scrollback</div>
+          <div class="label-pin body">body height = terminal rows - bottom reserve</div>
+          <div class="label-pin bottom">bottom reserve = preview + composer + status</div>
+        </div>
+      </article>
+
+      <aside class="panel legend-panel" aria-label="visual legend">
+        <section class="legend-block">
+          <h2>Input Paths</h2>
+          <div class="path-list">
+            <div class="path">
+              <div class="path-name">initial</div>
+              <div class="path-flow">
+                <span class="mini-chip">composer</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip">session.input</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip good">prompt node</span>
+              </div>
+            </div>
+            <div class="path">
+              <div class="path-name">active follow-up</div>
+              <div class="path-flow">
+                <span class="mini-chip">composer</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip warn">pending preview</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip">session.followup</span>
+              </div>
+            </div>
+            <div class="path">
+              <div class="path-name">stream</div>
+              <div class="path-flow">
+                <span class="mini-chip">streaming_text</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip good">active node</span><span class="arrow">-&gt;</span>
+                <span class="mini-chip">scrollback prefix</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="legend-block">
+          <h2>No Jump Rules</h2>
+          <div class="rule-list">
+            <div class="rule">
+              <span class="rule-mark">1</span>
+              <div><strong>Reserve bottom first</strong><span>body = terminal - composer - preview - footer</span></div>
+            </div>
+            <div class="rule">
+              <span class="rule-mark">2</span>
+              <div><strong>Composer has fixed bounds</strong><span>visual rows clamp to 3..10</span></div>
+            </div>
+            <div class="rule">
+              <span class="rule-mark">3</span>
+              <div><strong>Move only closed stream lines</strong><span>complete lines emit to native scrollback</span></div>
+            </div>
+            <div class="rule">
+              <span class="rule-mark">4</span>
+              <div><strong>Keep open tail local</strong><span>last changing line stays in live viewport</span></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="legend-block">
+          <h2>Bounds</h2>
+          <div class="bounds-list">
+            <div class="bound">
+              <span class="bound-mark">B</span>
+              <div><strong>Body rows</strong><span>active_viewport_lines_with_stream_skip(...)</span></div>
+            </div>
+            <div class="bound">
+              <span class="bound-mark">C</span>
+              <div><strong>Composer rows</strong><span>wrapped input clamp: 3..10</span></div>
+            </div>
+            <div class="bound">
+              <span class="bound-mark">P</span>
+              <div><strong>Pending preview</strong><span>queued/active follow-up clamp: 0..8</span></div>
+            </div>
+            <div class="bound">
+              <span class="bound-mark">S</span>
+              <div><strong>Stream skip</strong><span>strip already emitted live_stream_prefix</span></div>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </section>
+
+    <section class="source-strip" aria-label="code anchors">
+      <div class="source">
+        <b>Layout split</b>
+        <code>render.rs: main_layout_areas, composer_pane_height</code>
+      </div>
+      <div class="source">
+        <b>Composer wrap</b>
+        <code>composer.rs: wrapped_composer_input_lines</code>
+      </div>
+      <div class="source">
+        <b>Transcript nodes</b>
+        <code>transcript.rs: committed_node_for_event, active_node_for_session</code>
+      </div>
+      <div class="source">
+        <b>Native streaming</b>
+        <code>main.rs: maybe_emit_native_transcript, native_live_stream_plan</code>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const phases = [
+      {
+        title: "Draft initial message",
+        subtitle: "Composer owns draft text. Transcript is still empty.",
+        status: "ready for Enter",
+        events: ["Composer text", "No event yet", "No transcript node", "Body stable", "Footer fixed"],
+        activeEvent: 0,
+        committed: ["no committed chat rows yet"],
+        committedTypes: ["muted"],
+        stream: "",
+        rules: ["draft only", "cursor inside composer"],
+        preview: "",
+        composer: "> Find the cheapest nonstop flight tomorrow",
+        meta: ["3..10 input rows", "not in transcript"]
+      },
+      {
+        title: "Submit initial message",
+        subtitle: "Enter clears the composer and commits session.input.",
+        status: "agent starting",
+        events: ["take_submission()", "session.input", "Prompt node", "Start agent", "Composer cleared"],
+        activeEvent: 1,
+        committed: ["> Find the cheapest nonstop flight tomorrow"],
+        committedTypes: ["prompt"],
+        stream: "",
+        rules: ["prompt becomes committed", "composer rows stay reserved"],
+        preview: "",
+        composer: "> ",
+        meta: ["empty draft", "same bottom height"]
+      },
+      {
+        title: "Stream open tail",
+        subtitle: "Tokens land in the active node inside the body viewport.",
+        status: "streaming model text",
+        events: ["model turn", "streaming_text", "Active node", "Open tail", "No native emit"],
+        activeEvent: 2,
+        committed: ["> Find the cheapest nonstop flight tomorrow"],
+        committedTypes: ["prompt"],
+        stream: "I found two good browser targets. Comparing prices",
+        typing: true,
+        rules: ["open tail stays here", "native scrollback waits"],
+        preview: "",
+        composer: "> ",
+        meta: ["can type follow-up", "bottom stays pinned"]
+      },
+      {
+        title: "Promote complete line",
+        subtitle: "Closed stream lines move up; the changing tail stays below.",
+        status: "native scrollback updated",
+        events: ["native_live_stream_plan", "emit closed line", "record prefix", "Skip duplicate", "Open tail remains"],
+        activeEvent: 1,
+        committed: [
+          "> Find the cheapest nonstop flight tomorrow",
+          "I found two good browser targets."
+        ],
+        committedTypes: ["prompt", "assistant"],
+        stream: "Comparing prices on the airline site now",
+        typing: true,
+        promote: true,
+        rules: ["closed line emitted", "live_stream_prefix skips it"],
+        preview: "",
+        composer: "> ",
+        meta: ["same composer box", "same footer row"]
+      },
+      {
+        title: "Type active follow-up",
+        subtitle: "Follow-up is pending, so preview rows appear above composer.",
+        status: "follow-up pending after next tool call",
+        events: ["Composer follow-up", "session.followup.pending", "Preview rows", "Runtime mailbox", "Body reserve shrinks"],
+        activeEvent: 1,
+        committed: [
+          "> Find the cheapest nonstop flight tomorrow",
+          "I found two good browser targets."
+        ],
+        committedTypes: ["prompt", "assistant"],
+        stream: "Waiting for the current tool call to finish",
+        typing: true,
+        rules: ["preview max 8 rows", "body recomputed before paint"],
+        preview: "> Change it to nonstop only",
+        composer: "> ",
+        meta: ["draft cleared", "pending preview visible"]
+      },
+      {
+        title: "Follow-up commits",
+        subtitle: "Pending marker disappears; session.followup becomes a prompt node.",
+        status: "streaming with follow-up applied",
+        events: ["Tool boundary", "session.followup", "Prompt node", "Preview cleared", "Stream continues"],
+        activeEvent: 1,
+        committed: [
+          "> Find the cheapest nonstop flight tomorrow",
+          "I found two good browser targets.",
+          "> Change it to nonstop only"
+        ],
+        committedTypes: ["prompt", "assistant", "prompt"],
+        stream: "Filtering to nonstop options and refreshing the comparison",
+        typing: true,
+        rules: ["follow-up now committed", "preview reserve returns empty"],
+        preview: "",
+        composer: "> ",
+        meta: ["ready for next draft", "status row unchanged"]
+      }
+    ];
+
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let phaseIndex = 0;
+    let playing = !reducedMotion;
+    let typedCount = 0;
+
+    const phaseTitle = document.getElementById("phaseTitle");
+    const phaseSubtitle = document.getElementById("phaseSubtitle");
+    const playButton = document.getElementById("playButton");
+    const prevButton = document.getElementById("prevButton");
+    const nextButton = document.getElementById("nextButton");
+    const phaseDots = document.getElementById("phaseDots");
+    const eventFlow = document.getElementById("eventFlow");
+    const committedLines = document.getElementById("committedLines");
+    const streamText = document.getElementById("streamText");
+    const viewportRules = document.getElementById("viewportRules");
+    const previewLine = document.getElementById("previewLine");
+    const composerText = document.getElementById("composerText");
+    const composerMeta = document.getElementById("composerMeta");
+    const statusText = document.getElementById("statusText");
+    const motionGhost = document.getElementById("motionGhost");
+
+    function makeChip(text, active) {
+      const chip = document.createElement("span");
+      chip.className = active ? "chip is-active" : "chip";
+      chip.textContent = text;
+      return chip;
+    }
+
+    function makeMiniChip(text, kind) {
+      const chip = document.createElement("span");
+      chip.className = kind ? "mini-chip " + kind : "mini-chip";
+      chip.textContent = text;
+      return chip;
+    }
+
+    function renderDots() {
+      phaseDots.replaceChildren();
+      phases.forEach((phase, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = index === phaseIndex ? "phase-dot is-active" : "phase-dot";
+        button.setAttribute("aria-label", "Show " + phase.title);
+        button.addEventListener("click", () => {
+          playing = false;
+          setPhase(index);
+        });
+        phaseDots.appendChild(button);
+      });
+    }
+
+    function renderPhase() {
+      const phase = phases[phaseIndex];
+      typedCount = phase.typing && !reducedMotion ? 0 : phase.stream.length;
+
+      phaseTitle.textContent = phase.title;
+      phaseSubtitle.textContent = phase.subtitle;
+      playButton.textContent = playing ? "Pause" : "Play";
+      statusText.textContent = phase.status;
+
+      eventFlow.replaceChildren();
+      phase.events.forEach((event, index) => {
+        eventFlow.appendChild(makeChip(event, index === phase.activeEvent));
+      });
+
+      committedLines.replaceChildren();
+      phase.committed.forEach((line, index) => {
+        const row = document.createElement("div");
+        const type = phase.committedTypes[index];
+        row.className = type === "prompt" ? "terminal-line is-prompt" : type === "muted" ? "terminal-line muted-line" : "terminal-line";
+        row.textContent = line;
+        committedLines.appendChild(row);
+      });
+
+      viewportRules.replaceChildren();
+      phase.rules.forEach((rule, index) => {
+        viewportRules.appendChild(makeMiniChip(rule, index === 0 ? "good" : "warn"));
+      });
+
+      if (phase.preview) {
+        previewLine.classList.remove("is-empty");
+        previewLine.textContent = phase.preview;
+      } else {
+        previewLine.classList.add("is-empty");
+        previewLine.textContent = "empty reserve";
+      }
+
+      composerText.textContent = phase.composer;
+      composerMeta.replaceChildren();
+      phase.meta.forEach((item) => composerMeta.appendChild(makeMiniChip(item)));
+
+      motionGhost.classList.toggle("is-active", Boolean(phase.promote && playing && !reducedMotion));
+      renderDots();
+      renderStream();
+    }
+
+    function renderStream() {
+      const phase = phases[phaseIndex];
+      if (!phase.stream) {
+        streamText.textContent = "active viewport waits for agent output";
+        return;
+      }
+
+      if (phase.typing && playing && !reducedMotion) {
+        typedCount = Math.min(phase.stream.length, typedCount + 2);
+      } else {
+        typedCount = phase.stream.length;
+      }
+
+      streamText.textContent = phase.stream.slice(0, typedCount);
+    }
+
+    function setPhase(nextIndex) {
+      phaseIndex = (nextIndex + phases.length) % phases.length;
+      renderPhase();
+    }
+
+    prevButton.addEventListener("click", () => {
+      playing = false;
+      setPhase(phaseIndex - 1);
+    });
+
+    nextButton.addEventListener("click", () => {
+      playing = false;
+      setPhase(phaseIndex + 1);
+    });
+
+    playButton.addEventListener("click", () => {
+      playing = !playing;
+      renderPhase();
+    });
+
+    setInterval(() => {
+      if (playing && !reducedMotion) {
+        renderStream();
+      }
+    }, 70);
+
+    setInterval(() => {
+      if (playing && !reducedMotion) {
+        setPhase(phaseIndex + 1);
+      }
+    }, 3300);
+
+    if (reducedMotion) {
+      playing = false;
+    }
+
+    renderPhase();
+  </script>
+</body>
+</html>
