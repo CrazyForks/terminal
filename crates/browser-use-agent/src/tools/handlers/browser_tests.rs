@@ -663,7 +663,7 @@ async fn stored_local_profile_does_not_open_marker_when_chrome_is_not_reachable(
 }
 
 #[tokio::test]
-async fn local_connect_falls_back_to_connect_when_profile_discovery_errors() {
+async fn local_connect_blocks_without_default_when_profile_discovery_errors() {
     let backend = Arc::new(FakeBackend {
         fail_local_profiles: true,
         ..Default::default()
@@ -679,18 +679,25 @@ async fn local_connect_falls_back_to_connect_when_profile_discovery_errors() {
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(out.exit_code, 0);
-    assert!(out.stdout.contains("\"status\":\"connected\""));
+    assert!(out.stdout.contains("\"status\":\"blocked\""));
+    assert!(out
+        .stdout
+        .contains("\"state\":\"profile-discovery-failed\""));
+    assert!(out.stdout.contains("profile discovery failed"));
+    assert!(
+        out.stdout
+            .contains("Do not run browser connect local without a selected default profile"),
+        "{}",
+        out.stdout
+    );
     assert_eq!(
         backend.commands(),
-        vec![
-            "browser local profiles --json".to_string(),
-            "browser connect local".to_string(),
-        ]
+        vec!["browser local profiles --json".to_string()]
     );
 }
 
 #[tokio::test]
-async fn local_connect_falls_back_to_connect_when_profile_discovery_reports_failed() {
+async fn local_connect_blocks_without_default_when_profile_discovery_reports_failed() {
     let backend = Arc::new(FakeBackend::default());
     *backend.local_profiles.lock().unwrap() = Some(json!({
         "status": "failed",
@@ -708,13 +715,14 @@ async fn local_connect_falls_back_to_connect_when_profile_discovery_reports_fail
     let out = run_direct(&tool, &req).await.unwrap();
 
     assert_eq!(out.exit_code, 0);
-    assert!(out.stdout.contains("\"status\":\"connected\""));
+    assert!(out.stdout.contains("\"status\":\"blocked\""));
+    assert!(out
+        .stdout
+        .contains("\"state\":\"profile-discovery-failed\""));
+    assert!(out.stdout.contains("profile discovery failed"));
     assert_eq!(
         backend.commands(),
-        vec![
-            "browser local profiles --json".to_string(),
-            "browser connect local".to_string(),
-        ]
+        vec!["browser local profiles --json".to_string()]
     );
 }
 

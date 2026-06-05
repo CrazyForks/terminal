@@ -934,14 +934,23 @@ fn local_connect_default_profile_preflight(
         "browser local profiles --json",
     ) {
         Ok(output) => output.content,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            return Ok(Some(local_profile_discovery_failed_preflight(format!(
+                "{error:#}"
+            ))));
+        }
     };
     if profiles
         .get("status")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|status| status == "failed")
     {
-        return Ok(None);
+        let error = profiles
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("profile discovery failed")
+            .to_string();
+        return Ok(Some(local_profile_discovery_failed_preflight(error)));
     }
     let local_profiles = profiles
         .get("local_profiles")
@@ -960,6 +969,21 @@ fn local_connect_default_profile_preflight(
         }),
         events: Vec::new(),
     }))
+}
+
+fn local_profile_discovery_failed_preflight(error: String) -> BrowserCommandOutput {
+    BrowserCommandOutput {
+        content: json!({
+            "status": "blocked",
+            "state": "profile-discovery-failed",
+            "reason": "No default local Chrome profile is set, and Chrome profile discovery failed.",
+            "error": error,
+            "browser_task_blocked": true,
+            "next_step": "Report that local Chrome profile discovery failed. Do not run browser connect local without a selected default profile.",
+            "model_instruction": "Browser work is blocked. Do not answer the user's browser/search/page task from memory. Do not connect to Local Chrome without a selected default profile; report the profile discovery failure and ask the user to fix profile discovery or set a default profile with /profile.",
+        }),
+        events: Vec::new(),
+    }
 }
 
 pub(crate) fn enrich_local_connect_recovery_with_default_profile(
