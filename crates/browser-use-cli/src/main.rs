@@ -86,6 +86,7 @@ use serde_json::Value;
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -3937,6 +3938,20 @@ fn sdk_server_stdio() -> Result<()> {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
                                 let projected = projection.apply_event(&event);
+                                let event_value = sdk_transport_value(
+                                    &serde_json::to_value(&event).unwrap_or_else(|error| {
+                                        serde_json::json!({
+                                            "serialization_error": error.to_string(),
+                                        })
+                                    }),
+                                );
+                                let projected_value = sdk_transport_value(
+                                    &serde_json::to_value(&projected).unwrap_or_else(|error| {
+                                        serde_json::json!({
+                                            "serialization_error": error.to_string(),
+                                        })
+                                    }),
+                                );
                                 let session_id =
                                     event.session_id.as_ref().map(|id| id.as_str().to_string());
                                 let run_id = event
@@ -3953,7 +3968,7 @@ fn sdk_server_stdio() -> Result<()> {
                                         "run_id": run_id.clone(),
                                         "session_id": session_id.clone(),
                                         "agent_id": agent_id.clone(),
-                                        "event": event,
+                                        "event": event_value,
                                     },
                                 });
                                 if response_tx.send(notification).is_err() {
@@ -3966,7 +3981,7 @@ fn sdk_server_stdio() -> Result<()> {
                                         "run_id": run_id,
                                         "session_id": session_id,
                                         "agent_id": agent_id,
-                                        "event": projected,
+                                        "event": projected_value,
                                     },
                                 });
                                 if response_tx.send(notification).is_err() {
@@ -4266,14 +4281,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     )?;
     let event_values = events
         .iter()
-        .map(|event| {
-            serde_json::json!({
-                "seq": event.seq,
-                "id": event.id,
-                "event_type": event.event_type,
-                "payload": event.payload,
-            })
-        })
+        .map(sdk_transport_event_value)
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
         "agent_id": agent_id.as_str(),
@@ -4290,6 +4298,48 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
         },
         "final_projected_event": final_projected_event,
     }))
+}
+
+fn sdk_transport_event_value(event: &browser_use_protocol::EventRecord) -> Value {
+    serde_json::json!({
+        "seq": event.seq,
+        "id": event.id,
+        "event_type": event.event_type,
+        "payload": sdk_transport_value(&event.payload),
+    })
+}
+
+fn sdk_transport_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(sdk_transport_string(text)),
+        Value::Array(items) => Value::Array(items.iter().map(sdk_transport_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sdk_transport_value(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sdk_transport_string(text: &str) -> String {
+    if text.len() <= SDK_EVENT_STRING_LIMIT_BYTES {
+        return text.to_string();
+    }
+    let end = sdk_floor_char_boundary(text, SDK_EVENT_STRING_LIMIT_BYTES);
+    let omitted = text.len().saturating_sub(end);
+    format!(
+        "{}\n...[truncated {omitted} bytes for SDK transport; full output remains in terminal artifacts/events]",
+        &text[..end]
+    )
+}
+
+fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
@@ -7813,6 +7863,34 @@ command = "test-mcp"
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn sdk_transport_event_value_truncates_oversized_nested_strings() {
+        let oversized = format!("{}é", "x".repeat(SDK_EVENT_STRING_LIMIT_BYTES));
+        let event = browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "event-1".to_string(),
+            session_id: "session-1".to_string(),
+            ts_ms: 123,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "nested": {
+                    "text": oversized,
+                },
+            }),
+        };
+
+        let value = sdk_transport_event_value(&event);
+        let text = value["payload"]["nested"]["text"]
+            .as_str()
+            .expect("truncated text");
+
+        assert!(text.len() < SDK_EVENT_STRING_LIMIT_BYTES + 200);
+        assert!(text.contains("truncated"));
+        assert!(text.contains("SDK transport"));
+        assert_eq!(value["event_type"], "tool.output");
     }
 
     #[test]
