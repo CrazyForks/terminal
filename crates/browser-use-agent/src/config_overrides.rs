@@ -357,7 +357,7 @@ impl Default for AgentRunOptions {
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
             model_stream_idle_timeout_ms: None,
-            python_tool_timeout_seconds: 120,
+            python_tool_timeout_seconds: 300,
             python_env: Vec::new(),
             child_agent_runner: None,
             final_output_json_schema: None,
@@ -1819,7 +1819,7 @@ command = "profile-server"
             options.model_provider_id_source,
             RunConfigValueSource::Default
         );
-        assert_eq!(options.python_tool_timeout_seconds, 120);
+        assert_eq!(options.python_tool_timeout_seconds, 300);
         assert!(options.python_env.is_empty());
         assert!(options.child_agent_runner.is_none());
         assert!(options.final_output_json_schema.is_none());

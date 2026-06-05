@@ -4986,7 +4986,6 @@ fn sdk_provider_run_config(
         options = options.with_final_output_json_schema(schema.clone(), true);
     }
     if let Some(timeout) = llm.get("timeout").and_then(Value::as_u64) {
-        options.python_tool_timeout_seconds = timeout;
         options.model_stream_idle_timeout_ms = Some(timeout.saturating_mul(1000));
     }
     let config_overrides = sdk_config_overrides_from_params(params)?;
@@ -8012,7 +8011,7 @@ command = "test-mcp"
             config.options.final_output_json_schema,
             params.get("output_schema").cloned()
         );
-        assert_eq!(config.options.python_tool_timeout_seconds, 45);
+        assert_eq!(config.options.python_tool_timeout_seconds, 300);
         assert_eq!(config.options.model_stream_idle_timeout_ms, Some(45_000));
         assert!(config
             .options
