@@ -4154,7 +4154,15 @@ impl BrowserSession {
         } else {
             let targets = self.targets()?;
             let launched_profile_id = self.preferred_profile_id.take();
-            let target_info = select_attach_page_target(&targets);
+            let allow_initial_placeholder = self.mode == BrowserMode::RemoteCloud;
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                select_initial_page_target(&targets, allow_initial_placeholder)
+            };
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
                 attached_browser_context_id = target_info
@@ -4262,7 +4270,15 @@ impl BrowserSession {
         } else {
             let targets = self.targets_with_deadline(deadline)?;
             let launched_profile_id = self.preferred_profile_id.take();
-            let target_info = select_attach_page_target(&targets);
+            let allow_initial_placeholder = self.mode == BrowserMode::RemoteCloud;
+            let target_info = if launched_profile_id.is_some() {
+                targets
+                    .iter()
+                    .find(|target| is_page_target(target) && !is_profile_marker_target(target))
+                    .cloned()
+            } else {
+                select_initial_page_target(&targets, allow_initial_placeholder)
+            };
             if launched_profile_id.is_some() {
                 attached_profile_id = launched_profile_id;
                 attached_browser_context_id = target_info
@@ -8658,7 +8674,24 @@ fn is_real_page_target(target: &Value) -> bool {
     true
 }
 
-fn is_blank_page_attach_target(target: &Value) -> bool {
+fn select_initial_page_target(targets: &[Value], allow_placeholder: bool) -> Option<Value> {
+    targets
+        .iter()
+        .find(|target| is_real_page_target(target))
+        .cloned()
+        .or_else(|| {
+            allow_placeholder
+                .then(|| {
+                    targets
+                        .iter()
+                        .find(|target| is_reusable_placeholder_page_target(target))
+                        .cloned()
+                })
+                .flatten()
+        })
+}
+
+fn is_reusable_placeholder_page_target(target: &Value) -> bool {
     if !is_page_target(target)
         || is_profile_marker_target(target)
         || is_remote_debugging_setup_target(target)
@@ -8669,22 +8702,10 @@ fn is_blank_page_attach_target(target: &Value) -> bool {
         .get("url")
         .and_then(Value::as_str)
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_ascii_lowercase();
     url.is_empty() || url == "about:blank" || url.starts_with("about:blank#")
 }
-
-fn select_attach_page_target(targets: &[Value]) -> Option<Value> {
-    targets
-        .iter()
-        .find(|target| is_real_page_target(target))
-        .or_else(|| {
-            targets
-                .iter()
-                .find(|target| is_blank_page_attach_target(target))
-        })
-        .cloned()
-}
-
 fn is_internal_browser_url(url: &str) -> bool {
     let url = url.trim().to_ascii_lowercase();
     url == "about:blank"
@@ -9287,6 +9308,50 @@ mod tests {
             "url": "https://dashboard.brex.com/account-management/home",
             "title": "Brex",
         })));
+    }
+
+    #[test]
+    fn initial_target_selection_prefers_real_page() {
+        let targets = vec![
+            json!({
+                "type": "page",
+                "targetId": "blank",
+                "url": "about:blank",
+            }),
+            json!({
+                "type": "page",
+                "targetId": "real",
+                "url": "https://example.test",
+            }),
+        ];
+
+        let selected = select_initial_page_target(&targets, true).expect("selected target");
+
+        assert_eq!(selected["targetId"], "real");
+    }
+
+    #[test]
+    fn cloud_initial_target_selection_reuses_existing_blank_page() {
+        let targets = vec![json!({
+            "type": "page",
+            "targetId": "cloud-start-page",
+            "url": "about:blank",
+        })];
+
+        let selected = select_initial_page_target(&targets, true).expect("selected target");
+
+        assert_eq!(selected["targetId"], "cloud-start-page");
+    }
+
+    #[test]
+    fn non_cloud_initial_target_selection_rejects_existing_blank_page() {
+        let targets = vec![json!({
+            "type": "page",
+            "targetId": "local-start-page",
+            "url": "about:blank",
+        })];
+
+        assert!(select_initial_page_target(&targets, false).is_none());
     }
 
     #[test]
@@ -10317,8 +10382,8 @@ print("navigation helpers wait for page state")
             }),
         ];
 
-        let selected =
-            select_attach_page_target(&targets).expect("existing blank page should be reusable");
+        let selected = select_initial_page_target(&targets, true)
+            .expect("existing blank page should be reusable");
         assert_eq!(
             selected.get("targetId").and_then(Value::as_str),
             Some("blank-target")
@@ -10338,7 +10403,7 @@ print("navigation helpers wait for page state")
                 "url": "https://example.com/",
             }),
         ];
-        let selected = select_attach_page_target(&targets_with_real_page)
+        let selected = select_initial_page_target(&targets_with_real_page, true)
             .expect("real page should be selected");
         assert_eq!(
             selected.get("targetId").and_then(Value::as_str),
