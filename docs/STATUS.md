@@ -48,7 +48,7 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   a "continue from current page" task context instead of making the model spend
   its first turns repeatedly calling `navigate`/browser-status recovery.
 - Proof:
-  - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session'`
+  - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session or run_pre_navigates_cdp_session_before_sdk_by_default'`
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-providers anthropic_messages_downsamples_oversized_tool_images -- --nocapture`
   - `cargo test -p browser-use-providers anthropic_messages -- --nocapture`
