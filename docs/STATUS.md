@@ -22,6 +22,11 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   even when the model calls it as a bare statement and discards the Python return
   value. This gives the next turn explicit evidence that navigation was sent,
   without adding an implicit load wait or screenshots.
+- [x] Navigation observations now include bounded target-level page state
+  (`page_state.target.url/title` when CDP target metadata reflects the requested
+  URL), and mutable `browser status --json` paths enrich `page` with URL/title
+  when probing is available. This gives repeated status/recovery loops concrete
+  page evidence without forcing a full load wait.
 - Proof:
   - `cargo fmt --all --check`
   - `cargo test -p browser-use-agent duplicate_tool_output_keeps_first_browser_script_result -- --nocapture`
