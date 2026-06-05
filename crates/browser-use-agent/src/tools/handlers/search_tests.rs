@@ -474,3 +474,48 @@ async fn orchestrated_search_completes_under_none() {
         result.output.stdout
     );
 }
+
+// ---- live smoke (ignored: hits the real DuckDuckGo endpoint) --------------
+
+/// End-to-end check against the REAL DuckDuckGo Lite endpoint via the default
+/// [`HttpSearchBackend`]. Ignored by default (network + non-deterministic, and
+/// DuckDuckGo may rate-limit/serve a challenge). Run it manually with:
+///
+/// ```text
+/// cargo test -p browser-use-agent --lib -- --ignored --nocapture search_live_smoke
+/// ```
+#[tokio::test]
+#[ignore = "hits the live DuckDuckGo Lite endpoint"]
+async fn search_live_smoke() {
+    let tool = SearchTool::new();
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let out = tool
+        .run(
+            &SearchRequest::new("rust programming language"),
+            &attempt,
+            &ctx(),
+        )
+        .await
+        .expect("run ok");
+
+    eprintln!(
+        "exit_code={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.exit_code, out.stdout, out.stderr
+    );
+    // A challenge/CAPTCHA is a legitimate live outcome (exit 1 + message); only
+    // assert hard on the success shape so the test documents both paths.
+    if out.exit_code == 0 {
+        assert!(
+            out.stdout.contains("Search results for") || out.stdout.contains("No results found"),
+            "unexpected stdout: {}",
+            out.stdout
+        );
+    } else {
+        assert!(
+            out.stderr.contains("Search failed:"),
+            "unexpected stderr: {}",
+            out.stderr
+        );
+    }
+}
