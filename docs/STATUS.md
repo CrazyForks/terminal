@@ -368,3 +368,20 @@ Switch `browser-use-tui` + `browser-use-cli` from `browser-use-core` → `browse
 
 ## FINAL CUTOVER = [BLOCKED-NEEDS-HUMAN]
 After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-use-core → browser-use-agent, retire browser-use-core. ONLY human-gated step — do NOT do autonomously.
+
+---
+
+## Browser-Use Rust SDK Integration Proof Ledger
+
+- [x] SDK browser-use API tool surface — the Python `browser_use.rust.Agent` now
+  sends `config_overrides.tool_allowlist=["browser","browser_script","done"]`
+  with SDK runs, and the terminal SDK server converts JSON-RPC config overrides
+  into `AgentRunOptions.config_overrides` before building the production tool
+  registry. This keeps browser-use API/eval runs on the browser interaction
+  surface and prevents model-visible drift into `exec_command`, `python`,
+  `apply_patch`, planning, image, or hosted-search workspace tools unless a
+  caller uses another terminal entrypoint/config.
+  - Proof: `uv run pytest tests/ci/test_rust_agent.py -q -k 'translates_browser_use_args_to_terminal or run_pre_navigates_cdp_session_before_sdk_by_default'`
+  - Proof: `cargo test -q -p browser-use-cli sdk_provider_run_config_accepts_browser_use_tool_allowlist`
+  - Proof: `cargo test -q -p browser-use-agent browser_use_api_tool_allowlist_hides_workspace_tools`
+  - Proof: `cargo fmt --all --check`

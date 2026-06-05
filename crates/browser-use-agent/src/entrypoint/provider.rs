@@ -3223,6 +3223,34 @@ mod tests {
             build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
     }
 
+    #[test]
+    fn browser_use_api_tool_allowlist_hides_workspace_tools() {
+        let options = crate::config_overrides::AgentRunOptions {
+            config_overrides: vec![(
+                "tool_allowlist".to_string(),
+                toml::Value::Array(vec![
+                    toml::Value::String("browser".to_string()),
+                    toml::Value::String("browser_script".to_string()),
+                    toml::Value::String("done".to_string()),
+                ]),
+            )],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["browser", "browser_script", "done"]);
+        assert!(!names.contains(&"exec_command"));
+        assert!(!names.contains(&"python"));
+        assert!(!names.contains(&"tool_search"));
+    }
+
     /// An empty `mcp_servers` map registers NO `mcp` tool (prior behavior).
     #[test]
     fn empty_mcp_servers_registers_no_mcp_tool() {
