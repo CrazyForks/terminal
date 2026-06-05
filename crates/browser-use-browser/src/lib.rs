@@ -1975,7 +1975,7 @@ fn dispatch_browser_command(
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
         "status" => {
             session.refresh_connection_health();
-            Ok(session.status_json())
+            Ok(session.status_json_with_page_probe())
         }
         "doctor" => {
             let doctor = session.doctor(cwd)?;
@@ -2759,7 +2759,7 @@ fn dispatch_remote(
     match argv.get(1).map(String::as_str) {
         Some("start") => session.start_remote_cloud(argv),
         Some("stop") => session.stop_owned_remote(),
-        Some("status") => Ok(session.status_json()),
+        Some("status") => Ok(session.status_json_with_page_probe()),
         Some("live-url") => Ok(json!({ "live_url": session.live_url })),
         Some("profiles") => list_cloud_profiles_with_options(options),
         Some(other) => bail!("unknown browser remote command: {other}"),
@@ -2919,6 +2919,16 @@ impl BrowserSession {
             "remote_browser_id": self.remote_browser_id,
             "live_url": self.live_url,
         })
+    }
+
+    fn status_json_with_page_probe(&mut self) -> Value {
+        let mut status = self.status_json();
+        if self.connection.is_some() {
+            if let Ok(page) = self.current_page_probe_mut() {
+                status["page"] = page;
+            }
+        }
+        status
     }
 
     fn last_issue_diagnosis(&self) -> Option<BrowserIssueDiagnosis> {
@@ -6964,7 +6974,7 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
         "meta" => {
             let meta = request.get("meta").and_then(Value::as_str).unwrap_or("");
             match meta {
-                "status" => Ok(session.status_json()),
+                "status" => Ok(session.status_json_with_page_probe()),
                 "session" => Ok(json!({ "session_id": session.current_session_id })),
                 "current_tab" => session.current_page_probe_mut(),
                 "set_session" => {
@@ -6987,7 +6997,7 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                     Ok(json!({
                         "session_id": session_id,
                         "target_id": target_id,
-                        "browser": session.status_json(),
+                        "browser": session.status_json_with_page_probe(),
                     }))
                 }
                 "pending_dialog" => Ok(json!({ "dialog": null })),
@@ -6995,7 +7005,7 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                 other => bail!("unknown browser_script bridge meta request: {other}"),
             }
         }
-        "status" => Ok(session.status_json()),
+        "status" => Ok(session.status_json_with_page_probe()),
         other => bail!("unknown browser_script bridge request: {other}"),
     }
 }
@@ -9681,10 +9691,13 @@ print("time shadow ok")
             temp.path().join("artifacts"),
             r#"
 calls = []
+last_url = None
 
 def cdp(method, session_id=None, **params):
+    global last_url
     calls.append((method, params))
     if method == "Page.navigate":
+        last_url = params["url"]
         return {"frameId": "frame-1"}
     if method == "Target.createTarget":
         return {"targetId": "target-1"}
@@ -9695,6 +9708,16 @@ def wait_for_load(*args, **kwargs):
 
 def _current_target_url():
     return "https://already-open.test"
+
+def current_tab():
+    return {
+        "targetId": "target-1",
+        "target_id": "target-1",
+        "sessionId": "session-1",
+        "session_id": "session-1",
+        "url": last_url or "about:blank",
+        "title": "Example loaded",
+    }
 
 def switch_tab(target):
     calls.append(("switch_tab", {"target": target}))
@@ -9732,6 +9755,18 @@ print("navigation helpers do not auto wait")
                 .pointer("/value/waited_for_load")
                 .and_then(Value::as_bool),
             Some(false)
+        );
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/page_state/observed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            navigations[0]
+                .pointer("/value/page_state/target/url")
+                .and_then(Value::as_str),
+            Some("https://example.test/one")
         );
     }
 

@@ -411,8 +411,47 @@ def last_domain_skills(include_content=False):
     return __last_domain_skills
 
 
+def _target_matches_requested_url(target_url, requested_url):
+    target_url = str(target_url or "")
+    requested_url = str(requested_url or "")
+    if not target_url or target_url.startswith(INTERNAL):
+        return False
+    if not requested_url:
+        return True
+    try:
+        target = urlparse(target_url)
+        requested = urlparse(requested_url)
+        if requested.netloc and target.netloc == requested.netloc:
+            return True
+    except Exception:
+        pass
+    return target_url == requested_url or target_url.startswith(requested_url)
+
+
+def _navigation_target_state(requested_url, timeout=3.0):
+    deadline = _time.time() + float(timeout)
+    last_tab = None
+    last_error = None
+    while _time.time() < deadline:
+        try:
+            tab = current_tab()
+            last_tab = tab
+            if _target_matches_requested_url(tab.get("url"), requested_url):
+                return {"observed": True, "target": tab}
+        except Exception as exc:
+            last_error = str(exc)
+        _time.sleep(0.25)
+    state = {"observed": False}
+    if last_tab is not None:
+        state["target"] = last_tab
+    if last_error is not None:
+        state["error"] = last_error
+    return state
+
+
 def _emit_navigation(action, url, result):
     """Record navigation commands even when callers discard helper return values."""
+    page_state = _navigation_target_state(url)
     try:
         emit_output(
             {
@@ -420,6 +459,7 @@ def _emit_navigation(action, url, result):
                 "url": url,
                 "status": "navigation_sent",
                 "waited_for_load": False,
+                "page_state": page_state,
                 "result": result,
             },
             label="navigation",
