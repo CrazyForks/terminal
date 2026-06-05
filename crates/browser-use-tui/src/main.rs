@@ -14760,7 +14760,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn live_thinking_without_streamed_text_shows_pending_reasoning_detail() -> Result<()> {
+    fn live_thinking_without_streamed_text_shows_plain_status() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -14782,7 +14782,7 @@ wire_api = "responses"
         let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
 
         assert!(text.contains("Thinking..."), "{text}");
-        assert!(text.contains("reasoning pending"), "{text}");
+        assert!(!text.contains("reasoning pending"), "{text}");
         Ok(())
     }
 

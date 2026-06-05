@@ -1907,7 +1907,6 @@ fn active_node_for_session(
     let status_detail = if live_status == "Thinking..." {
         live_thinking_text
             .map(|text| live_thinking_status_detail(live_events, text))
-            .or_else(|| live_reasoning_pending_detail(live_events))
             .or_else(|| active_subagent_summary(active_child_count))
     } else {
         active_subagent_summary(active_child_count)
@@ -2052,14 +2051,6 @@ fn live_thinking_status_detail(live_events: &[EventRecord], thinking_text: &str)
         "({elapsed_s}s · ↓ ~{} tokens)",
         crate::render::format_token_count(est_tokens)
     )
-}
-
-fn live_reasoning_pending_detail(live_events: &[EventRecord]) -> Option<String> {
-    live_events
-        .iter()
-        .rev()
-        .any(|event| event.event_type == "model.turn.request")
-        .then(|| "reasoning pending".to_string())
 }
 
 /// Approximate characters per token — mirrors `product_analytics` so estimated
