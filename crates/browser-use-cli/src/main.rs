@@ -73,8 +73,8 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
     FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    MemoryJournal, RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState,
-    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId,
+    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -3872,7 +3872,7 @@ struct JsonRpcRequest {
 }
 
 struct SdkServerContext {
-    journal: Arc<MemoryJournal>,
+    journal: Arc<SqliteJournal>,
     runtime: RuntimeHandle,
     store: SharedStore,
     _ephemeral_state_dir: Arc<tempfile::TempDir>,
@@ -3880,9 +3880,14 @@ struct SdkServerContext {
 
 impl SdkServerContext {
     fn memory() -> Result<Self> {
-        let (runtime, journal) = BrowserUseRuntime::memory();
         let ephemeral_state_dir = Arc::new(tempfile::Builder::new().prefix("but-sdk-").tempdir()?);
-        let store = Store::open_in_memory(ephemeral_state_dir.path())?;
+        let store = Store::open(ephemeral_state_dir.path())?;
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(
+            ephemeral_state_dir.path(),
+        )?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal.clone();
+        let runtime = BrowserUseRuntime::new(persistence, state_index);
         Ok(Self {
             journal,
             runtime: runtime.handle(),
@@ -4650,9 +4655,10 @@ fn sdk_run_agent_with_runtime(
     session_id: &SessionId,
     browser_id: Option<BrowserId>,
     initial_input: Option<Value>,
-    config: ProviderRunConfig,
+    mut config: ProviderRunConfig,
 ) -> Result<()> {
     let runtime = context.runtime.clone();
+    attach_sdk_child_agent_runner(context, &mut config)?;
     let driver_runtime = runtime.clone();
     let store = Arc::clone(&context.store);
     let session_id_for_driver = session_id.as_str().to_string();
@@ -4701,6 +4707,16 @@ fn sdk_run_agent_with_runtime(
             .await?;
         Ok::<(), anyhow::Error>(())
     })
+}
+
+fn attach_sdk_child_agent_runner(
+    context: &SdkServerContext,
+    config: &mut ProviderRunConfig,
+) -> Result<()> {
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    let executor = cli_runtime_agent_executor(&store, context.runtime.clone())?;
+    attach_cli_child_agent_runner(&store, executor, config);
+    Ok(())
 }
 
 fn build_sdk_run_runtime() -> Result<tokio::runtime::Runtime> {
@@ -7703,7 +7719,6 @@ command = "test-mcp"
 
     #[test]
     fn sdk_json_rpc_ping_and_create_methods_use_runtime() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc")?;
         let context = SdkServerContext::memory()?;
 
         let ping = handle_sdk_json_rpc_line(
@@ -7780,18 +7795,11 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.input"));
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory context must not create a SQLite database"
-        );
-
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
     fn sdk_json_rpc_reports_protocol_errors() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-errors")?;
         let context = SdkServerContext::memory()?;
 
         let parse = handle_sdk_json_rpc_line(&context, "{not-json");
@@ -7802,12 +7810,6 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":4,"method":"missing.method","params":{}}"#,
         );
         assert_eq!(missing["error"]["code"], -32601);
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory context must not create a SQLite database"
-        );
-
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -7988,8 +7990,49 @@ command = "test-mcp"
     }
 
     #[test]
+    fn sdk_context_uses_temporary_sqlite_store_for_child_agents() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let state_dir = context
+            .store
+            .lock()
+            .expect("sdk store mutex poisoned")
+            .state_dir()
+            .to_path_buf();
+
+        assert!(
+            state_dir.join("state.db").exists(),
+            "SDK context must use Store-backed state so child agents share runtime/session data"
+        );
+        assert!(state_dir.starts_with(context._ephemeral_state_dir.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_run_attaches_child_agent_runner_to_provider_config() -> Result<()> {
+        let context = SdkServerContext::memory()?;
+        let mut config = sdk_provider_run_config(
+            &serde_json::json!({
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"}
+            }),
+            Some("inspect"),
+            None,
+        )?;
+
+        assert!(config.options.child_agent_runner.is_none());
+
+        attach_sdk_child_agent_runner(&context, &mut config)?;
+
+        assert!(config.options.multi_agent_v2.enabled);
+        assert!(
+            config.options.child_agent_runner.is_some(),
+            "SDK runs should expose terminal sub-agent tools through the same child runner as CLI runs"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sdk_json_rpc_agent_run_executes_fake_backend() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-run-fake")?;
         let context = SdkServerContext::memory()?;
         let agent = handle_sdk_json_rpc_line(
             &context,
@@ -8051,10 +8094,6 @@ command = "test-mcp"
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.followup.runtime_queued"));
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory runs must not create Store-backed agent_messages or SQLite state"
-        );
         let browser_snapshot = context
             .runtime
             .browsers()
@@ -8065,13 +8104,11 @@ command = "test-mcp"
             browser_use_runtime::BrowserStatus::Released
         );
 
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
     fn sdk_json_rpc_agent_run_task_executes_fake_backend_with_normalized_history() -> Result<()> {
-        let temp = unique_cli_test_dir("sdk-json-rpc-run-task-fake")?;
         let context = SdkServerContext::memory()?;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -8130,12 +8167,7 @@ command = "test-mcp"
             browser_snapshot.config.cdp_url.as_deref(),
             Some("wss://browser.example.test/cdp")
         );
-        assert!(
-            !temp.join("state.db").exists(),
-            "SDK memory runs must not create Store-backed SQLite state"
-        );
 
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
