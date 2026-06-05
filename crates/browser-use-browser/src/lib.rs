@@ -648,6 +648,44 @@ fn active_browser_script_next_step(active_scripts: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn active_browser_script_start_guard_output(
+    session_id: &str,
+    registry: &BrowserScriptRunRegistry,
+) -> Option<BrowserScriptOutput> {
+    let active_scripts = active_browser_script_runs_json_with_registry(session_id, registry);
+    let script = active_scripts.as_array()?.first()?;
+    let run_id = script.get("run_id").and_then(Value::as_str)?.to_string();
+    let status = script
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    let next_step = script
+        .get("next_step")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("browser_script action=observe run_id={run_id}"));
+    let state = if matches!(status, "finished" | "timed_out") {
+        "A previous browser_script has completed but its final result has not been observed yet."
+    } else {
+        "A browser_script is already active for this browser session."
+    };
+    Some(BrowserScriptOutput {
+        ok: true,
+        status: Some("running".to_string()),
+        run_id: Some(run_id.clone()),
+        next_observe_ms: Some(BROWSER_SCRIPT_DEFAULT_OBSERVE_MS),
+        text: format!(
+            "{state}\nrun_id: {run_id}\nNext step: {next_step}\nDo not start another browser_script until this run has been observed or cancelled; observe first so the previous navigation/page result remains attached to the next model turn."
+        ),
+        data: json!({
+            "attempted_start_deferred": true,
+            "session_id": session_id,
+            "active_scripts": active_scripts,
+        }),
+        ..Default::default()
+    })
+}
+
 fn is_browser_recovery_command(argv: &[String]) -> bool {
     argv.first().map(String::as_str) == Some("recover")
 }
@@ -968,6 +1006,9 @@ pub fn start_browser_script_with_registries(
     script_registry: &BrowserScriptRunRegistry,
     session_registry: &BrowserSessionRegistry,
 ) -> Result<BrowserScriptOutput> {
+    if let Some(output) = active_browser_script_start_guard_output(session_id, script_registry) {
+        return Ok(output);
+    }
     let mut run = spawn_browser_script_with_session_registry(
         session_id,
         cwd,
@@ -7387,6 +7428,26 @@ def _summary_from_output(label, output_value):
     if label is None:
         return None
     label_text = str(label)
+    if label_text == "navigation" and isinstance(output_value, dict):
+        page_info = output_value.get("page_info") if isinstance(output_value.get("page_info"), dict) else {{}}
+        url = output_value.get("url") or page_info.get("url")
+        status = output_value.get("status") or "navigation_sent"
+        message = f"{{status}} {{url}}".strip()
+        record = {{
+            "kind": "navigation",
+            "message": message,
+            "output_label": label_text,
+            "status": status,
+            "url": url,
+            "next_step": output_value.get("next_step"),
+        }}
+        title = page_info.get("title")
+        if title:
+            record["title"] = title
+        ready_state = page_info.get("readyState")
+        if ready_state:
+            record["readyState"] = ready_state
+        return record
     spec = __browser_summary_specs.get(label_text)
     if spec is None:
         return {{"kind": "observed", "message": f"Recorded {{label_text}}", "output_label": label_text}}
@@ -9933,6 +9994,31 @@ print("navigation helpers wait for page state")
                 .and_then(Value::as_str),
             Some("https://example.test/one")
         );
+        let navigation_summaries = output
+            .summary
+            .iter()
+            .filter(|summary| summary.get("kind").and_then(Value::as_str) == Some("navigation"))
+            .collect::<Vec<_>>();
+        assert_eq!(navigation_summaries.len(), 2, "{:?}", output.summary);
+        assert_eq!(
+            navigation_summaries[0]
+                .get("status")
+                .and_then(Value::as_str),
+            Some("navigation_ready")
+        );
+        assert_eq!(
+            navigation_summaries[0].get("url").and_then(Value::as_str),
+            Some("https://example.test/one")
+        );
+        assert!(
+            navigation_summaries[0]
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("navigation_ready")
+                    && message.contains("https://example.test/one")),
+            "{:?}",
+            navigation_summaries[0]
+        );
     }
 
     #[test]
@@ -11064,6 +11150,53 @@ print("bridge retry ok")
             "internal stream file leaked as artifact: {:?}",
             finished.artifacts
         );
+    }
+
+    #[test]
+    fn browser_script_start_defers_when_session_has_active_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BrowserScriptRunRegistry::new();
+        let session_id = "script-start-active-guard";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
+        let started = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\nprint('first started')\ntime.sleep(2.0)\nprint('first done')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert!(started.ok);
+        assert_eq!(started.status.as_deref(), Some("running"));
+        let run_id = started.run_id.as_deref().unwrap().to_string();
+        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+
+        let deferred = start_browser_script_with_registry(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print('second should not spawn')",
+            5,
+            &registry,
+        )
+        .unwrap();
+
+        assert!(deferred.ok);
+        assert_eq!(deferred.status.as_deref(), Some("running"));
+        assert_eq!(deferred.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(registry.active_run_count_for_session(session_id), 1);
+        assert!(
+            deferred.text.contains("already active")
+                && deferred
+                    .text
+                    .contains("Do not start another browser_script"),
+            "deferred text: {}",
+            deferred.text
+        );
+        assert_eq!(deferred.data["attempted_start_deferred"], true);
+        let _ = cancel_browser_script_with_registry(session_id, &run_id, &registry);
     }
 
     #[test]
