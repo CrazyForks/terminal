@@ -385,3 +385,13 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   - Proof: `cargo test -q -p browser-use-cli sdk_provider_run_config_accepts_browser_use_tool_allowlist`
   - Proof: `cargo test -q -p browser-use-agent browser_use_api_tool_allowlist_hides_workspace_tools`
   - Proof: `cargo fmt --all --check`
+
+- [x] Busy browser-script status recovery — `browser status --json` now returns
+  live busy guidance when a long `browser_script` has checked out the browser
+  session, including the active script `run_id`, an observe next step, and a
+  page-probed checkout snapshot. This prevents the browser-use API agent from
+  treating a still-running navigation/script as a broken browser and wasting
+  steps on repeated navigation/status/recovery loops.
+  - Proof: `cargo test -q -p browser-use-browser browser_status`
+  - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
+  - Proof: `cargo fmt --all --check && git diff --check`

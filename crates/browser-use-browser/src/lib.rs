@@ -405,7 +405,7 @@ impl BrowserSessionRegistry {
     }
 
     fn checkout_session(&self, session_id: &str) -> Result<BrowserSession> {
-        let session = {
+        let mut session = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -417,7 +417,10 @@ impl BrowserSessionRegistry {
         self.checked_out_statuses
             .lock()
             .expect("browser checked-out session registry poisoned")
-            .insert(session_id.to_string(), session.status_json());
+            .insert(
+                session_id.to_string(),
+                session.status_json_with_page_probe(),
+            );
         Ok(session)
     }
 
@@ -753,7 +756,7 @@ pub fn run_browser_command_with_options_and_registries(
         if argv.first().map(String::as_str) == Some("status") {
             return Ok(BrowserCommandOutput {
                 events: Vec::new(),
-                content,
+                content: busy_recovery_status_json(session_id, &argv, content, script_registry),
             });
         }
         if is_browser_recovery_command(&argv) {
@@ -9343,6 +9346,36 @@ mod tests {
                 }),
             );
 
+        let status_output = run_browser_command_with_options_and_registries(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            "browser status --json",
+            BrowserCommandOptions::default(),
+            &script_registry,
+            &registry,
+        )
+        .expect("busy status should return structured guidance");
+
+        assert_eq!(status_output.content["status"], "busy");
+        assert_eq!(status_output.content["busy"], true);
+        assert_eq!(
+            status_output.content["requested_command"],
+            "browser status --json"
+        );
+        assert_eq!(
+            status_output.content["active_scripts"][0]["run_id"],
+            "script-1"
+        );
+        assert!(status_output.content["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("browser_script action=observe run_id=script-1"));
+        assert!(status_output.content["model_instruction"]
+            .as_str()
+            .unwrap()
+            .contains("busy, not failed"));
+
         let output = run_browser_command_with_options_and_registries(
             session_id,
             temp.path(),
@@ -11091,6 +11124,7 @@ print("finished")
     fn browser_status_lists_active_script_runs() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-status-active-runs";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "500")]);
         let started = start_browser_script(
             session_id,
             temp.path(),
