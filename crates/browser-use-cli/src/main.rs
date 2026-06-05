@@ -4601,6 +4601,11 @@ fn sdk_provider_run_config(
         options.python_tool_timeout_seconds = timeout;
         options.model_stream_idle_timeout_ms = Some(timeout.saturating_mul(1000));
     }
+    let config_overrides = sdk_config_overrides_from_params(params)?;
+    if !config_overrides.is_empty() {
+        apply_runtime_config_overrides(&mut options, &config_overrides)?;
+        options = options.with_config_overrides(config_overrides);
+    }
     options.python_env.extend(sdk_python_env_from_params(
         params,
         browser,
@@ -4612,6 +4617,99 @@ fn sdk_provider_run_config(
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_config_overrides_from_params(params: &Value) -> Result<ConfigOverrides> {
+    let mut overrides = ConfigOverrides::new();
+    if let Some(raw) = params
+        .get("config_overrides")
+        .filter(|value| !value.is_null())
+    {
+        append_sdk_config_overrides(&mut overrides, raw)?;
+    }
+    for key in ["tool_allowlist", "tools"] {
+        if let Some(raw) = params.get(key).filter(|value| !value.is_null()) {
+            overrides.push(("tool_allowlist".to_string(), sdk_json_to_toml_value(raw)?));
+            break;
+        }
+    }
+    if let Some(raw) = params.get("can_write").filter(|value| !value.is_null()) {
+        overrides.push(("can_write".to_string(), sdk_json_to_toml_value(raw)?));
+    }
+    Ok(overrides)
+}
+
+fn append_sdk_config_overrides(overrides: &mut ConfigOverrides, raw: &Value) -> Result<()> {
+    match raw {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key.trim().is_empty() {
+                    bail!("config_overrides object keys must be non-empty");
+                }
+                overrides.push((key.trim().to_string(), sdk_json_to_toml_value(value)?));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::String(raw_override) => {
+                        overrides
+                            .extend(parse_config_overrides(std::slice::from_ref(raw_override))?);
+                    }
+                    Value::Object(map) => {
+                        let key = map
+                            .get("key")
+                            .or_else(|| map.get("name"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .context("config_overrides records require string `key`")?;
+                        let value = map
+                            .get("value")
+                            .context("config_overrides records require `value`")?;
+                        overrides.push((key.to_string(), sdk_json_to_toml_value(value)?));
+                    }
+                    _ => bail!(
+                        "config_overrides array entries must be raw strings or key/value objects"
+                    ),
+                }
+            }
+        }
+        Value::String(raw_override) => {
+            overrides.extend(parse_config_overrides(std::slice::from_ref(raw_override))?);
+        }
+        _ => bail!("config_overrides must be an object, array, or raw override string"),
+    }
+    Ok(())
+}
+
+fn sdk_json_to_toml_value(value: &Value) -> Result<toml::Value> {
+    match value {
+        Value::Null => Ok(toml::Value::String(String::new())),
+        Value::Bool(value) => Ok(toml::Value::Boolean(*value)),
+        Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return Ok(toml::Value::Integer(integer));
+            }
+            let float = number
+                .as_f64()
+                .context("JSON number cannot be represented as TOML float")?;
+            Ok(toml::Value::Float(float))
+        }
+        Value::String(value) => Ok(toml::Value::String(value.clone())),
+        Value::Array(items) => items
+            .iter()
+            .map(sdk_json_to_toml_value)
+            .collect::<Result<Vec<_>>>()
+            .map(toml::Value::Array),
+        Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in map {
+                table.insert(key.clone(), sdk_json_to_toml_value(value)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
 }
 
 fn sdk_browser_mode_from_params(
@@ -7517,6 +7615,34 @@ command = "test-mcp"
             .python_env
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_accepts_browser_use_tool_allowlist() -> Result<()> {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "fake", "model": "fake"},
+            "config_overrides": {
+                "tool_allowlist": ["browser", "browser_script", "done"]
+            }
+        });
+
+        let config = sdk_provider_run_config(&params, Some("inspect"), None)?;
+
+        let allowlist = config
+            .options
+            .config_overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "tool_allowlist")
+            .and_then(|(_, value)| value.as_array())
+            .context("tool_allowlist override")?;
+        let names = allowlist
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["browser", "browser_script", "done"]);
         Ok(())
     }
 
