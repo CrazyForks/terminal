@@ -395,3 +395,14 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   - Proof: `cargo test -q -p browser-use-browser browser_status`
   - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
   - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Idempotent browser-script observe — completed `browser_script` results are
+  cached briefly by `run_id`, so a repeated `observe` after completion returns
+  the final payload instead of an `unknown browser_script run_id` infrastructure
+  error. This keeps navigation/script results visible to the agent when it asks
+  for the same pending browser action one extra time.
+  - Proof: `cargo test -q -p browser-use-browser browser_script_observe_is_idempotent_after_completion`
+  - Proof: `cargo test -q -p browser-use-browser browser_script_start_observe_finishes_slow_scripts`
+  - Proof: `cargo test -q -p browser-use-browser browser_status`
+  - Proof: `cargo test -q -p browser-use-browser browser_recovery_while_checked_out_returns_busy_guidance`
+  - Proof: `cargo fmt --all --check && git diff --check`
