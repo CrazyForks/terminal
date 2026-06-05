@@ -275,21 +275,24 @@ fn format_results_renders_header_and_numbered_entries() {
 #[test]
 fn format_results_truncates_long_title_and_description() {
     let results = vec![SearchResult {
-        title: "ThisTitleIsWayTooLongToKeep".to_string(),
+        title: "ThisIsAVeryLongResultTitleThatExceedsThirtyCharacters".to_string(),
         url: "https://example.com/keep/this/whole/url".to_string(),
         description: "d".repeat(250),
     }];
     let out = format_results("q", &results);
 
-    // Title capped at 15 characters including the ellipsis.
+    // Title capped at 30 characters including the ellipsis.
     let title = out
         .lines()
         .find_map(|l| l.strip_prefix("1. "))
         .expect("title line");
-    assert_eq!(title.chars().count(), 15, "title capped at 15: {title:?}");
+    assert_eq!(title.chars().count(), 30, "title capped at 30: {title:?}");
     assert!(title.ends_with('…'), "title ellipsized: {title:?}");
-    assert!(title.starts_with("ThisTitle"), "title prefix: {title:?}");
-    assert!(!out.contains("TooLong"), "tail must be dropped: {out}");
+    assert!(
+        title.starts_with("ThisIsAVeryLong"),
+        "title prefix: {title:?}"
+    );
+    assert!(!out.contains("Characters"), "tail must be dropped: {out}");
 
     // URL is kept intact (not truncated).
     assert!(
@@ -297,10 +300,10 @@ fn format_results_truncates_long_title_and_description() {
         "url kept: {out}"
     );
 
-    // Description capped at 100 characters including the ellipsis.
+    // Description capped at 125 characters including the ellipsis.
     let desc_line = out.lines().find(|l| l.starts_with("   d")).expect("desc");
     let desc = desc_line.strip_prefix("   ").unwrap();
-    assert_eq!(desc.chars().count(), 100, "description capped at 100");
+    assert_eq!(desc.chars().count(), 125, "description capped at 125");
     assert!(desc.ends_with('…'), "description ellipsized: {desc:?}");
 }
 
@@ -377,15 +380,10 @@ async fn run_formats_results_from_backend_html() {
         "got: {}",
         out.stdout
     );
-    // Title is truncated to 15 chars (incl. the ellipsis) for token efficiency.
+    // This title (29 chars) is within the 30-char cap, so it appears in full.
     assert!(
-        out.stdout.contains("The Rust Progr…"),
+        out.stdout.contains("The Rust Programming Language"),
         "got: {}",
-        out.stdout
-    );
-    assert!(
-        !out.stdout.contains("The Rust Programming Language"),
-        "title should be truncated: {}",
         out.stdout
     );
     // URLs are kept intact.
@@ -504,9 +502,12 @@ async fn orchestrated_search_completes_under_none() {
 
     assert_eq!(result.sandbox_used, SandboxType::None);
     assert_eq!(result.output.exit_code, 0);
-    // Title truncated to 15 chars (incl. ellipsis) in the formatted output.
+    // Within the 30-char title cap, so it appears in full.
     assert!(
-        result.output.stdout.contains("The Rust Progr…"),
+        result
+            .output
+            .stdout
+            .contains("The Rust Programming Language"),
         "got: {}",
         result.output.stdout
     );

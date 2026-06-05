@@ -73,10 +73,10 @@ const SEARCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Max characters of a result title in the formatted output. Titles are trimmed
 /// (with an ellipsis counted within the cap) to keep the model-facing text token
 /// efficient.
-const MAX_TITLE_CHARS: usize = 15;
+const MAX_TITLE_CHARS: usize = 30;
 
 /// Max characters of a result description (snippet) in the formatted output.
-const MAX_DESCRIPTION_CHARS: usize = 100;
+const MAX_DESCRIPTION_CHARS: usize = 125;
 
 /// A single parsed search result.
 ///
