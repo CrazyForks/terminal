@@ -1155,6 +1155,34 @@ to the single frame that proves the task succeeded."
         }
     }
 
+    /// `search`: a LOCALLY-executed DuckDuckGo (Lite) web search. Unlike the
+    /// hosted [`web_search`](definitions::web_search), the client performs the
+    /// HTTP request itself and returns the parsed results as text. Ported from
+    /// the Python `search` action's description.
+    pub fn search() -> ToolDefinition {
+        ToolDefinition {
+            name: "search".to_string(),
+            description: "Search the web using DuckDuckGo and return results directly as text – \
+                 no browser navigation occurs. The returned results are final and complete. \
+                 NEVER open a search engine website after calling this action."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to look up on the web."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
+        }
+    }
+
     fn agent_status_output_schema() -> Value {
         json!({
             "oneOf": [
@@ -1924,9 +1952,10 @@ Agent-role guidance below only helps choose which agent to use after spawning is
 /// `WireArgs` types. The browser/python/mcp handlers need an injected backend
 /// (they would otherwise reach the OS), so those are supplied by the caller.
 ///
-/// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` =
-/// `true`; `shell` / `apply_patch` / `view_image` / `browser` / `python` /
-/// `update_plan` / `done` = `false` (serial). `mcp` is registered `false` here
+/// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` /
+/// `search` = `true`; `shell` / `apply_patch` / `view_image` / `browser` /
+/// `python` / `update_plan` / `done` = `false` (serial). `mcp` is registered
+/// `false` here
 /// (a serial default); its per-request read-only hint still drives the handler's
 /// own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
 #[allow(clippy::too_many_arguments)]
@@ -1940,6 +1969,7 @@ pub fn default_registry<S, A>(
     update_plan: crate::tools::handlers::update_plan::UpdatePlanTool,
     tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
     web_search: crate::tools::handlers::web_search::WebSearchTool,
+    search: crate::tools::handlers::search::SearchTool,
     done: crate::tools::handlers::done::DoneTool,
 ) -> ToolRegistry<S, A>
 where
@@ -1951,6 +1981,7 @@ where
     use crate::tools::handlers::done::DoneRequest;
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
+    use crate::tools::handlers::search::SearchRequest;
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, WriteStdinRequest, WriteStdinTool,
     };
@@ -2002,6 +2033,9 @@ where
         tool_search,
     );
     reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
+    // `search`: locally-executed DuckDuckGo search. Read-only HTTP GET +
+    // pure parse, so parallel-safe like `web_search` / `tool_search`.
+    reg.register::<_, SearchRequest>("search", definitions::search(), true, search);
     // `done`: the completion tool. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, done);
 
