@@ -270,6 +270,97 @@ def _has_return_statement(expression):
     return False
 
 
+def _has_top_level_lexical_declaration(expression):
+    i = 0
+    n = len(expression)
+    state = "code"
+    quote = ""
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+
+    def is_ident(ch):
+        return ch == "_" or ch == "$" or ch.isalnum()
+
+    def is_keyword_at(keyword, pos):
+        if not expression.startswith(keyword, pos):
+            return False
+        before = expression[pos - 1] if pos > 0 else ""
+        after_pos = pos + len(keyword)
+        after = expression[after_pos] if after_pos < n else ""
+        return not is_ident(before) and not is_ident(after)
+
+    while i < n:
+        ch = expression[i]
+        nxt = expression[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch in ("'", '"', "`"):
+                state = "string"
+                quote = ch
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                state = "line_comment"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                i += 2
+                continue
+            if ch == "{":
+                brace_depth += 1
+                i += 1
+                continue
+            if ch == "}":
+                brace_depth = max(0, brace_depth - 1)
+                i += 1
+                continue
+            if ch == "(":
+                paren_depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+                i += 1
+                continue
+            if ch == "[":
+                bracket_depth += 1
+                i += 1
+                continue
+            if ch == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+                i += 1
+                continue
+            if brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+                for keyword in ("let", "const", "class", "function"):
+                    if is_keyword_at(keyword, i):
+                        return True
+            i += 1
+            continue
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+            i += 1
+            continue
+        if state == "string":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                state = "code"
+                quote = ""
+            i += 1
+            continue
+    return False
+
+
 def js(expression, *args, target_id=None, returnByValue=True):
     """Run JS in the attached tab, or call a JS function with JSON args.
 
@@ -310,6 +401,11 @@ def js(expression, *args, target_id=None, returnByValue=True):
         elif source.startswith("(function") and "await " in source:
             expression = _asyncify_parenthesized_function_iife(expression)
         elif _has_return_statement(expression) and not expression.strip().startswith("("):
+            if "await " in expression:
+                expression = f"(async function(){{{expression}}})()"
+            else:
+                expression = f"(function(){{{expression}}})()"
+        elif _has_top_level_lexical_declaration(expression) and not expression.strip().startswith("("):
             if "await " in expression:
                 expression = f"(async function(){{{expression}}})()"
             else:
