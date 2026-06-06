@@ -413,6 +413,11 @@ impl TranscriptNode {
             TranscriptKind::Cancelled { title, text, style } => {
                 native_grouped_lines(title, std::slice::from_ref(text), *style, width)
             }
+            // Collapsed reasoning summary: a single gray line, expandable via Ctrl+O.
+            TranscriptKind::Thinking { summary } => vec![NativeLine::plain(Line::from(vec![
+                Span::styled("· ".to_string(), dim()),
+                Span::styled(summary.clone(), muted()),
+            ]))],
         }
     }
 
