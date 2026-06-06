@@ -1413,13 +1413,17 @@ def browser_fetch(
     return browser_fetch_many([request], timeout=timeout, return_errors=return_error)[0]
 
 
-def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True):
+def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=True, max_workers=None):
     """Fetch many URLs from the current page context, preserving order.
 
     Each item may be a URL string or a dict with url/method/headers/body/json_body/
     timeout/binary. This is useful after the page reveals stable endpoints but
     direct http_get lacks cookies, auth headers, or browser-only access.
+
+    max_workers is accepted as a compatibility alias for http_get_many callers.
     """
+    if max_workers is not None:
+        max_concurrency = max_workers
     normalized = []
     for item in list(requests):
         if isinstance(item, dict):
