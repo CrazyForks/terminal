@@ -1486,6 +1486,7 @@ def browser_fetch(
     headers=None,
     body=None,
     json_body=None,
+    json=None,
     timeout=20.0,
     binary=None,
     return_error=True,
@@ -1502,7 +1503,7 @@ def browser_fetch(
         method=method,
         headers=headers,
         body=body,
-        json_body=json_body,
+        json_body=json_body if json_body is not None else json,
         timeout=timeout,
         binary=binary,
     )
@@ -1529,7 +1530,7 @@ def browser_fetch_many(requests, timeout=20.0, max_concurrency=6, return_errors=
                     method=item.get("method", "GET"),
                     headers=item.get("headers"),
                     body=item.get("body"),
-                    json_body=item.get("json_body"),
+                    json_body=item.get("json_body") if item.get("json_body") is not None else item.get("json"),
                     timeout=item.get("timeout", timeout),
                     binary=item.get("binary"),
                 )
