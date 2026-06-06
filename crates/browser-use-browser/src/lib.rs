@@ -11459,6 +11459,11 @@ print("http_get_many parity ok")
             temp.path().join("artifacts"),
             r#"
 def fake_runtime_evaluate(expression, await_promise=False, return_by_value=False):
+    if "https://example.test/b" in expression:
+        return [
+            {"ok": False, "url": "https://example.test/a", "error": "Failed to fetch"},
+            {"ok": False, "url": "https://example.test/b", "error": "Failed to fetch"},
+        ]
     return [{"ok": False, "url": "https://example.test/api", "error": "Failed to fetch"}]
 
 globals()["_runtime_evaluate"] = fake_runtime_evaluate
@@ -11479,6 +11484,9 @@ except RuntimeError as exc:
     assert "browser_fetch failed" in str(exc), exc
 else:
     raise AssertionError("return_error=False should raise")
+
+batch = browser_fetch_many(["https://example.test/a", "https://example.test/b"], max_workers=2)
+assert [item["ok"] for item in batch] == [False, False], batch
 
 print("browser_fetch single structured error ok")
 "#,
