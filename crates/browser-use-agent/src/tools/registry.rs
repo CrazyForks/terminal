@@ -1116,7 +1116,7 @@ to the single frame that proves the task succeeded."
         ToolDefinition {
             name: "done".to_string(),
             description:
-                "Signal that the task is finished, carrying the complete user-facing final answer."
+                "Signal that the task is finished, carrying the user-facing final answer. If the wall-clock or step budget is nearly exhausted, call done with the best verified partial result instead of continuing until external cancellation; clearly mark unknown, unavailable, or incomplete fields and name the remaining gaps."
                     .to_string(),
             input_schema: json!({
                 "type": "object",

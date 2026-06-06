@@ -1024,6 +1024,16 @@ fn definitions_carry_required_fields_and_names() {
 }
 
 #[test]
+fn done_definition_preserves_timebox_partial_result_guidance() {
+    let done = definitions::done();
+    assert!(done.description.contains("best verified partial result"));
+    assert!(done.description.contains("external cancellation"));
+    assert!(done
+        .description
+        .contains("unknown, unavailable, or incomplete fields"));
+}
+
+#[test]
 fn subagent_v2_definitions_match_codex_output_schema_surface() {
     let spawn = definitions::spawn_agent();
     assert_eq!(
