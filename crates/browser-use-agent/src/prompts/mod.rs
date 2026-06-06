@@ -206,10 +206,16 @@ pub fn browser_mode_instruction(mode: &str) -> String {
         .to_string(),
         "cloud" | "browser-use-cloud" => concat!(
             "Selected browser mode: Browser Use cloud. Use `browser connect` before page work. ",
-            "For login-sensitive tasks, first run `browser profile suggest --domain <regex> --json`; choose a cloud profile whose matching cookie domains fit the target login domain, run `browser profile remember --mode cloud --profile <profile-id>`, then run `browser connect`. ",
-            "Browser Use Cloud profiles are snapshots, not live mirrors of local Chrome. If a selected cloud profile still reaches a login/password page, refresh it with a domain-filtered `browser profile sync --profile <local-profile-id> --domain <site-domain> --domain <identity-provider-domain> --cloud-profile-id <cloud-profile-id>`, stop the remote browser, then reconnect with that cloud profile. If no local profile is known, omit `--profile` so the sync command returns local profile choices. If sync returns `status: \"needs-user-action\"` with `action: \"approve-interactive-cookie-refresh\"`, ask the user for permission to run its `local_refresh_command`, keep Browser Use Cloud as the working browser, do not run `browser connect local`, then rerun `retry_sync_command`. ",
-            "Plain `browser connect` uses the remembered cloud profile when one is set. If a named cloud profile lookup fails, do not continue in a clean cloud browser; list profiles with `browser remote profiles --json` and choose by profile ID/cookieDomains. ",
+            "Plain `browser connect` uses the remembered cloud profile when one is set. ",
             "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+        )
+        .to_string(),
+        "remote-cdp" | "cdp" => concat!(
+            "Selected browser mode: Remote CDP. The evaluation harness already provides the browser endpoint. ",
+            "Do not call `browser connect managed`, `browser connect local`, or `browser remote start`. ",
+            "If the task says the browser session is already open at the start URL, first inspect the current page with `browser_script` using `page_info()` and extraction/screenshot as needed; do not navigate to that same URL again unless the current page URL is wrong. ",
+            "Otherwise start page work directly with `browser_script` using `new_tab(url)` for first navigation, or `goto_url(url)` only when the current tab should be reused; trust its `navigation_ready` page_info result when the URL is correct, then inspect/extract instead of repeating the same navigation. ",
+            "Use `browser status --json` only if you need to inspect the current connection."
         )
         .to_string(),
         other => format!(
