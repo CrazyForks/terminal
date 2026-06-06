@@ -419,3 +419,11 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   - Proof: `cargo test -q -p browser-use-browser browser_script_navigation_helpers_wait_for_page_state`
   - Proof: `cargo test -q -p browser-use-agent prompts::tests::prompts_avoid_screenshots_for_text_heavy_extraction`
   - Proof: `cargo fmt --all --check && git diff --check`
+
+- [x] Browser-script JS lexical isolation — `js(...)` now wraps snippets with
+  top-level `let`/`const`/`class`/function declarations in an IIFE before CDP
+  `Runtime.evaluate`. This keeps repeated extraction snippets from failing with
+  `Identifier ... has already been declared` while preserving direct expression
+  behavior for simple reads like `document.title`.
+  - Proof: `cargo test -p browser-use-browser browser_script_js_wraps_top_level_lexical_declarations -- --nocapture`
+  - Proof: `cargo fmt --check`

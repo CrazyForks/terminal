@@ -11501,6 +11501,41 @@ print("browser_fetch single structured error ok")
     }
 
     #[test]
+    fn browser_script_js_wraps_top_level_lexical_declarations() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-js-wraps-lexical-declarations",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+captured = []
+
+def fake_runtime_evaluate(expression, session_id=None, await_promise=False, return_by_value=True):
+    captured.append(expression)
+    return "ok"
+
+globals()["_runtime_evaluate"] = fake_runtime_evaluate
+
+assert js("let wrapper = 1; if (wrapper) wrapper += 1;") == "ok"
+assert captured[-1].lstrip().startswith("(function(){"), captured[-1]
+
+assert js("const answer = 42;") == "ok"
+assert captured[-1].lstrip().startswith("(function(){"), captured[-1]
+
+assert js("document.title") == "ok"
+assert captured[-1] == "document.title", captured[-1]
+
+print("js lexical wrapper ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("js lexical wrapper ok"));
+    }
+
+    #[test]
     fn browser_script_bridge_retries_transient_busy_errors() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
