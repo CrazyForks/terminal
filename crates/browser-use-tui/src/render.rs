@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
-    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -68,6 +68,36 @@ pub(crate) fn render_filled_block_colors(
         }
     }
     Ok(colors)
+}
+
+#[cfg(test)]
+pub(crate) fn render_text_foregrounds(
+    app: &mut App,
+    needle: &str,
+) -> Result<Vec<ratatui::style::Color>> {
+    app.drain_store_notifications()?;
+    let backend = TestBackend::new(app.args.width, app.args.height);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| render(frame, app))?;
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    for y in area.y..area.y.saturating_add(area.height) {
+        let mut text = String::new();
+        let mut cells = Vec::new();
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell = &buffer[(x, y)];
+            text.push_str(cell.symbol());
+            cells.push(cell.fg);
+        }
+        if let Some(byte_start) = text.find(needle) {
+            let start = text[..byte_start].chars().count();
+            let end = start
+                .saturating_add(needle.chars().count())
+                .min(cells.len());
+            return Ok(cells[start..end].to_vec());
+        }
+    }
+    Ok(Vec::new())
 }
 
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
@@ -1718,8 +1748,15 @@ fn composer_bottom_border(
             spans.push(Span::raw(" "));
         }
         if let Some(label) = browser_label {
+            let tag_style = if app.browser == BROWSER_USE_CLOUD
+                && !app.browser_use_cloud_key_ready().unwrap_or(false)
+            {
+                failed()
+            } else {
+                text_style()
+            };
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(label, text_style()));
+            spans.push(Span::styled(label, tag_style));
             spans.push(Span::raw(" "));
         }
         spans.push(Span::styled("─".repeat(trail), border()));
@@ -2523,10 +2560,10 @@ fn account_lines(app: &App) -> Vec<Line<'static>> {
         )));
         lines.push(Line::from(""));
     }
-    for (idx, account) in ACCOUNT_CHOICES.iter().enumerate() {
+    for (idx, account) in AUTH_CHOICES.iter().enumerate() {
         let status = if app.account_ready(account).unwrap_or(false) {
             "connected"
-        } else if account.contains("API key") {
+        } else if account.contains("API key") || *account == BROWSER_USE_CLOUD {
             "needs key"
         } else {
             "needs auth"
