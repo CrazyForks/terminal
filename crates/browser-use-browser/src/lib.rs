@@ -7725,42 +7725,45 @@ def load_agent_helpers():
 def _run_user_code():
     exec(compile(__USER_CODE, "<browser_script>", "exec"), globals())
 
-stdout = _BrowserScriptStream("stdout")
-stderr = _BrowserScriptStream("stderr")
-ok = True
-error = None
-__capture_thread = None
-try:
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        _load_browser_script_helpers()
-        load_agent_helpers()
-        __capture_thread = _start_capture()
-        _run_user_code()
-except Exception:
-    ok = False
-    error = traceback.format_exc()
-finally:
-    __capture_stop.set()
-    if __capture_thread is not None:
-        __capture_thread.join(timeout=2.0)
+def _run_browser_script_envelope():
+    stdout = _BrowserScriptStream("stdout")
+    stderr = _BrowserScriptStream("stderr")
+    ok = True
+    error = None
+    capture_thread = None
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            _load_browser_script_helpers()
+            load_agent_helpers()
+            capture_thread = _start_capture()
+            _run_user_code()
+    except Exception:
+        ok = False
+        error = traceback.format_exc()
+    finally:
+        __capture_stop.set()
+        if capture_thread is not None:
+            capture_thread.join(timeout=2.0)
 
-text = stdout.getvalue()
-if stderr.getvalue():
-    text += ("\n" if text else "") + stderr.getvalue()
+    text = stdout.getvalue()
+    if stderr.getvalue():
+        text += ("\n" if text else "") + stderr.getvalue()
 
-_auto_collect_artifacts()
+    _auto_collect_artifacts()
 
-result = {{
-    "ok": ok,
-    "text": text[-{SCRIPT_MAX_OUTPUT_CHARS}:],
-    "error": error,
-    "data": {{"domain_skills": globals().get("__last_domain_skills", [])}} if globals().get("__last_domain_skills") else {{}},
-    "outputs": __outputs,
-    "summary": __summary,
-    "artifacts": __artifacts,
-    "images": __images,
-    "browser_events": [],
-}}
+    return {{
+        "ok": ok,
+        "text": text[-{SCRIPT_MAX_OUTPUT_CHARS}:],
+        "error": error,
+        "data": {{"domain_skills": globals().get("__last_domain_skills", [])}} if globals().get("__last_domain_skills") else {{}},
+        "outputs": __outputs,
+        "summary": __summary,
+        "artifacts": __artifacts,
+        "images": __images,
+        "browser_events": [],
+    }}
+
+result = _run_browser_script_envelope()
 sys.__stdout__.write("__BROWSER_SCRIPT_RESULT__" + json.dumps(result, default=_jsonable) + "\n")
 sys.__stdout__.flush()
 "#
@@ -10016,6 +10019,29 @@ print(session_metadata()["outputs_dir"])
     }
 
     #[test]
+    fn browser_script_user_globals_cannot_corrupt_result_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-result-envelope-shadowing",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+ok = []
+error = {"unexpected": "shape"}
+stdout = "not a stream"
+stderr = "not a stream"
+print("shadowed envelope globals")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.error.is_none(), "{:?}", output.error);
+        assert!(output.text.contains("shadowed envelope globals"));
+    }
+
+    #[test]
     fn browser_script_session_outputs_dir_isolates_parallel_cwd_files() {
         let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_SESSION_OUTPUTS", "1")]);
         let temp = tempfile::tempdir().unwrap();
@@ -11458,7 +11484,10 @@ print("http_get_many parity ok")
             temp.path(),
             temp.path().join("artifacts"),
             r#"
+captured = []
+
 def fake_runtime_evaluate(expression, await_promise=False, return_by_value=False):
+    captured.append(expression)
     if "https://example.test/b" in expression:
         return [
             {"ok": False, "url": "https://example.test/a", "error": "Failed to fetch"},
@@ -11487,6 +11516,13 @@ else:
 
 batch = browser_fetch_many(["https://example.test/a", "https://example.test/b"], max_workers=2)
 assert [item["ok"] for item in batch] == [False, False], batch
+
+browser_fetch("https://example.test/json", method="POST", json={"query": "value"})
+assert '"Content-Type": "application/json"' in captured[-1], captured[-1]
+assert '\\"query\\": \\"value\\"' in captured[-1], captured[-1]
+
+browser_fetch_many([{"url": "https://example.test/json-many", "method": "POST", "json": {"page": 1}}])
+assert '\\"page\\": 1' in captured[-1], captured[-1]
 
 print("browser_fetch single structured error ok")
 "#,

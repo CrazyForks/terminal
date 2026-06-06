@@ -53,7 +53,13 @@ _Last updated: 2026-05-30. Single source of truth for what is DONE vs NOT._
   should be trusted instead of repeating the same navigation. The Python wrapper
   task context also tells the Rust agent to inspect current page state before
   any repeat navigation.
+- [x] `browser_script` result-envelope state now lives in function locals, so
+  model-written Python globals like `ok`, `error`, `stdout`, or `stderr` cannot
+  corrupt the final `__BROWSER_SCRIPT_RESULT__` marker. This fixes eval failures
+  where Rust rejected a completed script result with `invalid type: sequence,
+  expected a boolean`.
 - Proof:
+  - `cargo test -p browser-use-browser browser_script_user_globals_cannot_corrupt_result_envelope -- --nocapture`
   - `uv run pytest tests/ci/test_rust_agent.py -q -k 'direct_initial_navigation or initial_actions_can_pre_navigate_existing_cdp_session or run_pre_navigates_cdp_session_before_sdk_by_default'`
   - `cargo test -p browser-use-agent prompts::tests`
   - `cargo fmt --all --check`
@@ -427,3 +433,19 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   behavior for simple reads like `document.title`.
   - Proof: `cargo test -p browser-use-browser browser_script_js_wraps_top_level_lexical_declarations -- --nocapture`
   - Proof: `cargo fmt --check`
+
+- [x] Browser fetch JSON body compatibility — `browser_fetch(...)` now accepts
+  the common Python-style `json=` keyword as an alias for `json_body=`, and
+  `browser_fetch_many(...)` accepts per-request `{"json": ...}` bodies. This
+  prevents model-authored browser API fetches from failing on a wrapper
+  signature mismatch while preserving the existing JSON serialization and
+  `Content-Type: application/json` behavior.
+  - Proof: `cargo test -p browser-use-browser browser_script_browser_fetch_single_returns_structured_errors_by_default -- --nocapture`
+
+- [x] Browser-script result envelope isolation — the helper now builds the
+  final `__BROWSER_SCRIPT_RESULT__` payload inside its own function scope, so
+  user-authored scripts cannot corrupt wrapper-owned `ok`, `error`, `stdout`,
+  or `stderr` variables by assigning those names in their extraction code.
+  This preserves a structured browser_script result even when model-authored
+  code shadows common variable names.
+  - Proof: `cargo test -p browser-use-browser browser_script_user_globals_cannot_corrupt_result_envelope -- --nocapture`
