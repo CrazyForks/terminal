@@ -449,3 +449,12 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   This preserves a structured browser_script result even when model-authored
   code shadows common variable names.
   - Proof: `cargo test -p browser-use-browser browser_script_user_globals_cannot_corrupt_result_envelope -- --nocapture`
+
+- [x] Browser-script fresh-process `NameError` guidance — Python `NameError`
+  tracebacks from `browser_script` are now classified separately and return
+  model-visible recovery guidance that every variable must be defined in the
+  same call or loaded from checkpoint files because Python variables from
+  previous `browser_script` calls do not persist. This targets repeated
+  low-score action churn where the browser/page was still usable but the model
+  retried with stale script-local names.
+  - Proof: `cargo test -p browser-use-browser browser_script_tracebacks_are_not_treated_as_dropped_websockets -- --nocapture`

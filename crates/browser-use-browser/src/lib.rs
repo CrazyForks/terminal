@@ -4929,6 +4929,8 @@ fn classify_browser_script_failure(message: &str) -> &'static str {
         "browser-script-timeout"
     } else if lower.contains("browser_script did not emit a result") {
         "browser-script-no-result"
+    } else if lower.contains("nameerror:") {
+        "browser-script-name-error"
     } else if is_cdp_command_error(message) {
         "cdp-command-error"
     } else if lower.contains("read cdp")
@@ -5011,6 +5013,23 @@ fn browser_issue_diagnosis(
             "The Python worker exited before emitting the browser_script result marker.",
             if page_usable {
                 "Fix the script so it completes normally, then rerun on the same page.".to_string()
+            } else {
+                fallback_next_step()
+            },
+            browser_connected,
+            page_usable,
+        ),
+        "browser-script-name-error" => (
+            if page_usable {
+                "The script failed with a missing Python name, but the browser page should still be reusable."
+            } else if browser_connected {
+                "The script failed with a missing Python name; browser is connected but page state needs checking."
+            } else {
+                "The script failed with a missing Python name and browser state needs a status check."
+            },
+            "The Python browser_script code referenced a variable, helper alias, or intermediate result that was not defined in this fresh script process.",
+            if page_usable {
+                "Rerun a smaller browser_script that defines every variable it uses in the same call, or reload checkpoint data from outputs_dir(); Python variables from previous browser_script calls do not persist.".to_string()
             } else {
                 fallback_next_step()
             },
@@ -9609,13 +9628,14 @@ mod tests {
         let message = "Traceback (most recent call last):\nNameError: name 'x' is not defined";
         assert_eq!(
             classify_browser_script_failure(message),
-            "browser-script-error"
+            "browser-script-name-error"
         );
         let diagnosis =
             browser_issue_diagnosis(classify_browser_script_failure(message), true, true, None);
         assert!(diagnosis.browser_usable);
         assert!(diagnosis.page_usable);
-        assert!(diagnosis.next_step.contains("Fix the Python"));
+        assert!(diagnosis.next_step.contains("defines every variable"));
+        assert!(diagnosis.next_step.contains("do not persist"));
     }
 
     #[test]
