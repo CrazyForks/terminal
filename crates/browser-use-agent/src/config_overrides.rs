@@ -50,6 +50,7 @@ pub const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
 pub const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 300_000;
 pub const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 1;
 pub const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
+pub const DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS: u64 = 45 * 60;
 
 /// Parsed CLI/TUI `--config key=value` overrides: an ordered list of dotted TOML
 /// paths paired with their parsed values.
@@ -362,7 +363,7 @@ impl Default for AgentRunOptions {
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
             model_stream_idle_timeout_ms: None,
-            python_tool_timeout_seconds: 300,
+            python_tool_timeout_seconds: DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS,
             python_env: Vec::new(),
             child_agent_runner: None,
             final_output_json_schema: None,
@@ -1842,7 +1843,10 @@ command = "profile-server"
             options.model_provider_id_source,
             RunConfigValueSource::Default
         );
-        assert_eq!(options.python_tool_timeout_seconds, 300);
+        assert_eq!(
+            options.python_tool_timeout_seconds,
+            DEFAULT_PYTHON_TOOL_TIMEOUT_SECONDS
+        );
         assert!(options.python_env.is_empty());
         assert!(options.child_agent_runner.is_none());
         assert!(options.final_output_json_schema.is_none());

@@ -205,6 +205,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                     self.observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
                         turn_id,
                         reason: TurnAbortReason::Interrupted,
+                        last_agent_message: last_agent_message.clone(),
                     });
                     return Ok(last_agent_message);
                 }
@@ -242,6 +243,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                     self.observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
                         turn_id,
                         reason: TurnAbortReason::MaxTurns,
+                        last_agent_message: last_agent_message.clone(),
                     });
                     return Ok(last_agent_message);
                 }

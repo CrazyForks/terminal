@@ -1313,15 +1313,26 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         false,
         UpdatePlanTool::new(),
     );
-    // `web_search` is ENABLED (hosted/provider-side). The OpenAI Responses
-    // request builder encodes it as the hosted `{"type":"web_search_preview"}`
-    // tool (see `browser-use-llm` `openai_responses.rs::lower_tool`).
-    reg.register::<_, WebSearchRequest>(
-        "web_search",
-        definitions::web_search(),
-        true,
-        WebSearchTool::new(WebSearchConfig::enabled()),
-    );
+    if provider_supports_hosted_web_search(config) {
+        // `web_search` is hosted/provider-side for backends that support it. The
+        // provider request builder encodes it as the hosted web-search tool.
+        reg.register::<_, WebSearchRequest>(
+            "web_search",
+            definitions::web_search(),
+            true,
+            WebSearchTool::new(WebSearchConfig::enabled()),
+        );
+    } else {
+        // Anthropic and other non-hosted providers would otherwise receive a
+        // model-visible no-op marker. Route the familiar `web_search` name through
+        // the local DuckDuckGo implementation so research tasks get real results.
+        reg.register::<_, SearchRequest>(
+            "web_search",
+            definitions::web_search(),
+            true,
+            SearchTool::new(),
+        );
+    }
     // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
     // the HTTP request and parses the results itself (distinct from the hosted
     // `web_search` above). Read-only, so parallel_safe = true.
@@ -2160,6 +2171,13 @@ fn register_legacy_subagent_tools<S, A>(
 }
 
 fn provider_supports_tool_namespaces(config: &ProviderRunConfig) -> bool {
+    matches!(
+        config.backend,
+        ProviderBackend::Openai | ProviderBackend::Codex
+    )
+}
+
+fn provider_supports_hosted_web_search(config: &ProviderRunConfig) -> bool {
     matches!(
         config.backend,
         ProviderBackend::Openai | ProviderBackend::Codex
@@ -3567,6 +3585,61 @@ mod tests {
             .expect("anthropic spawn_agent");
         assert_eq!(openai_spawn.namespace.as_deref(), Some("agents"));
         assert_eq!(anthropic_spawn.namespace.as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn web_search_uses_local_search_for_non_hosted_providers() {
+        use browser_use_llm::schema::ContentPart;
+        use tokio_util::sync::CancellationToken;
+
+        fn result_of(msg: &browser_use_llm::schema::Message) -> (String, bool) {
+            for part in &msg.content {
+                if let ContentPart::ToolResult {
+                    content, is_error, ..
+                } = part
+                {
+                    let text = content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    return (text, *is_error);
+                }
+            }
+            (String::new(), false)
+        }
+
+        let anthropic = ProviderRunConfig::new(ProviderBackend::Anthropic, "claude-x");
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &anthropic, None);
+        let call = ContentPart::ToolCall {
+            id: "call-web-search".to_string(),
+            name: "web_search".to_string(),
+            input: serde_json::json!({ "query": "" }),
+            provider_metadata: None,
+        };
+
+        let result = dispatcher
+            .dispatch_ordered(vec![call], CancellationToken::new())
+            .await;
+        let (text, is_error) = result_of(
+            result
+                .outputs_in_order
+                .first()
+                .expect("one web_search output"),
+        );
+
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("search query must not be empty"),
+            "web_search should route through local search for Anthropic, got: {text}"
+        );
+        assert!(
+            !text.contains("web_search(hosted)"),
+            "Anthropic web_search must not be the hosted no-op marker: {text}"
+        );
     }
 
     /// A `spawn_agent` call routes from the production registration into the

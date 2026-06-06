@@ -316,6 +316,7 @@ impl TaskDriver {
         self.observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
             turn_id: active.turn_id,
             reason,
+            last_agent_message: None,
         });
     }
 }

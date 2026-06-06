@@ -5165,7 +5165,7 @@ fn browser_issue_diagnosis(
             },
             "The Python browser_script code referenced a variable, helper alias, or intermediate result that was not defined in this fresh script process.",
             if page_usable {
-                "Rerun a smaller browser_script that defines every variable it uses in the same call, or reload checkpoint data from outputs_dir(); Python variables from previous browser_script calls do not persist.".to_string()
+                "Rerun a smaller browser_script that defines any missing variable in the same call, or reload checkpoint data from outputs_dir(); simple picklable variables are restored when possible, but functions/classes and failed restores must be recreated.".to_string()
             } else {
                 fallback_next_step()
             },
@@ -7821,6 +7821,10 @@ fn browser_script_prelude(
     Ok(format!(
         r#"
 import base64, contextlib, hashlib, importlib, io, json, os, pathlib, pickle, shutil, socket, sys, threading, time, traceback, types, urllib.request
+__browser_use_importlib = importlib
+__browser_use_pickle = pickle
+__browser_use_time = time
+__browser_use_types = types
 
 BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
@@ -7995,12 +7999,19 @@ def _persistable_user_name(name):
         return False
     return True
 
+def _persistable_user_value(value):
+    if isinstance(value, (__browser_use_types.FunctionType, __browser_use_types.BuiltinFunctionType, __browser_use_types.MethodType, type)):
+        return False
+    if callable(value):
+        return False
+    return True
+
 def _load_persistent_browser_script_state():
     if not STATE_PATH.exists():
         return
     try:
         with STATE_PATH.open("rb") as f:
-            payload = pickle.load(f)
+            payload = __browser_use_pickle.load(f)
     except Exception as exc:
         _stream_event({{"type": "summary", "summary": {{"kind": "browser_script_state", "message": "Could not restore prior Python variables", "error": str(exc)[:500]}}}})
         return
@@ -8013,7 +8024,7 @@ def _load_persistent_browser_script_state():
             if not _persistable_user_name(name) or not isinstance(module_name, str):
                 continue
             try:
-                globals()[name] = importlib.import_module(module_name)
+                globals()[name] = __browser_use_importlib.import_module(module_name)
                 restored += 1
             except Exception:
                 pass
@@ -8033,11 +8044,13 @@ def _save_persistent_browser_script_state():
     for name, value in list(globals().items()):
         if not _persistable_user_name(name):
             continue
-        if isinstance(value, types.ModuleType):
+        if isinstance(value, __browser_use_types.ModuleType):
             modules[name] = value.__name__
             continue
+        if not _persistable_user_value(value):
+            continue
         try:
-            encoded = pickle.dumps(value)
+            encoded = __browser_use_pickle.dumps(value)
         except Exception:
             continue
         size = len(encoded)
@@ -8047,11 +8060,11 @@ def _save_persistent_browser_script_state():
             break
         values[name] = value
         total_bytes += size
-    payload = {{"values": values, "modules": modules, "saved_at_ms": int(time.time() * 1000)}}
+    payload = {{"values": values, "modules": modules, "saved_at_ms": int(__browser_use_time.time() * 1000)}}
     try:
         tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
         with tmp.open("wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            __browser_use_pickle.dump(payload, f, protocol=__browser_use_pickle.HIGHEST_PROTOCOL)
         tmp.replace(STATE_PATH)
     except Exception as exc:
         _stream_event({{"type": "summary", "summary": {{"kind": "browser_script_state", "message": "Could not save Python variables for the next browser_script call", "error": str(exc)[:500]}}}})
@@ -10335,8 +10348,10 @@ mod tests {
             browser_issue_diagnosis(classify_browser_script_failure(message), true, true, None);
         assert!(diagnosis.browser_usable);
         assert!(diagnosis.page_usable);
-        assert!(diagnosis.next_step.contains("defines every variable"));
-        assert!(diagnosis.next_step.contains("do not persist"));
+        assert!(diagnosis.next_step.contains("defines any missing variable"));
+        assert!(diagnosis
+            .next_step
+            .contains("simple picklable variables are restored"));
     }
 
     #[test]
@@ -12524,6 +12539,55 @@ print("state restored", len(records))
 
         assert!(second.ok, "{:?}\n{}", second.error, second.text);
         assert!(second.text.contains("state restored 2"), "{}", second.text);
+        assert!(
+            second.summary.iter().any(|record| {
+                record.get("kind").and_then(Value::as_str) == Some("browser_script_state")
+            }),
+            "restore summary missing: {:?}",
+            second.summary
+        );
+    }
+
+    #[test]
+    fn browser_script_skips_callables_without_poisoning_persistent_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-state-callables";
+        let artifact_dir = temp.path().join("artifacts");
+
+        let first = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifact_dir,
+            r#"
+def query_zip(zip_code):
+    return {"zip": zip_code}
+answer = {"value": 42}
+print("state saved")
+"#,
+            10,
+        )
+        .unwrap();
+        assert!(first.ok, "{:?}\n{}", first.error, first.text);
+
+        let second = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifact_dir,
+            r#"
+assert answer == {"value": 42}, answer
+assert "query_zip" not in globals()
+print("data restored without callable")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(second.ok, "{:?}\n{}", second.error, second.text);
+        assert!(
+            second.text.contains("data restored without callable"),
+            "{}",
+            second.text
+        );
         assert!(
             second.summary.iter().any(|record| {
                 record.get("kind").and_then(Value::as_str) == Some("browser_script_state")

@@ -80,5 +80,6 @@ pub enum TurnLifecycleEvent {
     TurnAborted {
         turn_id: String,
         reason: TurnAbortReason,
+        last_agent_message: Option<String>,
     },
 }

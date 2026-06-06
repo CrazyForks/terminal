@@ -753,8 +753,36 @@ async fn bounded_loop_aborts_after_max_turns() {
         events.last(),
         Some(TurnLifecycleEvent::TurnAborted {
             reason: TurnAbortReason::MaxTurns,
+            last_agent_message: Some(message),
             ..
-        })
+        }) if message == "step 1"
+    ));
+}
+
+#[tokio::test]
+async fn interrupted_loop_aborts_with_last_agent_message_when_available() {
+    let sampler = ScriptedSamplingDriver::new(vec![
+        SamplingScript::Ok(follow_up("working")),
+        SamplingScript::Err(AgentError::TurnAborted),
+    ]);
+    let state = InMemoryTurnState::new(Vec::new(), token_status(false));
+    let observer = RecordingObserver::new();
+
+    let turn = TurnLoop::new(state, sampler, observer.clone());
+    let out = turn
+        .run(ctx(), false, CancellationToken::new())
+        .await
+        .expect("interrupted loop should stop gracefully");
+
+    assert_eq!(out.as_deref(), Some("working"));
+    let events = observer.events.lock().unwrap();
+    assert!(matches!(
+        events.last(),
+        Some(TurnLifecycleEvent::TurnAborted {
+            reason: TurnAbortReason::Interrupted,
+            last_agent_message: Some(message),
+            ..
+        }) if message == "working"
     ));
 }
 

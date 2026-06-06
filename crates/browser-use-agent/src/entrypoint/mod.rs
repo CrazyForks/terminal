@@ -90,7 +90,7 @@ use crate::session::SessionId;
 use crate::session::SharedStore;
 use crate::session::{initial_context_messages_from_events, provider_messages_from_events};
 use crate::subagents::display_agent_path_for_session;
-use crate::task::TurnLifecycleEvent;
+use crate::task::{TurnAbortReason, TurnLifecycleEvent};
 use crate::turn::sampling::FusionRecorder;
 use crate::turn::CompactionMode;
 use crate::turn::SamplingDriver;
@@ -1911,6 +1911,7 @@ fn append_context_window_full(
                 "total_token_usage": total_usage,
                 "last_token_usage": last_usage,
                 "model_context_window": window,
+                "usage_source": "context_estimate",
             },
             "turn_idx": 0,
         }),
@@ -2405,8 +2406,9 @@ fn media_content_part_for_provider(
 ///
 /// On turn completion it emits the final agent message as a `session.done`
 /// event through the durable UI sink, so the run's result is visible to the TUI
-/// and protocol reducers. The streaming text deltas are emitted by the sampling
-/// driver through the same durable sink.
+/// and protocol reducers. On max-turn abort it emits `session.failed` with a
+/// partial result if the model produced one. The streaming text deltas are
+/// emitted by the sampling driver through the same durable sink.
 struct StoreObserver {
     sink: Arc<dyn EventSink>,
     session_id: String,
@@ -2420,19 +2422,38 @@ impl StoreObserver {
 
 impl TurnObserver for StoreObserver {
     fn on_lifecycle(&self, ev: TurnLifecycleEvent) {
-        // Phase-E seam: started/aborted lifecycle markers are not surfaced as
-        // store events yet (the legacy stack had richer turn-lifecycle telemetry).
-        // We persist the terminal session result, which is what readers need today.
-        if let TurnLifecycleEvent::TurnComplete {
-            last_agent_message: Some(text),
-            ..
-        } = ev
-        {
-            self.sink.emit(PendingEvent::new(
-                self.session_id.clone(),
-                names::SESSION_DONE,
-                session_done_payload(Some(&text), None),
-            ));
+        match ev {
+            TurnLifecycleEvent::TurnComplete {
+                last_agent_message: Some(text),
+                ..
+            } => {
+                self.sink.emit(PendingEvent::new(
+                    self.session_id.clone(),
+                    names::SESSION_DONE,
+                    session_done_payload(Some(&text), None),
+                ));
+            }
+            TurnLifecycleEvent::TurnAborted {
+                reason: TurnAbortReason::MaxTurns,
+                last_agent_message,
+                ..
+            } => {
+                let mut payload = json!({
+                    "code": "max_turns_without_final_answer",
+                    "error": "Rust terminal session reached the step limit before the agent explicitly finished.",
+                });
+                if let Some(text) = last_agent_message.filter(|text| !text.trim().is_empty()) {
+                    payload["partial_result"] = Value::String(format!(
+                        "PARTIAL RESULT: step limit reached before the agent explicitly finished.\n\n{text}"
+                    ));
+                }
+                self.sink.emit(PendingEvent::new(
+                    self.session_id.clone(),
+                    names::SESSION_FAILED,
+                    payload,
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -3247,6 +3268,17 @@ mod tests {
                     std::env::remove_var(key);
                 }
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingEventSink {
+        events: StdMutex<Vec<PendingEvent>>,
+    }
+
+    impl EventSink for CapturingEventSink {
+        fn emit(&self, ev: PendingEvent) {
+            self.events.lock().unwrap().push(ev);
         }
     }
 
@@ -4388,6 +4420,59 @@ mod tests {
         assert!(
             saw_session_done,
             "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[test]
+    fn store_observer_publishes_max_turn_partial_as_session_failed() {
+        let sink = Arc::new(CapturingEventSink::default());
+        let observer = StoreObserver::new(sink.clone(), "session-1".to_string());
+
+        observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
+            turn_id: "session-1".to_string(),
+            reason: TurnAbortReason::MaxTurns,
+            last_agent_message: Some("answer so far".to_string()),
+        });
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, names::SESSION_FAILED);
+        assert_eq!(
+            events[0].payload.get("code").and_then(Value::as_str),
+            Some("max_turns_without_final_answer")
+        );
+        assert_eq!(
+            events[0]
+                .payload
+                .get("partial_result")
+                .and_then(Value::as_str),
+            Some(
+                "PARTIAL RESULT: step limit reached before the agent explicitly finished.\n\nanswer so far"
+            )
+        );
+    }
+
+    #[test]
+    fn store_observer_publishes_max_turn_failure_without_partial_text() {
+        let sink = Arc::new(CapturingEventSink::default());
+        let observer = StoreObserver::new(sink.clone(), "session-1".to_string());
+
+        observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
+            turn_id: "session-1".to_string(),
+            reason: TurnAbortReason::MaxTurns,
+            last_agent_message: None,
+        });
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, names::SESSION_FAILED);
+        assert_eq!(
+            events[0].payload.get("code").and_then(Value::as_str),
+            Some("max_turns_without_final_answer")
+        );
+        assert!(
+            events[0].payload.get("partial_result").is_none(),
+            "no synthetic answer should be attached when the model produced no text"
         );
     }
 
