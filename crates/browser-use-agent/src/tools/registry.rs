@@ -1162,16 +1162,19 @@ to the single frame that proves the task succeeded."
         }
     }
 
-    /// `search`: a LOCALLY-executed DuckDuckGo (Lite) web search. Unlike the
-    /// hosted [`web_search`](definitions::web_search), the client performs the
-    /// HTTP request itself and returns the parsed results as text. Ported from
-    /// the Python `search` action's description.
+    /// `search`: a web search via the browser-use search API
+    /// (`search.browser-use.com`). Unlike the hosted
+    /// [`web_search`](definitions::web_search), the client performs the API
+    /// call itself and returns the parsed results as text.
     pub fn search() -> ToolDefinition {
         ToolDefinition {
             name: "search".to_string(),
-            description: "Search the web using DuckDuckGo and return results directly as text – \
-                 no browser navigation occurs. The returned results are final and complete. \
-                 NEVER open a search engine website after calling this action."
+            description: "Search the web with the browser-use search API and return compact \
+                 text results. This does not use or require a browser connection or browser \
+                 session. Use this instead of navigating a browser to Google, DuckDuckGo, Bing, \
+                 or any other search engine; it is far more token-efficient than reading a search \
+                 results page in the browser. Only use the browser after search when you need to \
+                 inspect a specific result page."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1988,7 +1991,7 @@ where
     use crate::tools::handlers::done::DoneRequest;
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
-    use crate::tools::handlers::search::SearchRequest;
+    use crate::tools::handlers::search::{SearchRequest, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, WriteStdinRequest, WriteStdinTool,
     };
@@ -2040,9 +2043,14 @@ where
         tool_search,
     );
     reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
-    // `search`: locally-executed DuckDuckGo search. Read-only HTTP GET +
-    // pure parse, so parallel-safe like `web_search` / `tool_search`.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, search);
+    // `search`: web search via the browser-use search API. Read-only and
+    // parallel-safe so independent source-discovery queries can run in one turn.
+    reg.register::<_, SearchRequest>(
+        "search",
+        definitions::search(),
+        SEARCH_PARALLEL_SAFE,
+        search,
+    );
     // `done`: the completion tool. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, done);
 

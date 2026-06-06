@@ -122,6 +122,10 @@ fn named_tool_call(id: &str, name: &str) -> ContentPart {
     }
 }
 
+fn browser_script_call(id: &str) -> ContentPart {
+    named_tool_call(id, "browser_script")
+}
+
 /// Extract the call id from a `ToolCall` content part.
 fn call_id(call: &ContentPart) -> String {
     match call {
@@ -385,6 +389,39 @@ async fn needs_follow_up_true_when_calls_dispatched_false_for_empty() {
     );
     assert!(empty.outputs_in_order.is_empty());
     assert_eq!(empty_runner.runs_started(), 0);
+}
+
+#[tokio::test]
+async fn repeated_browser_script_output_gets_recovery_guidance() {
+    let runner = ScriptedRunner::new(vec![script("repeat", 1, false)]);
+    let dispatcher = ToolDispatcher::with_runner(runner, true);
+
+    for attempt in 1..=3 {
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![browser_script_call("repeat")],
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(out.outputs_in_order.len(), 1);
+        let (text, is_error) = output_text_and_error(&out.outputs_in_order[0]);
+        assert!(!is_error);
+        if attempt < 3 {
+            assert!(
+                !text.contains("Repeated browser_script output detected"),
+                "attempt {attempt} should not warn yet: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("Repeated browser_script output detected"),
+                "third repeated browser_script result should steer recovery: {text}"
+            );
+            assert!(
+                text.contains("call done with the best verified result"),
+                "guidance should encourage a user-facing result: {text}"
+            );
+        }
+    }
 }
 
 // ---- (6) end-to-end: registry-backed RegistryRunner through the dispatcher --

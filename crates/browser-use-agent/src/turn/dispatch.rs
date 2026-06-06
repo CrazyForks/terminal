@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use browser_use_llm::schema::{ContentPart, Message, MessageRole, ToolDefinition};
 use futures_util::stream::{FuturesOrdered, StreamExt};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, ToolParallelism};
@@ -58,6 +58,9 @@ use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::runtime::{Approver, AutoApprover, ToolCtx};
 use crate::tools::sandbox::{NoneSandboxProvider, SandboxProvider};
+
+const BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD: usize = 3;
+const BROWSER_SCRIPT_NO_PROGRESS_NUDGE: &str = "Repeated browser_script output detected: this browser state or script error has already been returned multiple times. Do not repeat the same page_info, list_tabs, or extraction script. Change strategy now: take a concrete browser action, narrow the extraction, use search/fetch for source discovery, or call done with the best verified result or partial result.";
 
 /// Runs a single tool call to completion, producing the `Message` to record.
 ///
@@ -373,6 +376,10 @@ pub struct ToolDispatcher<R: CallRunner = OrchestratorRunner> {
     /// registry's advertised order (name-sorted). Empty for bare/test dispatchers
     /// built without specs.
     tool_specs: Vec<ToolDefinition>,
+    /// Tracks repeated browser_script results across turns so the agent gets a
+    /// recovery nudge before spending the whole step budget on no-op state/error
+    /// loops.
+    no_progress_state: Arc<Mutex<NoProgressState>>,
 }
 
 impl ToolDispatcher<OrchestratorRunner> {
@@ -415,6 +422,7 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
             runner: Arc::new(runner),
             supports_parallel_tool_calls,
             tool_specs,
+            no_progress_state: Arc::new(Mutex::new(NoProgressState::default())),
         }
     }
 
@@ -447,6 +455,7 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
             std::pin::Pin<Box<dyn std::future::Future<Output = Option<Message>> + Send>>,
         > = FuturesOrdered::new();
 
+        let mut scheduled_calls = Vec::with_capacity(calls.len());
         for call in calls {
             // Stop *scheduling* new calls once cancellation has fired. Already
             // scheduled futures remain in `ordered` and are still drained below
@@ -455,6 +464,7 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
                 break;
             }
 
+            scheduled_calls.push(call.clone());
             let parallelism = decision::classify_parallelism(
                 self.runner.parallel_safe(&call),
                 self.supports_parallel_tool_calls,
@@ -491,10 +501,94 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
                 outputs_in_order.push(msg);
             }
         }
+        self.annotate_repeated_browser_script_outputs(&scheduled_calls, &mut outputs_in_order)
+            .await;
 
         ToolDispatchResult {
             outputs_in_order,
             needs_follow_up: dispatched_any,
+        }
+    }
+
+    async fn annotate_repeated_browser_script_outputs(
+        &self,
+        calls: &[ContentPart],
+        outputs: &mut [Message],
+    ) {
+        for (call, output) in calls.iter().zip(outputs.iter_mut()) {
+            let Some(signature) = no_progress_signature(call, output) else {
+                continue;
+            };
+            let mut state = self.no_progress_state.lock().await;
+            let repeats = state.observe(signature);
+            if repeats >= BROWSER_SCRIPT_NO_PROGRESS_REPEAT_THRESHOLD {
+                append_tool_result_text(output, BROWSER_SCRIPT_NO_PROGRESS_NUDGE);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoProgressState {
+    last: Option<String>,
+    repeat_count: usize,
+}
+
+impl NoProgressState {
+    fn observe(&mut self, signature: String) -> usize {
+        if self.last.as_deref() == Some(signature.as_str()) {
+            self.repeat_count = self.repeat_count.saturating_add(1);
+        } else {
+            self.last = Some(signature);
+            self.repeat_count = 1;
+        }
+        self.repeat_count
+    }
+}
+
+fn no_progress_signature(call: &ContentPart, output: &Message) -> Option<String> {
+    let ContentPart::ToolCall { name, .. } = call else {
+        return None;
+    };
+    if name != "browser_script" {
+        return None;
+    }
+    let text = tool_result_text(output);
+    if text.trim().is_empty() || text.contains("browser_script is still running.") {
+        return None;
+    }
+    Some(normalize_no_progress_text(&text))
+}
+
+fn normalize_no_progress_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn tool_result_text(message: &Message) -> String {
+    let mut chunks = Vec::new();
+    collect_tool_result_text(&message.content, &mut chunks);
+    chunks.join("\n")
+}
+
+fn collect_tool_result_text(parts: &[ContentPart], chunks: &mut Vec<String>) {
+    for part in parts {
+        match part {
+            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                if !text.is_empty() {
+                    chunks.push(text.clone());
+                }
+            }
+            ContentPart::ToolResult { content, .. } => collect_tool_result_text(content, chunks),
+            ContentPart::Media { .. } | ContentPart::ToolCall { .. } => {}
+        }
+    }
+}
+
+fn append_tool_result_text(message: &mut Message, text: &str) {
+    for part in &mut message.content {
+        if let ContentPart::ToolResult { content, .. } = part {
+            content.push(ContentPart::text(text.to_string()));
+            return;
         }
     }
 }

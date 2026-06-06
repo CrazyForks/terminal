@@ -741,11 +741,11 @@ async fn bounded_loop_aborts_after_max_turns() {
         ..
     }) = recorded_inputs[1].last()
     else {
-        panic!("last bounded request should include final-step developer nudge");
+        panic!("last bounded request should include final-window developer nudge");
     };
     assert!(
-        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("final allowed step")),
-        "final nudge should tell the agent to finish"
+        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("almost out of allowed steps")),
+        "final-window nudge should tell the agent to finish"
     );
     assert_eq!(observer.kinds(), vec!["started", "aborted"]);
     let events = observer.events.lock().unwrap();
@@ -757,6 +757,57 @@ async fn bounded_loop_aborts_after_max_turns() {
             ..
         }) if message == "step 1"
     ));
+}
+
+#[tokio::test]
+async fn bounded_loop_adds_final_nudge_before_last_turn() {
+    let scripts: Vec<SamplingScript> = (0..10)
+        .map(|i| SamplingScript::Ok(follow_up(&format!("step {i}"))))
+        .collect();
+    let sampler = ScriptedSamplingDriver::new(scripts);
+    let inputs = sampler.inputs_handle();
+    let state = InMemoryTurnState::new(Vec::new(), token_status(false));
+    let observer = RecordingObserver::new();
+
+    let turn = TurnLoop::new(state, sampler, observer);
+    let out = turn
+        .run_with_max_turns(ctx(), false, CancellationToken::new(), 10)
+        .await
+        .expect("bounded loop should stop gracefully");
+
+    assert_eq!(out.as_deref(), Some("step 9"));
+    let recorded_inputs = inputs.lock().unwrap();
+    assert_eq!(recorded_inputs.len(), 10);
+    for request_index in 0..2 {
+        assert!(
+            !matches!(
+                recorded_inputs[request_index].last(),
+                Some(Message {
+                    role: MessageRole::Developer,
+                    ..
+                })
+            ),
+            "turn {} should be outside the finalization window",
+            request_index + 1
+        );
+    }
+    for request_index in 2..10 {
+        let Some(Message {
+            role: MessageRole::Developer,
+            content,
+            ..
+        }) = recorded_inputs[request_index].last()
+        else {
+            panic!(
+                "turn {} should include the final-window nudge",
+                request_index + 1
+            );
+        };
+        assert!(
+            matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("call the done tool now")),
+            "final-window nudge should be present before the last turn"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1139,9 +1139,9 @@ fn resolve_provider_with_python(
 /// The registry registers the backend-free handlers — `shell`, `apply_patch`,
 /// `view_image`, `update_plan`, `done`, `tool_search` (catalog populated from the registered tools' defs),
 /// `web_search` (ENABLED; the Responses builder encodes it as the hosted
-/// `web_search_preview` tool), `search` (a locally-executed DuckDuckGo search,
-/// distinct from the hosted `web_search`) — plus the two product-surface tools
-/// that drive real subsystems:
+/// `web_search_preview` tool), `search` (a client-executed call to the
+/// browser-use search API, distinct from the hosted `web_search`) — plus the
+/// two product-surface tools that drive real subsystems:
 ///   * `browser` ([`BrowserTool::new`]): standalone — the production
 ///     [`RealBackend`](crate::tools::handlers::browser::RealBackend) wraps the
 ///     `browser-use-browser` crate and manages CDP sessions internally (keyed by
@@ -1237,7 +1237,7 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
-    use crate::tools::handlers::search::{SearchRequest, SearchTool};
+    use crate::tools::handlers::search::{SearchRequest, SearchTool, SEARCH_PARALLEL_SAFE};
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
         WriteStdinTool,
@@ -1324,19 +1324,23 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         );
     } else {
         // Anthropic and other non-hosted providers would otherwise receive a
-        // model-visible no-op marker. Route the familiar `web_search` name through
-        // the local DuckDuckGo implementation so research tasks get real results.
+        // model-visible no-op marker. Route the familiar `web_search` name
+        // through the browser-use search API so research tasks get real results.
         reg.register::<_, SearchRequest>(
             "web_search",
             definitions::web_search(),
-            true,
+            SEARCH_PARALLEL_SAFE,
             SearchTool::new(),
         );
     }
-    // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
-    // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Read-only, so parallel_safe = true.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    // `search`: web search via the browser-use search API. Read-only and
+    // parallel-safe so independent source-discovery queries can run in one turn.
+    reg.register::<_, SearchRequest>(
+        "search",
+        definitions::search(),
+        SEARCH_PARALLEL_SAFE,
+        SearchTool::new(),
+    );
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
         runtime_handle.as_ref(),
@@ -3296,8 +3300,8 @@ mod tests {
         assert!(names.contains(&"browser"));
         assert!(names.contains(&"done"));
         assert!(names.contains(&"update_plan"));
-        // Both web searches are wired into the production dispatcher: the hosted
-        // `web_search` and the locally-executed DuckDuckGo `search`.
+        // Both web searches are wired into the production dispatcher: hosted
+        // `web_search` and client-executed browser-use API `search`.
         assert!(names.contains(&"web_search"));
         assert!(
             names.contains(&"search"),

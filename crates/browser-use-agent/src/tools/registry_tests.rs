@@ -486,8 +486,8 @@ impl McpClient for FakeMcpClient {
     }
 }
 
-/// A fake search backend: returns a canned DuckDuckGo Lite HTML fragment with a
-/// single result echoing the query, so no network is touched (mirrors
+/// A fake search backend: returns a canned browser-use search API JSON response
+/// with a single result echoing the query, so no network is touched (mirrors
 /// `search_tests.rs`).
 struct FakeSearchBackend;
 
@@ -495,10 +495,7 @@ struct FakeSearchBackend;
 impl SearchBackend for FakeSearchBackend {
     async fn fetch(&self, query: &str) -> Result<String, SearchError> {
         Ok(format!(
-            "<table>\
-               <tr><td><a class=\"result-link\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F\">Result for {query}</a></td></tr>\
-               <tr><td class=\"result-snippet\">snippet for {query}</td></tr>\
-             </table>"
+            r#"{{"results":[{{"title":"Result for {query}","url":"https://example.com/","content":"snippet for {query}"}}]}}"#
         ))
     }
 }
@@ -838,8 +835,8 @@ async fn search_dispatches_to_the_fake_backend() {
         .await
         .expect("search should dispatch");
     assert_eq!(out.exit_code, 0);
-    // The fake backend's canned HTML yields one result whose title echoes the
-    // query (within the 30-char cap, so shown in full), its unwrapped
+    // The fake backend's canned search-service JSON yields one result whose
+    // title echoes the query (within the 30-char cap, so shown in full), its
     // destination URL (kept intact), and the snippet.
     assert!(
         out.stdout.contains("Result for rust lang"),

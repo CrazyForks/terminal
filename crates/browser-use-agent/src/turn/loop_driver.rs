@@ -82,7 +82,8 @@ use crate::task::{TurnAbortReason, TurnLifecycleEvent};
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use tokio_util::sync::CancellationToken;
 
-const FINAL_MAX_TURNS_NUDGE: &str = "This is the final allowed step for this run. Stop exploring and call the done tool with the best complete answer you can provide now. Include unknown or unavailable items explicitly instead of continuing to search.";
+const FINAL_MAX_TURNS_WINDOW: usize = 8;
+const FINAL_MAX_TURNS_NUDGE: &str = "This run is almost out of allowed steps. Do not start broad new exploration. If you have any verified answer, saved artifact, or usable partial result, call the done tool now with the best user-facing answer you can provide. Include unknown, unavailable, or incomplete items explicitly. Only call another non-done tool when one short targeted check is strictly necessary to turn already gathered evidence into the final answer.";
 const PROGRESS_MAX_TURNS_NUDGE: &str = "Progress checkpoint: If you have enough evidence, a saved artifact, or a complete-enough answer, stop further exploration and call the done tool now. Continue only for clearly missing required information that is likely to change the final answer.";
 
 /// The async, unbounded turn-loop driver. Generic over the three frozen turn
@@ -180,7 +181,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             let mut request = self.state.clone_history_for_prompt().await;
             request.extend(input);
             let next_turn = turns_run + 1;
-            if max_turns.is_some_and(|limit| next_turn == limit) {
+            if max_turns.is_some_and(|limit| should_emit_final_nudge(limit, next_turn)) {
                 request.push(Message::new(
                     MessageRole::Developer,
                     vec![ContentPart::text(FINAL_MAX_TURNS_NUDGE)],
@@ -271,4 +272,12 @@ fn should_emit_progress_nudge(max_turns: usize, next_turn: usize) -> bool {
         return false;
     }
     next_turn >= max_turns / 2 && next_turn % 10 == 0
+}
+
+fn should_emit_final_nudge(max_turns: usize, next_turn: usize) -> bool {
+    let final_window_start = max_turns
+        .saturating_sub(FINAL_MAX_TURNS_WINDOW)
+        .saturating_add(1)
+        .max(1);
+    next_turn >= final_window_start && next_turn <= max_turns
 }
