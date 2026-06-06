@@ -60,15 +60,15 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// Default per-script timeout (seconds) when a request omits one.
 ///
 /// The `browser-use-browser` script fns take a `timeout_seconds`; we default to
-/// a generous 300s so a single page interaction has room to complete while the
-/// run-level task timebox remains responsible for bounding the whole agent.
-pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 300;
+/// the eval task timebox so long extraction/browser waits are bounded by the run
+/// budget instead of a separate short per-script ceiling.
+pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 45 * 60;
 
 /// Default observe poll window (ms) for [`BrowserAction::Observe`].
 ///
 /// Long browser_script runs should be observed in coarse windows so the agent
-/// does not burn many LLM turns polling the same run_id while work is ongoing.
-pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 30_000;
+/// can see progress without burning many LLM turns polling the same run_id.
+pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 15_000;
 pub const MAX_OBSERVE_TIMEOUT_MS: u64 = 120_000;
 
 /// Appended to `browser_script` stdout when the response carries image parts.

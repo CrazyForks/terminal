@@ -2,8 +2,8 @@
 //!
 //! The LLM-facing split is intentional:
 //! - `browser` controls connection/lifecycle/debug state.
-//! - `browser_script` runs fresh Python for page interaction through this
-//!   Rust-held CDP connection.
+//! - `browser_script` runs Python for page interaction through this Rust-held
+//!   CDP connection, restoring simple per-session Python state between calls.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -29,7 +29,7 @@ const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
 const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 15_000;
-const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 30_000;
+const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 15_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
@@ -1355,6 +1355,7 @@ fn spawn_browser_script_with_session_registry(
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
     let frames_dir = artifact_dir.as_ref().join(format!(".{run_id}.frames"));
+    let state_path = browser_script_state_path(session_id, artifact_dir.as_ref());
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -1363,6 +1364,7 @@ fn spawn_browser_script_with_session_registry(
         &domain_skill_roots,
         &stream_path,
         &frames_dir,
+        &state_path,
         code,
     )?;
     let mut command = browser_script_python_command();
@@ -1406,6 +1408,26 @@ fn spawn_browser_script_with_session_registry(
         timeout_seconds: timeout_seconds.max(1),
         deadline: Instant::now() + Duration::from_secs(timeout_seconds.max(1)),
     })
+}
+
+fn browser_script_state_path(session_id: &str, artifact_dir: &Path) -> PathBuf {
+    let mut safe_session = String::with_capacity(session_id.len().min(96));
+    for ch in session_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            safe_session.push(ch);
+        } else {
+            safe_session.push('_');
+        }
+        if safe_session.len() >= 96 {
+            break;
+        }
+    }
+    if safe_session.is_empty() {
+        safe_session.push_str("session");
+    }
+    artifact_dir
+        .join(".browser_script_state")
+        .join(format!("{safe_session}.pickle"))
 }
 
 fn finish_browser_script_run(
@@ -7785,6 +7807,7 @@ fn browser_script_prelude(
     domain_skill_roots: &[PathBuf],
     stream_path: &Path,
     frames_dir: &Path,
+    state_path: &Path,
     user_code: &str,
 ) -> Result<String> {
     let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
@@ -7797,18 +7820,20 @@ fn browser_script_prelude(
     )?;
     Ok(format!(
         r#"
-import base64, contextlib, hashlib, io, json, os, pathlib, shutil, socket, sys, threading, time, traceback, urllib.request
+import base64, contextlib, hashlib, importlib, io, json, os, pathlib, pickle, shutil, socket, sys, threading, time, traceback, types, urllib.request
 
 BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 STREAM_PATH = pathlib.Path({stream_path:?}).expanduser().resolve()
 FRAMES_DIR = pathlib.Path({frames_dir:?}).expanduser().resolve()
+STATE_PATH = pathlib.Path({state_path:?}).expanduser().resolve()
 AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
 DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
 OUTPUTS_DIR = pathlib.Path(os.environ.get("BH_OUTPUTS_DIR") or {cwd:?}).expanduser().resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -7950,6 +7975,9 @@ __outputs = []
 __summary = []
 __artifacts = []
 __images = []
+__persistent_reserved_names = set()
+__PERSISTENT_STATE_ITEM_LIMIT_BYTES = 5 * 1024 * 1024
+__PERSISTENT_STATE_TOTAL_LIMIT_BYTES = 50 * 1024 * 1024
 
 def _jsonable(value):
     try:
@@ -7957,6 +7985,76 @@ def _jsonable(value):
         return value
     except TypeError:
         return repr(value)
+
+def _persistable_user_name(name):
+    if not isinstance(name, str) or not name or name.startswith("__"):
+        return False
+    if name in __persistent_reserved_names:
+        return False
+    if name in ("exit", "quit", "get_ipython"):
+        return False
+    return True
+
+def _load_persistent_browser_script_state():
+    if not STATE_PATH.exists():
+        return
+    try:
+        with STATE_PATH.open("rb") as f:
+            payload = pickle.load(f)
+    except Exception as exc:
+        _stream_event({{"type": "summary", "summary": {{"kind": "browser_script_state", "message": "Could not restore prior Python variables", "error": str(exc)[:500]}}}})
+        return
+    if not isinstance(payload, dict):
+        return
+    restored = 0
+    modules = payload.get("modules")
+    if isinstance(modules, dict):
+        for name, module_name in modules.items():
+            if not _persistable_user_name(name) or not isinstance(module_name, str):
+                continue
+            try:
+                globals()[name] = importlib.import_module(module_name)
+                restored += 1
+            except Exception:
+                pass
+    values = payload.get("values")
+    if isinstance(values, dict):
+        for name, value in values.items():
+            if _persistable_user_name(name):
+                globals()[name] = value
+                restored += 1
+    if restored:
+        _stream_event({{"type": "summary", "summary": {{"kind": "browser_script_state", "message": f"Restored {{restored}} Python variable(s) from the previous browser_script call."}}}})
+
+def _save_persistent_browser_script_state():
+    values = {{}}
+    modules = {{}}
+    total_bytes = 0
+    for name, value in list(globals().items()):
+        if not _persistable_user_name(name):
+            continue
+        if isinstance(value, types.ModuleType):
+            modules[name] = value.__name__
+            continue
+        try:
+            encoded = pickle.dumps(value)
+        except Exception:
+            continue
+        size = len(encoded)
+        if size > __PERSISTENT_STATE_ITEM_LIMIT_BYTES:
+            continue
+        if total_bytes + size > __PERSISTENT_STATE_TOTAL_LIMIT_BYTES:
+            break
+        values[name] = value
+        total_bytes += size
+    payload = {{"values": values, "modules": modules, "saved_at_ms": int(time.time() * 1000)}}
+    try:
+        tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(STATE_PATH)
+    except Exception as exc:
+        _stream_event({{"type": "summary", "summary": {{"kind": "browser_script_state", "message": "Could not save Python variables for the next browser_script call", "error": str(exc)[:500]}}}})
 
 def _parse_browser_summary_specs(source):
     lines = source.splitlines()
@@ -8222,6 +8320,7 @@ def _run_user_code():
     exec(compile(__USER_CODE, "<browser_script>", "exec"), globals())
 
 def _run_browser_script_envelope():
+    global __persistent_reserved_names
     stdout = _BrowserScriptStream("stdout")
     stderr = _BrowserScriptStream("stderr")
     ok = True
@@ -8231,12 +8330,15 @@ def _run_browser_script_envelope():
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             _load_browser_script_helpers()
             load_agent_helpers()
+            __persistent_reserved_names = set(globals().keys())
+            _load_persistent_browser_script_state()
             capture_thread = _start_capture()
             _run_user_code()
     except Exception:
         ok = False
         error = traceback.format_exc()
     finally:
+        _save_persistent_browser_script_state()
         __capture_stop.set()
         if capture_thread is not None:
             capture_thread.join(timeout=2.0)
@@ -12383,6 +12485,52 @@ print("bridge retry ok")
             .error
             .as_deref()
             .is_some_and(|error| error.contains("browser_script timed out after 1 seconds")));
+    }
+
+    #[test]
+    fn browser_script_restores_picklable_user_state_between_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-state-persistence";
+        let artifact_dir = temp.path().join("artifacts");
+
+        let first = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifact_dir,
+            r#"
+import re
+records = [{"name": "Ada"}]
+answer = 41
+print("state saved")
+"#,
+            10,
+        )
+        .unwrap();
+        assert!(first.ok, "{:?}\n{}", first.error, first.text);
+
+        let second = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifact_dir,
+            r#"
+assert answer == 41, answer
+assert re.search("da", records[0]["name"]), records
+records.append({"name": "Grace"})
+print("state restored", len(records))
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(second.ok, "{:?}\n{}", second.error, second.text);
+        assert!(second.text.contains("state restored 2"), "{}", second.text);
+        assert!(
+            second.summary.iter().any(|record| {
+                record.get("kind").and_then(Value::as_str) == Some("browser_script_state")
+            }),
+            "restore summary missing: {:?}",
+            second.summary
+        );
     }
 
     #[test]

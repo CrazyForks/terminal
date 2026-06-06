@@ -30,7 +30,7 @@ Mental model:
 - `browser` owns runtime/control/debug.
 - `browser_script` owns page interaction/data extraction.
 - Rust holds the CDP websocket, current target id, current session id, ownership, and connection generation.
-- Python in `browser_script` is fresh per call; Python variables do not persist.
+- `browser_script` restores simple picklable Python variables/imported modules for the same session, but browser handles, threads, files, sockets, and large page dumps should not be treated as durable state.
 - Nothing reloads, relaunches, closes, or switches tabs silently. If IDs may change, this tool reports that and you choose the next action.
 - `browser status --json` may include `last_issue`, a compact diagnosis from the most recent browser/browser_script failure. Use its `next_step`, `browser_usable`, and `page_usable` fields before deciding to reconnect.
 - `browser status --json` also lists active `browser_script` runs. Use the `browser_script` tool with `action="observe"` to listen to them; use `browser script cancel <run_id>` only for cleanup or explicit cancellation.

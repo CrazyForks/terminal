@@ -1528,7 +1528,7 @@ fn browser_script_running_tool_text(payload: &Value) -> Option<String> {
         let observe_ms = payload
             .get("next_observe_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(1_000);
+            .unwrap_or(15_000);
         parts.push(format!(
             "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={observe_ms}."
         ));

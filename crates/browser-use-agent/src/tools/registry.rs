@@ -943,7 +943,7 @@ pub mod definitions {
                     },
                     "code": {
                         "type": "string",
-                        "description": "Python code to run in a fresh process with browser helpers preimported. Omit when action is observe or cancel."
+                        "description": "Python code to run with browser helpers preimported. Simple picklable globals/imported modules persist for the same session. Omit when action is observe or cancel."
                     },
                     "run_id": {
                         "type": "string",
@@ -953,7 +953,7 @@ pub mod definitions {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 120000,
-                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 30000. Use longer windows, up to 120000, for long-running extraction or navigation scripts instead of repeatedly polling the same run_id."
+                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 15000. Use longer windows, up to 120000, only when a running script is making useful progress without needing a decision."
                     }
                 },
                 "additionalProperties": false

@@ -6,11 +6,11 @@ Use the `browser` tool for connection/runtime work first. If the browser is not 
 
 Important execution model:
 
-- Each `browser_script` call starts a fresh Python process.
-- Python variables do not persist across calls.
+- Each `browser_script` call starts a Python process for the current session.
+- Simple picklable Python variables and imported modules persist across calls for the same session. Do not rely on this for browser handles, threads, open files, sockets, huge page dumps, or final artifacts; save durable outputs under `outputs_dir()`.
 - Browser/CDP state persists in Rust.
 - Fast calls return their final result immediately. Long calls return `status: running` with a `run_id`; keep observing that same run until it finishes, fails, or is cancelled.
-- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. Prefer coarse waits such as 30000-120000 ms for long navigation or extraction scripts; do not burn many turns polling the same `run_id` with short waits.
+- To listen to a running script, call this tool with `action="observe"`, the returned `run_id`, and optionally `observe_timeout_ms`. Use about 15000 ms for normal progress checks, and longer waits up to 120000 ms only when the script is making useful progress without needing a decision from you.
 - To stop a running script, call this tool with `action="cancel"` and the `run_id`. Partial images and artifacts emitted before cancellation are preserved.
 - A failed `browser_script` call may include a short diagnosis. Read that diagnosis first: if it says the browser is still connected or the same page is usable, continue from the same page instead of reconnecting.
 - Helpers are preimported; you do not need imports for normal browser work.
@@ -81,7 +81,7 @@ Usage guidance:
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
 - If a running script emits screenshots/images before it finishes, `observe` returns those images as soon as they are available. Use the pixels to guide the next observe/retry.
-- Use `emit_output(value, label="...")` for structured observations that the next model turn may need, such as `page_info()`, extracted rows, selected DOM state, or API responses. The full value stays model-visible.
+- Use `emit_output(value, label="...")` for structured observations that the next model turn may need, such as `page_info()`, extracted rows, selected DOM state, or API responses. For exploration, emit compact focused summaries of visible headings, links, buttons, forms, and task-relevant text; do not emit full page text, full HTML, full accessibility trees, cookies, localStorage, or app caches unless smaller field-level extraction failed. The full value stays model-visible.
 - When a script emits labeled structured output, add a `# browser_summary:` JSON comment block at the top of the script that maps each emitted label to the compact transcript summary. Write the code/labels first mentally, then place or update this block before submitting the tool call; the runtime parses the whole script before execution.
 - Summary values may be literals, JSONPath-like selectors such as `$.url`, or template strings such as `Read ${$.length} employee rows`. Missing summary specs fall back to a generic `Recorded <label>` summary while preserving the full output.
 - Prefer this pattern over printing page or extraction objects:

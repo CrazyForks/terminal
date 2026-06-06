@@ -307,7 +307,7 @@ fn browser_script_running_transcript_text(response: &BrowserScriptOutput) -> Str
         }) {
             lines.push(format!(
 				"Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={}.",
-				response.next_observe_ms.unwrap_or(30_000)
+				response.next_observe_ms.unwrap_or(15_000)
 			));
         }
     }

@@ -269,8 +269,9 @@ impl ChildAgentRunner {
 
 /// Per-run knobs the TUI/CLI assemble before starting a session.
 ///
-/// Mirrors `browser-use-core::AgentRunOptions` (`lib.rs:202`), including every
-/// field and the exact default values.
+/// Mirrors `browser-use-core::AgentRunOptions` (`lib.rs:202`) while carrying
+/// terminal-specific runtime defaults where the Rust core needs different
+/// operational behavior.
 #[derive(Clone, Debug)]
 pub struct AgentRunOptions {
     pub max_turns: usize,
@@ -367,7 +368,7 @@ impl Default for AgentRunOptions {
             final_output_json_schema: None,
             final_output_json_schema_strict: true,
             model_compaction_enabled: true,
-            model_auto_compact_token_limit: None,
+            model_auto_compact_token_limit: Some(100_000),
             model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope::Total,
             analytics_source: None,
             analytics_provider_kind: None,
@@ -1847,6 +1848,7 @@ command = "profile-server"
         assert!(options.final_output_json_schema.is_none());
         assert!(options.final_output_json_schema_strict);
         assert!(options.model_compaction_enabled);
+        assert_eq!(options.model_auto_compact_token_limit, Some(100_000));
         assert!(options.analytics_source.is_none());
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
