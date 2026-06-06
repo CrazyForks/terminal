@@ -914,18 +914,23 @@ except NameError:
 
 
 def email_address():
-    """Return the agent's email inbox address (for email verification / 2FA).
+    """Return the agent's disposable inbox address — a real inbox the agent owns.
 
-    Type this into an email/username field at signup or login, then read the
-    arriving code with email_code(). Raises if no inbox is configured."""
+    Use it as the email for ANY flow that sends mail: account sign-ups, magic
+    sign-in links, newsletters, confirmations — not only 2FA. Type it into an
+    email/username field, then read incoming mail with email_code() (for a
+    verification/2FA code). Raises if no inbox is configured."""
     if not _EMAIL_AVAILABLE:
         raise RuntimeError(
-            "No email inbox is configured. Set one up with `secrets email set-token`."
+            "No email inbox is configured. Ask the user to set one up with `/email` in the terminal."
         )
     resp = _bridge({"kind": "email", "op": "address"})
+    err = resp.get("error")
+    if err:
+        raise RuntimeError(f"email inbox unavailable: {err}")
     address = resp.get("value")
     if not address:
-        raise RuntimeError("failed to provision an email inbox (check the AgentMail token).")
+        raise RuntimeError("email inbox isn't set up yet — ask the user to run `/email`.")
     return address
 
 
@@ -938,11 +943,14 @@ def email_code(timeout=120):
         fill_input("#code", email_code())"""
     if not _EMAIL_AVAILABLE:
         raise RuntimeError(
-            "No email inbox is configured. Set one up with `secrets email set-token`."
+            "No email inbox is configured. Ask the user to set one up with `/email` in the terminal."
         )
     deadline = _time.time() + max(1, int(timeout))
     while _time.time() < deadline:
         resp = _bridge({"kind": "email", "op": "code"})
+        err = resp.get("error")
+        if err:
+            raise RuntimeError(f"email inbox unavailable: {err}")
         code = resp.get("value")
         if code:
             return code

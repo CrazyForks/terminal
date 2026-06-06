@@ -264,6 +264,7 @@ enum Surface {
     Developer,
     Secrets,
     Domains,
+    Email,
     Feedback,
     FeedbackThanks,
 }
@@ -291,6 +292,7 @@ impl Surface {
                 | Self::Developer
                 | Self::Secrets
                 | Self::Domains
+                | Self::Email
                 | Self::Feedback
         )
     }
@@ -307,7 +309,12 @@ impl Surface {
     fn is_text_input_popup(self) -> bool {
         matches!(
             self,
-            Self::ApiKey | Self::Telemetry | Self::ModelSearch | Self::Secrets | Self::Domains
+            Self::ApiKey
+                | Self::Telemetry
+                | Self::ModelSearch
+                | Self::Secrets
+                | Self::Domains
+                | Self::Email
         )
     }
 
@@ -1265,6 +1272,9 @@ struct App {
     domains_deny: Vec<String>,
     /// The `/domains` add form + selection (mirrors `secret_form`).
     domain_form: Option<DomainForm>,
+    /// Whether email-2FA (AgentMail) is configured — cached for the `/email`
+    /// panel so the renderer doesn't touch the store.
+    email_configured: bool,
     store_rx: mpsc::Receiver<StoreNotification>,
     clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
     clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
@@ -2347,6 +2357,7 @@ impl App {
             domains_allow: Vec::new(),
             domains_deny: Vec::new(),
             domain_form: None,
+            email_configured: false,
             agent_backend,
             quit_hint_until: None,
             escape_stop_until: None,
@@ -5443,7 +5454,11 @@ impl App {
             } => self.submit()?,
             _ if (matches!(
                 self.surface,
-                Surface::ApiKey | Surface::Telemetry | Surface::Secrets | Surface::Domains
+                Surface::ApiKey
+                    | Surface::Telemetry
+                    | Surface::Secrets
+                    | Surface::Domains
+                    | Surface::Email
             ) || (self.surface == Surface::ModelSearch
                 && self.model_search_has_filter_input()))
                 && self.handle_api_key_key(key) => {}
@@ -5567,7 +5582,11 @@ impl App {
                     self.prompt_history.reset_navigation();
                 }
             }
-            Surface::ApiKey | Surface::Telemetry | Surface::Secrets | Surface::Domains => {
+            Surface::ApiKey
+            | Surface::Telemetry
+            | Surface::Secrets
+            | Surface::Domains
+            | Surface::Email => {
                 self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
@@ -5831,6 +5850,10 @@ impl App {
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
             Surface::Secrets => self.secrets_surface_enter()?,
             Surface::Domains => self.domains_surface_enter()?,
+            Surface::Email => match self.selected_row.min(1) {
+                0 => self.save_agentmail_token(),
+                _ => self.close_surface(),
+            },
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
@@ -6104,6 +6127,7 @@ impl App {
                 self.start_1password_import();
             }
             PaletteAction::ManageDomains => self.open_domains_surface(),
+            PaletteAction::ConfigureEmail => self.open_email_surface(),
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
@@ -6241,6 +6265,33 @@ impl App {
         self.open_surface(Surface::Domains);
     }
 
+    fn open_email_surface(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        self.email_configured = sa::email_2fa_configured(&self.store);
+        self.composer.clear();
+        self.selected_row = 0;
+        self.status_notice = None;
+        self.open_surface(Surface::Email);
+    }
+
+    /// Store the pasted AgentMail token. The inbox is provisioned lazily the first
+    /// time the agent calls `email_address()`, so this stays a fast local write.
+    fn save_agentmail_token(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let token = self.composer.take_trimmed();
+        if token.is_empty() {
+            self.status_notice = Some("Paste your AgentMail API key first.".to_string());
+            return;
+        }
+        match sa::set_agentmail_token(&self.store, &token) {
+            Ok(()) => {
+                self.email_configured = true;
+                self.close_surface();
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+    }
+
     /// Saved rules as `(domain, is_allow)`, allow-list first. `DomainFocus::Saved`
     /// indexes into this.
     pub(crate) fn domain_rows(&self) -> Vec<(String, bool)> {
@@ -6255,8 +6306,10 @@ impl App {
         let mut order: Vec<DomainFocus> = (0..self.domain_rows().len())
             .map(DomainFocus::Saved)
             .collect();
-        order.push(DomainFocus::Mode);
+        // Domain first, then Mode — matches the /secrets field order and the
+        // natural "allow <domain>" reading.
         order.push(DomainFocus::Input);
+        order.push(DomainFocus::Mode);
         order
     }
 
@@ -6295,10 +6348,13 @@ impl App {
         let idx = current
             .and_then(|focus| order.iter().position(|o| *o == focus))
             .unwrap_or(0);
+        // Clamp at the ends (don't wrap): with only two form fields, wrapping
+        // makes ↑ from the top field jump to the bottom one, which reads as
+        // inverted arrows.
         let next = if forward {
-            (idx + 1) % order.len()
+            (idx + 1).min(order.len() - 1)
         } else {
-            (idx + order.len() - 1) % order.len()
+            idx.saturating_sub(1)
         };
         self.domain_set_focus(order[next]);
     }
@@ -8162,6 +8218,7 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
+            Surface::Email => 2,
             Surface::Secrets | Surface::Domains => 0,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
             Surface::OpenAiAuth => self.openai_auth_rows().len(),
@@ -10964,6 +11021,80 @@ mod redesign_tests {
     }
 
     #[test]
+    fn domains_caret_lands_on_the_domain_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_domains_surface(); // default focus = Domain input
+        app.handle_paste("git"); // give the field some text to anchor the caret
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret should be visible while the Domain field is focused");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Domain"),
+            "caret at row {} = {:?}; full dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        assert!(
+            !caret_row.contains("Add a rule"),
+            "caret landed on the heading: {caret_row:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn email_surface_setup_and_save() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        assert_eq!(app.surface, Surface::Email);
+
+        // Unconfigured: shows where to get the key + how to set it up.
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("agentmail.to"));
+        assert!(text.contains("Save key"));
+        assert!(!app.email_configured);
+
+        // Paste a key on the Save row + Enter → stored, panel closes.
+        app.handle_paste("fake-agentmail-key");
+        app.execute_surface_selection()?;
+        assert!(app.email_configured);
+        assert_eq!(
+            sa::agentmail_token(&app.store).as_deref(),
+            Some("fake-agentmail-key")
+        );
+
+        // Reopening now shows the configured state.
+        app.open_email_surface();
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("Configured"));
+        Ok(())
+    }
+
+    #[test]
+    fn email_caret_lands_on_the_key_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        app.handle_paste("abc");
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret visible on the key field");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Key"),
+            "caret at row {} = {:?}; dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        Ok(())
+    }
+
+    #[test]
     fn domains_form_add_toggle_delete() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -12234,6 +12365,7 @@ mod redesign_tests {
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
             Surface::Secrets => "Secrets",
             Surface::Domains => "Domains",
+            Surface::Email => "Email inbox",
             Surface::Feedback | Surface::FeedbackThanks => "Feedback",
             Surface::Main => "",
         }
@@ -14099,7 +14231,7 @@ mod redesign_tests {
         let mut app = ready_app(&temp)?;
         // The command palette grew an item; give the fixture a couple more rows
         // (real terminals have them) so the running transcript still shows under it.
-        app.args.height = 30;
+        app.args.height = 32;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,

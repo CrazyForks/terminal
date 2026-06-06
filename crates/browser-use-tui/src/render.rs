@@ -47,6 +47,20 @@ pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     Ok(buffer_to_string(terminal.backend().buffer()))
 }
 
+/// Like [`render_dump`] but also returns the terminal cursor position, so tests
+/// can verify the blinking caret lands on the intended row/column.
+#[cfg(test)]
+pub(crate) fn render_dump_with_cursor(
+    app: &mut App,
+) -> Result<(String, Option<ratatui::layout::Position>)> {
+    app.drain_store_notifications()?;
+    let backend = TestBackend::new(app.args.width, app.args.height);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| render(frame, app))?;
+    let cursor = terminal.get_cursor_position().ok();
+    Ok((buffer_to_string(terminal.backend().buffer()), cursor))
+}
+
 /// The set of foreground colors used by filled block cells ("█"), so tests can
 /// assert the context bar actually colors its segments per category.
 #[cfg(test)]
@@ -878,6 +892,35 @@ fn surface_popup_rect(
     })
 }
 
+/// Screen rows a plain-text line occupies under `Wrap { trim: false }` at
+/// `width` columns (greedy word wrap, ASCII-width). Used to map a line index to
+/// its rendered row when positioning the input caret.
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    if text.chars().count() <= width {
+        return 1;
+    }
+    let mut rows: u16 = 1;
+    let mut col = 0usize;
+    for word in text.split(' ') {
+        let wlen = word.chars().count();
+        if col == 0 {
+            col = wlen;
+        } else if col + 1 + wlen <= width {
+            col += 1 + wlen;
+        } else {
+            rows = rows.saturating_add(1);
+            col = wlen;
+        }
+        // A single word wider than the line spills onto further rows.
+        while col > width {
+            rows = rows.saturating_add(1);
+            col -= width;
+        }
+    }
+    rows.max(1)
+}
+
 fn render_surface_popup_box(
     buffer: &mut Buffer,
     popup_rect: Rect,
@@ -961,26 +1004,32 @@ fn render_surface_popup_box(
             Surface::ModelSearch => app.composer.input().to_string(),
             Surface::Secrets => secrets_input_field(app),
             Surface::Domains => domains_input_field(app),
+            Surface::Email => email_input_field(app),
             _ => String::new(),
         };
         let target = format!("  {masked}");
         let cursor_col = target.chars().count() as u16;
-        let visible_h = body_area.height as usize;
-        lines
-            .iter()
-            .take(visible_h)
-            .enumerate()
-            .find_map(|(row, line)| {
-                let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                if plain.starts_with(&target) {
-                    Some(Position {
-                        x: body_area.x.saturating_add(cursor_col.min(body_area.width)),
-                        y: body_area.y.saturating_add(row as u16),
-                    })
-                } else {
-                    None
-                }
-            })
+        // Walk lines accumulating their *wrapped* screen height — the body
+        // Paragraph wraps with `Wrap { trim: false }`, so a long line above the
+        // input occupies several rows. Counting by line index lands the caret too
+        // high (e.g. on the heading above the field).
+        let mut screen_row: u16 = 0;
+        let mut found = None;
+        for line in lines.iter() {
+            if screen_row >= body_area.height {
+                break;
+            }
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if plain.starts_with(&target) {
+                found = Some(Position {
+                    x: body_area.x.saturating_add(cursor_col.min(body_area.width)),
+                    y: body_area.y.saturating_add(screen_row),
+                });
+                break;
+            }
+            screen_row = screen_row.saturating_add(wrapped_rows(&plain, body_area.width));
+        }
+        found
     } else {
         None
     };
@@ -1400,6 +1449,10 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Save passwords & 2FA codes the agent uses to log in",
         ),
         Surface::Domains => ("Domains", "Allow or block which sites the agent may visit"),
+        Surface::Email => (
+            "Email inbox",
+            "A disposable inbox the agent uses for sign-ups, links & codes",
+        ),
         Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
         Surface::FeedbackThanks => ("Feedback", ""),
         Surface::Main => ("", ""),
@@ -1433,6 +1486,7 @@ fn surface_footer(surface: Surface) -> &'static str {
     match surface {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
+        Surface::Email => "Enter:save | Esc:cancel",
         Surface::History => "Type to filter | Enter:open | Esc:close",
         Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
@@ -1509,6 +1563,7 @@ fn surface_lines(
         Surface::Developer => developer_lines(app, state),
         Surface::Secrets => secrets_lines(app),
         Surface::Domains => domains_lines(app),
+        Surface::Email => email_lines(app),
         Surface::Feedback => feedback_lines(app),
         Surface::FeedbackThanks => Vec::new(),
         Surface::Main => Vec::new(),
@@ -4631,33 +4686,9 @@ pub(crate) fn domains_lines(app: &App) -> Vec<Line<'static>> {
         "Add a rule:".to_string(),
         accent(),
     )));
-    let mode_focused = matches!(
-        app.domain_form.as_ref().map(|f| f.focus),
-        Some(DomainFocus::Mode)
-    );
-    let allow_mode = matches!(
-        app.domain_form.as_ref().map(|f| f.mode),
-        Some(DomainMode::Allow)
-    );
-    let mode_text = if allow_mode {
-        "‹ Allow ›"
-    } else {
-        "‹ Block ›"
-    };
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            format!("{:<8}{}", "Mode", mode_text),
-            if mode_focused {
-                accent()
-            } else {
-                Style::default().fg(text())
-            },
-        ),
-        Span::styled("   (←/→ to switch)".to_string(), muted()),
-    ]));
-    // The Domain input line carries the caret when focused (matches
-    // `domains_input_field`, so the cursor lands at the end of the text).
+    // Domain input first (carries the caret when focused — matches
+    // `domains_input_field`, so the cursor lands at the end of the text), then the
+    // Mode toggle below it.
     let input_focused = matches!(
         app.domain_form.as_ref().map(|f| f.focus),
         Some(DomainFocus::Input)
@@ -4681,6 +4712,37 @@ pub(crate) fn domains_lines(app: &App) -> Vec<Line<'static>> {
             },
         ),
     ]));
+    let mode_focused = matches!(
+        app.domain_form.as_ref().map(|f| f.focus),
+        Some(DomainFocus::Mode)
+    );
+    let allow_mode = matches!(
+        app.domain_form.as_ref().map(|f| f.mode),
+        Some(DomainMode::Allow)
+    );
+    let value = if allow_mode { "Allow" } else { "Block" };
+    // Only bracket the value (and show the hint) when the Mode field is focused,
+    // so the ‹ › reads as "you're here, use ←/→" rather than a stuck cursor.
+    let mode_text = if mode_focused {
+        format!("‹ {value} ›")
+    } else {
+        value.to_string()
+    };
+    let mut mode_spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<8}{}", "Mode", mode_text),
+            if mode_focused {
+                accent()
+            } else {
+                Style::default().fg(text())
+            },
+        ),
+    ];
+    if mode_focused {
+        mode_spans.push(Span::styled("   (←/→ to switch)".to_string(), muted()));
+    }
+    lines.push(Line::from(mode_spans));
     lines.push(Line::from(""));
     lines.push(help_line(
         "↑/↓ Tab: move   ←/→: Allow/Block   Enter: add / toggle   Del: remove   Esc: close",
@@ -4688,6 +4750,72 @@ pub(crate) fn domains_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(notice) = app.status_notice.as_deref() {
         lines.push(Line::from(Span::styled(notice.to_string(), accent())));
     }
+    lines
+}
+
+/// The masked AgentMail key as it appears in the input field: dots (like the
+/// `/secrets` value field), keyed by a `Key` label so the caret lands on it.
+pub(crate) fn email_input_field(app: &App) -> String {
+    let dots = "•".repeat(app.composer.input().chars().count());
+    format!("{:<8}{dots}", "Key")
+}
+
+pub(crate) fn email_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("Disposable email inbox", bold()))];
+    lines.push(Line::from(""));
+
+    // Status / what it does — prose uses help_line (no leading spaces) so the
+    // only "  …" line is the input field, where the caret goes.
+    if app.email_configured {
+        lines.push(Line::from(vec![
+            Span::styled("✓ ", Style::default().fg(crate::theme::palette().done)),
+            Span::styled(
+                "Configured — the agent has its own inbox.",
+                Style::default().fg(text()),
+            ),
+        ]));
+        lines.push(help_line(
+            "It can be the agent's email for any sign-up or service, and the agent",
+        ));
+        lines.push(help_line(
+            "reads the verification / 2FA codes that arrive — no checking your email.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(help_line("Paste a new key below to replace it."));
+    } else {
+        lines.push(help_line(
+            "Give the agent its own inbox to use as its email for sign-ups and any",
+        ));
+        lines.push(help_line(
+            "service, and to read verification / 2FA codes itself — not just 2FA.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(help_line(
+            "Get a free API key at https://agentmail.to, then paste it below.",
+        ));
+    }
+    lines.push(Line::from(""));
+
+    // Labeled, masked input field — styled like a /secrets field (accent + caret).
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(email_input_field(app), accent()),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(help_line(
+        "Stored locally & encrypted. Codes the agent reads are redacted from output.",
+    ));
+    lines.push(Line::from(""));
+
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            notice.clone(),
+            status_style("failed"),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(selected("Save key", 0, app.selected_row));
+    lines.push(selected("Cancel", 1, app.selected_row));
     lines
 }
 

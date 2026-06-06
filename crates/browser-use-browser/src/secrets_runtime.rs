@@ -113,8 +113,10 @@ pub fn has_secret_resolver() -> bool {
 }
 
 /// Resolves an email-inbox op: `"address"` (the agent's inbox) or `"code"` (poll
-/// for the latest code). `None` when unavailable / no code yet.
-pub type EmailResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// for the latest code). `Ok(None)` when unavailable / no code yet; `Err(msg)`
+/// carries the real failure (bad token, network, store lock) so it surfaces to
+/// the script instead of a misleading generic message.
+pub type EmailResolver = Arc<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
 
 fn email_resolver_slot() -> &'static Mutex<Option<EmailResolver>> {
     static SLOT: OnceLock<Mutex<Option<EmailResolver>>> = OnceLock::new();
@@ -136,17 +138,24 @@ pub fn has_email_resolver() -> bool {
         .is_some()
 }
 
-/// Run an email-inbox op; a returned `code` is recorded for redaction.
-pub(crate) fn email_for_session(session_id: &str, op: &str) -> Option<String> {
-    let resolver = email_resolver_slot()
+/// Run an email-inbox op; a returned `code` is recorded for redaction. `Err`
+/// carries the real failure for the script to report.
+pub(crate) fn email_for_session(session_id: &str, op: &str) -> Result<Option<String>, String> {
+    let resolver = match email_resolver_slot()
         .lock()
         .expect("email resolver poisoned")
-        .clone()?;
+        .clone()
+    {
+        Some(resolver) => resolver,
+        None => return Ok(None),
+    };
     let value = resolver(op)?;
     if op == "code" {
-        record_redaction_needle(session_id, &value, "email_code");
+        if let Some(code) = &value {
+            record_redaction_needle(session_id, code, "email_code");
+        }
     }
-    Some(value)
+    Ok(value)
 }
 
 /// Record a value to scrub from this session's model-visible output.

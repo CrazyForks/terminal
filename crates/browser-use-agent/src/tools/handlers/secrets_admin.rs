@@ -338,11 +338,24 @@ credential on its real login form, never in a search box or an unrelated field."
 
     if email_2fa_configured(store) {
         block.push_str(
-            "\n\n## Email verification / 2FA inbox\n\n\
-An email inbox is available for sign-ups and email one-time codes. Use \
-`email_address()` to get the address to enter into an email field, and \
-`email_code()` (after submitting) to read the arriving verification/2FA code and \
-fill it in. The code is redacted from your output.",
+            "\n\n## Email inbox\n\n\
+You have your own disposable inbox. `email_address()` returns its address — enter \
+it into ANY email field (account sign-ups, services, logins), not only 2FA flows. \
+After an email is triggered, `email_code()` reads the arriving verification/2FA/\
+one-time code and you fill it in; the code is redacted from your output.",
+        );
+    } else {
+        block.push_str(
+            "\n\n## Email verification / 2FA (not set up)\n\n\
+This isn't configured yet, but it can be. When a task reaches an email field for \
+sign-up/login, or needs a code/link sent by email, tell the user CONCRETELY what \
+turning it on would let you do — don't just say 'automation can be enabled'. Spell \
+it out, e.g.: \"I can generate a disposable email address, enter it in the sign-up \
+form myself, then read the verification/2FA code straight from that inbox and \
+finish — you won't have to check your email or give me an address.\" Then say they \
+can turn it on by running `/email` in the terminal (paste a free AgentMail API key \
+from agentmail.to), and ask how they'd like to proceed. You have no inbox until \
+it's set up.",
         );
     }
 
@@ -389,11 +402,13 @@ pub fn install_script_security(store: &Store, session_id: &str) -> Result<()> {
     if !browser_use_browser::has_email_resolver() {
         let state_dir = store.state_dir().to_path_buf();
         browser_use_browser::set_email_resolver(std::sync::Arc::new(move |op: &str| {
-            let store = Store::open(&state_dir).ok()?;
+            let store = Store::open(&state_dir).map_err(|err| format!("open store: {err}"))?;
             match op {
-                "address" => agentmail_inbox_address(&store).ok(),
-                "code" => agentmail_latest_code(&store).ok().flatten(),
-                _ => None,
+                "address" => agentmail_inbox_address(&store)
+                    .map(Some)
+                    .map_err(|err| format!("{err:#}")),
+                "code" => agentmail_latest_code(&store).map_err(|err| format!("{err:#}")),
+                _ => Ok(None),
             }
         }));
     }
@@ -696,7 +711,11 @@ mod tests {
     fn prompt_context_lists_names_not_values() {
         let (store, _dir) = temp_store();
         let secret_store = InMemorySecretStore::new();
-        assert!(secrets_prompt_context(&store).is_none()); // none configured yet
+        // With nothing configured, the only context is the offer to set up email
+        // automation (no saved-credentials block).
+        let empty = secrets_prompt_context(&store).expect("email-automation offer");
+        assert!(empty.contains("not set up"));
+        assert!(!empty.contains("Saved credentials"));
 
         set_secret(
             &store,

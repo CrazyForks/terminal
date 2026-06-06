@@ -6957,8 +6957,10 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
         "email" => {
             let op = request.get("op").and_then(Value::as_str).unwrap_or("");
             let session_id = session.session_id.clone().unwrap_or_default();
-            let value = secrets_runtime::email_for_session(&session_id, op);
-            Ok(json!({ "value": value }))
+            match secrets_runtime::email_for_session(&session_id, op) {
+                Ok(value) => Ok(json!({ "value": value })),
+                Err(error) => Ok(json!({ "value": null, "error": error })),
+            }
         }
         other => bail!("unknown browser_script bridge request: {other}"),
     }

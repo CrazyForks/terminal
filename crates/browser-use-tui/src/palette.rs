@@ -12,6 +12,7 @@ pub(crate) enum PaletteAction {
     ManageSecrets,
     ImportPasswords,
     ManageDomains,
+    ConfigureEmail,
     Reload,
     Update,
     Exit,
@@ -25,7 +26,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 12] = [
+const VISIBLE_ITEMS: [PaletteItem; 13] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -80,6 +81,11 @@ const VISIBLE_ITEMS: [PaletteItem; 12] = [
         command: "/domains",
         description: "allow/block which sites the agent can visit",
         action: PaletteAction::ManageDomains,
+    },
+    PaletteItem {
+        command: "/email",
+        description: "give the agent a disposable inbox for sign-ups, links & codes",
+        action: PaletteAction::ConfigureEmail,
     },
     PaletteItem {
         command: "/feedback",
