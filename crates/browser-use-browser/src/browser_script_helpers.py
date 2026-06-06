@@ -1314,12 +1314,15 @@ class _HttpErrorRecord(dict):
         raise ValueError(f"request failed for {self.url}: {self.error}")
 
 
-def http_get(url, headers=None, timeout=20.0, binary=None):
+def http_get(url, headers=None, timeout=20.0, binary=None, return_error=True):
     """Pure HTTP fetch for static pages and APIs.
 
     When BROWSER_USE_API_KEY is set and fetch_use is installed, route through
     fetch-use like browser-harness. Otherwise fall back to local urllib with a
     browser-like UA and gzip handling. Pass binary=True for bytes.
+    By default HTTP/proxy errors return a structured error object instead of
+    failing the whole browser_script call. Pass return_error=False when a
+    required URL should abort the current script.
     """
     if os.environ.get("BROWSER_USE_API_KEY"):
         try:
@@ -1371,11 +1374,21 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
             f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with js(fetch(...)), "
             "pass site-specific headers/cookies, or configure the Browser Use fetch proxy with BROWSER_USE_API_KEY."
         )
+        if return_error:
+            return _HttpErrorRecord(
+                url=url,
+                error=guidance,
+                status_code=exc.code,
+                headers=dict(exc.headers.items()) if exc.headers else {},
+            )
         raise RuntimeError(guidance) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(
+        guidance = (
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
-        ) from exc
+        )
+        if return_error:
+            return _HttpErrorRecord(url=url, error=guidance)
+        raise RuntimeError(guidance) from exc
 
 
 def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, return_errors=True):
@@ -1408,6 +1421,7 @@ def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, 
             headers=request_headers,
             timeout=request_timeout,
             binary=request_binary,
+            return_error=return_errors,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:

@@ -12215,6 +12215,17 @@ try:
     assert blob == bytes([0, 159, 255])
     assert blob.status_code == 200
     assert blob.content == bytes([0, 159, 255])
+    missing = http_get(base + "/missing")
+    assert missing["ok"] is False, missing
+    assert missing.status_code == 404, missing
+    assert missing.text == "", missing
+    assert missing.content == b"", missing
+    try:
+        http_get(base + "/missing", return_error=False)
+    except RuntimeError as exc:
+        assert "http_get received HTTP 404" in str(exc), exc
+    else:
+        raise AssertionError("return_error=False should raise")
 finally:
     server.shutdown()
     server.server_close()
@@ -12303,8 +12314,8 @@ try:
     assert results[2]["ok"] is False, results[2]
     assert results[2]["url"].endswith("/missing"), results[2]
     assert results[2].ok is False, results[2]
-    assert results[2].status_code is None, results[2]
-    assert results[2].headers == {}, results[2]
+    assert results[2].status_code == 404, results[2]
+    assert results[2].headers, results[2]
     assert results[2].text == "", results[2]
     assert results[2].content == b"", results[2]
     try:
