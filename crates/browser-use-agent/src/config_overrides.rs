@@ -302,6 +302,10 @@ pub struct AgentRunOptions {
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
+    /// Persist exact provider input (system/messages/tool schemas) in
+    /// `model.turn.request` events. Default `false` keeps local CLI/TUI history
+    /// compact and avoids duplicating screenshots/prompt text every turn.
+    pub full_llm_input_events: bool,
     /// MCP servers to connect to and expose via the model-callable `mcp` tool.
     ///
     /// Empty (the default) registers no `mcp` tool, preserving prior behavior.
@@ -368,6 +372,7 @@ impl Default for AgentRunOptions {
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
+            full_llm_input_events: false,
             mcp_servers: HashMap::new(),
             // Default preserves the prior non-interactive behavior: tools
             // auto-approve, the approver is never consulted.
@@ -772,6 +777,15 @@ pub fn apply_runtime_config_overrides(
     }
     if let Some(value) = config_override_bool(overrides, "model_compaction_enabled") {
         options.model_compaction_enabled = value;
+    }
+    if let Some(value) = config_override_bool_any(
+        overrides,
+        &[
+            "full_llm_input_events",
+            "observability.full_llm_input_events",
+        ],
+    ) {
+        options.full_llm_input_events = value;
     }
     if let Some(value) = config_override_i64(overrides, "model_auto_compact_token_limit") {
         options.model_auto_compact_token_limit = Some(value);
@@ -1563,6 +1577,14 @@ fn config_override_bool(overrides: &ConfigOverrides, key: &str) -> Option<bool> 
         .and_then(|(_, value)| value.as_bool())
 }
 
+fn config_override_bool_any(overrides: &ConfigOverrides, keys: &[&str]) -> Option<bool> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| value.as_bool())
+}
+
 fn config_override_i64(overrides: &ConfigOverrides, key: &str) -> Option<i64> {
     overrides
         .iter()
@@ -1828,6 +1850,7 @@ command = "profile-server"
         assert!(options.analytics_source.is_none());
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
+        assert!(!options.full_llm_input_events);
         assert!(options.mcp_servers.is_empty());
         // Approval defaults preserve prior non-interactive behavior.
         assert_eq!(options.approval_policy, AskForApproval::Never);
@@ -1844,6 +1867,7 @@ command = "profile-server"
             "browser_mode=\"remote-cdp\"",
             "python_tool_timeout_seconds=45",
             "model_compaction_enabled=false",
+            "full_llm_input_events=true",
         ]))
         .unwrap();
         let mut options = AgentRunOptions::default();
@@ -1854,6 +1878,21 @@ command = "profile-server"
         assert_eq!(options.browser_mode.as_deref(), Some("remote-cdp"));
         assert_eq!(options.python_tool_timeout_seconds, 45);
         assert!(!options.model_compaction_enabled);
+        assert!(options.full_llm_input_events);
+    }
+
+    #[test]
+    fn runtime_config_overrides_materialize_observability_full_llm_input_alias() {
+        let overrides = parse_config_overrides(&ov(&[
+            "full_llm_input_events=false",
+            "observability.full_llm_input_events=true",
+        ]))
+        .unwrap();
+        let mut options = AgentRunOptions::default();
+
+        apply_runtime_config_overrides(&mut options, &overrides).unwrap();
+
+        assert!(options.full_llm_input_events);
     }
 
     #[test]

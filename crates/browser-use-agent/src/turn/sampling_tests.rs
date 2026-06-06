@@ -740,11 +740,54 @@ async fn open_stream_cache_breakpoints_account_for_browser_mode_system_message()
 }
 
 #[tokio::test]
-async fn turn_request_event_carries_full_llm_input_messages() {
+async fn turn_request_event_omits_full_llm_input_by_default() {
     let (transport, _opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
     let sink = Arc::new(RecordingSink::default());
     let d = driver(transport, sink.clone(), 5);
+
+    let _ = d
+        .run_sampling_request(
+            vec![Message::new(
+                MessageRole::User,
+                vec![
+                    ContentPart::text("Find the account page."),
+                    ContentPart::Media {
+                        mime_type: "image/png".to_string(),
+                        data: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB".to_string()),
+                        url: None,
+                        detail: Some("low".to_string()),
+                    },
+                ],
+            )],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let request = events
+        .iter()
+        .find(|event| event.event_type == names::MODEL_TURN_REQUEST)
+        .expect("turn request event emitted");
+    let llm_input = &request.payload["llm_input"];
+    assert_eq!(llm_input["message_count"], serde_json::json!(1));
+    assert_eq!(llm_input["omitted_earlier_messages"], serde_json::json!(1));
+    assert_eq!(llm_input["full_input_omitted"], serde_json::json!(true));
+    assert_eq!(llm_input["truncated"], serde_json::json!(true));
+    assert!(llm_input.get("messages").is_none());
+    assert!(llm_input.get("system").is_none());
+    assert!(llm_input.get("tools").is_none());
+    let serialized = serde_json::to_string(llm_input).expect("llm_input serializes");
+    assert!(!serialized.contains("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"));
+}
+
+#[tokio::test]
+async fn turn_request_event_carries_full_llm_input_messages() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink.clone(), 5).with_full_llm_input_events(true);
 
     let input = vec![
         Message::new(
@@ -810,7 +853,7 @@ async fn turn_request_event_carries_all_observability_messages_without_text_budg
     let (transport, _opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
     let sink = Arc::new(RecordingSink::default());
-    let d = driver(transport, sink.clone(), 5);
+    let d = driver(transport, sink.clone(), 5).with_full_llm_input_events(true);
 
     let long_text = "observe-this-text".repeat(6_000);
     let mut input: Vec<Message> = (0..85)
@@ -1047,7 +1090,8 @@ async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
     let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
     let d = ModelSamplingDriver::new(transport, sink_for_driver, ctx(), 5)
         .without_jitter()
-        .with_fusion(dispatcher, recorder);
+        .with_fusion(dispatcher, recorder)
+        .with_full_llm_input_events(true);
 
     let _ = d
         .run_sampling_request(user_input(), CancellationToken::new())

@@ -6452,6 +6452,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
+        full_llm_input_events: false,
         // Provider-level runtime options are merged by ConfigDatasetRunner; this
         // per-case layer carries dataset-specific browser/python limits.
         mcp_servers: std::collections::HashMap::new(),

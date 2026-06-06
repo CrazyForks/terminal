@@ -1101,7 +1101,8 @@ fn resolve_provider_with_python(
     let goal_store = build_goal_store(&user_input);
     let goals_enabled = goal_runtime_enabled(config, &user_input);
     let preemption_probe = mailbox_preemption_probe(&user_input, runtime_handle.as_ref());
-    let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries);
+    let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries)
+        .with_full_llm_input_events(config.options.full_llm_input_events);
     if goals_enabled {
         driver = driver.with_goal_store(goal_store.clone());
     }

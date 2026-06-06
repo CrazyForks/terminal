@@ -364,6 +364,10 @@ pub struct ModelSamplingDriver<
     /// stops the current response and reports follow-up so the turn loop drains
     /// that mail on the next iteration.
     mailbox_preemption_probe: Option<MailboxPreemptionProbe>,
+    /// Include the full provider input in `model.turn.request` events. Disabled
+    /// for normal CLI/TUI persistence because it can duplicate large screenshots
+    /// and prompt text into the local event log on every turn.
+    full_llm_input_events: bool,
 }
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
@@ -388,6 +392,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             recorder: None,
             goal_store: None,
             mailbox_preemption_probe: None,
+            full_llm_input_events: false,
         }
     }
 
@@ -417,6 +422,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             recorder: Some(recorder),
             goal_store: self.goal_store,
             mailbox_preemption_probe: self.mailbox_preemption_probe,
+            full_llm_input_events: self.full_llm_input_events,
         }
     }
 }
@@ -435,6 +441,11 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
 
     pub fn with_mailbox_preemption_probe(mut self, probe: MailboxPreemptionProbe) -> Self {
         self.mailbox_preemption_probe = Some(probe);
+        self
+    }
+
+    pub fn with_full_llm_input_events(mut self, enabled: bool) -> Self {
+        self.full_llm_input_events = enabled;
         self
     }
 
@@ -900,7 +911,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // exist here (they are never persisted as message events). Uses the same
         // byte->token estimator the agent uses elsewhere, so it stays consistent.
         let composition = request_composition(&req);
-        let llm_input = request_observability_input(&req);
+        let llm_input = request_observability_input(&req, self.full_llm_input_events);
         let mut attempt: u32 = 0;
         loop {
             self.emit_turn_request(turn_idx, attempt, &composition, &llm_input);
@@ -1146,8 +1157,19 @@ fn request_composition(req: &LlmRequest) -> Value {
     })
 }
 
-fn request_observability_input(req: &LlmRequest) -> Value {
+fn request_observability_input(req: &LlmRequest, include_full_input: bool) -> Value {
     let message_count = req.messages.len();
+    if !include_full_input {
+        return serde_json::json!({
+            "message_count": message_count,
+            "system_count": req.system.len(),
+            "tools_count": req.tools.len(),
+            "omitted_earlier_messages": message_count,
+            "truncated": true,
+            "full_input_omitted": true,
+        });
+    }
+
     let messages: Vec<Value> = req.messages.iter().map(observability_json_value).collect();
     let system: Vec<Value> = req.system.iter().map(observability_json_value).collect();
     let tools: Vec<Value> = req.tools.iter().map(observability_json_value).collect();
