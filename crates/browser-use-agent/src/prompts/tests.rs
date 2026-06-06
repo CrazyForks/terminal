@@ -147,6 +147,21 @@ fn dataset_prompt_enforces_timeboxed_finalization() {
     assert!(prompt.contains("Never keep running until the external runner timeout"));
 }
 
+#[test]
+fn dataset_prompt_authorizes_bounded_source_discovery_helpers() {
+    let prompt = include_str!("../../../../prompts/dataset-case-user.md");
+
+    assert!(BASE_SYSTEM_PROMPT
+        .contains("dataset/eval instructions explicitly authorize bounded read-only helper work"));
+    assert!(prompt.contains("Source-discovery contract"));
+    assert!(prompt.contains("first consider `search` or `web_search`"));
+    assert!(prompt.contains("Do not spend repeated browser navigation steps"));
+    assert!(prompt.contains("Helper-agent contract"));
+    assert!(prompt.contains("three or more independent sources"));
+    assert!(prompt.contains("Spawn at most two helpers at a time"));
+    assert!(prompt.contains("keep shared browser-state actions"));
+}
+
 /// Plan mode was removed. The compatibility enum value now renders the Default
 /// asset so stale configs do not re-enable planning behavior.
 #[test]
