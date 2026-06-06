@@ -1076,9 +1076,7 @@ fn resolve_provider_with_python(
     let mut client = ModelClient::default();
     if let Some(timeout_ms) = config.options.model_stream_idle_timeout_ms {
         let timeout = Duration::from_millis(timeout_ms.max(1));
-        client = client
-            .with_request_timeout(timeout)
-            .with_stream_idle_timeout(timeout);
+        client = client.with_stream_idle_timeout(timeout);
     }
     let client = Arc::new(client);
     let transport = build_transport(client, route, &ctx, Vec::new());

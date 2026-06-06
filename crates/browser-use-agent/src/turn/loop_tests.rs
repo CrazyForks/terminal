@@ -752,7 +752,7 @@ async fn bounded_loop_aborts_after_max_turns() {
     assert!(matches!(
         events.last(),
         Some(TurnLifecycleEvent::TurnAborted {
-            reason: TurnAbortReason::Interrupted,
+            reason: TurnAbortReason::MaxTurns,
             ..
         })
     ));

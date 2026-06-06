@@ -446,6 +446,7 @@ def _is_ip_address(host: str) -> bool:
 
 
 def _domain_pattern_matches(url: str, host: str, scheme: str, pattern: str) -> bool:
+    parsed_url = urllib.parse.urlparse(url)
     full_url_pattern = f"{scheme}://{host}"
     pattern = pattern.strip()
     if not pattern:
@@ -458,10 +459,30 @@ def _domain_pattern_matches(url: str, host: str, scheme: str, pattern: str) -> b
                 host_lower == domain_part or host_lower.endswith(f".{domain_part}")
             )
         if pattern.endswith("/*"):
+            prefix = pattern[:-1]
+            if "://" in prefix:
+                parsed_pattern = urllib.parse.urlparse(prefix)
+                pattern_host = parsed_pattern.hostname
+                if not pattern_host:
+                    return False
+                return (
+                    parsed_pattern.scheme.lower() == scheme.lower()
+                    and pattern_host.lower() == host.lower()
+                    and parsed_url.path.startswith(parsed_pattern.path or "/")
+                )
             return url.startswith(pattern[:-1])
         return fnmatch.fnmatch(full_url_pattern if "://" in pattern else host, pattern)
     if "://" in pattern:
-        return url.lower().startswith(pattern.lower())
+        parsed_pattern = urllib.parse.urlparse(pattern)
+        pattern_host = parsed_pattern.hostname
+        if not pattern_host:
+            return False
+        if parsed_pattern.scheme.lower() != scheme.lower() or pattern_host.lower() != host.lower():
+            return False
+        pattern_path = parsed_pattern.path or ""
+        if pattern_path and pattern_path != "/" and not parsed_url.path.startswith(pattern_path):
+            return False
+        return True
     host_lower = host.lower()
     pattern_lower = pattern.lower()
     if host_lower == pattern_lower:
@@ -486,18 +507,20 @@ def _browser_profile_url_allowed(url: str) -> bool:
 
     allowed_domains = _env_json_string_list("BU_BROWSER_ALLOWED_DOMAINS")
     prohibited_domains = _env_json_string_list("BU_BROWSER_PROHIBITED_DOMAINS")
+    if prohibited_domains and any(
+        _domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in prohibited_domains
+    ):
+        return False
     if allowed_domains:
         return any(_domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in allowed_domains)
-    if prohibited_domains:
-        return not any(_domain_pattern_matches(url, host, parsed.scheme, pattern) for pattern in prohibited_domains)
     return True
 
 
 def _enforce_browser_domain_constraints(method: str, params: dict[str, Any]) -> None:
-    if method != "Page.navigate":
-        return
     url = params.get("url")
     if not isinstance(url, str) or not url:
+        return
+    if method not in {"Page.navigate", "Target.createTarget"} and "." in method:
         return
     if not _browser_profile_url_allowed(url):
         raise RuntimeError(f"BrowserProfile domain constraints blocked navigation to {url}")

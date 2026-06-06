@@ -241,7 +241,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                 _ if max_turns.is_some_and(|limit| turns_run >= limit) => {
                     self.observer.on_lifecycle(TurnLifecycleEvent::TurnAborted {
                         turn_id,
-                        reason: TurnAbortReason::Interrupted,
+                        reason: TurnAbortReason::MaxTurns,
                     });
                     return Ok(last_agent_message);
                 }

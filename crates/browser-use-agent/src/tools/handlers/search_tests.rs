@@ -239,6 +239,29 @@ fn parse_lite_results_strips_inline_markup_and_collapses_whitespace() {
     );
 }
 
+#[test]
+fn parse_lite_results_filters_duckduckgo_hosts_without_dropping_mentions_elsewhere() {
+    let html = r#"
+    <html><body><table>
+      <tr><td><a class="result-link"
+             href="https://example.com/articles/duckduckgo.com-review">Valid Mention</a></td></tr>
+      <tr><td class="result-snippet">kept</td></tr>
+      <tr><td><a class="result-link"
+             href="https://duckduckgo.com/about">DuckDuckGo About</a></td></tr>
+      <tr><td class="result-snippet">dropped</td></tr>
+    </table></body></html>
+    "#;
+
+    let results = parse_lite_results(html);
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].title, "Valid Mention");
+    assert_eq!(
+        results[0].url,
+        "https://example.com/articles/duckduckgo.com-review"
+    );
+}
+
 // ---- pure helpers: format_results -----------------------------------------
 
 #[test]

@@ -1063,7 +1063,6 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     base_system.cache = Some(CacheHint::Ephemeral);
     req.system.push(base_system);
     req.messages = input;
-    mark_message_cache_breakpoints(&mut req.messages);
     if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
         req.messages.insert(
             0,
@@ -1073,6 +1072,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
             ),
         );
     }
+    mark_message_cache_breakpoints(&mut req.messages);
     req
 }
 

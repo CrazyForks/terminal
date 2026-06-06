@@ -478,7 +478,7 @@ pub fn parse_lite_results(html: &str) -> Vec<SearchResult> {
         let Some(url) = extract_real_url(&anchor.href) else {
             continue;
         };
-        if seen.contains(&url) || url.contains("duckduckgo.com") {
+        if seen.contains(&url) || is_duckduckgo_result_host(&url) {
             continue;
         }
         seen.insert(url.clone());
@@ -501,6 +501,13 @@ pub fn parse_lite_results(html: &str) -> Vec<SearchResult> {
     }
 
     results
+}
+
+fn is_duckduckgo_result_host(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
 }
 
 /// A raw `a.result-link` extracted from the HTML, with its byte offset.

@@ -13,6 +13,7 @@ use image::imageops::FilterType;
 use serde_json::{json, Map, Value};
 
 const ANTHROPIC_MAX_MANY_IMAGE_DIMENSION: u32 = 2_000;
+const ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS: usize = 8 * 1024 * 1024;
 
 use crate::protocols::utils::{Lifecycle, ToolStream};
 use crate::route::framing::SseFrame;
@@ -168,7 +169,7 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             ..
         } => {
             let source = if let Some(data) = data {
-                let (media_type, data) = anthropic_safe_inline_image(mime_type, data)
+                let (media_type, data) = anthropic_safe_inline_image(mime_type, data)?
                     .unwrap_or_else(|| (mime_type.clone(), data.clone()));
                 json!({ "type": "base64", "media_type": media_type, "data": data })
             } else if let Some(url) = url {
@@ -236,16 +237,35 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
     }
 }
 
-fn anthropic_safe_inline_image(mime_type: &str, data: &str) -> Option<(String, String)> {
+fn anthropic_safe_inline_image(
+    mime_type: &str,
+    data: &str,
+) -> Result<Option<(String, String)>, LlmError> {
     if !mime_type.starts_with("image/") {
-        return None;
+        return Ok(None);
     }
-    let bytes = general_purpose::STANDARD.decode(data.as_bytes()).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
+    if data.len() > ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS {
+        return Err(LlmError::new(
+            LlmErrorReason::InvalidRequest,
+            format!(
+                "inline image is too large to normalize safely: {} base64 chars exceeds {}",
+                data.len(),
+                ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS
+            ),
+        ));
+    }
+    let bytes = match general_purpose::STANDARD.decode(data.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let image = match image::load_from_memory(&bytes) {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
     let width = image.width();
     let height = image.height();
     if width <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION && height <= ANTHROPIC_MAX_MANY_IMAGE_DIMENSION {
-        return None;
+        return Ok(None);
     }
 
     let scale = (ANTHROPIC_MAX_MANY_IMAGE_DIMENSION as f32 / width as f32)
@@ -256,11 +276,11 @@ fn anthropic_safe_inline_image(mime_type: &str, data: &str) -> Option<(String, S
     let mut encoded = Cursor::new(Vec::new());
     resized
         .write_to(&mut encoded, image::ImageFormat::Png)
-        .ok()?;
-    Some((
+        .map_err(|err| LlmError::new(LlmErrorReason::InvalidRequest, err.to_string()))?;
+    Ok(Some((
         "image/png".to_string(),
         general_purpose::STANDARD.encode(encoded.into_inner()),
-    ))
+    )))
 }
 
 fn flatten_error_tool_result_content(content: &[ContentPart]) -> String {
@@ -1033,6 +1053,27 @@ mod tests {
         let resized = image::load_from_memory(&bytes).unwrap();
         assert_eq!(resized.width(), 2000);
         assert_eq!(resized.height(), 1000);
+    }
+
+    #[test]
+    fn build_body_rejects_unbounded_inline_image_normalization() {
+        let mut req = LlmRequest::new("m", "anthropic");
+        req.messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::Media {
+                mime_type: "image/png".into(),
+                data: Some("A".repeat(ANTHROPIC_MAX_INLINE_IMAGE_BASE64_CHARS + 1)),
+                url: None,
+                detail: None,
+            }],
+        ));
+
+        let err = AnthropicMessagesProtocol::new()
+            .build_body(&req)
+            .expect_err("oversized inline image should fail before decode");
+
+        assert_eq!(err.reason, LlmErrorReason::InvalidRequest);
+        assert!(err.message.contains("inline image is too large"));
     }
 
     #[test]

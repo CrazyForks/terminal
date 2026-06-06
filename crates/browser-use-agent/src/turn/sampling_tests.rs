@@ -386,7 +386,9 @@ async fn active_goal_context_is_injected_with_codex_envelope() {
     assert!(text.starts_with("<goal_context>\n"));
     assert!(text.ends_with("\n</goal_context>"));
     assert!(text.contains("<objective>\nfinish the active goal\n</objective>"));
-    assert_eq!(req.messages[1], user_input()[0]);
+    let mut expected_user = user_input()[0].clone();
+    expected_user.cache = Some(CacheHint::Ephemeral);
+    assert_eq!(req.messages[1], expected_user);
 }
 
 // ---- (2) text-only stream -> no follow_up ---------------------------------
@@ -697,6 +699,47 @@ async fn open_stream_marks_an_earlier_cache_breakpoint_for_long_histories() {
 }
 
 #[tokio::test]
+async fn open_stream_cache_breakpoints_account_for_browser_mode_system_message() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let mut turn_ctx = ctx();
+    turn_ctx.browser_mode_instruction = Some("Browser mode: cloud".to_string());
+    let d = ModelSamplingDriver::new(transport, sink, turn_ctx, 5).without_jitter();
+
+    let input: Vec<Message> = (0..25)
+        .map(|index| {
+            Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!("browser state {index}"))],
+            )
+        })
+        .collect();
+    let _ = d
+        .run_sampling_request(input, CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    assert_eq!(req.messages[0].role, MessageRole::System);
+    let cache_indices: Vec<usize> = req
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.cache == Some(CacheHint::Ephemeral)).then_some(index)
+        })
+        .collect();
+
+    assert_eq!(
+        cache_indices,
+        vec![9, 25],
+        "cache hints should be computed after browser-mode system insertion, not shifted onto stale indices"
+    );
+}
+
+#[tokio::test]
 async fn turn_request_event_carries_full_llm_input_messages() {
     let (transport, _opens) =
         ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
@@ -836,7 +879,9 @@ async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
         "mode instruction message was not prepended: {:?}",
         req.messages[0]
     );
-    assert_eq!(&req.messages[1..], input.as_slice());
+    let mut expected_input = input.clone();
+    expected_input.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
+    assert_eq!(&req.messages[1..], expected_input.as_slice());
 }
 
 // ---- (6) each turn installs its OWN request (the cell is per-call) ----------
@@ -864,9 +909,11 @@ async fn each_open_sees_its_own_per_call_request() {
             !req.messages.is_empty(),
             "open #{i} received an EMPTY request"
         );
+        let mut expected_input = input.clone();
+        expected_input.last_mut().unwrap().cache = Some(CacheHint::Ephemeral);
         assert_eq!(
-            req.messages, input,
-            "open #{i} must carry the per-call input verbatim"
+            req.messages, expected_input,
+            "open #{i} must carry the per-call input plus provider cache hint"
         );
     }
 }

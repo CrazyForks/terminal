@@ -497,9 +497,9 @@ def test_worker_cdp_enforces_browser_domain_constraints_env(monkeypatch) -> None
         def ensure_daemon(self):
             self.ensure_calls += 1
 
-    def expect_blocked(url: str) -> None:
+    def expect_blocked(url: str, method: str = "Page.navigate") -> None:
         try:
-            helpers.cdp("Page.navigate", session_id="target-1", url=url)
+            helpers.cdp(method, session_id="target-1", url=url)
         except RuntimeError as exc:
             assert "BrowserProfile domain constraints blocked navigation" in str(exc)
             assert url in str(exc)
@@ -516,6 +516,12 @@ def test_worker_cdp_enforces_browser_domain_constraints_env(monkeypatch) -> None
     assert calls == [("Page.navigate", "target-1", {"url": "https://www.example.com/path"})]
 
     expect_blocked("https://iana.org/")
+    expect_blocked("https://example.com.evil.org/")
+
+    assert len(calls) == 1
+
+    monkeypatch.setenv("BU_BROWSER_PROHIBITED_DOMAINS", '["www.example.com"]')
+    expect_blocked("https://www.example.com/path")
 
     assert len(calls) == 1
 
@@ -526,13 +532,18 @@ def test_worker_cdp_enforces_browser_domain_constraints_env(monkeypatch) -> None
 
     assert len(calls) == 1
 
+    helpers.cdp("Target.createTarget", url="https://safe.example/")
+    assert calls[-1] == ("Target.createTarget", None, {"url": "https://safe.example/"})
+
+    expect_blocked("https://ads.tracking.example/", method="Target.createTarget")
+
     monkeypatch.delenv("BU_BROWSER_PROHIBITED_DOMAINS", raising=False)
     monkeypatch.setenv("BU_BROWSER_BLOCK_IP_ADDRESSES", "true")
 
     expect_blocked("http://127.0.0.1/")
 
-    assert len(calls) == 1
-    assert admin.ensure_calls == 4
+    assert len(calls) == 2
+    assert admin.ensure_calls == 8
 
 
 def test_worker_page_info_fallback_reads_target_url_and_title(

@@ -783,7 +783,15 @@ impl ModelClient {
         let max = self.retry.max_attempts.max(1);
         let mut last_err: Option<LlmError> = None;
         for attempt in 0..max {
-            match self.send_once(url, headers, body).await {
+            let send_once = self.send_once(url, headers, body);
+            let attempt_result = match self.request_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, send_once).await {
+                    Ok(result) => result,
+                    Err(_) => Err((model_request_timeout_error(timeout), None)),
+                },
+                None => send_once.await,
+            };
+            match attempt_result {
                 Ok(resp) => return Ok(resp),
                 Err((err, retry_after_ms)) => {
                     let last_attempt = attempt + 1 >= max;
@@ -814,13 +822,7 @@ impl ModelClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + Send>>, LlmError> {
         let (body, headers) = self.prepare(route, req)?;
         let url = route.endpoint.url();
-        let send = self.send_with_retry(&url, &headers, &body);
-        let resp = match self.request_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, send)
-                .await
-                .map_err(|_| model_request_timeout_error(timeout))??,
-            None => send.await?,
-        };
+        let resp = self.send_with_retry(&url, &headers, &body).await?;
 
         let state = StreamState {
             byte_stream: Box::pin(resp.bytes_stream()),
@@ -1398,6 +1400,39 @@ mod tests {
         (format!("http://{addr}/v1"), handle)
     }
 
+    fn spawn_timeout_then_sse_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if attempt == 0 {
+                    thread::spawn(move || {
+                        let _keep_open = stream;
+                        thread::sleep(Duration::from_millis(100));
+                    });
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                        .expect("write headers");
+                }
+            }
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
     #[tokio::test]
     async fn stream_open_timeout_yields_retryable_transport_error() {
         let (base_url, handle) = spawn_no_response_server();
@@ -1426,6 +1461,31 @@ mod tests {
             err.message.contains("model request timeout after 20ms"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_open_timeout_is_per_attempt_not_whole_retry_loop() {
+        let (base_url, handle) = spawn_timeout_then_sse_server();
+        let client = ModelClient::with_retry(RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            jitter_seed: None,
+        })
+        .with_request_timeout(Duration::from_millis(20));
+        let route = Route::new(
+            Box::new(OpenAiResponsesProtocol::new()),
+            Endpoint::new(base_url, "/responses"),
+            Auth::bearer("sk-not-used"),
+        );
+        let mut req = LlmRequest::new("gpt-5.1-codex", "openai");
+        req.messages.push(crate::schema::Message::user_text("hi"));
+
+        let _stream = client
+            .stream(&route, &req)
+            .await
+            .expect("second request-open attempt should succeed");
+        handle.join().expect("server thread");
     }
 
     #[tokio::test]
