@@ -30,6 +30,7 @@ use browser_use_llm::providers::{
 };
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{ContentPart, LlmRequest, Message, MessageRole, SystemPart};
+use serde_json::json;
 
 use crate::events::{EventSink, TurnCtx};
 use crate::turn::sampling::{ModelClientTransport, ModelSamplingDriver};
@@ -249,7 +250,15 @@ pub fn build_transport(
             ),
         );
     }
+    apply_browser_use_provider_options(&ctx.provider, &mut req);
     ModelClientTransport::new(client, route, req)
+}
+
+pub(crate) fn apply_browser_use_provider_options(provider: &str, req: &mut LlmRequest) {
+    let normalized = provider.trim().to_ascii_lowercase().replace(['_', '-'], "");
+    if normalized == "browseruse" {
+        req.provider_options = Some(json!({ "request_type": "rust_agent" }));
+    }
 }
 
 /// Build the production text-only [`ModelSamplingDriver`] over a live transport.
@@ -358,6 +367,18 @@ mod tests {
         assert_eq!(
             route.endpoint.url(),
             "https://llm.internal/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn browser_use_provider_options_tag_rust_agent_requests() {
+        let mut req = LlmRequest::new("bu-3-max", "browseruse");
+
+        apply_browser_use_provider_options("browser-use", &mut req);
+
+        assert_eq!(
+            req.provider_options,
+            Some(serde_json::json!({ "request_type": "rust_agent" }))
         );
     }
 

@@ -102,6 +102,12 @@ impl Protocol for OpenAiChatProtocol {
 
         apply_generation(&mut body, &req.generation);
 
+        if let Some(Value::Object(provider_options)) = &req.provider_options {
+            for (key, value) in provider_options {
+                body.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
         body.insert("stream".to_string(), Value::Bool(true));
         body.insert(
             "stream_options".to_string(),
@@ -807,6 +813,20 @@ mod tests {
         });
 
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_body_merges_provider_options_without_overriding_core_fields() {
+        let mut req = LlmRequest::new("gpt-4o", "browser-use");
+        req.provider_options = Some(json!({
+            "request_type": "rust_agent",
+            "model": "wrong-model"
+        }));
+
+        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
+
+        assert_eq!(body["request_type"], "rust_agent");
+        assert_eq!(body["model"], "gpt-4o");
     }
 
     #[test]

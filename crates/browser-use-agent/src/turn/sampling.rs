@@ -1083,6 +1083,7 @@ fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
             ),
         );
     }
+    super::model_path::apply_browser_use_provider_options(&ctx.provider, &mut req);
     mark_message_cache_breakpoints(&mut req.messages);
     req
 }
