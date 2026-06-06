@@ -458,3 +458,11 @@ After all 4 safety WPs: switch browser-use-tui + browser-use-cli from browser-us
   low-score action churn where the browser/page was still usable but the model
   retried with stale script-local names.
   - Proof: `cargo test -p browser-use-browser browser_script_tracebacks_are_not_treated_as_dropped_websockets -- --nocapture`
+
+- [x] Done tool timebox partial-result guidance — the `done` tool description
+  now explicitly tells the model to submit the best verified partial result
+  with unknown/incomplete fields marked when wall-clock or step budget is nearly
+  exhausted, instead of continuing until external cancellation. This targets
+  repeated evaluated-but-low rows where the agent had evidence but hit the
+  30-minute budget without an intentional finalization step.
+  - Proof: `cargo test -p browser-use-agent done_definition_preserves_timebox_partial_result_guidance -- --nocapture`
