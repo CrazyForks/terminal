@@ -11,21 +11,15 @@
 //!
 //! # What this tool does (and does NOT) do
 //!
-//! It RECORDS the model's final completion message and returns a deterministic
+//! It records the model's final completion message and returns a deterministic
 //! acknowledgement (prefixed with [`DONE_STDOUT_PREFIX`]) so the loop / host can
-//! recognize that the agent declared itself finished, and so the final `text`
-//! (the summary) is surfaced to the host.
+//! recognize that the agent declared itself finished, and so the final `result`
+//! or legacy `text` summary is surfaced to the host.
 //!
-//! It does NOT itself force the turn loop to stop: the loop's termination signal
-//! is "the model produced a final assistant message with NO tool calls"
-//! ([`TurnRunOutcome::NoToolCalls`](crate::turn::loop::TurnRunOutcome)). A `done`
-//! call is a tool call, so it is dispatched, recorded, and the loop re-samples;
-//! the model then typically produces a final no-tool message and the loop stops.
-//! Wiring the loop to treat a successful `done` [`ExecOutput`] as terminal (a
-//! short-circuit) needs the loop's classifier (`turn/loop.rs` /
-//! `turn/fusion.rs`) to inspect the dispatched tool name/output — those files are
-//! outside this WP's owned set, so that deeper loop wiring is REPORTED, not
-//! implemented here.
+//! The fused turn loop treats a successful non-empty `done` call as terminal. An
+//! empty `done` call is rejected as a recoverable tool error so the model gets
+//! another turn to provide a real user-visible answer instead of ending the run
+//! with `None`.
 //!
 //! # Parity grounding
 //!
@@ -67,8 +61,9 @@ pub const DONE_STDOUT_PREFIX: &str = "done:";
 ///
 /// `result` is the canonical final answer. `text` remains accepted for legacy
 /// callers, and `result_file` can point at a persisted artifact when the answer
-/// is intentionally file-backed. All fields are optional so the model may still
-/// declare done with no message.
+/// is intentionally file-backed. At least one field must carry a non-empty value
+/// at runtime; an empty `done` call is rejected so the model can repair the final
+/// answer instead of silently ending the run with no user-visible result.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoneRequest {
     /// Canonical user-facing final answer.
@@ -213,10 +208,15 @@ impl ToolRuntime<DoneRequest, ExecOutput> for DoneTool {
         // to make the seam explicit, matching the other tools.
         let _ = attempt;
 
-        // Record the final summary into a deterministic, prefixed acknowledgement
-        // the loop/host can recognize as the declared completion. The summary may
-        // be empty (the model can declare done without a message).
         let summary = req.summary();
+        if summary.is_empty() {
+            return Err(ToolError::Rejected(
+                "done requires a non-empty result, text, or result_file. Include the final answer or partial findings.".to_string(),
+            ));
+        }
+
+        // Record the final summary into a deterministic, prefixed acknowledgement
+        // the loop/host can recognize as the declared completion.
         Ok(ExecOutput {
             exit_code: 0,
             stdout: format!("{DONE_STDOUT_PREFIX}{summary}"),

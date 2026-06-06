@@ -1224,6 +1224,41 @@ async fn fused_done_result_becomes_final_message_without_follow_up() {
 }
 
 #[tokio::test]
+async fn fused_empty_done_requests_follow_up_instead_of_finalizing_none() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    let specs = vec![tool_def("done")];
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner, /* model_supports */ true, specs,
+    ));
+    let (transport, _opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        tool_call_with_input("done", serde_json::json!({})),
+        finish(FinishReason::ToolUse),
+    ])]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert!(
+        out.model_needs_follow_up,
+        "empty done must feed the tool result/error back to the model instead of ending with None"
+    );
+    assert_eq!(out.last_agent_message, None);
+    assert!(
+        !out.defers_mailbox_delivery_to_next_turn,
+        "empty done is not a final-answer boundary"
+    );
+}
+
+#[tokio::test]
 async fn text_only_driver_sends_no_tool_specs() {
     // The text-only driver (no dispatcher) must send NO tools — codex sends the
     // tool catalog only when the turn's toolset is non-empty, and this is the

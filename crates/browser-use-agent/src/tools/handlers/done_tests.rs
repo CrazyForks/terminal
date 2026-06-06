@@ -71,20 +71,22 @@ async fn done_with_text_records_the_summary() {
     assert_eq!(summary, "All tests pass; shipped.");
 }
 
-// ---- (2) a done call WITHOUT text still succeeds (empty summary) ----
+// ---- (2) a done call WITHOUT text is rejected so the model can repair it ----
 
 #[tokio::test]
-async fn done_without_text_yields_empty_summary() {
+async fn done_without_text_is_rejected() {
     let tool = DoneTool::new();
     let launch = none_launch();
     let attempt = none_attempt(&launch);
 
-    let out = tool
+    let err = tool
         .run(&DoneRequest::default(), &attempt, &ctx())
         .await
-        .unwrap();
-    assert_eq!(out.exit_code, 0);
-    assert_eq!(out.stdout, DONE_STDOUT_PREFIX);
+        .unwrap_err();
+    let crate::tools::runtime::ToolError::Rejected(message) = err else {
+        panic!("expected rejected empty done, got {err:?}");
+    };
+    assert!(message.contains("non-empty result"), "message: {message}");
 }
 
 // ---- (3) the wire args deserialize from Browser Use-style and legacy payloads ----
@@ -115,7 +117,7 @@ fn done_wire_args_round_trip() {
             .expect("file done deserialize");
     assert_eq!(file_only.summary(), "Result file: outputs/answer.json");
 
-    // Minimal: fields omitted -> None (the model may declare done with no message).
+    // Minimal: fields omitted -> None; runtime rejects this so the model can repair.
     let empty: DoneRequest =
         serde_json::from_value(serde_json::json!({})).expect("empty done deserialize");
     assert_eq!(empty.result, None);

@@ -707,21 +707,7 @@ fn extract_tool_calls(parts: &[ContentPart]) -> Vec<ContentPart> {
 /// [`DONE_TOOL_NAME`](crate::tools::handlers::done::DONE_TOOL_NAME).
 const DONE_TOOL_NAME: &str = "done";
 
-/// Whether any of `tool_calls` is a call to the completion (`done`) tool.
-///
-/// When the model calls `done`, it has declared the turn complete: the fused
-/// driver dispatches the call (so the `done` summary is recorded into history),
-/// then reports `model_needs_follow_up = false` so the loop terminates instead
-/// of re-sampling. This is the engine-side terminal signal the `done` handler's
-/// module doc flagged as deferred ("wiring the loop to treat a successful `done`
-/// output as terminal needs the loop's classifier") — wired here.
-fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
-    tool_calls
-        .iter()
-        .any(|p| matches!(p, ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME))
-}
-
-/// The final summary carried by the model's `done` call, if any.
+/// Return the completion (`done`) summary when the model supplied one.
 ///
 /// Reads the `result` field from the first `done` tool call's JSON arguments,
 /// falling back to the legacy `text` alias and then to a compact `result_file`
@@ -989,18 +975,19 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match (&self.dispatcher, &self.recorder, tool_calls.is_empty()) {
                     // Fused path with at least one tool call.
                     (Some(dispatcher), Some(recorder), false) => {
-                        // A `done` call declares the turn finished: dispatch it (so the
-                        // summary is recorded) but report NO follow-up, terminating the
-                        // loop. Detect it BEFORE the calls vec is consumed by dispatch.
-                        let is_terminal = calls_done_tool(&tool_calls);
+                        // A `done` call only declares the turn finished when it carries
+                        // a non-empty result. Empty `done` calls are dispatched as
+                        // recoverable tool errors and followed up, so the model gets a
+                        // chance to return the final answer instead of silently ending
+                        // the run with `None`.
+                        let terminal_done_summary = done_summary(&tool_calls);
+                        let is_terminal = terminal_done_summary.is_some();
                         // Surface the `done` summary as the turn result when the model
                         // declared completion via `done` and streamed no other text, so
                         // the loop returns the summary (codex keeps the final message).
                         if is_terminal && last_agent_message.is_none() {
-                            last_agent_message = done_summary(&tool_calls);
-                            if last_agent_message.is_some() {
-                                acc.defers_mailbox_delivery_to_next_turn = true;
-                            }
+                            last_agent_message = terminal_done_summary;
+                            acc.defers_mailbox_delivery_to_next_turn = true;
                         }
 
                         // 1. Record the assistant message (text + tool calls), so the
