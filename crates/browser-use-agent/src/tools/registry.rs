@@ -1155,14 +1155,14 @@ to the single frame that proves the task succeeded."
         }
     }
 
-    /// `search`: a LOCALLY-executed DuckDuckGo (Lite) web search. Unlike the
-    /// hosted [`web_search`](definitions::web_search), the client performs the
-    /// HTTP request itself and returns the parsed results as text. Ported from
-    /// the Python `search` action's description.
+    /// `search`: a web search via the browser-use search API
+    /// (`search.browser-use.com`). Unlike the hosted
+    /// [`web_search`](definitions::web_search), the client performs the API
+    /// call itself and returns the parsed results as text.
     pub fn search() -> ToolDefinition {
         ToolDefinition {
             name: "search".to_string(),
-            description: "Search the web with a local DuckDuckGo Lite request and return compact \
+            description: "Search the web with the browser-use search API and return compact \
                  text results. This does not use or require a browser connection or browser \
                  session. Use this instead of navigating a browser to Google, DuckDuckGo, Bing, \
                  or any other search engine; it is far more token-efficient than reading a search \
@@ -2036,8 +2036,8 @@ where
         tool_search,
     );
     reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
-    // `search`: locally-executed DuckDuckGo search. Serial to avoid
-    // DuckDuckGo Lite rate-limit blocks from concurrent requests.
+    // `search`: web search via the browser-use search API. Serial: a
+    // conservative scheduling default for a billed API call.
     reg.register::<_, SearchRequest>(
         "search",
         definitions::search(),

@@ -488,8 +488,8 @@ impl McpClient for FakeMcpClient {
     }
 }
 
-/// A fake search backend: returns a canned DuckDuckGo Lite HTML fragment with a
-/// single result echoing the query, so no network is touched (mirrors
+/// A fake search backend: returns a canned search-API JSON body with a single
+/// result echoing the query, so no network is touched (mirrors
 /// `search_tests.rs`).
 struct FakeSearchBackend;
 
@@ -497,10 +497,7 @@ struct FakeSearchBackend;
 impl SearchBackend for FakeSearchBackend {
     async fn fetch(&self, query: &str) -> Result<String, SearchError> {
         Ok(format!(
-            "<table>\
-               <tr><td><a class=\"result-link\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F\">Result for {query}</a></td></tr>\
-               <tr><td class=\"result-snippet\">snippet for {query}</td></tr>\
-             </table>"
+            r#"{{"results":[{{"title":"Result for {query}","url":"https://example.com/","content":"snippet for {query}"}}]}}"#
         ))
     }
 }
@@ -582,8 +579,8 @@ fn default_registry_registers_all_tools() {
 fn search_definition_guides_model_away_from_browser_search_engines() {
     let desc = definitions::search().description;
     assert!(
-        desc.contains("local DuckDuckGo Lite request"),
-        "search description should explain the local search backend: {desc}"
+        desc.contains("browser-use search API"),
+        "search description should explain the search backend: {desc}"
     );
     assert!(
         desc.contains("does not use or require a browser connection or browser session"),

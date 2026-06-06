@@ -1111,9 +1111,9 @@ fn resolve_provider_with_python(
 /// The registry registers the backend-free handlers — `shell`, `apply_patch`,
 /// `view_image`, `update_plan`, `done`, `tool_search` (catalog populated from the registered tools' defs),
 /// `web_search` (ENABLED; the Responses builder encodes it as the hosted
-/// `web_search_preview` tool), `search` (a locally-executed DuckDuckGo search,
-/// distinct from the hosted `web_search`) — plus the two product-surface tools
-/// that drive real subsystems:
+/// `web_search_preview` tool), `search` (a client-executed call to the
+/// browser-use search API, distinct from the hosted `web_search`) — plus the
+/// two product-surface tools that drive real subsystems:
 ///   * `browser` ([`BrowserTool::new`]): standalone — the production
 ///     [`RealBackend`](crate::tools::handlers::browser::RealBackend) wraps the
 ///     `browser-use-browser` crate and manages CDP sessions internally (keyed by
@@ -1294,9 +1294,10 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         true,
         WebSearchTool::new(WebSearchConfig::enabled()),
     );
-    // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
-    // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Serial to avoid DuckDuckGo Lite rate-limit blocks.
+    // `search`: web search via the browser-use search API — the client makes
+    // the API call (auth: `BROWSER_USE_API_KEY`) and formats the results itself
+    // (distinct from the hosted `web_search` above). Serial: a conservative
+    // scheduling default for a billed API call.
     reg.register::<_, SearchRequest>(
         "search",
         definitions::search(),
