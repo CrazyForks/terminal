@@ -35,6 +35,13 @@ const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
 const BROWSER_CONNECT_CDP_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod secrets_runtime;
+pub use secrets_runtime::{
+    clear_script_security, has_email_resolver, has_script_security, has_secret_resolver,
+    set_email_resolver, set_script_security, set_secret_resolver, EmailResolver, ScriptSecret,
+    ScriptSecurity, SecretResolver,
+};
+
 #[derive(Debug)]
 pub struct BrowserCommandOutput {
     pub content: Value,
@@ -1065,13 +1072,16 @@ pub fn run_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    run_browser_script_with_session_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_sessions(),
+        run_browser_script_with_session_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_sessions(),
+        ),
     )
 }
 
@@ -1109,13 +1119,16 @@ pub fn start_browser_script(
     code: &str,
     timeout_seconds: u64,
 ) -> Result<BrowserScriptOutput> {
-    start_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        cwd,
-        artifact_dir,
-        code,
-        timeout_seconds,
-        browser_script_runs(),
+        start_browser_script_with_registry(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -1236,11 +1249,14 @@ pub fn observe_browser_script(
     run_id: &str,
     observe_timeout_ms: u64,
 ) -> Result<BrowserScriptOutput> {
-    observe_browser_script_with_registry(
+    secrets_runtime::finish_with_redaction(
         session_id,
-        run_id,
-        observe_timeout_ms,
-        browser_script_runs(),
+        observe_browser_script_with_registry(
+            session_id,
+            run_id,
+            observe_timeout_ms,
+            browser_script_runs(),
+        ),
     )
 }
 
@@ -1344,7 +1360,10 @@ pub fn observe_browser_script_with_registry(
 }
 
 pub fn cancel_browser_script(session_id: &str, run_id: &str) -> Result<BrowserScriptOutput> {
-    cancel_browser_script_with_registry(session_id, run_id, browser_script_runs())
+    secrets_runtime::finish_with_redaction(
+        session_id,
+        cancel_browser_script_with_registry(session_id, run_id, browser_script_runs()),
+    )
 }
 
 pub fn cancel_browser_script_with_registry(
@@ -1410,6 +1429,8 @@ fn spawn_browser_script_with_session_registry(
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
     let frames_dir = artifact_dir.as_ref().join(format!(".{run_id}.frames"));
+    let security = secrets_runtime::script_security_for(session_id);
+    let security_blob = security.stdin_blob();
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -1435,11 +1456,20 @@ fn spawn_browser_script_with_session_registry(
         .arg("-c")
         .arg(prelude)
         .current_dir(cwd.as_ref())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn browser_script python")?;
+    // Hand the secrets + nav policy to the child over stdin (one JSON line) so
+    // secret values never appear in the `-c` argv (process listings) or on disk.
+    // The Rust-side nav guard is authoritative regardless, so a write failure
+    // here only means the child runs without secrets — never without the guard.
+    if let Some(mut child_stdin) = child.stdin.take() {
+        let _ = child_stdin.write_all(security_blob.as_bytes());
+        let _ = child_stdin.write_all(b"\n");
+        // Dropping the handle closes stdin -> EOF for the child's readline.
+    }
     let stdout_reader = child.stdout.take().map(read_browser_script_stdout);
     let stderr_reader = child.stderr.take().map(read_browser_script_stderr);
     Ok(BrowserScriptRun {
@@ -8050,6 +8080,17 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
                     }
                 }
             }
+            // Navigation guard (Cloud `allowed_domains`): every CDP call funnels here.
+            if method == "Page.navigate" {
+                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                    if let Some(script_session) = session.session_id.as_deref() {
+                        let security = secrets_runtime::script_security_for(script_session);
+                        if let Some(reason) = secrets_runtime::nav_denied_reason(url, &security) {
+                            bail!("{reason}");
+                        }
+                    }
+                }
+            }
             let session_id = request.get("session_id").and_then(Value::as_str);
             let use_browser_session = session_id.is_none() && !method.starts_with("Target.");
             let current_session = session.current_session_id.clone();
@@ -8095,10 +8136,38 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
             }
         }
         "status" => Ok(session.status_json_with_page_probe()),
+        // Lazy, on-demand secret fetch. The script asks for a value only when it
+        // is about to fill a field, so the encrypted store is read exactly then —
+        // not eagerly at spawn — and at most once per secret.
+        "secret" => {
+            let domain = request.get("domain").and_then(Value::as_str).unwrap_or("");
+            let name = request.get("name").and_then(Value::as_str).unwrap_or("");
+            let session_id = session.session_id.clone().unwrap_or_default();
+            let value = secrets_runtime::fetch_secret_for_session(&session_id, domain, name)?;
+            Ok(json!({ "value": value }))
+        }
+        // Email inbox access. `op` is "address" (the agent's inbox address),
+        // "inbox" (list recent messages; `limit` optional), or "message" (read
+        // one message's full body; requires `message_id`). For "inbox"/"message"
+        // the value is a JSON string the helper parses. `value: null` when no
+        // inbox is configured.
+        "email" => {
+            let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+            let arg = match op {
+                "message" => request.get("message_id").and_then(Value::as_str),
+                "inbox" => request.get("limit").and_then(Value::as_str),
+                _ => None,
+            };
+            match secrets_runtime::email_for_session(op, arg) {
+                Ok(value) => Ok(json!({ "value": value })),
+                Err(error) => Ok(json!({ "value": null, "error": error })),
+            }
+        }
         other => bail!("unknown browser_script bridge request: {other}"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browser_script_prelude(
     bridge_port: u16,
     cwd: &Path,
@@ -8135,6 +8204,21 @@ FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
 OUTPUTS_DIR = pathlib.Path(os.environ.get("BH_OUTPUTS_DIR") or {cwd:?}).expanduser().resolve()
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
+# Secret METADATA + navigation policy are handed over on stdin (one JSON line).
+# Only metadata is sent — which placeholders exist per domain and whether each is
+# a TOTP — NEVER values. The actual value is fetched on demand via the `secret`
+# bridge request when secret()/totp() is called, so the OS keychain is read only
+# when the agent is on the page and filling a field. Shape:
+# {{meta:{{domain:{{name:{{totp:bool}}}}}}, nav_allow:[...], nav_deny:[...]}}.
+try:
+    _security = json.loads(sys.stdin.readline() or "{{}}")
+except Exception:
+    _security = {{}}
+_SECRET_META = _security.get("meta") or {{}}
+# Enforced in Rust on Page.navigate; also checked here after load to catch redirects.
+_NAV_ALLOW = _security.get("nav_allow") or []
+_NAV_DENY = _security.get("nav_deny") or []
+_EMAIL_AVAILABLE = bool(_security.get("email_available"))
 
 # 2fps screen capture (observability prototype). Polls Page.captureScreenshot on
 # a fixed cadence so frames land even when the page is visually static. Frames
@@ -12432,6 +12516,81 @@ print("fill_input cdp/browser-harness events ok")
     }
 
     #[test]
+    fn browser_script_fill_input_waits_briefly_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-fill-input-default-wait",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+events = []
+query_count = 0
+
+def cdp(method, **params):
+    global query_count
+    events.append((method, params))
+    if method == "DOM.getDocument":
+        return {"root": {"nodeId": 1}}
+    if method == "DOM.querySelector":
+        query_count += 1
+        assert params["selector"] == "#late", params
+        return {"nodeId": 0 if query_count < 3 else 2}
+    if method == "DOM.getBoxModel":
+        return {"model": {"border": [0, 0, 20, 0, 20, 20, 0, 20]}}
+    return {}
+
+fill_input("#late", "ok")
+assert query_count == 3, query_count
+assert ("Input.insertText", {"text": "ok"}) in events, events
+print("fill_input default wait ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("fill_input default wait ok"));
+    }
+
+    #[test]
+    fn browser_script_email_inbox_filters_after_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-email-inbox-sent-after",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+_EMAIL_AVAILABLE = True
+messages = [
+    {"message_id": "new", "timestamp": "2026-06-07T12:00:01.000Z", "preview": "code 222222"},
+    {"message_id": "old", "timestamp": "2026-06-07T11:59:59.000Z", "preview": "code 111111"},
+]
+
+def _bridge(message):
+    assert message["kind"] == "email", message
+    assert message["op"] == "inbox", message
+    return {"value": json.dumps(messages)}
+
+now = current_datetime()
+assert now["utc"].endswith("Z"), now
+assert isinstance(now["unix"], float), now
+
+recent = email_inbox(sent_after="2026-06-07T12:00:00.000Z")
+assert [m["message_id"] for m in recent] == ["new"], recent
+
+recent_from_unix_ms = email_inbox(sent_after="1780833600000")
+assert [m["message_id"] for m in recent_from_unix_ms] == ["new"], recent_from_unix_ms
+print("email_inbox sent_after ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("email_inbox sent_after ok"));
+    }
+
+    #[test]
     fn browser_script_type_text_maps_to_insert_text_and_fill_input_missing_selector_errors() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -12452,7 +12611,7 @@ def js(expression, *args, **kwargs):
     return False
 
 try:
-    fill_input("#missing", "hello")
+    fill_input("#missing", "hello", timeout=0)
 except RuntimeError as exc:
     assert "element not found" in str(exc), exc
 else:

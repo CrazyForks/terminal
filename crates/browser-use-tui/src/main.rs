@@ -161,6 +161,10 @@ pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
     "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
+/// Max saved-secret rows shown at once in `/secrets` before the list scrolls
+/// within its own container (and the search box appears).
+const SECRETS_VISIBLE_ROWS: usize = 6;
+
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
@@ -258,6 +262,9 @@ enum Surface {
     History,
     Messages,
     Developer,
+    Secrets,
+    Domains,
+    Email,
     Feedback,
     FeedbackThanks,
 }
@@ -283,6 +290,9 @@ impl Surface {
                 | Self::History
                 | Self::Messages
                 | Self::Developer
+                | Self::Secrets
+                | Self::Domains
+                | Self::Email
                 | Self::Feedback
         )
     }
@@ -297,7 +307,15 @@ impl Surface {
     /// of these is active the composer must not also be rendered underneath —
     /// the popup itself is the input field, with its own cursor.
     fn is_text_input_popup(self) -> bool {
-        matches!(self, Self::ApiKey | Self::Telemetry | Self::ModelSearch)
+        matches!(
+            self,
+            Self::ApiKey
+                | Self::Telemetry
+                | Self::ModelSearch
+                | Self::Secrets
+                | Self::Domains
+                | Self::Email
+        )
     }
 
     fn uses_main_view(self) -> bool {
@@ -1114,8 +1132,167 @@ impl RecordingGoalSink {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The three fields of the `/secrets` add form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretField {
+    Domain,
+    Name,
+    Value,
+}
+
+/// What the `/secrets` panel selection is on: a saved row (which can be deleted)
+/// or one of the add-form fields (which can be typed into). ↑/↓/Tab move through
+/// the saved rows then the form fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretFocus {
+    /// The live search box (shown when the saved list is long / filtered). Stays
+    /// focusable even when the filter has zero matches.
+    Search,
+    Saved(usize),
+    Field(SecretField),
+}
+
+/// The `/secrets` panel state: the add form (Domain / Name / Value) plus which
+/// row/field is selected. The focused field's text lives in the shared
+/// `composer` (so editing + paste work); the other two are parked here.
+struct SecretForm {
+    domain: String,
+    name: String,
+    value: String,
+    focus: SecretFocus,
+    /// Forces the saved kind to TOTP regardless of the name — set when editing an
+    /// existing 2FA secret so re-saving doesn't downgrade it to a password.
+    totp: bool,
+    /// When editing an existing secret, its original `(domain, name)`. The row is
+    /// hidden from the list while editing but only removed once the edit is saved
+    /// (so cancelling with Esc doesn't lose it).
+    editing_original: Option<(String, String)>,
+}
+
+impl SecretForm {
+    fn new() -> Self {
+        Self {
+            domain: String::new(),
+            name: String::new(),
+            value: String::new(),
+            focus: SecretFocus::Field(SecretField::Domain),
+            editing_original: None,
+            totp: false,
+        }
+    }
+
+    fn field(&self, field: SecretField) -> &str {
+        match field {
+            SecretField::Domain => &self.domain,
+            SecretField::Name => &self.name,
+            SecretField::Value => &self.value,
+        }
+    }
+
+    fn set_field(&mut self, field: SecretField, text: String) {
+        match field {
+            SecretField::Domain => self.domain = text,
+            SecretField::Name => self.name = text,
+            SecretField::Value => self.value = text,
+        }
+    }
+
+    fn focused_field(&self) -> Option<SecretField> {
+        match self.focus {
+            SecretFocus::Field(field) => Some(field),
+            SecretFocus::Search | SecretFocus::Saved(_) => None,
+        }
+    }
+}
+
+/// Whether an `/domains` rule allows or blocks navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DomainMode {
+    Allow,
+    Deny,
+}
+
+impl DomainMode {
+    fn toggled(self) -> Self {
+        match self {
+            DomainMode::Allow => DomainMode::Deny,
+            DomainMode::Deny => DomainMode::Allow,
+        }
+    }
+}
+
+/// `/domains` selection: a saved rule row, the Allow/Deny toggle, or the
+/// add-rule domain input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DomainFocus {
+    Saved(usize),
+    Mode,
+    Input,
+}
+
+/// `/domains` panel state: the add form (a domain input + Allow/Deny mode) and
+/// which row/field is selected. Mirrors [`SecretForm`]; the focused input's live
+/// text lives in the shared `composer`.
+struct DomainForm {
+    input: String,
+    mode: DomainMode,
+    focus: DomainFocus,
+}
+
+impl DomainForm {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            mode: DomainMode::Allow,
+            focus: DomainFocus::Input,
+        }
+    }
+}
+
+type ImportOutcome =
+    std::result::Result<browser_use_agent::tools::handlers::secrets_import::ImportStats, String>;
+
+/// Why a 1Password import can't run — drives which setup guidance is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpSetupIssue {
+    /// The `op` CLI binary isn't installed / on PATH.
+    NotInstalled,
+    /// `op` is installed but no account is signed in.
+    NotSignedIn,
+}
+
+/// A password import running on a background thread (so the UI can animate).
+struct SecretImport {
+    label: String,
+    started: Instant,
+    rx: mpsc::Receiver<ImportOutcome>,
+    /// `Some` once the worker finishes.
+    outcome: Option<ImportOutcome>,
+    settled_at: Option<Instant>,
+}
+
 struct App {
     store: Store,
+    /// Cached `/secrets` panel contents (metadata only — never values).
+    secrets_list: Vec<browser_use_agent::tools::handlers::secrets_admin::Meta>,
+    /// The in-progress add form while the `/secrets` surface is open.
+    secret_form: Option<SecretForm>,
+    /// Live filter over the saved-secrets list (by domain or name).
+    secrets_search: String,
+    /// 1Password setup guidance to show (CLI not installed vs. not signed in).
+    op_setup_hint: Option<OpSetupIssue>,
+    /// Secrets surface opened solely for an import → Esc goes back in one press.
+    secret_import_standalone: bool,
+    /// A running / just-finished password import (drives the animation).
+    secret_import: Option<SecretImport>,
+    /// Cached `/domains` panel contents.
+    domains_allow: Vec<String>,
+    domains_deny: Vec<String>,
+    /// The `/domains` add form + selection (mirrors `secret_form`).
+    domain_form: Option<DomainForm>,
+    /// Whether email-2FA (AgentMail) is configured — cached for the `/email`
+    /// panel so the renderer doesn't touch the store.
+    email_configured: bool,
     store_rx: mpsc::Receiver<StoreNotification>,
     clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
     clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
@@ -2236,6 +2413,16 @@ impl App {
             browser_notice: None,
             browser_select_chromium_expanded: false,
             status_notice: None,
+            secrets_list: Vec::new(),
+            secret_form: None,
+            secrets_search: String::new(),
+            op_setup_hint: None,
+            secret_import_standalone: false,
+            secret_import: None,
+            domains_allow: Vec::new(),
+            domains_deny: Vec::new(),
+            domain_form: None,
+            email_configured: false,
             agent_backend,
             quit_hint_until: None,
             escape_stop_until: None,
@@ -5150,6 +5337,58 @@ impl App {
                 self.escape_stop_until = None;
                 self.cancel_secret_entry();
             }
+            // /import-passwords opened Secrets just for the import → Esc goes back.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && self.secret_import_standalone => {
+                self.escape_stop_until = None;
+                self.op_setup_hint = None;
+                self.secret_import = None;
+                self.secret_import_standalone = false;
+                self.close_surface();
+            }
+            // Secrets: Esc dismisses the op-CLI setup guidance first.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && self.op_setup_hint.is_some() => {
+                self.escape_stop_until = None;
+                self.op_setup_hint = None;
+            }
+            // Secrets: a non-empty search filter is cleared first (like History).
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && !self.secrets_search.is_empty() => {
+                self.escape_stop_until = None;
+                self.secrets_search.clear();
+                self.clamp_secret_focus();
+            }
+            // Secrets: if the form has any text, a first Esc clears it; a second
+            // Esc (empty form) closes the panel via the generic handler below.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && !self.secret_form_is_empty() => {
+                self.escape_stop_until = None;
+                self.secret_form = Some(SecretForm::new());
+                self.composer.clear();
+                self.status_notice = Some("Cleared.".to_string());
+            }
+            // Domains: a first Esc clears a typed-but-unsaved domain; a second
+            // (empty input) closes the panel via the generic handler below.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Domains
+                && (!self.composer.input().is_empty()
+                    || self
+                        .domain_form
+                        .as_ref()
+                        .is_some_and(|form| !form.input.is_empty())) =>
+            {
+                self.escape_stop_until = None;
+                if let Some(form) = self.domain_form.as_mut() {
+                    form.input.clear();
+                }
+                self.composer.clear();
+            }
             // Model search: Esc goes back to the provider auth menu for the
             // provider being searched.
             KeyEvent {
@@ -5201,6 +5440,110 @@ impl App {
                 ..
             } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
             _ if self.is_first_run_setup_visible()? => {}
+            // Ctrl-O imports logins live from 1Password.
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.surface == Surface::Secrets => self.start_1password_import(),
+            // Secrets form: Tab/▼ move to the next field, Shift-Tab/▲ to the
+            // previous one. (Must come before the generic Tab=open-history arm.)
+            KeyEvent {
+                code: KeyCode::Tab | KeyCode::Down,
+                ..
+            } if self.surface == Surface::Secrets => self.secret_form_move_focus(true),
+            KeyEvent {
+                code: KeyCode::BackTab | KeyCode::Up,
+                ..
+            } if self.surface == Surface::Secrets => self.secret_form_move_focus(false),
+            // Delete removes the highlighted saved secret. Backspace also removes
+            // it (macOS "delete" key) — but only when the search box isn't shown,
+            // where Backspace edits the filter instead.
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } if self.surface == Surface::Secrets && self.secret_focus_is_saved() => {
+                self.secret_delete_focused()
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Secrets
+                && self.secret_focus_is_saved()
+                && !self.secrets_search_active() =>
+            {
+                self.secret_delete_focused()
+            }
+            // Typing on the search box / a saved row filters the list (form-field
+            // typing is unaffected — handled by the composer below).
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.surface == Surface::Secrets
+                && self.secret_focus_can_search()
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.secrets_search.push(ch);
+                if let Some(form) = self.secret_form.as_mut() {
+                    form.focus = SecretFocus::Search;
+                }
+                self.clamp_secret_focus();
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Secrets && self.secret_focus_can_search() => {
+                self.secrets_search.pop();
+                if let Some(form) = self.secret_form.as_mut() {
+                    form.focus = SecretFocus::Search;
+                }
+                self.clamp_secret_focus();
+            }
+            // Domains form: Tab/▼/▲ move; ←/→/Space toggle Allow/Deny (or a rule);
+            // Del removes a highlighted rule.
+            KeyEvent {
+                code: KeyCode::Tab | KeyCode::Down,
+                ..
+            } if self.surface == Surface::Domains => self.domain_form_move_focus(true),
+            KeyEvent {
+                code: KeyCode::BackTab | KeyCode::Up,
+                ..
+            } if self.surface == Surface::Domains => self.domain_form_move_focus(false),
+            KeyEvent {
+                code: KeyCode::Left | KeyCode::Right | KeyCode::Char(' '),
+                ..
+            } if self.surface == Surface::Domains
+                && !matches!(
+                    self.domain_form.as_ref().map(|form| form.focus),
+                    Some(DomainFocus::Input)
+                ) =>
+            {
+                self.domain_toggle_mode()
+            }
+            // Backspace too: on macOS the "delete" key sends Backspace. Safe here
+            // because the composer is empty while a rule row is focused.
+            KeyEvent {
+                code: KeyCode::Delete | KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Domains && self.domain_focus_is_saved() => {
+                self.domain_delete_focused()
+            }
+            // Block stray typing when not on the domain input.
+            KeyEvent {
+                code: KeyCode::Char(_),
+                modifiers,
+                ..
+            } if self.surface == Surface::Domains
+                && !matches!(
+                    self.domain_form.as_ref().map(|form| form.focus),
+                    Some(DomainFocus::Input)
+                )
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) => {}
             KeyEvent {
                 code: KeyCode::BackTab,
                 ..
@@ -5329,9 +5672,15 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if (matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
-                || (self.surface == Surface::ModelSearch
-                    && self.model_search_has_filter_input()))
+            _ if (matches!(
+                self.surface,
+                Surface::ApiKey
+                    | Surface::Telemetry
+                    | Surface::Secrets
+                    | Surface::Domains
+                    | Surface::Email
+            ) || (self.surface == Surface::ModelSearch
+                && self.model_search_has_filter_input()))
                 && self.handle_api_key_key(key) => {}
             // A leading `/` opens the slash palette popup. Once the composer
             // has text, slash is regular prompt input.
@@ -5453,7 +5802,11 @@ impl App {
                     self.prompt_history.reset_navigation();
                 }
             }
-            Surface::ApiKey | Surface::Telemetry => {
+            Surface::ApiKey
+            | Surface::Telemetry
+            | Surface::Secrets
+            | Surface::Domains
+            | Surface::Email => {
                 self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
@@ -5736,6 +6089,12 @@ impl App {
                 self.dispatch(AppCommand::SaveDefaultProfile(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
+            Surface::Secrets => self.secrets_surface_enter()?,
+            Surface::Domains => self.domains_surface_enter()?,
+            Surface::Email => match self.selected_row.min(1) {
+                0 => self.save_agentmail_token(),
+                _ => self.close_surface(),
+            },
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
@@ -6005,12 +6364,631 @@ impl App {
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::SyncCookies => self.dispatch(AppCommand::SyncCookies)?,
+            PaletteAction::ManageSecrets => self.open_secrets_surface(),
+            PaletteAction::ImportPasswords => {
+                self.open_secrets_surface();
+                self.secret_import_standalone = true;
+                self.start_1password_import();
+            }
+            PaletteAction::ManageDomains => self.open_domains_surface(),
+            PaletteAction::ConfigureEmail => self.open_email_surface(),
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
             PaletteAction::Feedback => self.dispatch(AppCommand::OpenFeedback)?,
         }
         Ok(false)
+    }
+
+    fn refresh_secrets(&mut self) {
+        self.secrets_list =
+            browser_use_agent::tools::handlers::secrets_admin::list_secrets(&self.store)
+                .unwrap_or_default();
+    }
+
+    fn refresh_domains(&mut self) {
+        let (allow, deny) =
+            browser_use_agent::tools::handlers::secrets_admin::list_domains(&self.store)
+                .unwrap_or_default();
+        self.domains_allow = allow;
+        self.domains_deny = deny;
+    }
+
+    fn open_secrets_surface(&mut self) {
+        self.secret_form = Some(SecretForm::new());
+        self.secrets_search.clear();
+        self.op_setup_hint = None;
+        self.secret_import_standalone = false;
+        self.composer.clear();
+        self.refresh_secrets();
+        self.status_notice = None;
+        self.open_surface(Surface::Secrets);
+    }
+
+    /// Spawn the import worker and start the animation.
+    fn spawn_secret_import(
+        &mut self,
+        label: &str,
+        job: impl FnOnce(
+                &Store,
+            ) -> anyhow::Result<
+                browser_use_agent::tools::handlers::secrets_import::ImportStats,
+            > + Send
+            + 'static,
+    ) {
+        if self.secret_import.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let state_dir = self.store.state_dir().to_path_buf();
+        std::thread::spawn(move || {
+            let outcome: ImportOutcome = (|| {
+                let store = Store::open(&state_dir).map_err(|err| err.to_string())?;
+                job(&store).map_err(|err| format!("{err:#}"))
+            })();
+            let _ = tx.send(outcome);
+        });
+        self.secret_import = Some(SecretImport {
+            label: label.to_string(),
+            started: Instant::now(),
+            rx,
+            outcome: None,
+            settled_at: None,
+        });
+        self.composer.clear();
+    }
+
+    fn start_1password_import(&mut self) {
+        // Guide the user to install the CLI rather than flashing a failed import.
+        if !browser_use_agent::tools::handlers::secrets_import::op_available() {
+            self.op_setup_hint = Some(OpSetupIssue::NotInstalled);
+            self.status_notice = None;
+            return;
+        }
+        self.spawn_secret_import("1Password", |store| {
+            browser_use_agent::tools::handlers::secrets_import::import_1password(store)
+        });
+    }
+
+    /// Poll the import worker; reveal the result, then auto-dismiss. Returns true
+    /// if a redraw is warranted.
+    fn drain_secret_import(&mut self) -> bool {
+        let mut redraw = false;
+        let mut dismiss = false;
+        let mut not_signed_in = false;
+        let mut succeeded = false;
+        if let Some(import) = self.secret_import.as_mut() {
+            if import.outcome.is_none() {
+                if let Ok(outcome) = import.rx.try_recv() {
+                    // "Not signed in" gets the persistent guidance panel, not a banner.
+                    match &outcome {
+                        Err(message) if message.contains("signed in") => not_signed_in = true,
+                        Ok(_) => succeeded = true,
+                        _ => {}
+                    }
+                    import.outcome = Some(outcome);
+                    import.settled_at = Some(Instant::now());
+                    redraw = true;
+                }
+            } else if import
+                .settled_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(2400))
+            {
+                dismiss = true;
+            }
+        }
+        if succeeded {
+            // Show the imported secrets right away, not on auto-dismiss.
+            self.refresh_secrets();
+        }
+        if not_signed_in {
+            self.secret_import = None;
+            self.op_setup_hint = Some(OpSetupIssue::NotSignedIn);
+            redraw = true;
+        }
+        if dismiss {
+            self.secret_import = None;
+            self.refresh_secrets();
+            redraw = true;
+        }
+        redraw
+    }
+
+    /// True while an import is actively running (keeps the spinner animating).
+    fn should_animate_import(&self) -> bool {
+        self.secret_import
+            .as_ref()
+            .is_some_and(|import| import.outcome.is_none())
+    }
+
+    fn open_domains_surface(&mut self) {
+        self.domain_form = Some(DomainForm::new());
+        self.composer.clear();
+        self.refresh_domains();
+        self.status_notice = None;
+        self.open_surface(Surface::Domains);
+    }
+
+    fn open_email_surface(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        self.email_configured = sa::email_2fa_configured(&self.store);
+        self.composer.clear();
+        self.selected_row = 0;
+        self.status_notice = None;
+        self.open_surface(Surface::Email);
+    }
+
+    /// Store the pasted AgentMail token. The inbox is provisioned lazily the first
+    /// time the agent calls `email_address()`, so this stays a fast local write.
+    fn save_agentmail_token(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let token = self.composer.take_trimmed();
+        if token.is_empty() {
+            self.status_notice = Some("Paste your AgentMail API key first.".to_string());
+            return;
+        }
+        match sa::set_agentmail_token(&self.store, &token) {
+            Ok(()) => {
+                self.email_configured = true;
+                self.close_surface();
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+    }
+
+    /// Saved rules as `(domain, is_allow)`, allow-list first. `DomainFocus::Saved`
+    /// indexes into this.
+    pub(crate) fn domain_rows(&self) -> Vec<(String, bool)> {
+        self.domains_allow
+            .iter()
+            .map(|d| (d.clone(), true))
+            .chain(self.domains_deny.iter().map(|d| (d.clone(), false)))
+            .collect()
+    }
+
+    fn domain_focus_order(&self) -> Vec<DomainFocus> {
+        let mut order: Vec<DomainFocus> = (0..self.domain_rows().len())
+            .map(DomainFocus::Saved)
+            .collect();
+        // Domain first, then Mode — matches the /secrets field order and the
+        // natural "allow <domain>" reading.
+        order.push(DomainFocus::Input);
+        order.push(DomainFocus::Mode);
+        order
+    }
+
+    fn domain_focus_is_saved(&self) -> bool {
+        matches!(
+            self.domain_form.as_ref().map(|form| form.focus),
+            Some(DomainFocus::Saved(_))
+        )
+    }
+
+    /// Move selection, parking/loading the input text in the composer.
+    fn domain_set_focus(&mut self, next: DomainFocus) {
+        let current = self.composer.input().to_string();
+        let load = match self.domain_form.as_mut() {
+            Some(form) => {
+                if matches!(form.focus, DomainFocus::Input) {
+                    form.input = current;
+                }
+                form.focus = next;
+                matches!(next, DomainFocus::Input).then(|| form.input.clone())
+            }
+            None => return,
+        };
+        match load {
+            Some(text) => self.composer.set_input(text),
+            None => self.composer.clear(),
+        }
+    }
+
+    fn domain_form_move_focus(&mut self, forward: bool) {
+        let order = self.domain_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let current = self.domain_form.as_ref().map(|form| form.focus);
+        let idx = current
+            .and_then(|focus| order.iter().position(|o| *o == focus))
+            .unwrap_or(0);
+        // Clamp at the ends (don't wrap): with only two form fields, wrapping
+        // makes ↑ from the top field jump to the bottom one, which reads as
+        // inverted arrows.
+        let next = if forward {
+            (idx + 1).min(order.len() - 1)
+        } else {
+            idx.saturating_sub(1)
+        };
+        self.domain_set_focus(order[next]);
+    }
+
+    /// ←/→/Space: on the Mode toggle, switch Allow/Deny; on a saved rule, move it
+    /// between the allow and deny lists.
+    fn domain_toggle_mode(&mut self) {
+        match self.domain_form.as_ref().map(|form| form.focus) {
+            Some(DomainFocus::Mode) => {
+                if let Some(form) = self.domain_form.as_mut() {
+                    form.mode = form.mode.toggled();
+                }
+            }
+            Some(DomainFocus::Saved(idx)) => self.domain_toggle_rule(idx),
+            _ => {}
+        }
+    }
+
+    /// Flip a saved rule between allow and deny. Adds to the target list FIRST and
+    /// only removes from the old list once that succeeds, so a failed write can
+    /// never silently drop the rule.
+    fn domain_toggle_rule(&mut self, idx: usize) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let Some((domain, was_allow)) = self.domain_rows().get(idx).cloned() else {
+            return;
+        };
+        match sa::add_domain(&self.store, &domain, !was_allow) {
+            Ok(_) => {
+                if let Err(error) = sa::remove_domain(&self.store, &domain, was_allow) {
+                    self.status_notice = Some(format!("Error: {error}"));
+                } else {
+                    self.status_notice = None;
+                }
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_domains();
+        self.clamp_domain_focus();
+    }
+
+    fn domain_delete_focused(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.domain_form.as_ref().map(|form| form.focus) {
+            Some(DomainFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some((domain, is_allow)) = self.domain_rows().get(idx).cloned() else {
+            return;
+        };
+        match sa::remove_domain(&self.store, &domain, is_allow) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_domains();
+        self.clamp_domain_focus();
+    }
+
+    fn clamp_domain_focus(&mut self) {
+        let len = self.domain_rows().len();
+        if let Some(form) = self.domain_form.as_mut() {
+            if let DomainFocus::Saved(idx) = form.focus {
+                form.focus = if len == 0 {
+                    DomainFocus::Input
+                } else {
+                    DomainFocus::Saved(idx.min(len - 1))
+                };
+            }
+        }
+    }
+
+    fn secret_form_is_empty(&self) -> bool {
+        let composer_empty = self.composer.input().is_empty();
+        match self.secret_form.as_ref() {
+            Some(form) => {
+                composer_empty
+                    && form.domain.is_empty()
+                    && form.name.is_empty()
+                    && form.value.is_empty()
+            }
+            None => composer_empty,
+        }
+    }
+
+    /// Saved secrets after applying the live search filter (by domain or name).
+    /// `SecretFocus::Saved(i)` indexes into this filtered view.
+    pub(crate) fn secrets_view(
+        &self,
+    ) -> Vec<browser_use_agent::tools::handlers::secrets_admin::Meta> {
+        let query = self.secrets_search.trim().to_ascii_lowercase();
+        // Hide the row currently being edited (it's pulled into the form, but not
+        // yet removed from storage).
+        let editing = self
+            .secret_form
+            .as_ref()
+            .and_then(|form| form.editing_original.clone());
+        self.secrets_list
+            .iter()
+            .filter(|meta| {
+                if let Some((domain, name)) = &editing {
+                    if &meta.domain == domain && &meta.placeholder == name {
+                        return false;
+                    }
+                }
+                query.is_empty()
+                    || meta.domain.to_ascii_lowercase().contains(&query)
+                    || meta.placeholder.to_ascii_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the search box should be shown (enough saved secrets, or a query
+    /// is already active).
+    pub(crate) fn secrets_search_active(&self) -> bool {
+        self.secrets_list.len() > SECRETS_VISIBLE_ROWS || !self.secrets_search.is_empty()
+    }
+
+    /// Re-clamp focus after the filter changes. A highlighted row that filtered
+    /// out drops back to the (still-editable) search box; a focused search box
+    /// that's no longer shown moves into the list/form.
+    fn clamp_secret_focus(&mut self) {
+        let len = self.secrets_view().len();
+        let search_active = self.secrets_search_active();
+        if let Some(form) = self.secret_form.as_mut() {
+            match form.focus {
+                SecretFocus::Saved(idx) => {
+                    form.focus = if len == 0 {
+                        if search_active {
+                            SecretFocus::Search
+                        } else {
+                            SecretFocus::Field(SecretField::Domain)
+                        }
+                    } else {
+                        SecretFocus::Saved(idx.min(len - 1))
+                    };
+                }
+                SecretFocus::Search if !search_active => {
+                    form.focus = if len > 0 {
+                        SecretFocus::Saved(0)
+                    } else {
+                        SecretFocus::Field(SecretField::Domain)
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The selectable items in the `/secrets` panel, in order: the search box (when
+    /// shown), each filtered saved row, then the three add-form fields.
+    fn secret_focus_order(&self) -> Vec<SecretFocus> {
+        let mut order: Vec<SecretFocus> = Vec::new();
+        if self.secrets_search_active() {
+            order.push(SecretFocus::Search);
+        }
+        order.extend((0..self.secrets_view().len()).map(SecretFocus::Saved));
+        order.push(SecretFocus::Field(SecretField::Domain));
+        order.push(SecretFocus::Field(SecretField::Name));
+        order.push(SecretFocus::Field(SecretField::Value));
+        order
+    }
+
+    fn secret_focus_is_saved(&self) -> bool {
+        matches!(
+            self.secret_form.as_ref().map(|form| form.focus),
+            Some(SecretFocus::Saved(_))
+        )
+    }
+
+    /// Whether typing should edit the search filter (on the search box, or on a
+    /// saved row while the search box is shown).
+    fn secret_focus_can_search(&self) -> bool {
+        match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Search) => true,
+            Some(SecretFocus::Saved(_)) => self.secrets_search_active(),
+            _ => false,
+        }
+    }
+
+    /// Set selection to `next`, parking the currently-focused field's live text
+    /// (held in the composer) and loading the newly-focused field's text into the
+    /// composer (or clearing it when selecting a saved row).
+    fn secret_set_focus(&mut self, next: SecretFocus) {
+        let current_text = self.composer.input().to_string();
+        let load = match self.secret_form.as_mut() {
+            Some(form) => {
+                if let SecretFocus::Field(field) = form.focus {
+                    form.set_field(field, current_text);
+                }
+                form.focus = next;
+                match next {
+                    SecretFocus::Field(field) => Some(form.field(field).to_string()),
+                    SecretFocus::Search | SecretFocus::Saved(_) => None,
+                }
+            }
+            None => return,
+        };
+        match load {
+            Some(text) => self.composer.set_input(text),
+            None => self.composer.clear(),
+        }
+    }
+
+    /// Move the selection through the saved rows and form fields.
+    fn secret_form_move_focus(&mut self, forward: bool) {
+        let order = self.secret_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let current = self
+            .secret_form
+            .as_ref()
+            .map(|form| form.focus)
+            .unwrap_or(SecretFocus::Field(SecretField::Domain));
+        let idx = order
+            .iter()
+            .position(|focus| *focus == current)
+            .unwrap_or(0);
+        let next = if forward {
+            order[(idx + 1) % order.len()]
+        } else {
+            order[(idx + order.len() - 1) % order.len()]
+        };
+        self.secret_set_focus(next);
+    }
+
+    /// Delete the highlighted saved secret (when a saved row is selected).
+    fn secret_delete_focused(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some(meta) = self.secrets_view().get(idx).cloned() else {
+            return;
+        };
+        match sa::remove_secret_active(&self.store, &meta.domain, &meta.placeholder) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_secrets();
+        // Keep the selection sensible after the row disappears.
+        let len = self.secrets_view().len();
+        if let Some(form) = self.secret_form.as_mut() {
+            form.focus = if len == 0 {
+                SecretFocus::Field(SecretField::Domain)
+            } else {
+                SecretFocus::Saved(idx.min(len - 1))
+            };
+        }
+    }
+
+    /// Enter on a highlighted saved row: pull that secret into the add form for
+    /// editing (domain + name + its current value) and remove it from the saved
+    /// list. Re-saving (Enter on the filled form) writes it back; Esc discards.
+    fn edit_focused_secret(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some(meta) = self.secrets_view().get(idx).cloned() else {
+            return;
+        };
+        // Read the current value (from the encrypted file) so the user can keep
+        // it without retyping. The original is left in storage and only removed
+        // once the edit is saved (Esc cancels without data loss).
+        let value =
+            sa::read_secret_value(&self.store, &meta.domain, &meta.placeholder).unwrap_or_default();
+        self.secrets_search.clear();
+
+        let mut form = SecretForm::new();
+        form.domain = meta.domain.clone();
+        form.name = meta.placeholder.clone();
+        form.value = value;
+        form.totp = matches!(meta.kind, sa::Kind::Totp);
+        form.editing_original = Some((meta.domain, meta.placeholder));
+        form.focus = SecretFocus::Field(SecretField::Domain);
+        self.composer.set_input(form.domain.clone());
+        self.secret_form = Some(form);
+        self.status_notice =
+            Some("Editing — change fields and Enter to save, Esc to discard.".to_string());
+    }
+
+    /// Enter in the `/secrets` panel: on a saved row, edit it; on a field, commit
+    /// and save once domain+name+value are all filled.
+    fn secrets_surface_enter(&mut self) -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        // On a saved row, pull it into the form for editing.
+        if self.secret_focus_is_saved() {
+            self.edit_focused_secret();
+            return Ok(());
+        }
+        // Commit whatever is in the composer into the focused field.
+        let current_text = self.composer.input().to_string();
+        let (domain, name, value, form_totp, editing_original) = match self.secret_form.as_mut() {
+            Some(form) => {
+                if let Some(field) = form.focused_field() {
+                    form.set_field(field, current_text);
+                }
+                (
+                    form.domain.clone(),
+                    form.name.clone(),
+                    form.value.clone(),
+                    form.totp,
+                    form.editing_original.clone(),
+                )
+            }
+            None => return Ok(()),
+        };
+
+        let domain_t = domain.trim();
+        let name_t = name.trim();
+        if domain_t.is_empty() || name_t.is_empty() || value.is_empty() {
+            // Not ready to save — advance to the next field so the user can fill
+            // it in. (Value is kept untrimmed; it may contain whitespace.)
+            self.secret_form_move_focus(true);
+            self.status_notice = Some("Fill in domain, name, and value.".to_string());
+            return Ok(());
+        }
+
+        // `form_totp` (set when editing a 2FA secret) keeps the TOTP kind even if
+        // the name wouldn't otherwise be detected as 2FA.
+        let totp = form_totp
+            || matches!(name_t, "otp" | "2fa" | "totp")
+            || name_t.ends_with("bu_2fa_code");
+        let kind = if totp {
+            sa::Kind::Totp
+        } else {
+            sa::Kind::Password
+        };
+        match sa::set_secret_active(&self.store, domain_t, name_t, kind, Vec::new(), &value) {
+            Ok(_) => {
+                // If editing renamed the secret, remove the original now that the
+                // new one is safely written.
+                if let Some((od, on)) = &editing_original {
+                    if od != domain_t || on != name_t {
+                        let _ = sa::remove_secret_active(&self.store, od, on);
+                    }
+                }
+                // The updated saved-secrets list is the confirmation; no notice.
+                self.status_notice = None;
+                self.refresh_secrets();
+                // Reset the form so the (now updated) list shows and the next
+                // secret can be entered from a clean Domain field.
+                self.secret_form = Some(SecretForm::new());
+                self.composer.clear();
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        Ok(())
+    }
+
+    /// Handle Enter in the `/domains` surface: `allow|deny <domain>`,
+    /// `rm allow|deny <domain>`, or `clear`.
+    fn domains_surface_enter(&mut self) -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let focus = self.domain_form.as_ref().map(|form| form.focus);
+        // On a saved rule, Enter flips it between allow and deny.
+        if let Some(DomainFocus::Saved(idx)) = focus {
+            self.domain_toggle_rule(idx);
+            return Ok(());
+        }
+        // Otherwise add the typed domain (live text is in the composer when the
+        // Input field is focused, else parked on the form).
+        let domain = if matches!(focus, Some(DomainFocus::Input)) {
+            self.composer.take_trimmed()
+        } else {
+            self.domain_form
+                .as_ref()
+                .map(|form| form.input.trim().to_string())
+                .unwrap_or_default()
+        };
+        if domain.is_empty() {
+            return Ok(());
+        }
+        let allow = matches!(
+            self.domain_form.as_ref().map(|form| form.mode),
+            Some(DomainMode::Allow)
+        );
+        match sa::add_domain(&self.store, &domain, allow) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        if let Some(form) = self.domain_form.as_mut() {
+            form.input.clear();
+        }
+        self.composer.clear();
+        self.refresh_domains();
+        Ok(())
     }
 
     fn run_update(&mut self) -> Result<()> {
@@ -7856,6 +8834,8 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
+            Surface::Email => 2,
+            Surface::Secrets | Surface::Domains => 0,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
             Surface::OpenAiAuth => self.provider_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
@@ -9301,6 +10281,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_default_profile_notifications()?;
             draw_needed |= app.drain_provider_fetch()?;
             draw_needed |= app.drain_feedback_notifications()?;
+            draw_needed |= app.drain_secret_import();
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -9333,6 +10314,10 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.should_animate_live_spinner() {
                 poll_interval = poll_interval.min(LIVE_SPINNER_TICK_INTERVAL);
             }
+            // Keep the password-import spinner smooth while the worker runs.
+            if app.should_animate_import() {
+                poll_interval = poll_interval.min(Duration::from_millis(80));
+            }
             // Keep redrawing while the typewriter is animating even after the
             // logo physics settle to rest (logo stops driving redraws then).
             if app.is_home_examples_active() {
@@ -9356,6 +10341,10 @@ fn run_terminal(mut app: App) -> Result<()> {
                     app.tick_live_spinner();
                     draw_needed = true;
                     last_live_spinner_tick = Instant::now();
+                }
+                // Advance the password-import spinner (frame derived from elapsed).
+                if app.should_animate_import() {
+                    draw_needed = true;
                 }
                 // Advance the typewriter placeholder animation while on the home screen
                 // with an empty composer and no session history.
@@ -10793,6 +11782,442 @@ mod redesign_tests {
         Ok(app)
     }
 
+    fn plain_lines(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn secrets_panel_shows_form_and_list() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        assert_eq!(app.surface, Surface::Secrets);
+
+        let panel = plain_lines(&render::secrets_lines(&app)).join("\n");
+        // Separate labeled fields, the saved list, and the 2FA tip are all shown.
+        assert!(panel.contains("Saved secrets:"));
+        assert!(panel.contains("Add a secret:"));
+        assert!(panel.contains("Domain"));
+        assert!(panel.contains("Name"));
+        assert!(panel.contains("Value"));
+        assert!(panel.contains("\"otp\" for a 2FA code"));
+
+        // Caret invariant: exactly one rendered line is the focused field's row
+        // (`"  " + focused content`), so the masked caret lands only there.
+        let target = format!("  {}", render::secrets_input_field(&app));
+        let matches = plain_lines(&render::secrets_lines(&app))
+            .iter()
+            .filter(|l| l.starts_with(&target))
+            .count();
+        assert_eq!(matches, 1, "exactly one row must match the caret target");
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_value_field_is_masked() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        // Move focus to the Value field and type — it must render as bullets.
+        app.secret_form_move_focus(true); // -> Name
+        app.secret_form_move_focus(true); // -> Value
+        app.handle_paste("hunter2pass");
+        let panel = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(!panel.contains("hunter2pass"));
+        assert!(panel.contains("••••••"));
+        Ok(())
+    }
+
+    #[test]
+    fn domains_panel_is_a_form_with_a_rules_list() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        sa::add_domain(&app.store, "github.com", true).unwrap();
+        sa::add_domain(&app.store, "ads.example.com", false).unwrap();
+        app.open_domains_surface();
+        assert_eq!(app.surface, Surface::Domains);
+
+        let text = plain_lines(&render::domains_lines(&app)).join("\n");
+        assert!(text.contains("Rules (2)"));
+        assert!(text.contains("github.com"));
+        assert!(text.contains("Allowed"));
+        assert!(text.contains("ads.example.com"));
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("Add a rule:"));
+        assert!(text.contains("Mode"));
+
+        // Exactly one line carries the caret target (the focused Domain input).
+        let target = format!("  {}", render::domains_input_field(&app));
+        let caret_lines = plain_lines(&render::domains_lines(&app))
+            .iter()
+            .filter(|l| l.starts_with(&target))
+            .count();
+        assert_eq!(caret_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn domains_caret_lands_on_the_domain_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_domains_surface(); // default focus = Domain input
+        app.handle_paste("git"); // give the field some text to anchor the caret
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret should be visible while the Domain field is focused");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Domain"),
+            "caret at row {} = {:?}; full dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        assert!(
+            !caret_row.contains("Add a rule"),
+            "caret landed on the heading: {caret_row:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn email_surface_setup_and_save() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        assert_eq!(app.surface, Surface::Email);
+
+        // Unconfigured: shows where to get the key + how to set it up.
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("agentmail.to"));
+        assert!(text.contains("Save key"));
+        assert!(!app.email_configured);
+
+        // Paste a key on the Save row + Enter → stored, panel closes.
+        app.handle_paste("fake-agentmail-key");
+        app.execute_surface_selection()?;
+        assert!(app.email_configured);
+        assert_eq!(
+            sa::agentmail_token(&app.store).as_deref(),
+            Some("fake-agentmail-key")
+        );
+
+        // Reopening now shows the configured state.
+        app.open_email_surface();
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("Configured"));
+        Ok(())
+    }
+
+    #[test]
+    fn email_caret_lands_on_the_key_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        app.handle_paste("abc");
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret visible on the key field");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Key"),
+            "caret at row {} = {:?}; dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn domains_form_add_toggle_delete() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_domains_surface();
+
+        // Focused on the input (Allow mode) → type + Enter adds an allow rule.
+        app.handle_paste("github.com");
+        app.domains_surface_enter()?;
+        assert_eq!(app.domain_rows(), vec![("github.com".to_string(), true)]);
+
+        // Select the row, Enter toggles it to Block.
+        app.domain_set_focus(DomainFocus::Saved(0));
+        app.domains_surface_enter()?;
+        assert_eq!(app.domain_rows(), vec![("github.com".to_string(), false)]);
+
+        // The macOS "delete" key (Backspace) on the highlighted row removes it.
+        app.domain_set_focus(DomainFocus::Saved(0));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        assert!(app.domain_rows().is_empty());
+
+        // Mode toggle switches the add-mode.
+        app.domain_set_focus(DomainFocus::Mode);
+        app.domain_toggle_mode();
+        assert!(matches!(
+            app.domain_form.as_ref().unwrap().mode,
+            DomainMode::Deny
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_form_focus_parks_each_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Field(SecretField::Domain)
+        ));
+
+        // Type into Domain, Tab to Name: the domain is parked, composer cleared.
+        app.handle_paste("github.com");
+        app.secret_form_move_focus(true);
+        {
+            let form = app.secret_form.as_ref().unwrap();
+            assert_eq!(form.domain, "github.com");
+            assert!(matches!(form.focus, SecretFocus::Field(SecretField::Name)));
+        }
+        assert_eq!(app.composer.input(), "");
+
+        // Type into Name, Tab back to Domain: the parked domain reloads into the
+        // composer for editing.
+        app.handle_paste("password");
+        app.secret_form_move_focus(false); // -> Domain
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Field(SecretField::Domain)
+        ));
+        assert_eq!(app.composer.input(), "github.com");
+        assert_eq!(app.secret_form.as_ref().unwrap().name, "password");
+        Ok(())
+    }
+
+    #[test]
+    fn saved_secrets_scroll_and_search() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        for i in 0..10 {
+            sa::set_secret_active(
+                &app.store,
+                &format!("site{i}.example.com"),
+                "password",
+                sa::Kind::Password,
+                vec![],
+                &format!("pw{i}"),
+            )
+            .unwrap();
+        }
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 10);
+
+        // Long list → search box + scrolled window (not all 10 rows shown).
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("Saved secrets (10)"));
+        assert!(text.contains("Search:"));
+        assert!(text.contains("more below"));
+        let rows = plain_lines(&render::secrets_lines(&app))
+            .iter()
+            .filter(|l| l.contains("••••••"))
+            .count();
+        assert!(
+            rows <= SECRETS_VISIBLE_ROWS,
+            "rows {rows} should be windowed"
+        );
+
+        // Filtering narrows to matching rows.
+        app.secrets_search = "site3".to_string();
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("site3.example.com"));
+        assert!(!text.contains("site7.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_no_matches_stays_editable() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        for i in 0..8 {
+            sa::set_secret_active(
+                &app.store,
+                &format!("site{i}.example.com"),
+                "password",
+                sa::Kind::Password,
+                vec![],
+                &format!("pw{i}"),
+            )
+            .unwrap();
+        }
+        app.open_secrets_surface();
+        // Highlight a saved row, then type a query that matches nothing.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        for ch in "zzznope".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        assert!(app.secrets_view().is_empty());
+        // Focus stays on the search box (not dropped into the form), so it's still
+        // editable — the previously-broken case.
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Search
+        ));
+
+        // Backspacing recovers — matches come back.
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        assert!(app.secrets_search.is_empty());
+        assert_eq!(app.secrets_view().len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn op_setup_hint_shows_download_link() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+
+        // Not installed → download link.
+        app.op_setup_hint = Some(OpSetupIssue::NotInstalled);
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("1Password CLI not installed"));
+        assert!(text.contains("1password.com/downloads/command-line"));
+
+        // Installed but not signed in → sign-in steps, no download link.
+        app.op_setup_hint = Some(OpSetupIssue::NotSignedIn);
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("not signed in"));
+        assert!(text.contains("Integrate with 1Password CLI"));
+        assert!(text.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+        assert!(!text.contains("downloads/command-line"));
+        Ok(())
+    }
+
+    #[test]
+    fn editing_a_saved_secret_loads_form_and_hides_row() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let seed = "TESTTESTTESTTESTTESTTESTTESTTEST";
+        sa::set_secret_active(
+            &app.store,
+            "github.com",
+            "otp",
+            sa::Kind::Totp,
+            vec![],
+            seed,
+        )
+        .unwrap();
+
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 1);
+
+        // Select the saved row and press Enter → edit.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        app.secrets_surface_enter()?;
+
+        // It's pulled into the form (value + totp preserved); still in storage but
+        // hidden from the view until the edit is saved (Esc would not lose it).
+        assert_eq!(app.secrets_list.len(), 1, "original kept until save");
+        assert!(app.secrets_view().is_empty(), "edited row hidden from view");
+        let form = app.secret_form.as_ref().unwrap();
+        assert_eq!(form.domain, "github.com");
+        assert_eq!(form.name, "otp");
+        assert_eq!(form.value, seed);
+        assert!(form.totp, "TOTP kind preserved for editing");
+        assert_eq!(
+            form.editing_original,
+            Some(("github.com".to_string(), "otp".to_string()))
+        );
+
+        // Re-saving writes it back (same key → overwrite, still one secret).
+        app.secret_set_focus(SecretFocus::Field(SecretField::Value));
+        app.secrets_surface_enter()?;
+        assert_eq!(app.secrets_list.len(), 1);
+        assert!(matches!(app.secrets_list[0].kind, sa::Kind::Totp));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_an_edit_keeps_the_original() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        sa::set_secret_active(
+            &app.store,
+            "github.com",
+            "password",
+            sa::Kind::Password,
+            vec![],
+            "pw",
+        )
+        .unwrap();
+
+        app.open_secrets_surface();
+        app.secret_set_focus(SecretFocus::Saved(0));
+        app.secrets_surface_enter()?; // edit
+                                      // Cancel: first Esc clears the form (and the edit state) — original intact.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+        assert_eq!(app.secrets_list.len(), 1, "original not lost on cancel");
+        assert_eq!(
+            sa::read_secret_value(&app.store, "github.com", "password").as_deref(),
+            Some("pw")
+        );
+        assert!(app.secret_form.as_ref().unwrap().editing_original.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_delete_highlighted_saved_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Seed two metadata rows directly (no keychain needed for the delete to
+        // remove the metadata; the keychain delete tolerates a missing entry).
+        for name in ["password", "otp"] {
+            let meta = serde_json::json!({
+                "domain": "github.com", "placeholder": name,
+                "kind": if name == "otp" { "totp" } else { "password" },
+                "allowed_domains": [],
+            });
+            app.store.set_setting(
+                &format!("secrets.meta.github.com/{name}"),
+                &serde_json::to_string(&meta)?,
+            )?;
+        }
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 2);
+
+        // Select the first saved row and delete it.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        assert!(app.secret_focus_is_saved());
+        app.secret_delete_focused();
+        assert_eq!(app.secrets_list.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn paste_reaches_secrets_and_domains_inputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.open_secrets_surface();
+        app.handle_paste("github.com password");
+        assert_eq!(app.composer.input(), "github.com password");
+
+        app.open_domains_surface(); // clears the composer
+        assert_eq!(app.composer.input(), "");
+        app.handle_paste("allow github.com");
+        assert_eq!(app.composer.input(), "allow github.com");
+        Ok(())
+    }
+
     // Run with: cargo test -p browser-use-tui timing_drain_store_notifications_in_session -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -11874,6 +13299,9 @@ mod redesign_tests {
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
+            Surface::Secrets => "Secrets",
+            Surface::Domains => "Domains",
+            Surface::Email => "Email inbox",
             Surface::Feedback | Surface::FeedbackThanks => "Feedback",
             Surface::Main => "",
         }
@@ -14155,6 +15583,9 @@ mod redesign_tests {
     fn slash_palette_layers_over_running_content() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        // The command palette grew an item; give the fixture a couple more rows
+        // (real terminals have them) so the running transcript still shows under it.
+        app.args.height = 32;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
