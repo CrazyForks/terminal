@@ -3237,7 +3237,10 @@ impl BrowserSession {
     }
 
     fn effective_live_url(&self) -> Option<String> {
-        self.live_url.clone().or_else(|| self.local_live_url())
+        if self.mode == BrowserMode::RemoteCloud {
+            return self.live_url.clone();
+        }
+        self.local_live_url()
     }
 
     fn local_live_url(&self) -> Option<String> {
@@ -3684,6 +3687,9 @@ impl BrowserSession {
         self.connection = Some(connection);
         self.mode = mode;
         self.owner = owner;
+        if self.mode != BrowserMode::RemoteCloud {
+            self.live_url = None;
+        }
         self.connection_generation += 1;
         self.last_error = None;
         self.last_error_kind = None;
@@ -3708,6 +3714,9 @@ impl BrowserSession {
         self.connection = Some(connection);
         self.mode = mode;
         self.owner = owner;
+        if self.mode != BrowserMode::RemoteCloud {
+            self.live_url = None;
+        }
         self.connection_generation += 1;
         self.last_error = None;
         self.last_error_kind = None;
@@ -10285,14 +10294,25 @@ mod tests {
         });
 
         let first = session.browser_events();
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 1);
         assert_eq!(first[0]["type"], "browser.disconnected");
-        assert_eq!(first[1]["type"], "browser.live_url");
+        assert_eq!(first[0]["payload"]["live_url"], Value::Null);
+        assert!(session.browser_events().is_empty());
+
+        session.mode = BrowserMode::RemoteCloud;
+        session.connection_generation += 1;
+        let cloud = session.browser_events();
+        assert_eq!(cloud.len(), 2);
+        assert_eq!(cloud[0]["type"], "browser.disconnected");
         assert_eq!(
-            first[1]["payload"]["live_url"],
+            cloud[0]["payload"]["live_url"],
             "https://live.browser-use.com/watch"
         );
-        assert!(session.browser_events().is_empty());
+        assert_eq!(cloud[1]["type"], "browser.live_url");
+        assert_eq!(
+            cloud[1]["payload"]["live_url"],
+            "https://live.browser-use.com/watch"
+        );
 
         let connected = json!({
             "status": "connected",
