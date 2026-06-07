@@ -168,6 +168,7 @@ const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
+const SESSION_SETTINGS_EVENT: &str = "session.settings";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
 const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
@@ -959,6 +960,15 @@ struct SessionModelSelection {
     account: String,
     backend: AgentBackend,
     model_provider_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRuntimeSettings {
+    browser: String,
+    browser_local_label: Option<String>,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    collaboration_mode: CollaborationModeKind,
 }
 
 // ── Typewriter animation ──────────────────────────────────────────────────────
@@ -2009,6 +2019,48 @@ fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionMode
     })
 }
 
+fn session_runtime_settings_from_event(event: &EventRecord) -> Option<SessionRuntimeSettings> {
+    if event.event_type != SESSION_SETTINGS_EVENT {
+        return None;
+    }
+    let browser = event
+        .payload
+        .get("browser")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let browser_local_label = event
+        .payload
+        .get("browser_local_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_id = event
+        .payload
+        .get("browser_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_label = event
+        .payload
+        .get("browser_profile_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let collaboration_mode = event
+        .payload
+        .get("collaboration_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(collaboration_mode_from_setting)
+        .unwrap_or(CollaborationModeKind::Default);
+    Some(SessionRuntimeSettings {
+        browser,
+        browser_local_label,
+        browser_profile_id,
+        browser_profile_label,
+        collaboration_mode,
+    })
+}
+
 impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
@@ -2206,6 +2258,9 @@ impl App {
             feedback_rx: None,
             feedback_thanks_started: None,
         };
+        if let Some(session_id) = app.selected_session_id.clone() {
+            app.apply_session_settings_to_app(&session_id)?;
+        }
         app.refresh_cached_projection();
         if resumed_from_reexec {
             app.status_notice = Some(if app.selected_session_id.is_some() {
@@ -2278,7 +2333,7 @@ impl App {
         while let Ok(notification) = self.store_rx.try_recv() {
             drained_any = true;
             if notification == StoreNotification::SettingsChanged {
-                changed |= self.refresh_browser_profile_label()?;
+                changed |= self.refresh_visible_runtime_settings()?;
             }
             changed |= self
                 .state_cache
@@ -2544,7 +2599,7 @@ impl App {
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let mut changed = self.state_cache.refresh_all(&self.store)?;
-        changed |= self.refresh_browser_profile_label()?;
+        changed |= self.refresh_visible_runtime_settings()?;
         if changed {
             self.refresh_cached_projection();
         }
@@ -3988,7 +4043,11 @@ impl App {
         // Auth-nudge: when the account is not ready, route ALL submissions
         // (including follow-ups to a non-running session) through the nudge
         // path so we never dispatch work to an agent that can't start.
-        let account_not_ready = !self.account_ready(&self.account)?
+        let skip_account_gate_for_non_provider_followup =
+            matches!(self.agent_backend, AgentBackend::Fake | AgentBackend::None)
+                && self.selected_session_id.is_some();
+        let account_not_ready = (!skip_account_gate_for_non_provider_followup
+            && !self.account_ready(&self.account)?)
             || (self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()?);
         if account_not_ready {
             let submission = self.take_composer_submission();
@@ -4047,6 +4106,8 @@ impl App {
         // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
+        self.append_session_model_selection(&session.id, &self.current_model_selection())?;
+        self.append_current_session_runtime_settings(&session.id)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -4177,12 +4238,16 @@ impl App {
             AppCommand::ReconnectBrowser => self.request_reconnect_browser()?,
             AppCommand::NewTask => {
                 self.selected_session_id = None;
+                self.restore_default_runtime_settings()?;
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
             AppCommand::OpenHistory => self.open_surface(Surface::History),
             AppCommand::SelectHistory(session_id) => {
                 self.selected_session_id = Some(session_id);
+                if let Some(session_id) = self.selected_session_id.clone() {
+                    self.apply_session_settings_to_app(&session_id)?;
+                }
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
@@ -4202,6 +4267,7 @@ impl App {
                 }
                 self.collaboration_mode = mode;
                 self.persist_runtime_settings()?;
+                self.stamp_selected_inactive_session_settings()?;
             }
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
@@ -4239,6 +4305,7 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
+        self.append_current_session_runtime_settings(&session.id)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
         self.append_pending_initial_goal_to_session(&session.id)?;
@@ -4481,8 +4548,12 @@ impl App {
         let backend = selection.backend;
         let model = selection.provider_model.clone();
         let model_provider_id = selection.model_provider_id.clone();
-        let browser = self.browser.clone();
-        let collaboration_mode = self.collaboration_mode;
+        let runtime_settings = self.session_runtime_settings_or_current(&session_id)?;
+        let browser = runtime_settings.browser.clone();
+        let browser_profile_id = runtime_settings.browser_profile_id.clone();
+        let browser_profile_label = runtime_settings.browser_profile_label.clone();
+        let browser_local_browser = runtime_settings.browser_local_label.clone();
+        let collaboration_mode = runtime_settings.collaboration_mode;
         let config_profile = self.args.config_profile.clone();
         let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
@@ -4493,6 +4564,9 @@ impl App {
             model,
             model_provider_id,
             browser,
+            browser_profile_id,
+            browser_profile_label,
+            browser_local_browser,
             collaboration_mode,
             config_profile,
             config_overrides,
@@ -5586,7 +5660,18 @@ impl App {
             return Ok(());
         };
         if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
+            if self.has_codex_login()? {
+                self.codex_login_available = true;
+                self.account = account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    account,
+                    "Connected with Codex auth.".to_string(),
+                );
+            } else {
+                self.start_codex_auth(account)?;
+            }
         } else if is_claude_code_account(&account) {
             self.account = account.clone();
             self.persist_runtime_settings()?;
@@ -6155,15 +6240,7 @@ impl App {
         // No top "Model set to X" notice — the active model already shows in the
         // composer status line at the bottom.
         self.status_notice = None;
-        if let Some(session_id) = self.selected_session_id.as_deref() {
-            if self
-                .store
-                .load_session(session_id)?
-                .is_some_and(|session| !session.status.is_active())
-            {
-                self.append_session_model_selection(session_id, &self.current_model_selection())?;
-            }
-        }
+        self.stamp_selected_inactive_session_settings()?;
         self.close_surface();
         // If a nudge session is waiting for auth, start it now that the
         // account and model are confirmed ready.
@@ -6179,6 +6256,132 @@ impl App {
             backend: self.agent_backend,
             model_provider_id: self.model_provider_id.clone(),
         }
+    }
+
+    fn current_runtime_settings(&self) -> Result<SessionRuntimeSettings> {
+        Ok(SessionRuntimeSettings {
+            browser: self.browser.clone(),
+            browser_local_label: self.browser_local_label.clone(),
+            browser_profile_id: self
+                .default_profile
+                .current_profile_id
+                .clone()
+                .or(self.current_local_profile_id_for_settings()?),
+            browser_profile_label: self.browser_profile_label.clone(),
+            collaboration_mode: self.collaboration_mode,
+        })
+    }
+
+    fn session_runtime_settings_or_current(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSettings> {
+        Ok(self
+            .session_runtime_settings(session_id)?
+            .unwrap_or(self.current_runtime_settings()?))
+    }
+
+    fn session_runtime_settings(&self, session_id: &str) -> Result<Option<SessionRuntimeSettings>> {
+        Ok(self
+            .store
+            .events_for_session(session_id)?
+            .iter()
+            .rev()
+            .find_map(session_runtime_settings_from_event))
+    }
+
+    fn append_session_runtime_settings(
+        &self,
+        session_id: &str,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<()> {
+        self.store.append_event(
+            session_id,
+            SESSION_SETTINGS_EVENT,
+            serde_json::json!({
+                "browser": settings.browser,
+                "browser_local_label": settings.browser_local_label,
+                "browser_profile_id": settings.browser_profile_id,
+                "browser_profile_label": settings.browser_profile_label,
+                "collaboration_mode": collaboration_mode_setting_value(settings.collaboration_mode),
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn append_current_session_runtime_settings(&self, session_id: &str) -> Result<()> {
+        self.append_session_runtime_settings(session_id, &self.current_runtime_settings()?)
+    }
+
+    fn stamp_selected_inactive_session_settings(&self) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .store
+            .load_session(session_id)?
+            .is_some_and(|session| !session.status.is_active())
+        {
+            self.append_session_model_selection(session_id, &self.current_model_selection())?;
+            self.append_current_session_runtime_settings(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn apply_session_settings_to_app(&mut self, session_id: &str) -> Result<()> {
+        if let Some(selection) = self.session_model_selection(session_id)? {
+            self.model = selection.display_model;
+            self.provider_model = selection.provider_model;
+            self.account = selection.account;
+            self.agent_backend = selection.backend;
+            self.model_provider_id = selection.model_provider_id;
+            self.model_configured = true;
+        }
+        if let Some(settings) = self.session_runtime_settings(session_id)? {
+            self.browser = settings.browser;
+            self.browser_local_label = settings.browser_local_label;
+            self.browser_profile_label = settings.browser_profile_label;
+            self.default_profile.current_profile_id = settings.browser_profile_id;
+            self.collaboration_mode = settings.collaboration_mode;
+        }
+        Ok(())
+    }
+
+    fn restore_default_runtime_settings(&mut self) -> Result<()> {
+        self.account = self
+            .store
+            .get_setting("account")?
+            .unwrap_or_else(|| self.args.account.clone());
+        self.agent_backend = self
+            .store
+            .get_setting("agent.backend")?
+            .and_then(|value| AgentBackend::from_setting(&value))
+            .unwrap_or(self.args.agent);
+        if let Some(model) = self.store.get_setting("model")? {
+            self.model = model;
+        }
+        if let Some(provider_model) = self.store.get_setting("provider.model")? {
+            self.provider_model = provider_model;
+        }
+        self.model_provider_id = self
+            .store
+            .get_setting("provider.id")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some(model_provider_id_for_backend(self.agent_backend).to_string()));
+        self.collaboration_mode = self
+            .store
+            .get_setting(COLLABORATION_MODE_SETTING)?
+            .and_then(|value| collaboration_mode_from_setting(&value))
+            .unwrap_or_else(|| self.args.collaboration_mode.into());
+        self.browser = self
+            .store
+            .get_setting("browser")?
+            .unwrap_or_else(|| self.args.browser.clone());
+        self.browser_local_label = browser_local_label_from_store(&self.store)?;
+        self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
+        Ok(())
     }
 
     fn parsed_config_overrides(&self) -> Result<ConfigOverrides> {
@@ -6646,6 +6849,7 @@ impl App {
         )?;
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
@@ -6683,6 +6887,7 @@ impl App {
         }
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
@@ -7229,6 +7434,7 @@ impl App {
             .set_setting("browser.preference.profile_label", &profile_label)?;
         self.browser_profile_label = Some(profile_label.clone());
         self.default_profile.current_profile_id = Some(profile.id.clone());
+        self.stamp_selected_inactive_session_settings()?;
         self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
         self.close_surface();
         Ok(())
@@ -7256,14 +7462,47 @@ impl App {
         }
     }
 
-    fn refresh_browser_profile_label(&mut self) -> Result<bool> {
-        let local_browser = browser_local_label_from_store(&self.store)?;
-        let next = browser_profile_label_from_store(&self.store)?;
-        let changed =
-            self.browser_local_label != local_browser || self.browser_profile_label != next;
-        self.browser_local_label = local_browser;
-        self.browser_profile_label = next;
-        Ok(changed)
+    fn refresh_visible_runtime_settings(&mut self) -> Result<bool> {
+        if let Some(session_id) = self.selected_session_id.clone() {
+            let before = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            self.apply_session_settings_to_app(&session_id)?;
+            let after = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            Ok(before != after)
+        } else {
+            let before = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            self.browser_local_label = browser_local_label_from_store(&self.store)?;
+            self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+            let after = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            Ok(before != after)
+        }
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -12102,6 +12341,56 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn selected_session_keeps_browser_profile_while_new_task_uses_latest_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.setup_complete = true;
+        app.model_configured = true;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Google Chrome".to_string());
+        app.browser_profile_label = Some("Work".to_string());
+        app.default_profile.current_profile_id = Some("google-chrome:Work".to_string());
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.append_current_session_runtime_settings(&session.id)?;
+        app.append_session_model_selection(&session.id, &app.current_model_selection())?;
+
+        app.store.set_setting("browser", BROWSER_LOCAL_CHROME)?;
+        app.store.set_setting("browser.preference.mode", "local")?;
+        app.store
+            .set_setting("browser.preference.browser", "Brave")?;
+        app.store
+            .set_setting("browser.preference.browser_label", "Brave")?;
+        app.store
+            .set_setting("browser.preference.profile", "brave:Personal")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Personal")?;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Brave".to_string());
+        app.browser_profile_label = Some("Personal".to_string());
+        app.default_profile.current_profile_id = Some("brave:Personal".to_string());
+
+        app.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Google Chrome"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("google-chrome:Work")
+        );
+
+        app.dispatch(AppCommand::NewTask)?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Personal"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("brave:Personal")
+        );
+        Ok(())
     }
 
     #[test]
