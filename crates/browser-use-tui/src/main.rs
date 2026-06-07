@@ -5637,18 +5637,7 @@ impl App {
     }
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
-        if self.account_ready(&account)? {
-            self.account = account.clone();
-            self.persist_runtime_settings()?;
-            self.show_setup_result(
-                SetupResultKind::Success,
-                account,
-                "Connected with Codex auth.".to_string(),
-            );
-        } else {
-            self.start_codex_device_login(account)?;
-        }
-        Ok(())
+        self.start_codex_device_login(account)
     }
 
     fn show_setup_result(&mut self, kind: SetupResultKind, account: String, message: String) {
@@ -14217,6 +14206,57 @@ wire_api = "responses"
         assert!(app.setup_complete);
         assert_eq!(app.model, "gpt-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_selection_reauthenticates_over_stored_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.store
+            .set_setting("auth.codex.access_token", "old-access")?;
+        app.store
+            .set_setting("auth.codex.account_id", "old-account")?;
+        app.store
+            .set_setting("auth.codex.refresh_token", "old-refresh")?;
+
+        app.start_auth_flow(settings::ACCOUNT_CODEX.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .codex_login
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test Codex login sender")
+            .clone();
+
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "new-access",
+                "new-account",
+                Some("new-id".to_string()),
+                Some("new-refresh".to_string()),
+                None,
+                Some("2026-01-02T00:00:00Z".to_string()),
+            ),
+        )))
+        .expect("send test Codex auth result");
+        assert!(app.drain_codex_login_notifications()?);
+        assert_eq!(
+            app.store.get_setting("auth.codex.access_token")?,
+            Some("new-access".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.account_id")?,
+            Some("new-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("new-refresh".to_string())
+        );
         Ok(())
     }
 
