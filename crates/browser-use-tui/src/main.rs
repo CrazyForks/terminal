@@ -311,24 +311,24 @@ enum ModelSearchEntry {
     Item(String),
 }
 
-/// A row on the provider screen. `submenu` rows (OpenAI) open a sub-dialogue of
-/// auth methods; other rows connect their `account` directly.
+/// A row on the provider screen.
 struct ProviderRow {
     label: String,
     account: &'static str,
-    submenu: bool,
 }
 
 /// The OpenAI auth methods shown in the sub-dialogue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenAiAuthMethod {
+enum ProviderAuthMethod {
     Codex,
     ApiKey,
+    ChangeApiKey,
+    ChangeOAuth,
 }
 
-struct OpenAiAuthRow {
+struct ProviderAuthRow {
     label: String,
-    method: OpenAiAuthMethod,
+    method: ProviderAuthMethod,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -650,7 +650,6 @@ enum AppCommand {
     Reload,
     Update,
     SaveAccount(String),
-    SelectProvider(&'static str),
     SelectRecommended(usize),
     OpenModelSearch,
     SaveCustomModel(String),
@@ -3346,9 +3345,9 @@ impl App {
             Surface::Model => self.current_model_surface_index().unwrap_or(0),
             Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
             Surface::OpenAiAuth => self
-                .current_openai_method()
+                .current_provider_auth_method()
                 .and_then(|method| {
-                    self.openai_auth_rows()
+                    self.provider_auth_rows()
                         .iter()
                         .position(|row| row.method == method)
                 })
@@ -3402,30 +3401,25 @@ impl App {
             .position(|choice| self.model == choice.display && self.account == choice.account)
     }
 
-    /// The provider/auth rows shown beneath the recommended quick-picks. OpenAI
-    /// splits into "sign in" (OAuth) and "API key"; the "Codex login (detected)"
-    /// row appears only when an external codex login is present.
+    /// The provider/auth rows shown beneath the recommended quick-picks. Each
+    /// provider appears once and opens a provider-specific auth/model menu.
     fn provider_rows(&self) -> Vec<ProviderRow> {
         vec![
             ProviderRow {
                 label: "OpenAI".to_string(),
-                account: ACCOUNT_CODEX,
-                submenu: true,
+                account: ACCOUNT_OPENAI,
             },
             ProviderRow {
-                label: "Anthropic · API key".to_string(),
+                label: "Anthropic".to_string(),
                 account: ACCOUNT_ANTHROPIC,
-                submenu: false,
             },
             ProviderRow {
-                label: "OpenRouter · API key".to_string(),
+                label: "OpenRouter".to_string(),
                 account: ACCOUNT_OPENROUTER,
-                submenu: false,
             },
             ProviderRow {
-                label: "DeepSeek · API key".to_string(),
+                label: "DeepSeek".to_string(),
                 account: ACCOUNT_DEEPSEEK,
-                submenu: false,
             },
         ]
     }
@@ -3435,10 +3429,19 @@ impl App {
         if !self.model_configured {
             return false;
         }
-        if row.submenu {
+        if row.account == ACCOUNT_OPENAI {
             self.account == ACCOUNT_CODEX || self.account == ACCOUNT_OPENAI
         } else {
             self.account == row.account
+        }
+    }
+
+    fn provider_row_connected(&self, row: &ProviderRow) -> bool {
+        if row.account == ACCOUNT_OPENAI {
+            self.account_ready(ACCOUNT_CODEX).unwrap_or(false)
+                || self.account_ready(ACCOUNT_OPENAI).unwrap_or(false)
+        } else {
+            self.account_ready(row.account).unwrap_or(false)
         }
     }
 
@@ -3495,7 +3498,7 @@ impl App {
     }
 
     /// Provider screen selection: a recommended quick-pick (top rows) or a
-    /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
+    /// provider row (lower rows).
     fn provider_surface_select(&mut self) -> Result<()> {
         let rec_count = self.recommended_models().len();
         if self.selected_row < rec_count {
@@ -3504,53 +3507,167 @@ impl App {
         }
         let rows = self.provider_rows();
         if let Some(row) = rows.get(self.selected_row - rec_count) {
-            if row.submenu {
-                self.open_surface(Surface::OpenAiAuth);
-            } else {
-                let account = row.account;
-                self.dispatch(AppCommand::SelectProvider(account))?;
-            }
+            self.selected_provider = Some(row.account);
+            self.open_surface(Surface::OpenAiAuth);
         }
         Ok(())
     }
 
-    /// The OpenAI auth-method rows: Codex OAuth and API key.
-    fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
-        vec![
-            OpenAiAuthRow {
-                label: "Sign in with Codex OAuth".to_string(),
-                method: OpenAiAuthMethod::Codex,
-            },
-            OpenAiAuthRow {
-                label: "Use an API key".to_string(),
-                method: OpenAiAuthMethod::ApiKey,
-            },
-        ]
+    fn provider_auth_account(&self) -> &'static str {
+        match self.selected_provider {
+            Some(ACCOUNT_CODEX) => ACCOUNT_OPENAI,
+            Some(account) => account,
+            None => ACCOUNT_OPENAI,
+        }
     }
 
-    /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
-    fn current_openai_method(&self) -> Option<OpenAiAuthMethod> {
+    fn provider_auth_label(&self) -> &'static str {
+        match self.provider_auth_account() {
+            ACCOUNT_OPENAI => "OpenAI",
+            ACCOUNT_ANTHROPIC => "Anthropic",
+            ACCOUNT_OPENROUTER => "OpenRouter",
+            ACCOUNT_DEEPSEEK => "DeepSeek",
+            _ => "Provider",
+        }
+    }
+
+    fn provider_auth_api_key_ready(&self, account: &str) -> bool {
+        match account {
+            ACCOUNT_OPENAI => self
+                .has_stored_or_env(
+                    "auth.openai.api_key",
+                    &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_OPENROUTER => self
+                .has_stored_or_env(
+                    "auth.openrouter.api_key",
+                    &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_DEEPSEEK => self
+                .has_stored_or_env(
+                    "auth.deepseek.api_key",
+                    &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_ANTHROPIC => self
+                .has_stored_or_env(
+                    "auth.anthropic.api_key",
+                    &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                )
+                .unwrap_or(false),
+            _ => self.account_ready(account).unwrap_or(false),
+        }
+    }
+
+    /// Provider auth menu rows. OpenAI can route through Codex login or an
+    /// OpenAI API key; other providers route through their API key.
+    fn provider_auth_rows(&self) -> Vec<ProviderAuthRow> {
+        let account = self.provider_auth_account();
+        let mut rows = Vec::new();
+        let api_key_ready = self.provider_auth_api_key_ready(account);
+        let current = self.current_provider_auth_method();
+        let api_rows = |label: &str, include_change: bool| {
+            let mut rows = vec![ProviderAuthRow {
+                label: label.to_string(),
+                method: ProviderAuthMethod::ApiKey,
+            }];
+            if include_change {
+                rows.push(ProviderAuthRow {
+                    label: format!("Change {} API key", self.provider_auth_label()),
+                    method: ProviderAuthMethod::ChangeApiKey,
+                });
+            }
+            rows
+        };
+        if account == ACCOUNT_OPENAI {
+            let codex_ready = self.account_ready(ACCOUNT_CODEX).unwrap_or(false);
+            let codex_rows = || {
+                if codex_ready {
+                    vec![
+                        ProviderAuthRow {
+                            label: "Select model with current login".to_string(),
+                            method: ProviderAuthMethod::Codex,
+                        },
+                        ProviderAuthRow {
+                            label: "Change OpenAI OAuth".to_string(),
+                            method: ProviderAuthMethod::ChangeOAuth,
+                        },
+                    ]
+                } else {
+                    vec![ProviderAuthRow {
+                        label: "Sign in with Codex OAuth".to_string(),
+                        method: ProviderAuthMethod::Codex,
+                    }]
+                }
+            };
+            let api_label = if api_key_ready {
+                "Select model with current key"
+            } else {
+                "Use an API key"
+            };
+            let mut openai_api_rows = api_rows(api_label, api_key_ready);
+            if current == Some(ProviderAuthMethod::Codex) || !api_key_ready {
+                rows.extend(codex_rows());
+                rows.append(&mut openai_api_rows);
+            } else {
+                rows.append(&mut openai_api_rows);
+                rows.extend(codex_rows());
+            }
+            return rows;
+        }
+        if api_key_ready {
+            rows.extend(api_rows("Select model with current key", true));
+        } else {
+            rows.extend(api_rows("Use an API key", false));
+        }
+        rows
+    }
+
+    /// The provider auth method currently in use (highlighted in the sub-dialogue).
+    fn current_provider_auth_method(&self) -> Option<ProviderAuthMethod> {
         if !self.model_configured {
             return None;
         }
-        if self.account == ACCOUNT_OPENAI {
-            return Some(OpenAiAuthMethod::ApiKey);
-        }
-        if self.account == ACCOUNT_CODEX {
-            return Some(OpenAiAuthMethod::Codex);
+        let account = self.provider_auth_account();
+        if account == ACCOUNT_OPENAI {
+            if self.account == ACCOUNT_CODEX {
+                return Some(ProviderAuthMethod::Codex);
+            }
+            if self.provider_auth_api_key_ready(ACCOUNT_OPENAI) {
+                return Some(ProviderAuthMethod::ApiKey);
+            }
+            if self.account_ready(ACCOUNT_CODEX).unwrap_or(false) {
+                return Some(ProviderAuthMethod::Codex);
+            }
+        } else if self.provider_auth_api_key_ready(account) {
+            return Some(ProviderAuthMethod::ApiKey);
         }
         None
     }
 
-    /// OpenAI sub-dialogue Enter: route the chosen method through auth-first.
-    fn openai_auth_select(&mut self) -> Result<()> {
-        let rows = self.openai_auth_rows();
+    /// Provider auth menu Enter: route the chosen method through auth-first.
+    fn provider_auth_select(&mut self) -> Result<()> {
+        let account = self.provider_auth_account();
+        let rows = self.provider_auth_rows();
         let Some(method) = rows.get(self.selected_row).map(|row| row.method) else {
             return Ok(());
         };
         match method {
-            OpenAiAuthMethod::ApiKey => self.select_provider(ACCOUNT_OPENAI),
-            OpenAiAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ApiKey => self.select_provider(account),
+            ProviderAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ChangeApiKey => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_entry(account.to_string());
+                Ok(())
+            }
+            ProviderAuthMethod::ChangeOAuth => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_flow(ACCOUNT_CODEX.to_string())
+            }
         }
     }
 
@@ -4203,7 +4320,10 @@ impl App {
                 self.collaboration_mode = mode;
                 self.persist_runtime_settings()?;
             }
-            AppCommand::SignIn => self.open_surface(Surface::Account),
+            AppCommand::SignIn => {
+                self.selected_provider = None;
+                self.open_surface(Surface::Account);
+            }
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_browser_select()?,
             AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
@@ -4211,7 +4331,6 @@ impl App {
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
-            AppCommand::SelectProvider(account) => self.select_provider(account)?,
             AppCommand::SelectRecommended(index) => self.select_recommended(index)?,
             AppCommand::OpenModelSearch => self.open_model_search()?,
             AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
@@ -4957,15 +5076,20 @@ impl App {
                 self.escape_stop_until = None;
                 self.cancel_secret_entry();
             }
-            // Model search: Esc goes back to the provider screen.
+            // Model search: Esc goes back to the provider auth menu for the
+            // provider being searched.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::ModelSearch => {
                 self.escape_stop_until = None;
                 self.composer.clear();
-                self.open_surface(Surface::Provider);
+                if self.selected_provider.is_some() {
+                    self.open_surface(Surface::OpenAiAuth);
+                } else {
+                    self.open_surface(Surface::Provider);
+                }
             }
-            // OpenAI auth sub-dialogue: Esc goes back to the provider list.
+            // Provider auth menu: Esc goes back to the provider list.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::OpenAiAuth => {
@@ -5517,7 +5641,7 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Provider => self.provider_surface_select()?,
-            Surface::OpenAiAuth => self.openai_auth_select()?,
+            Surface::OpenAiAuth => self.provider_auth_select()?,
             Surface::Model => self.model_surface_select()?,
             Surface::ModelSearch => self.model_search_select()?,
             Surface::Mode => {
@@ -7011,6 +7135,12 @@ impl App {
     }
 
     fn cancel_auth_entry(&mut self) {
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && self
+                .api_key_account
+                .as_deref()
+                .is_some_and(|account| account != BROWSER_USE_CLOUD);
         self.api_key_account = None;
         self.pending_model_after_auth = None;
         self.pending_model_search_after_auth = false;
@@ -7019,7 +7149,12 @@ impl App {
             self.setup_pending_account = None;
             self.setup_result = None;
         }
-        self.cancel_secret_entry();
+        self.composer.clear();
+        if return_to_provider_auth {
+            self.open_surface(Surface::OpenAiAuth);
+        } else {
+            self.close_surface();
+        }
     }
 
     fn start_telemetry_entry(&mut self) {
@@ -7471,7 +7606,7 @@ impl App {
             Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
-            Surface::OpenAiAuth => self.openai_auth_rows().len(),
+            Surface::OpenAiAuth => self.provider_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
             Surface::ModelSearch => self.model_search_row_count(),
             Surface::Mode => 2,
@@ -14437,33 +14572,92 @@ wire_api = "responses"
         assert!(screen.contains("providers"), "{screen}");
         assert!(screen.contains(RECOMMENDED_MODELS[0].display), "{screen}");
         assert!(screen.contains("OpenAI"), "{screen}");
-        assert!(screen.contains("Anthropic · API key"), "{screen}");
-        assert!(screen.contains("OpenRouter · API key"), "{screen}");
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
         Ok(())
     }
 
     #[test]
-    fn provider_rows_collapse_openai_into_a_submenu() -> Result<()> {
+    fn provider_rows_are_single_menu_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app = ready_app(&temp)?;
         let rows = app.provider_rows();
-        // OpenAI is a single row that opens the auth sub-dialogue.
-        let openai = rows
-            .iter()
-            .find(|row| row.label == "OpenAI")
-            .expect("OpenAI row");
-        assert!(openai.submenu);
-        assert_eq!(openai.account, settings::ACCOUNT_CODEX);
-        // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
-        assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
-        // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
+        assert_eq!(rows.len(), 4);
         assert!(rows
             .iter()
-            .any(|row| row.label == "Anthropic · API key"
-                && row.account == settings::ACCOUNT_ANTHROPIC));
-        assert!(!rows
+            .any(|row| { row.label == "OpenAI" && row.account == settings::ACCOUNT_OPENAI }));
+        assert!(rows
             .iter()
-            .any(|row| row.label.contains("Anthropic · sign in")));
+            .any(|row| { row.label == "Anthropic" && row.account == settings::ACCOUNT_ANTHROPIC }));
+        assert!(rows.iter().any(|row| {
+            row.label == "OpenRouter" && row.account == settings::ACCOUNT_OPENROUTER
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.label == "DeepSeek" && row.account == settings::ACCOUNT_DEEPSEEK }));
+        assert!(!rows.iter().any(|row| row.label.contains("API key")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_auth_menu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+
+        let rows = app.provider_rows();
+        let provider_row = rows
+            .iter()
+            .position(|row| row.label == "OpenRouter")
+            .context("OpenRouter provider row")?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("connected"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = RECOMMENDED_MODELS.len() + provider_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(!screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenRouter use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        app.open_surface(Surface::OpenAiAuth);
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENROUTER)
+        );
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
         Ok(())
     }
 
@@ -14504,16 +14698,254 @@ wire_api = "responses"
         app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
         app.execute_surface_selection()?;
         assert_eq!(app.surface, Surface::OpenAiAuth);
-        // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
-        // login). The API-key method is always offered.
-        let methods: Vec<OpenAiAuthMethod> = app
-            .openai_auth_rows()
+        let methods: Vec<ProviderAuthMethod> = app
+            .provider_auth_rows()
             .iter()
             .map(|row| row.method)
             .collect();
-        assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::Codex));
+        Ok(())
+    }
+
+    #[test]
+    fn connected_openai_auth_submenu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        let change_row = rows
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenAI change-key row")?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        app.selected_row = change_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+
+        app.handle_paste("new-openai-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openai.api_key")?.as_deref(),
+            Some("new-openai-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_api_key_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[2].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[2].label, "Sign in with Codex OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeOAuth));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_auth_menu_defaults_to_current_login() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeApiKey));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_auth_menu_shows_change_rows_only_for_existing_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[1].label, "Change OpenAI API key");
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::Codex
+                && row.label == "Select model with current login"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::ChangeOAuth && row.label == "Change OpenAI OAuth"
+        }));
+
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_ANTHROPIC.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_api_key_providers_default_to_current_key_even_when_not_active() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.store
+            .set_setting("auth.deepseek.api_key", "old-deepseek-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+
+        for account in [
+            settings::ACCOUNT_ANTHROPIC,
+            settings::ACCOUNT_OPENROUTER,
+            settings::ACCOUNT_DEEPSEEK,
+        ] {
+            app.selected_provider = Some(account);
+            app.open_surface(Surface::OpenAiAuth);
+
+            let rows = app.provider_auth_rows();
+            assert_eq!(app.selected_row, 0, "{account}");
+            assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey, "{account}");
+            assert_eq!(rows[0].label, "Select model with current key", "{account}");
+            assert_eq!(
+                app.current_provider_auth_method(),
+                Some(ProviderAuthMethod::ApiKey)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_search_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenAI use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Provider);
+        Ok(())
+    }
+
+    #[test]
+    fn api_key_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        let anthropic_row = app
+            .provider_rows()
+            .iter()
+            .position(|row| row.account == settings::ACCOUNT_ANTHROPIC)
+            .context("Anthropic provider row")?;
+        app.selected_row = RECOMMENDED_MODELS.len() + anthropic_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("Anthropic change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("Change Anthropic API key"), "{screen}");
         Ok(())
     }
 
