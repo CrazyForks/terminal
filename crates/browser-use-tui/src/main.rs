@@ -10,8 +10,6 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-#[cfg(not(test))]
-use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex, Once,
@@ -45,14 +43,17 @@ use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
+    codex_oauth_pkce, codex_oauth_state, load_codex_auth_file, ClaudeCodeOAuthCredential,
+    CodexAuth, CodexManagedAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, load_codex_auth_file,
-    parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
+    ClaudeCodeAuthorization, CodexAuthorization, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 #[cfg(test)]
 use browser_use_store::StoreNotifier;
@@ -126,8 +127,8 @@ use settings::{
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
+    AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
     BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
@@ -154,8 +155,7 @@ const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Synthetic assistant nudge shown when user submits a task with no API key.
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
-You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
-free — or add your own key with /auth.";
+You can get one free at cloud.browser-use.com and add it with /auth.";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
     "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
@@ -171,7 +171,6 @@ pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
 const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
-const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
@@ -429,13 +428,13 @@ impl Drop for ClaudeCodeOAuthFlow {
 
 #[derive(Debug)]
 enum CodexLoginEvent {
-    Output(String),
-    Finished(Result<CodexAuth, String>),
+    Finished(Result<CodexManagedAuth, String>),
 }
 
 #[derive(Debug)]
 struct CodexLoginFlow {
     account: String,
+    url: String,
     output: String,
     started_at: Instant,
     stop_tx: mpsc::Sender<()>,
@@ -2551,11 +2550,6 @@ impl App {
         }
         for event in events {
             match event {
-                CodexLoginEvent::Output(text) => {
-                    if let Some(flow) = self.codex_login.as_mut() {
-                        flow.output.push_str(&strip_ansi(&text));
-                    }
-                }
                 CodexLoginEvent::Finished(result) => {
                     let account = self
                         .codex_login
@@ -2565,7 +2559,7 @@ impl App {
                     self.codex_login = None;
                     match result {
                         Ok(auth) => {
-                            self.store_codex_auth(&auth)?;
+                            self.store_codex_managed_auth(&auth)?;
                             self.codex_login_available = true;
                             self.account = account.clone();
                             self.persist_runtime_settings()?;
@@ -3535,6 +3529,7 @@ impl App {
         // Open the model picker on the currently active model
         self.selected_row = match surface {
             Surface::Provider => self.current_provider_screen_index().unwrap_or(0),
+            Surface::Account => self.current_auth_surface_index().unwrap_or(0),
             Surface::Model => self.current_model_surface_index().unwrap_or(0),
             Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
             Surface::OpenAiAuth => self
@@ -3563,6 +3558,13 @@ impl App {
                 .collect(),
             None => self.model_choices.clone(),
         }
+    }
+
+    fn current_auth_surface_index(&self) -> Option<usize> {
+        self.api_key_account
+            .as_deref()
+            .or(Some(self.account.as_str()))
+            .and_then(|account| AUTH_CHOICES.iter().position(|choice| *choice == account))
     }
 
     /// Whether the model screen shows the trailing "enter a custom model" row,
@@ -3699,21 +3701,18 @@ impl App {
         Ok(())
     }
 
-    /// The OpenAI auth-method rows: Sign in (OAuth), Codex (only when an external
-    /// login is detected), and API key.
+    /// The OpenAI auth-method rows: Codex OAuth and API key.
     fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
-        let mut rows = Vec::new();
-        if self.has_external_codex_login() {
-            rows.push(OpenAiAuthRow {
-                label: "Use detected Codex login".to_string(),
+        vec![
+            OpenAiAuthRow {
+                label: "Sign in with Codex OAuth".to_string(),
                 method: OpenAiAuthMethod::Codex,
-            });
-        }
-        rows.push(OpenAiAuthRow {
-            label: "Use an API key".to_string(),
-            method: OpenAiAuthMethod::ApiKey,
-        });
-        rows
+            },
+            OpenAiAuthRow {
+                label: "Use an API key".to_string(),
+                method: OpenAiAuthMethod::ApiKey,
+            },
+        ]
     }
 
     /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
@@ -3939,7 +3938,7 @@ impl App {
                 account_id,
             };
         }
-        if let Ok(auth) = load_codex_auth() {
+        if let Some(auth) = codex_auth_from_explicit_env() {
             return ProviderCredential::Oauth {
                 access_token: auth.access_token,
                 account_id: auth.account_id,
@@ -4266,6 +4265,7 @@ impl App {
         self.selected_session_id = Some(session.id.clone());
         self.pending_auth_resume = Some(session.id.clone());
         self.native_history.reset_with_clear();
+        self.drain_store_notifications()?;
         Ok(())
     }
 
@@ -5745,6 +5745,7 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
+        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5784,6 +5785,7 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
+            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5813,6 +5815,28 @@ impl App {
         true
     }
 
+    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
+        let overlay = self.live_link_overlay.borrow();
+        let link = overlay.as_ref()?;
+        if link.text.is_empty() || row != link.row {
+            return None;
+        }
+        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
+        let end = link.col.saturating_add(width);
+        if column < link.col || column >= end {
+            return None;
+        }
+        Some(link.url.clone())
+    }
+
+    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
+        let Some(url) = self.live_link_url_at(column, row) else {
+            return Ok(false);
+        };
+        self.request_open_browser_target(url)?;
+        Ok(true)
+    }
+
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -5825,12 +5849,9 @@ impl App {
             Surface::SetupConfirm => self.execute_setup_confirm_selection()?,
             Surface::SetupResult => self.execute_setup_result_selection()?,
             Surface::Account => {
-                let account = ACCOUNT_CHOICES
-                    .get(
-                        self.selected_row
-                            .min(ACCOUNT_CHOICES.len().saturating_sub(1)),
-                    )
-                    .unwrap_or(&ACCOUNT_CHOICES[0])
+                let account = AUTH_CHOICES
+                    .get(self.selected_row.min(AUTH_CHOICES.len().saturating_sub(1)))
+                    .unwrap_or(&AUTH_CHOICES[0])
                     .to_string();
                 self.dispatch(AppCommand::SaveAccount(account))?;
             }
@@ -5999,18 +6020,7 @@ impl App {
     }
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
-        if self.account_ready(&account)? {
-            self.account = account.clone();
-            self.persist_runtime_settings()?;
-            self.show_setup_result(
-                SetupResultKind::Success,
-                account,
-                "Connected with Codex auth.".to_string(),
-            );
-        } else {
-            self.start_codex_device_login(account)?;
-        }
-        Ok(())
+        self.start_codex_device_login(account)
     }
 
     fn show_setup_result(&mut self, kind: SetupResultKind, account: String, message: String) {
@@ -6048,7 +6058,10 @@ impl App {
         let Some(session) = self.store.load_session(&session_id)? else {
             return Ok(());
         };
-        if session.status.is_active() {
+        let events = self.store.events_for_session(&session_id)?;
+        if session.status.is_active()
+            && !self.session_events_are_waiting_for_auth(&session_id, &events)
+        {
             // Agent already running — just navigate.
             self.selected_session_id = Some(session_id);
             self.native_history.reset_with_clear();
@@ -7038,6 +7051,10 @@ impl App {
             self.start_codex_auth(account)?;
             return Ok(());
         }
+        if account == BROWSER_USE_CLOUD {
+            self.start_auth_flow(account)?;
+            return Ok(());
+        }
         self.account = account.clone();
         self.start_auth_flow(account)?;
         Ok(())
@@ -7906,18 +7923,26 @@ impl App {
                 return Ok(());
             }
         };
+        let auth_url = flow.url.clone();
         self.codex_login = Some(flow);
-        self.show_setup_result(
-            SetupResultKind::Pending,
-            account,
-            "Waiting for Codex device sign-in.".to_string(),
-        );
+        if let Some(flow) = self.codex_login.as_mut() {
+            flow.output.push_str(&auth_url);
+            flow.output.push('\n');
+        }
+        let message = match open_external_url(&auth_url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        self.show_setup_result(SetupResultKind::Pending, account, message);
         Ok(())
     }
 
     fn reopen_codex_device_auth_url(&mut self) {
-        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
-            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
+        let Some(url) = self.codex_login.as_ref().map(|flow| flow.url.clone()) else {
+            return;
+        };
+        let message = match open_external_url(&url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
             Err(error) => format!("Could not open browser automatically: {error}"),
         };
         if let Some(result) = self.setup_result.as_mut() {
@@ -7951,18 +7976,9 @@ impl App {
         Ok(())
     }
 
-    /// Whether a codex login exists OUTSIDE our own OAuth store keys (an external
-    /// `~/.codex/auth.json`, managed auth, or env). Drives the "Codex login
-    /// detected" provider row so it appears only for a pre-existing login.
-    fn has_external_codex_login(&self) -> bool {
-        load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
-    }
-
     fn setup_account_choices(&self) -> Result<Vec<&'static str>> {
         let mut choices = Vec::new();
-        if self.account_ready(ACCOUNT_CODEX)? {
-            choices.push(ACCOUNT_CODEX);
-        }
+        choices.push(ACCOUNT_CODEX);
         choices.extend([
             ACCOUNT_OPENAI,
             ACCOUNT_ANTHROPIC,
@@ -8018,7 +8034,7 @@ impl App {
     fn setup_row_count(&self) -> usize {
         self.setup_account_choices()
             .map(|choices| choices.len())
-            .unwrap_or_else(|_| ACCOUNT_CHOICES.len().saturating_sub(1))
+            .unwrap_or_else(|_| AUTH_CHOICES.len().saturating_sub(1))
     }
 
     fn cookie_sync_row_count(&self) -> usize {
@@ -8430,7 +8446,7 @@ impl App {
             Surface::Setup => self.setup_row_count(),
             Surface::SetupConfirm => 2,
             Surface::SetupResult => self.setup_result_row_count(),
-            Surface::Account => ACCOUNT_CHOICES.len(),
+            Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Email => 2,
             Surface::Secrets | Surface::Domains => 0,
@@ -8610,6 +8626,9 @@ impl App {
         let Some(session) = state.current_session.as_ref() else {
             return ProductState::Ready;
         };
+        if self.session_is_waiting_for_auth(&session.id) {
+            return ProductState::Result;
+        }
         if session.status.is_active() {
             ProductState::Running
         } else if session.status == SessionStatus::Cancelled {
@@ -8655,6 +8674,7 @@ impl App {
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
+            BROWSER_USE_CLOUD => self.browser_use_cloud_key_ready()?,
             account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
             ACCOUNT_CODEX => self.has_codex_login()?,
             _ => false,
@@ -8663,6 +8683,62 @@ impl App {
 
     fn auth_notice(&self) -> Result<Option<String>> {
         self.auth_notice_for_selection(&self.current_model_selection())
+    }
+
+    pub(crate) fn session_is_waiting_for_auth(&self, session_id: &str) -> bool {
+        self.session_events_are_waiting_for_auth(
+            session_id,
+            self.cached_events_for_session(session_id),
+        )
+    }
+
+    pub(crate) fn session_events_are_waiting_for_auth(
+        &self,
+        session_id: &str,
+        events: &[EventRecord],
+    ) -> bool {
+        let Some(nudge_seq) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.session_id == session_id
+                    && event.event_type == "session.notice"
+                    && event
+                        .payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(NO_KEY_NUDGE_TEXT)
+            })
+            .map(|event| event.seq)
+        else {
+            return false;
+        };
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "agent.run.started" | "session.done" | "session.failed" | "session.cancelled"
+                )
+        }) {
+            return false;
+        }
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && event.event_type == "session.status"
+                && event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running")
+        }) {
+            return false;
+        }
+        self.pending_auth_resume.as_deref() == Some(session_id)
+            || !events.iter().any(|event| {
+                event.session_id == session_id && event.event_type == "agent.run.started"
+            })
     }
 
     fn auth_notice_for_selection(
@@ -8778,20 +8854,49 @@ impl App {
         {
             return Ok(true);
         }
-        Ok(load_codex_managed_auth().is_ok()
-            || load_codex_auth().is_ok()
-            || codex_env_auth_present())
+        Ok(codex_env_auth_present())
     }
 
-    fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
+    fn store_codex_managed_auth(&self, auth: &CodexManagedAuth) -> Result<()> {
+        let snapshot = auth.current_snapshot()?;
         self.store
-            .set_setting("auth.codex.access_token", auth.access_token.trim())?;
+            .set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
         self.store
-            .set_setting("auth.codex.account_id", auth.account_id.trim())?;
-        self.store.delete_setting("auth.codex.id_token")?;
-        self.store.delete_setting("auth.codex.refresh_token")?;
-        self.store.delete_setting("auth.codex.source_path")?;
-        self.store.delete_setting("auth.codex.last_refresh")?;
+            .set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
+        if let Some(id_token) = snapshot
+            .id_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.id_token", id_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.id_token")?;
+        }
+        if let Some(refresh_token) = snapshot
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.refresh_token", refresh_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.refresh_token")?;
+        }
+        if let Some(source_path) = snapshot.source_path.as_ref() {
+            self.store.set_setting(
+                "auth.codex.source_path",
+                source_path.to_string_lossy().as_ref(),
+            )?;
+        } else {
+            self.store.delete_setting("auth.codex.source_path")?;
+        }
+        if let Some(last_refresh) = snapshot.last_refresh {
+            self.store
+                .set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
+        } else {
+            self.store.delete_setting("auth.codex.last_refresh")?;
+        }
         Ok(())
     }
 
@@ -8865,12 +8970,25 @@ impl App {
 const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
 fn codex_env_auth_present() -> bool {
+    codex_auth_from_explicit_env().is_some()
+}
+
+fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
+    if let Ok(path) = std::env::var("LLM_BROWSER_CODEX_AUTH_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_codex_auth_file(path).ok();
+        }
+    }
     if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_ok_and(|value| !value.trim().is_empty())
         && std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").is_ok_and(|value| !value.trim().is_empty())
     {
-        return true;
+        return Some(CodexAuth {
+            access_token: std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").ok()?,
+            account_id: std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").ok()?,
+        });
     }
-    std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
+    None
 }
 
 fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
@@ -9171,11 +9289,6 @@ fn account_kind(account: &str) -> &'static str {
     }
 }
 
-#[cfg(not(test))]
-fn app_codex_home(state_dir: &Path) -> PathBuf {
-    state_dir.join("codex-home")
-}
-
 fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
@@ -9339,68 +9452,30 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
 }
 
 #[cfg(not(test))]
-fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLoginFlow> {
-    let codex_home = app_codex_home(&state_dir);
-    std::fs::create_dir_all(&codex_home)
-        .with_context(|| format!("create app Codex home {}", codex_home.display()))?;
-    let auth_path = codex_home.join("auth.json");
-    let mut child = ProcessCommand::new("codex")
-        .args(["login", "--device-auth"])
-        .env("CODEX_HOME", &codex_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start `codex login --device-auth`")?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
-    if let Some(stdout) = stdout {
-        spawn_codex_output_reader(stdout, event_tx.clone());
-    }
-    if let Some(stderr) = stderr {
-        spawn_codex_output_reader(stderr, event_tx.clone());
-    }
     thread::Builder::new()
-        .name("browser-use-codex-login".to_string())
-        .spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
-                    "Codex device sign-in was cancelled".to_string(),
-                )));
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let result = if status.success() {
-                        load_codex_auth_file(&auth_path)
-                            .with_context(|| {
-                                format!(
-                                    "load app Codex auth after device sign-in from {}",
-                                    auth_path.display()
-                                )
-                            })
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        Err(format!("`codex login --device-auth` exited with {status}"))
-                    };
-                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
-                        "wait for Codex login process: {error}"
-                    ))));
-                    return;
-                }
-            }
+        .name("browser-use-codex-oauth".to_string())
+        .spawn(move || {
+            let result = wait_for_codex_oauth_credential(listener, verifier, state, stop_rx)
+                .map_err(|error| format!("{error:#}"));
+            let _ = event_tx.send(CodexLoginEvent::Finished(result));
         })
-        .context("spawn Codex device login watcher")?;
+        .context("spawn Codex OAuth callback listener")?;
     Ok(CodexLoginFlow {
         account,
+        url,
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -9409,31 +9484,99 @@ fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLo
 }
 
 #[cfg(not(test))]
-fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    let _ = event_tx.send(CodexLoginEvent::Output(text));
-                }
-                Err(_) => return,
-            }
+fn wait_for_codex_oauth_credential(
+    listener: TcpListener,
+    verifier: String,
+    expected_state: String,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexManagedAuth> {
+    let parsed = wait_for_codex_callback(listener, expected_state.as_str(), stop_rx)?;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
+}
+
+#[cfg(not(test))]
+fn wait_for_codex_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexAuthorization> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            anyhow::bail!("Codex OAuth sign-in was cancelled");
         }
-    });
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for Codex browser callback");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => return handle_codex_callback(&mut stream, expected_state),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("accept Codex OAuth callback"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if parsed.error.is_some() {
+        400
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Codex authentication completed. You can close this window.",
+        400 => parsed
+            .error_description
+            .as_deref()
+            .or(parsed.error.as_deref())
+            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
+        _ => "Codex callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        anyhow::bail!("{text}")
+    }
 }
 
 #[cfg(test)]
 fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (_verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
     let (stop_tx, _stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
     Ok(CodexLoginFlow {
         account,
+        url: codex_oauth_authorize_url(&challenge, &state),
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -9690,26 +9833,6 @@ fn unquote_env_value(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            output.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    output
 }
 
 fn print_native_transcript(app: &mut App) -> Result<()> {
@@ -10177,6 +10300,12 @@ fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) 
         SetAttribute(Attribute::Reset),
         SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
         MoveTo(link.col, link.row),
+    )?;
+    if link.modifier.contains(Modifier::UNDERLINED) {
+        queue!(target, SetAttribute(Attribute::Underlined))?;
+    }
+    queue!(
+        target,
         Print(live_link_osc8(&link.url, &link.text)),
         ResetColor,
         SetAttribute(Attribute::Reset),
@@ -10348,9 +10477,17 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let logo_handled = matches!(kind, MouseEventKind::Down(_))
-                && app.handle_welcome_logo_click(column, row);
-            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
+            let is_button_down = matches!(kind, MouseEventKind::Down(_));
+            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
+            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
+            app.trace_mouse_event(
+                kind_label,
+                column,
+                row,
+                before_cursor,
+                logo_handled,
+                live_link_handled,
+            );
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -12583,7 +12720,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_status_link_does_not_capture_terminal_mouse() -> Result<()> {
+    fn live_status_link_uses_native_hyperlink_without_capturing_scroll() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.browser = BROWSER_USE_CLOUD.to_string();
@@ -12607,13 +12744,27 @@ mod redesign_tests {
             .live_link_overlay
             .borrow()
             .as_ref()
-            .map(|link| (link.col, link.row, link.url.clone()))
+            .map(|link| (link.col, link.row, link.text.clone(), link.url.clone()))
             .context("live link overlay")?;
-        assert_eq!(link.2, live_url);
-        assert!(
-            !app.should_capture_mouse(),
-            "live links must stay terminal-native so scrollback and text selection keep working"
-        );
+        assert_eq!(link.2, "live browser");
+        assert_eq!(link.3, live_url);
+        assert!(!app.should_capture_mouse());
+        assert!(app.handle_live_link_click(link.0, link.1)?);
+        assert!(app.handle_live_link_click(
+            link.0
+                .saturating_add(u16::try_from(link.2.chars().count()).unwrap_or(0))
+                .saturating_sub(1),
+            link.1,
+        )?);
+        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let targets = events
+            .iter()
+            .filter(|event| event.event_type == "browser.open_requested")
+            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![live_url, live_url]);
         Ok(())
     }
 
@@ -12643,7 +12794,7 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Open Live Browser"));
+        assert!(screen.contains("live browser"));
         assert!(screen.contains("Headless Chromium"));
         assert!(!screen.contains("live file:///tmp/browser-use-terminal/.capture.frames/live.html"));
         let link = app
@@ -12679,17 +12830,23 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Open Live Browser"), "{screen}");
+        assert!(screen.contains("live browser"), "{screen}");
+        let footer = screen
+            .lines()
+            .find(|line| line.contains("live browser"))
+            .context("live browser footer")?;
+        assert!(
+            footer.chars().count() <= app.args.width as usize,
+            "footer overflowed configured width: {}\n{footer}",
+            footer.chars().count()
+        );
         let link = app
             .live_link_overlay
             .borrow()
             .as_ref()
             .map(|link| (link.text.clone(), link.url.clone()))
             .context("live link overlay")?;
-        assert_eq!(
-            link,
-            ("Open Live Browser".to_string(), live_url.to_string())
-        );
+        assert_eq!(link, ("live browser".to_string(), live_url.to_string()));
         Ok(())
     }
 
@@ -13031,14 +13188,10 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        if app
+        assert!(app
             .setup_account_choices()?
-            .contains(&settings::ACCOUNT_CODEX)
-        {
-            assert!(screen.contains("Continue with Codex login"));
-        } else {
-            assert!(!screen.contains("Codex login"));
-        }
+            .contains(&settings::ACCOUNT_CODEX));
+        assert!(screen.contains("Continue with Codex login"));
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
@@ -13359,6 +13512,15 @@ mod redesign_tests {
                 app.pending_auth_resume.as_deref(),
                 Some(session_id.as_str()),
                 "pending_auth_resume should point to the nudge session"
+            );
+            let screen = render_dump(&mut app)?;
+            assert!(
+                screen.contains("It looks like you don't have an API key set up yet"),
+                "nudge should render as committed assistant text"
+            );
+            assert!(
+                !screen.contains("Working..."),
+                "blocked auth nudge must not render as active work: {screen}"
             );
             Ok(())
         })();
@@ -13850,6 +14012,72 @@ mod redesign_tests {
     }
 
     #[test]
+    fn auth_surface_can_save_browser_use_cloud_key_without_changing_model_account() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let original_account = app.account.clone();
+
+            app.open_surface(Surface::Account);
+            app.selected_row = settings::AUTH_CHOICES
+                .iter()
+                .position(|account| *account == BROWSER_USE_CLOUD)
+                .context("Browser Use Cloud auth row")?;
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use Cloud"));
+            assert!(screen.contains("needs key"));
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            app.set_input("bu-auth-surface-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+                    .as_deref(),
+                Some("bu-auth-surface-key")
+            );
+            assert_eq!(app.account, original_account);
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert!(app.browser_use_cloud_key_ready()?);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn auth_surface_selects_browser_use_cloud_current_auth_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cloud_row = settings::AUTH_CHOICES
+            .iter()
+            .position(|account| *account == BROWSER_USE_CLOUD)
+            .context("Browser Use Cloud auth row")?;
+
+        app.account = BROWSER_USE_CLOUD.to_string();
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
+        app.account = settings::ACCOUNT_DEEPSEEK.to_string();
+        app.api_key_account = Some(BROWSER_USE_CLOUD.to_string());
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
+        Ok(())
+    }
+
+    #[test]
     fn account_flow_collects_api_key_inline() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
@@ -14118,6 +14346,52 @@ mod redesign_tests {
         assert!(!screen.contains("17.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
+        Ok(())
+    }
+
+    #[test]
+    fn composer_status_keeps_cloud_live_url_when_context_status_is_crowded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 66;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect crowded status"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {"input_tokens": 12345},
+                    "model_context_window": 100000
+                }
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"cost_usd": 0.0123}),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Browser Use Cloud"), "{screen}");
+        assert!(screen.contains("live browser"), "{screen}");
+        assert!(
+            !screen.contains("live https://live.browser-use"),
+            "{screen}"
+        );
         Ok(())
     }
 
@@ -14466,6 +14740,46 @@ mod redesign_tests {
 
         assert!(screen.contains(BROWSER_USE_CLOUD));
         Ok(())
+    }
+
+    #[test]
+    fn composer_browser_tag_is_red_when_cloud_key_is_missing() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.browser = BROWSER_USE_CLOUD.to_string();
+
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) == crate::theme::failed().fg),
+                "missing-key cloud browser tag should use failed color: {colors:?}"
+            );
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test-key")?;
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) != crate::theme::failed().fg),
+                "key-present cloud browser tag should not use failed color: {colors:?}"
+            );
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
     }
 
     #[test]
@@ -15361,7 +15675,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
+    fn codex_oauth_login_output_stores_auth_and_uses_default_model() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
 
@@ -15377,22 +15691,21 @@ wire_api = "responses"
             .and_then(|flow| flow.event_tx_guard.as_ref())
             .expect("test Codex login sender")
             .clone();
-        tx.send(CodexLoginEvent::Output(
-            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
-                .to_string(),
-        ))
-        .expect("send test Codex output");
 
-        assert!(app.drain_codex_login_notifications()?);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("https://auth.openai.com/codex/device"));
-        assert!(screen.contains("ABCD-EFGH"));
+        assert!(screen.contains("https://auth.openai.com/oauth/authorize"));
         assert!(!screen.contains("\u{1b}[94m"));
 
-        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
-            access_token: "codex-access".to_string(),
-            account_id: "codex-account".to_string(),
-        })))
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "codex-access",
+                "codex-account",
+                Some("codex-id".to_string()),
+                Some("codex-refresh".to_string()),
+                None,
+                Some("2026-01-01T00:00:00Z".to_string()),
+            ),
+        )))
         .expect("send test Codex auth result");
         assert!(app.drain_codex_login_notifications()?);
         assert_eq!(
@@ -15402,6 +15715,10 @@ wire_api = "responses"
         assert_eq!(
             app.store.get_setting("auth.codex.account_id")?,
             Some("codex-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("codex-refresh".to_string())
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
@@ -15424,6 +15741,57 @@ wire_api = "responses"
         assert!(app.setup_complete);
         assert_eq!(app.model, "gpt-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_selection_reauthenticates_over_stored_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.store
+            .set_setting("auth.codex.access_token", "old-access")?;
+        app.store
+            .set_setting("auth.codex.account_id", "old-account")?;
+        app.store
+            .set_setting("auth.codex.refresh_token", "old-refresh")?;
+
+        app.start_auth_flow(settings::ACCOUNT_CODEX.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .codex_login
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test Codex login sender")
+            .clone();
+
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "new-access",
+                "new-account",
+                Some("new-id".to_string()),
+                Some("new-refresh".to_string()),
+                None,
+                Some("2026-01-02T00:00:00Z".to_string()),
+            ),
+        )))
+        .expect("send test Codex auth result");
+        assert!(app.drain_codex_login_notifications()?);
+        assert_eq!(
+            app.store.get_setting("auth.codex.access_token")?,
+            Some("new-access".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.account_id")?,
+            Some("new-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("new-refresh".to_string())
+        );
         Ok(())
     }
 
@@ -15879,7 +16247,7 @@ wire_api = "responses"
             }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
-                Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Account => AUTH_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
                 Surface::Browser => 3,
@@ -20280,6 +20648,16 @@ wire_api = "responses"
             Some(session_id.as_str()),
             "pending_auth_resume should be set to the nudge session id"
         );
+        assert!(app.session_is_waiting_for_auth(&session_id));
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("It looks like you don't have an API key set up yet"),
+            "nudge should render as committed assistant text"
+        );
+        assert!(
+            !screen.contains("Working..."),
+            "blocked auth nudge must not render as active work: {screen}"
+        );
         // Composer should be cleared.
         assert!(app.composer.is_empty());
         Ok(())
@@ -20330,6 +20708,19 @@ wire_api = "responses"
             app.pending_auth_resume.is_none(),
             "pending_auth_resume should be cleared after resume"
         );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "session.status"
+                    && event
+                        .payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("running")
+            }),
+            "auth resume should mark the blocked nudge session running"
+        );
+        assert!(!app.session_events_are_waiting_for_auth(&session.id, &events));
         // The nudge session should be selected.
         assert_eq!(
             app.selected_session_id.as_deref(),
