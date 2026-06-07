@@ -61,11 +61,13 @@ use browser_use_protocol::{
     session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce,
-    exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
+    codex_oauth_pkce, codex_oauth_state, exchange_claude_code_authorization_code,
+    exchange_codex_authorization_code, load_codex_auth, load_codex_auth_file,
     load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
-    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    parse_codex_authorization_input, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
+    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
@@ -197,11 +199,11 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
-    /// Run a task against the codex (chatgpt.com) backend via the Codex CLI login.
+    /// Run a task against the Codex (chatgpt.com) backend via Codex OAuth.
     ///
-    /// Credentials resolve env-first (`CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`),
-    /// then the credential store (`auth login codex` / `auth import-codex`), then
-    /// `~/.codex/auth.json`.
+    /// Credentials resolve env-first (`LLM_BROWSER_CODEX_ACCESS_TOKEN` +
+    /// `LLM_BROWSER_CODEX_ACCOUNT_ID`), then the credential store
+    /// (`auth login codex` / `auth import-codex`).
     RunCodex {
         text: String,
         #[arg(long, default_value = "gpt-5.1-codex")]
@@ -3369,27 +3371,23 @@ fn auth_login(
         }
         AuthAccount::Codex => {
             let auth = if access_token.is_some() || account_id.is_some() {
-                CodexAuth {
-                    access_token: access_token
+                CodexManagedAuth::from_stored_parts(
+                    access_token
                         .context("auth login codex requires --access-token with --account-id")?,
-                    account_id: account_id
+                    account_id
                         .context("auth login codex requires --account-id with --access-token")?,
-                }
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             } else {
-                match load_codex_managed_auth() {
-                    Ok(managed_auth) => {
-                        let auth = managed_auth.current_auth()?;
-                        store_codex_managed_auth(store, &managed_auth)?;
-                        store.set_setting("account", "Codex login")?;
-                        println!("Codex login: connected account {}", auth.account_id);
-                        return Ok(());
-                    }
-                    Err(_) => load_codex_auth().context("load external Codex auth for login")?,
-                }
+                codex_login(code, !no_browser)?
             };
-            store_codex_auth(store, &auth)?;
+            let current = auth.current_auth()?;
+            store_codex_managed_auth(store, &auth)?;
             store.set_setting("account", "Codex login")?;
-            println!("Codex login: connected account {}", auth.account_id);
+            println!("Codex login: connected account {}", current.account_id);
             Ok(())
         }
         AuthAccount::ClaudeCode => {
@@ -3450,6 +3448,35 @@ fn read_required_secret(value: Option<String>, prompt: &str) -> Result<String> {
         bail!("{prompt} cannot be empty");
     }
     Ok(trimmed)
+}
+
+fn codex_login(code: Option<String>, open_browser: bool) -> Result<CodexManagedAuth> {
+    if code.is_some() {
+        bail!("Codex OAuth --code is not supported because PKCE requires the verifier from the generated login URL");
+    }
+
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let (tx, rx) = mpsc::channel();
+    let _callback = start_codex_callback_server(state.clone(), tx)?;
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    println!("Open this URL to login with Codex OAuth:\n");
+    println!("{url}");
+    println!(
+        "\nWaiting for browser callback on http://localhost:{CODEX_CALLBACK_PORT}{CODEX_CALLBACK_PATH} ..."
+    );
+    if open_browser {
+        if let Err(error) = open::that(&url) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+    let parsed = rx
+        .recv_timeout(Duration::from_secs(300))
+        .context("timed out waiting for Codex browser callback")??;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
 }
 
 fn claude_code_login(
@@ -3514,6 +3541,92 @@ impl Drop for CallbackServerHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn start_codex_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<browser_use_providers::CodexAuthorization>>,
+) -> Result<CallbackServerHandle> {
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_codex_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error).context("accept Codex OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(CallbackServerHandle {
+        stop: stop_tx,
+        thread: Some(thread),
+    })
+}
+
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<browser_use_providers::CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if parsed.error.is_some() {
+        400
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Codex authentication completed. You can close this window.",
+        400 => parsed
+            .error_description
+            .as_deref()
+            .or(parsed.error.as_deref())
+            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
+        _ => "Codex callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
     }
 }
 
