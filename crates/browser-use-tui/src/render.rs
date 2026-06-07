@@ -745,7 +745,7 @@ fn render_bottom_pane(
         app.composer_input_rect.set(None);
         return;
     }
-    let header = surface_header_lines(surface, content_width(area.width));
+    let header = surface_header_lines(app, surface, content_width(area.width));
     let header_h = header.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -972,7 +972,7 @@ fn render_surface_popup_box(
     }
 
     // Layout inside the popup: header lines, body, footer line.
-    let header = surface_header_lines(surface, inner.width);
+    let header = surface_header_lines(app, surface, inner.width);
     let header_h = (header.len() as u16).min(inner.height);
     let footer_text = surface_footer_for_app(surface, app);
     let footer_h: u16 = if footer_text.is_empty() { 0 } else { 1 };
@@ -1410,7 +1410,7 @@ fn render_surface(
     surface: Surface,
 ) {
     frame.render_widget(Clear, frame.area());
-    let header = surface_header_lines(surface, area.width);
+    let header = surface_header_lines(app, surface, area.width);
     let chrome_h = header.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1446,53 +1446,74 @@ fn render_surface(
 }
 
 /// Title and one-line description for a dropdown/settings surface header.
-fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
+fn surface_heading(app: &App, surface: Surface) -> (String, &'static str) {
     match surface {
-        Surface::Setup => ("Setup", "Choose how to run Browser Use"),
-        Surface::SetupConfirm => ("Setup", "Confirm provider"),
-        Surface::SetupResult => ("Setup", "Connection result"),
-        Surface::Account => ("Authenticate", "Sign in to a model provider"),
-        Surface::ApiKey => ("API key", "Enter your provider API key"),
-        Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
-        Surface::Provider => ("Model", "Pick a recommended model or choose a provider"),
-        Surface::OpenAiAuth => ("OpenAI", "Choose how to connect to OpenAI"),
-        Surface::Model => ("Model", "Choose the model and provider for this session"),
-        Surface::ModelSearch => ("Model", "Search this provider's models"),
-        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
-        Surface::Browser => ("Browser", "Change the browser backend"),
-        Surface::BrowserSelect => ("Browser", "Choose a local browser or backend"),
-        Surface::DefaultProfile => ("Profile", "Choose the default local Chrome profile"),
+        Surface::Setup => ("Setup".to_string(), "Choose how to run Browser Use"),
+        Surface::SetupConfirm => ("Setup".to_string(), "Confirm provider"),
+        Surface::SetupResult => ("Setup".to_string(), "Connection result"),
+        Surface::Account => ("Authenticate".to_string(), "Sign in to a model provider"),
+        Surface::ApiKey => ("API key".to_string(), "Enter your provider API key"),
+        Surface::Telemetry => ("Laminar".to_string(), "Configure Laminar telemetry"),
+        Surface::Provider => (
+            "Model".to_string(),
+            "Pick a recommended model or choose a provider",
+        ),
+        Surface::OpenAiAuth => (
+            app.provider_auth_label().to_string(),
+            "Choose how to connect to this provider",
+        ),
+        Surface::Model => (
+            "Model".to_string(),
+            "Choose the model and provider for this session",
+        ),
+        Surface::ModelSearch => ("Model".to_string(), "Search this provider's models"),
+        Surface::Mode => (
+            "Mode".to_string(),
+            "Choose the collaboration mode for the next turn",
+        ),
+        Surface::Browser => ("Browser".to_string(), "Change the browser backend"),
+        Surface::BrowserSelect => ("Browser".to_string(), "Choose a local browser or backend"),
+        Surface::DefaultProfile => (
+            "Profile".to_string(),
+            "Choose the default local Chrome profile",
+        ),
         Surface::CookieSync => (
-            "Cookie Sync",
+            "Cookie Sync".to_string(),
             "Import local browser cookies to Browser Use Cloud",
         ),
-        Surface::Context => ("Context", "Inspect current context window usage"),
-        Surface::Goal => ("Goal", "Inspect or change the active task goal"),
-        Surface::History => ("History", "Browse and resume previous tasks"),
+        Surface::Context => (
+            "Context".to_string(),
+            "Inspect current context window usage",
+        ),
+        Surface::Goal => ("Goal".to_string(), "Inspect or change the active task goal"),
+        Surface::History => ("History".to_string(), "Browse and resume previous tasks"),
         Surface::Messages => (
-            "Messages",
+            "Messages".to_string(),
             "Edit submitted prompts or cancel queued follow-ups",
         ),
-        Surface::Developer => ("Developer", "Developer tools and diagnostics"),
+        Surface::Developer => ("Developer".to_string(), "Developer tools and diagnostics"),
         Surface::Secrets => (
-            "Secrets",
+            "Secrets".to_string(),
             "Save passwords & 2FA codes the agent uses to log in",
         ),
-        Surface::Domains => ("Domains", "Allow or block which sites the agent may visit"),
+        Surface::Domains => (
+            "Domains".to_string(),
+            "Allow or block which sites the agent may visit",
+        ),
         Surface::Email => (
-            "Email inbox",
+            "Email inbox".to_string(),
             "A disposable inbox the agent uses for sign-ups, links & codes",
         ),
-        Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
-        Surface::FeedbackThanks => ("Feedback", ""),
-        Surface::Main => ("", ""),
+        Surface::Feedback => ("Feedback".to_string(), "Report a bug or share feedback"),
+        Surface::FeedbackThanks => ("Feedback".to_string(), ""),
+        Surface::Main => ("".to_string(), ""),
     }
 }
 
 /// A surface header: a full-width accent rule, the colored title, and a muted
 /// one-line description — the shared chrome for every dropdown/settings view.
-fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
-    let (title, description) = surface_heading(surface);
+fn surface_header_lines(app: &App, surface: Surface, width: u16) -> Vec<Line<'static>> {
+    let (title, description) = surface_heading(app, surface);
     let indent = if matches!(surface, Surface::CookieSync | Surface::DefaultProfile) {
         String::new()
     } else {
@@ -1502,7 +1523,7 @@ fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
         Line::from(Span::styled("─".repeat(width as usize), accent())),
         Line::from(vec![
             Span::raw(indent.clone()),
-            Span::styled(title.to_string(), accent()),
+            Span::styled(title, accent()),
         ]),
         Line::from(vec![
             Span::raw(indent),
@@ -2738,12 +2759,10 @@ fn provider_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled("providers", muted())));
     let base = recommended.len();
     for (idx, row) in app.provider_rows().iter().enumerate() {
-        let status = if app.account_ready(row.account).unwrap_or(false) {
+        let status = if app.provider_row_connected(row) {
             "connected"
-        } else if row.account.contains("API key") {
-            "needs key"
         } else {
-            "needs auth"
+            "needs key"
         };
         // Mark the provider row current only when the active model isn't a
         // recommended pick (avoids double-marking top + bottom).
@@ -2758,12 +2777,15 @@ fn provider_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// The OpenAI auth sub-dialogue: connect via Codex / API key, with the current
+/// The provider auth sub-dialogue: connect via Codex / API key, with the current
 /// method shown green.
 fn openai_auth_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled("connect openai", muted()))];
-    let current = app.current_openai_method();
-    for (idx, row) in app.openai_auth_rows().iter().enumerate() {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("connect {}", app.provider_auth_label().to_ascii_lowercase()),
+        muted(),
+    ))];
+    let current = app.current_provider_auth_method();
+    for (idx, row) in app.provider_auth_rows().iter().enumerate() {
         lines.push(selectable_row(
             &row.label,
             idx,

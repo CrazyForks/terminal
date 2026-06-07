@@ -172,6 +172,7 @@ const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
+const SESSION_SETTINGS_EVENT: &str = "session.settings";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
 const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
@@ -329,24 +330,24 @@ enum ModelSearchEntry {
     Item(String),
 }
 
-/// A row on the provider screen. `submenu` rows (OpenAI) open a sub-dialogue of
-/// auth methods; other rows connect their `account` directly.
+/// A row on the provider screen.
 struct ProviderRow {
     label: String,
     account: &'static str,
-    submenu: bool,
 }
 
 /// The OpenAI auth methods shown in the sub-dialogue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenAiAuthMethod {
+enum ProviderAuthMethod {
     Codex,
     ApiKey,
+    ChangeApiKey,
+    ChangeOAuth,
 }
 
-struct OpenAiAuthRow {
+struct ProviderAuthRow {
     label: String,
-    method: OpenAiAuthMethod,
+    method: ProviderAuthMethod,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -668,7 +669,6 @@ enum AppCommand {
     Reload,
     Update,
     SaveAccount(String),
-    SelectProvider(&'static str),
     SelectRecommended(usize),
     OpenModelSearch,
     SaveCustomModel(String),
@@ -977,6 +977,15 @@ struct SessionModelSelection {
     account: String,
     backend: AgentBackend,
     model_provider_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRuntimeSettings {
+    browser: String,
+    browser_local_label: Option<String>,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    collaboration_mode: CollaborationModeKind,
 }
 
 // ── Typewriter animation ──────────────────────────────────────────────────────
@@ -2186,6 +2195,48 @@ fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionMode
     })
 }
 
+fn session_runtime_settings_from_event(event: &EventRecord) -> Option<SessionRuntimeSettings> {
+    if event.event_type != SESSION_SETTINGS_EVENT {
+        return None;
+    }
+    let browser = event
+        .payload
+        .get("browser")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let browser_local_label = event
+        .payload
+        .get("browser_local_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_id = event
+        .payload
+        .get("browser_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_label = event
+        .payload
+        .get("browser_profile_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let collaboration_mode = event
+        .payload
+        .get("collaboration_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(collaboration_mode_from_setting)
+        .unwrap_or(CollaborationModeKind::Default);
+    Some(SessionRuntimeSettings {
+        browser,
+        browser_local_label,
+        browser_profile_id,
+        browser_profile_label,
+        collaboration_mode,
+    })
+}
+
 impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
@@ -2393,6 +2444,9 @@ impl App {
             feedback_rx: None,
             feedback_thanks_started: None,
         };
+        if let Some(session_id) = app.selected_session_id.clone() {
+            app.apply_session_settings_to_app(&session_id)?;
+        }
         app.refresh_cached_projection();
         if resumed_from_reexec {
             app.status_notice = Some(if app.selected_session_id.is_some() {
@@ -2465,7 +2519,7 @@ impl App {
         while let Ok(notification) = self.store_rx.try_recv() {
             drained_any = true;
             if notification == StoreNotification::SettingsChanged {
-                changed |= self.refresh_browser_profile_label()?;
+                changed |= self.refresh_visible_runtime_settings()?;
             }
             changed |= self
                 .state_cache
@@ -2731,7 +2785,7 @@ impl App {
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let mut changed = self.state_cache.refresh_all(&self.store)?;
-        changed |= self.refresh_browser_profile_label()?;
+        changed |= self.refresh_visible_runtime_settings()?;
         if changed {
             self.refresh_cached_projection();
         }
@@ -3533,9 +3587,9 @@ impl App {
             Surface::Model => self.current_model_surface_index().unwrap_or(0),
             Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
             Surface::OpenAiAuth => self
-                .current_openai_method()
+                .current_provider_auth_method()
                 .and_then(|method| {
-                    self.openai_auth_rows()
+                    self.provider_auth_rows()
                         .iter()
                         .position(|row| row.method == method)
                 })
@@ -3589,30 +3643,25 @@ impl App {
             .position(|choice| self.model == choice.display && self.account == choice.account)
     }
 
-    /// The provider/auth rows shown beneath the recommended quick-picks. OpenAI
-    /// splits into "sign in" (OAuth) and "API key"; the "Codex login (detected)"
-    /// row appears only when an external codex login is present.
+    /// The provider/auth rows shown beneath the recommended quick-picks. Each
+    /// provider appears once and opens a provider-specific auth/model menu.
     fn provider_rows(&self) -> Vec<ProviderRow> {
         vec![
             ProviderRow {
                 label: "OpenAI".to_string(),
-                account: ACCOUNT_CODEX,
-                submenu: true,
+                account: ACCOUNT_OPENAI,
             },
             ProviderRow {
-                label: "Anthropic · API key".to_string(),
+                label: "Anthropic".to_string(),
                 account: ACCOUNT_ANTHROPIC,
-                submenu: false,
             },
             ProviderRow {
-                label: "OpenRouter · API key".to_string(),
+                label: "OpenRouter".to_string(),
                 account: ACCOUNT_OPENROUTER,
-                submenu: false,
             },
             ProviderRow {
-                label: "DeepSeek · API key".to_string(),
+                label: "DeepSeek".to_string(),
                 account: ACCOUNT_DEEPSEEK,
-                submenu: false,
             },
         ]
     }
@@ -3622,10 +3671,19 @@ impl App {
         if !self.model_configured {
             return false;
         }
-        if row.submenu {
+        if row.account == ACCOUNT_OPENAI {
             self.account == ACCOUNT_CODEX || self.account == ACCOUNT_OPENAI
         } else {
             self.account == row.account
+        }
+    }
+
+    fn provider_row_connected(&self, row: &ProviderRow) -> bool {
+        if row.account == ACCOUNT_OPENAI {
+            self.account_ready(ACCOUNT_CODEX).unwrap_or(false)
+                || self.account_ready(ACCOUNT_OPENAI).unwrap_or(false)
+        } else {
+            self.account_ready(row.account).unwrap_or(false)
         }
     }
 
@@ -3682,7 +3740,7 @@ impl App {
     }
 
     /// Provider screen selection: a recommended quick-pick (top rows) or a
-    /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
+    /// provider row (lower rows).
     fn provider_surface_select(&mut self) -> Result<()> {
         let rec_count = self.recommended_models().len();
         if self.selected_row < rec_count {
@@ -3691,53 +3749,167 @@ impl App {
         }
         let rows = self.provider_rows();
         if let Some(row) = rows.get(self.selected_row - rec_count) {
-            if row.submenu {
-                self.open_surface(Surface::OpenAiAuth);
-            } else {
-                let account = row.account;
-                self.dispatch(AppCommand::SelectProvider(account))?;
-            }
+            self.selected_provider = Some(row.account);
+            self.open_surface(Surface::OpenAiAuth);
         }
         Ok(())
     }
 
-    /// The OpenAI auth-method rows: Codex OAuth and API key.
-    fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
-        vec![
-            OpenAiAuthRow {
-                label: "Sign in with Codex OAuth".to_string(),
-                method: OpenAiAuthMethod::Codex,
-            },
-            OpenAiAuthRow {
-                label: "Use an API key".to_string(),
-                method: OpenAiAuthMethod::ApiKey,
-            },
-        ]
+    fn provider_auth_account(&self) -> &'static str {
+        match self.selected_provider {
+            Some(ACCOUNT_CODEX) => ACCOUNT_OPENAI,
+            Some(account) => account,
+            None => ACCOUNT_OPENAI,
+        }
     }
 
-    /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
-    fn current_openai_method(&self) -> Option<OpenAiAuthMethod> {
+    fn provider_auth_label(&self) -> &'static str {
+        match self.provider_auth_account() {
+            ACCOUNT_OPENAI => "OpenAI",
+            ACCOUNT_ANTHROPIC => "Anthropic",
+            ACCOUNT_OPENROUTER => "OpenRouter",
+            ACCOUNT_DEEPSEEK => "DeepSeek",
+            _ => "Provider",
+        }
+    }
+
+    fn provider_auth_api_key_ready(&self, account: &str) -> bool {
+        match account {
+            ACCOUNT_OPENAI => self
+                .has_stored_or_env(
+                    "auth.openai.api_key",
+                    &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_OPENROUTER => self
+                .has_stored_or_env(
+                    "auth.openrouter.api_key",
+                    &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_DEEPSEEK => self
+                .has_stored_or_env(
+                    "auth.deepseek.api_key",
+                    &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_ANTHROPIC => self
+                .has_stored_or_env(
+                    "auth.anthropic.api_key",
+                    &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                )
+                .unwrap_or(false),
+            _ => self.account_ready(account).unwrap_or(false),
+        }
+    }
+
+    /// Provider auth menu rows. OpenAI can route through Codex login or an
+    /// OpenAI API key; other providers route through their API key.
+    fn provider_auth_rows(&self) -> Vec<ProviderAuthRow> {
+        let account = self.provider_auth_account();
+        let mut rows = Vec::new();
+        let api_key_ready = self.provider_auth_api_key_ready(account);
+        let current = self.current_provider_auth_method();
+        let api_rows = |label: &str, include_change: bool| {
+            let mut rows = vec![ProviderAuthRow {
+                label: label.to_string(),
+                method: ProviderAuthMethod::ApiKey,
+            }];
+            if include_change {
+                rows.push(ProviderAuthRow {
+                    label: format!("Change {} API key", self.provider_auth_label()),
+                    method: ProviderAuthMethod::ChangeApiKey,
+                });
+            }
+            rows
+        };
+        if account == ACCOUNT_OPENAI {
+            let codex_ready = self.account_ready(ACCOUNT_CODEX).unwrap_or(false);
+            let codex_rows = || {
+                if codex_ready {
+                    vec![
+                        ProviderAuthRow {
+                            label: "Select model with current login".to_string(),
+                            method: ProviderAuthMethod::Codex,
+                        },
+                        ProviderAuthRow {
+                            label: "Change OpenAI OAuth".to_string(),
+                            method: ProviderAuthMethod::ChangeOAuth,
+                        },
+                    ]
+                } else {
+                    vec![ProviderAuthRow {
+                        label: "Sign in with Codex OAuth".to_string(),
+                        method: ProviderAuthMethod::Codex,
+                    }]
+                }
+            };
+            let api_label = if api_key_ready {
+                "Select model with current key"
+            } else {
+                "Use an API key"
+            };
+            let mut openai_api_rows = api_rows(api_label, api_key_ready);
+            if current == Some(ProviderAuthMethod::Codex) || !api_key_ready {
+                rows.extend(codex_rows());
+                rows.append(&mut openai_api_rows);
+            } else {
+                rows.append(&mut openai_api_rows);
+                rows.extend(codex_rows());
+            }
+            return rows;
+        }
+        if api_key_ready {
+            rows.extend(api_rows("Select model with current key", true));
+        } else {
+            rows.extend(api_rows("Use an API key", false));
+        }
+        rows
+    }
+
+    /// The provider auth method currently in use (highlighted in the sub-dialogue).
+    fn current_provider_auth_method(&self) -> Option<ProviderAuthMethod> {
         if !self.model_configured {
             return None;
         }
-        if self.account == ACCOUNT_OPENAI {
-            return Some(OpenAiAuthMethod::ApiKey);
-        }
-        if self.account == ACCOUNT_CODEX {
-            return Some(OpenAiAuthMethod::Codex);
+        let account = self.provider_auth_account();
+        if account == ACCOUNT_OPENAI {
+            if self.account == ACCOUNT_CODEX {
+                return Some(ProviderAuthMethod::Codex);
+            }
+            if self.provider_auth_api_key_ready(ACCOUNT_OPENAI) {
+                return Some(ProviderAuthMethod::ApiKey);
+            }
+            if self.account_ready(ACCOUNT_CODEX).unwrap_or(false) {
+                return Some(ProviderAuthMethod::Codex);
+            }
+        } else if self.provider_auth_api_key_ready(account) {
+            return Some(ProviderAuthMethod::ApiKey);
         }
         None
     }
 
-    /// OpenAI sub-dialogue Enter: route the chosen method through auth-first.
-    fn openai_auth_select(&mut self) -> Result<()> {
-        let rows = self.openai_auth_rows();
+    /// Provider auth menu Enter: route the chosen method through auth-first.
+    fn provider_auth_select(&mut self) -> Result<()> {
+        let account = self.provider_auth_account();
+        let rows = self.provider_auth_rows();
         let Some(method) = rows.get(self.selected_row).map(|row| row.method) else {
             return Ok(());
         };
         match method {
-            OpenAiAuthMethod::ApiKey => self.select_provider(ACCOUNT_OPENAI),
-            OpenAiAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ApiKey => self.select_provider(account),
+            ProviderAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ChangeApiKey => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_entry(account.to_string());
+                Ok(())
+            }
+            ProviderAuthMethod::ChangeOAuth => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_flow(ACCOUNT_CODEX.to_string())
+            }
         }
     }
 
@@ -4175,7 +4347,11 @@ impl App {
         // Auth-nudge: when the account is not ready, route ALL submissions
         // (including follow-ups to a non-running session) through the nudge
         // path so we never dispatch work to an agent that can't start.
-        let account_not_ready = !self.account_ready(&self.account)?
+        let skip_account_gate_for_non_provider_followup =
+            matches!(self.agent_backend, AgentBackend::Fake | AgentBackend::None)
+                && self.selected_session_id.is_some();
+        let account_not_ready = (!skip_account_gate_for_non_provider_followup
+            && !self.account_ready(&self.account)?)
             || (self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()?);
         if account_not_ready {
             let submission = self.take_composer_submission();
@@ -4234,6 +4410,8 @@ impl App {
         // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
+        self.append_session_model_selection(&session.id, &self.current_model_selection())?;
+        self.append_current_session_runtime_settings(&session.id)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -4364,12 +4542,16 @@ impl App {
             AppCommand::ReconnectBrowser => self.request_reconnect_browser()?,
             AppCommand::NewTask => {
                 self.selected_session_id = None;
+                self.restore_default_runtime_settings()?;
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
             AppCommand::OpenHistory => self.open_surface(Surface::History),
             AppCommand::SelectHistory(session_id) => {
                 self.selected_session_id = Some(session_id);
+                if let Some(session_id) = self.selected_session_id.clone() {
+                    self.apply_session_settings_to_app(&session_id)?;
+                }
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
@@ -4389,8 +4571,12 @@ impl App {
                 }
                 self.collaboration_mode = mode;
                 self.persist_runtime_settings()?;
+                self.stamp_selected_inactive_session_settings()?;
             }
-            AppCommand::SignIn => self.open_surface(Surface::Account),
+            AppCommand::SignIn => {
+                self.selected_provider = None;
+                self.open_surface(Surface::Account);
+            }
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_browser_select()?,
             AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
@@ -4398,7 +4584,6 @@ impl App {
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
-            AppCommand::SelectProvider(account) => self.select_provider(account)?,
             AppCommand::SelectRecommended(index) => self.select_recommended(index)?,
             AppCommand::OpenModelSearch => self.open_model_search()?,
             AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
@@ -4426,6 +4611,7 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
+        self.append_current_session_runtime_settings(&session.id)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
         self.append_pending_initial_goal_to_session(&session.id)?;
@@ -4668,8 +4854,12 @@ impl App {
         let backend = selection.backend;
         let model = selection.provider_model.clone();
         let model_provider_id = selection.model_provider_id.clone();
-        let browser = self.browser.clone();
-        let collaboration_mode = self.collaboration_mode;
+        let runtime_settings = self.session_runtime_settings_or_current(&session_id)?;
+        let browser = runtime_settings.browser.clone();
+        let browser_profile_id = runtime_settings.browser_profile_id.clone();
+        let browser_profile_label = runtime_settings.browser_profile_label.clone();
+        let browser_local_browser = runtime_settings.browser_local_label.clone();
+        let collaboration_mode = runtime_settings.collaboration_mode;
         let config_profile = self.args.config_profile.clone();
         let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
@@ -4680,6 +4870,9 @@ impl App {
             model,
             model_provider_id,
             browser,
+            browser_profile_id,
+            browser_profile_label,
+            browser_local_browser,
             collaboration_mode,
             config_profile,
             config_overrides,
@@ -5196,15 +5389,20 @@ impl App {
                 }
                 self.composer.clear();
             }
-            // Model search: Esc goes back to the provider screen.
+            // Model search: Esc goes back to the provider auth menu for the
+            // provider being searched.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::ModelSearch => {
                 self.escape_stop_until = None;
                 self.composer.clear();
-                self.open_surface(Surface::Provider);
+                if self.selected_provider.is_some() {
+                    self.open_surface(Surface::OpenAiAuth);
+                } else {
+                    self.open_surface(Surface::Provider);
+                }
             }
-            // OpenAI auth sub-dialogue: Esc goes back to the provider list.
+            // Provider auth menu: Esc goes back to the provider list.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::OpenAiAuth => {
@@ -5870,7 +6068,7 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Provider => self.provider_surface_select()?,
-            Surface::OpenAiAuth => self.openai_auth_select()?,
+            Surface::OpenAiAuth => self.provider_auth_select()?,
             Surface::Model => self.model_surface_select()?,
             Surface::ModelSearch => self.model_search_select()?,
             Surface::Mode => {
@@ -5945,7 +6143,18 @@ impl App {
             return Ok(());
         };
         if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
+            if self.has_codex_login()? {
+                self.codex_login_available = true;
+                self.account = account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    account,
+                    "Connected with Codex auth.".to_string(),
+                );
+            } else {
+                self.start_codex_auth(account)?;
+            }
         } else if is_claude_code_account(&account) {
             self.account = account.clone();
             self.persist_runtime_settings()?;
@@ -7133,15 +7342,7 @@ impl App {
         // No top "Model set to X" notice — the active model already shows in the
         // composer status line at the bottom.
         self.status_notice = None;
-        if let Some(session_id) = self.selected_session_id.as_deref() {
-            if self
-                .store
-                .load_session(session_id)?
-                .is_some_and(|session| !session.status.is_active())
-            {
-                self.append_session_model_selection(session_id, &self.current_model_selection())?;
-            }
-        }
+        self.stamp_selected_inactive_session_settings()?;
         self.close_surface();
         // If a nudge session is waiting for auth, start it now that the
         // account and model are confirmed ready.
@@ -7157,6 +7358,133 @@ impl App {
             backend: self.agent_backend,
             model_provider_id: self.model_provider_id.clone(),
         }
+    }
+
+    fn current_runtime_settings(&self) -> Result<SessionRuntimeSettings> {
+        Ok(SessionRuntimeSettings {
+            browser: self.browser.clone(),
+            browser_local_label: self.browser_local_label.clone(),
+            browser_profile_id: self
+                .default_profile
+                .current_profile_id
+                .clone()
+                .or(self.current_local_profile_id_for_settings()?),
+            browser_profile_label: self.browser_profile_label.clone(),
+            collaboration_mode: self.collaboration_mode,
+        })
+    }
+
+    fn session_runtime_settings_or_current(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSettings> {
+        Ok(self
+            .session_runtime_settings(session_id)?
+            .unwrap_or(self.current_runtime_settings()?))
+    }
+
+    fn session_runtime_settings(&self, session_id: &str) -> Result<Option<SessionRuntimeSettings>> {
+        Ok(self
+            .store
+            .events_for_session(session_id)?
+            .iter()
+            .rev()
+            .find_map(session_runtime_settings_from_event))
+    }
+
+    fn append_session_runtime_settings(
+        &self,
+        session_id: &str,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<()> {
+        self.store.append_event(
+            session_id,
+            SESSION_SETTINGS_EVENT,
+            serde_json::json!({
+                "browser": settings.browser,
+                "browser_local_label": settings.browser_local_label,
+                "browser_profile_id": settings.browser_profile_id,
+                "browser_profile_label": settings.browser_profile_label,
+                "collaboration_mode": collaboration_mode_setting_value(settings.collaboration_mode),
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn append_current_session_runtime_settings(&self, session_id: &str) -> Result<()> {
+        self.append_session_runtime_settings(session_id, &self.current_runtime_settings()?)
+    }
+
+    fn stamp_selected_inactive_session_settings(&self) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .store
+            .load_session(session_id)?
+            .is_some_and(|session| !session.status.is_active())
+        {
+            self.append_session_model_selection(session_id, &self.current_model_selection())?;
+            self.append_current_session_runtime_settings(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn apply_session_settings_to_app(&mut self, session_id: &str) -> Result<()> {
+        self.restore_default_runtime_settings()?;
+        if let Some(selection) = self.session_model_selection(session_id)? {
+            self.model = selection.display_model;
+            self.provider_model = selection.provider_model;
+            self.account = selection.account;
+            self.agent_backend = selection.backend;
+            self.model_provider_id = selection.model_provider_id;
+            self.model_configured = true;
+        }
+        if let Some(settings) = self.session_runtime_settings(session_id)? {
+            self.browser = settings.browser;
+            self.browser_local_label = settings.browser_local_label;
+            self.browser_profile_label = settings.browser_profile_label;
+            self.default_profile.current_profile_id = settings.browser_profile_id;
+            self.collaboration_mode = settings.collaboration_mode;
+        }
+        Ok(())
+    }
+
+    fn restore_default_runtime_settings(&mut self) -> Result<()> {
+        self.account = self
+            .store
+            .get_setting("account")?
+            .unwrap_or_else(|| self.args.account.clone());
+        self.agent_backend = self
+            .store
+            .get_setting("agent.backend")?
+            .and_then(|value| AgentBackend::from_setting(&value))
+            .unwrap_or(self.args.agent);
+        if let Some(model) = self.store.get_setting("model")? {
+            self.model = model;
+        }
+        if let Some(provider_model) = self.store.get_setting("provider.model")? {
+            self.provider_model = provider_model;
+        }
+        self.model_provider_id = self
+            .store
+            .get_setting("provider.id")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some(model_provider_id_for_backend(self.agent_backend).to_string()));
+        self.collaboration_mode = self
+            .store
+            .get_setting(COLLABORATION_MODE_SETTING)?
+            .and_then(|value| collaboration_mode_from_setting(&value))
+            .unwrap_or_else(|| self.args.collaboration_mode.into());
+        self.browser = self
+            .store
+            .get_setting("browser")?
+            .unwrap_or_else(|| self.args.browser.clone());
+        self.browser_local_label = browser_local_label_from_store(&self.store)?;
+        self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
+        Ok(())
     }
 
     fn parsed_config_overrides(&self) -> Result<ConfigOverrides> {
@@ -7624,6 +7952,7 @@ impl App {
         )?;
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
@@ -7661,6 +7990,7 @@ impl App {
         }
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
@@ -7820,6 +8150,17 @@ impl App {
         }
         self.store
             .set_setting(auth_setting_key(&account), secret.trim())?;
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && !self.pending_model_search_after_auth
+            && self.pending_model_after_auth.is_none()
+            && self.setup_pending_account.as_deref() != Some(account.as_str());
+        if return_to_provider_auth {
+            self.api_key_account = None;
+            self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
+            self.open_surface(Surface::OpenAiAuth);
+            return Ok(());
+        }
         self.account = account.clone();
         self.persist_runtime_settings()?;
         self.api_key_account = None;
@@ -7989,6 +8330,12 @@ impl App {
     }
 
     fn cancel_auth_entry(&mut self) {
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && self
+                .api_key_account
+                .as_deref()
+                .is_some_and(|account| account != BROWSER_USE_CLOUD);
         self.api_key_account = None;
         self.pending_model_after_auth = None;
         self.pending_model_search_after_auth = false;
@@ -7997,7 +8344,12 @@ impl App {
             self.setup_pending_account = None;
             self.setup_result = None;
         }
-        self.cancel_secret_entry();
+        self.composer.clear();
+        if return_to_provider_auth {
+            self.open_surface(Surface::OpenAiAuth);
+        } else {
+            self.close_surface();
+        }
     }
 
     fn start_telemetry_entry(&mut self) {
@@ -8207,6 +8559,7 @@ impl App {
             .set_setting("browser.preference.profile_label", &profile_label)?;
         self.browser_profile_label = Some(profile_label.clone());
         self.default_profile.current_profile_id = Some(profile.id.clone());
+        self.stamp_selected_inactive_session_settings()?;
         self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
         self.close_surface();
         Ok(())
@@ -8234,14 +8587,47 @@ impl App {
         }
     }
 
-    fn refresh_browser_profile_label(&mut self) -> Result<bool> {
-        let local_browser = browser_local_label_from_store(&self.store)?;
-        let next = browser_profile_label_from_store(&self.store)?;
-        let changed =
-            self.browser_local_label != local_browser || self.browser_profile_label != next;
-        self.browser_local_label = local_browser;
-        self.browser_profile_label = next;
-        Ok(changed)
+    fn refresh_visible_runtime_settings(&mut self) -> Result<bool> {
+        if let Some(session_id) = self.selected_session_id.clone() {
+            let before = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            self.apply_session_settings_to_app(&session_id)?;
+            let after = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            Ok(before != after)
+        } else {
+            let before = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            self.browser_local_label = browser_local_label_from_store(&self.store)?;
+            self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+            let after = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            Ok(before != after)
+        }
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -8451,7 +8837,7 @@ impl App {
             Surface::Email => 2,
             Surface::Secrets | Surface::Domains => 0,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
-            Surface::OpenAiAuth => self.openai_auth_rows().len(),
+            Surface::OpenAiAuth => self.provider_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
             Surface::ModelSearch => self.model_search_row_count(),
             Surface::Mode => 2,
@@ -13533,6 +13919,56 @@ mod redesign_tests {
     }
 
     #[test]
+    fn selected_session_keeps_browser_profile_while_new_task_uses_latest_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.setup_complete = true;
+        app.model_configured = true;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Google Chrome".to_string());
+        app.browser_profile_label = Some("Work".to_string());
+        app.default_profile.current_profile_id = Some("google-chrome:Work".to_string());
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.append_current_session_runtime_settings(&session.id)?;
+        app.append_session_model_selection(&session.id, &app.current_model_selection())?;
+
+        app.store.set_setting("browser", BROWSER_LOCAL_CHROME)?;
+        app.store.set_setting("browser.preference.mode", "local")?;
+        app.store
+            .set_setting("browser.preference.browser", "Brave")?;
+        app.store
+            .set_setting("browser.preference.browser_label", "Brave")?;
+        app.store
+            .set_setting("browser.preference.profile", "brave:Personal")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Personal")?;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Brave".to_string());
+        app.browser_profile_label = Some("Personal".to_string());
+        app.default_profile.current_profile_id = Some("brave:Personal".to_string());
+
+        app.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Google Chrome"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("google-chrome:Work")
+        );
+
+        app.dispatch(AppCommand::NewTask)?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Personal"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("brave:Personal")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn switching_to_cloud_without_key_records_backend_change_before_auth() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
         unsafe {
@@ -15868,33 +16304,127 @@ wire_api = "responses"
         assert!(screen.contains("providers"), "{screen}");
         assert!(screen.contains(RECOMMENDED_MODELS[0].display), "{screen}");
         assert!(screen.contains("OpenAI"), "{screen}");
-        assert!(screen.contains("Anthropic · API key"), "{screen}");
-        assert!(screen.contains("OpenRouter · API key"), "{screen}");
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
         Ok(())
     }
 
     #[test]
-    fn provider_rows_collapse_openai_into_a_submenu() -> Result<()> {
+    fn provider_rows_are_single_menu_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app = ready_app(&temp)?;
         let rows = app.provider_rows();
-        // OpenAI is a single row that opens the auth sub-dialogue.
-        let openai = rows
-            .iter()
-            .find(|row| row.label == "OpenAI")
-            .expect("OpenAI row");
-        assert!(openai.submenu);
-        assert_eq!(openai.account, settings::ACCOUNT_CODEX);
-        // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
-        assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
-        // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
+        assert_eq!(rows.len(), 4);
         assert!(rows
             .iter()
-            .any(|row| row.label == "Anthropic · API key"
-                && row.account == settings::ACCOUNT_ANTHROPIC));
-        assert!(!rows
+            .any(|row| { row.label == "OpenAI" && row.account == settings::ACCOUNT_OPENAI }));
+        assert!(rows
             .iter()
-            .any(|row| row.label.contains("Anthropic · sign in")));
+            .any(|row| { row.label == "Anthropic" && row.account == settings::ACCOUNT_ANTHROPIC }));
+        assert!(rows.iter().any(|row| {
+            row.label == "OpenRouter" && row.account == settings::ACCOUNT_OPENROUTER
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.label == "DeepSeek" && row.account == settings::ACCOUNT_DEEPSEEK }));
+        assert!(!rows.iter().any(|row| row.label.contains("API key")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_auth_menu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+
+        let rows = app.provider_rows();
+        let provider_row = rows
+            .iter()
+            .position(|row| row.label == "OpenRouter")
+            .context("OpenRouter provider row")?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("connected"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = RECOMMENDED_MODELS.len() + provider_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(!screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenRouter use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        app.open_surface(Surface::OpenAiAuth);
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENROUTER)
+        );
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn change_provider_key_does_not_change_active_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-openai")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.model = "GPT-5.5".to_string();
+        app.provider_model = "gpt-5.5".to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        app.open_surface(Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
         Ok(())
     }
 
@@ -15935,16 +16465,254 @@ wire_api = "responses"
         app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
         app.execute_surface_selection()?;
         assert_eq!(app.surface, Surface::OpenAiAuth);
-        // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
-        // login). The API-key method is always offered.
-        let methods: Vec<OpenAiAuthMethod> = app
-            .openai_auth_rows()
+        let methods: Vec<ProviderAuthMethod> = app
+            .provider_auth_rows()
             .iter()
             .map(|row| row.method)
             .collect();
-        assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::Codex));
+        Ok(())
+    }
+
+    #[test]
+    fn connected_openai_auth_submenu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        let change_row = rows
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenAI change-key row")?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        app.selected_row = change_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+
+        app.handle_paste("new-openai-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openai.api_key")?.as_deref(),
+            Some("new-openai-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_api_key_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[2].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[2].label, "Sign in with Codex OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeOAuth));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_auth_menu_defaults_to_current_login() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeApiKey));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_auth_menu_shows_change_rows_only_for_existing_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[1].label, "Change OpenAI API key");
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::Codex
+                && row.label == "Select model with current login"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::ChangeOAuth && row.label == "Change OpenAI OAuth"
+        }));
+
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_ANTHROPIC.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_api_key_providers_default_to_current_key_even_when_not_active() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.store
+            .set_setting("auth.deepseek.api_key", "old-deepseek-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+
+        for account in [
+            settings::ACCOUNT_ANTHROPIC,
+            settings::ACCOUNT_OPENROUTER,
+            settings::ACCOUNT_DEEPSEEK,
+        ] {
+            app.selected_provider = Some(account);
+            app.open_surface(Surface::OpenAiAuth);
+
+            let rows = app.provider_auth_rows();
+            assert_eq!(app.selected_row, 0, "{account}");
+            assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey, "{account}");
+            assert_eq!(rows[0].label, "Select model with current key", "{account}");
+            assert_eq!(
+                app.current_provider_auth_method(),
+                Some(ProviderAuthMethod::ApiKey)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_search_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenAI use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Provider);
+        Ok(())
+    }
+
+    #[test]
+    fn api_key_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        let anthropic_row = app
+            .provider_rows()
+            .iter()
+            .position(|row| row.account == settings::ACCOUNT_ANTHROPIC)
+            .context("Anthropic provider row")?;
+        app.selected_row = RECOMMENDED_MODELS.len() + anthropic_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("Anthropic change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("Change Anthropic API key"), "{screen}");
         Ok(())
     }
 
