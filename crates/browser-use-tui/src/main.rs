@@ -11379,6 +11379,15 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live browser"), "{screen}");
+        let footer = screen
+            .lines()
+            .find(|line| line.contains("live browser"))
+            .context("live browser footer")?;
+        assert!(
+            footer.chars().count() <= app.args.width as usize,
+            "footer overflowed configured width: {}\n{footer}",
+            footer.chars().count()
+        );
         let link = app
             .live_link_overlay
             .borrow()

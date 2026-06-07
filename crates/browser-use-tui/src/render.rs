@@ -1695,10 +1695,10 @@ fn composer_bottom_border(
         .filter(|value| !value.is_empty());
     if !browser.is_empty() || live_url.is_some() {
         let live_label = LIVE_STATUS_LINK_TEXT;
-        let live_tag_w = live_label.chars().count() + 2;
-        let wants_live = live_url.is_some() && inner_w >= live_tag_w;
+        let live_segment_w = live_label.chars().count() + 3;
+        let wants_live = live_url.is_some() && inner_w >= live_segment_w;
         let browser_budget = if wants_live {
-            inner_w.saturating_sub(live_tag_w + 3)
+            inner_w.saturating_sub(live_segment_w + 2)
         } else {
             inner_w.saturating_sub(4).max(1)
         };
@@ -1709,7 +1709,7 @@ fn composer_bottom_border(
             .as_ref()
             .map(|label| label.chars().count() + 2)
             .unwrap_or(0);
-        let tag_w = usize::from(wants_live) * live_tag_w + browser_tag_w;
+        let tag_w = usize::from(wants_live) * live_segment_w + browser_tag_w;
         let trail = 2usize.min(inner_w.saturating_sub(tag_w));
         let lead = inner_w.saturating_sub(tag_w + trail);
         spans.push(Span::styled("─".repeat(lead), border()));
