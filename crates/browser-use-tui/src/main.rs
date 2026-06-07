@@ -6329,6 +6329,7 @@ impl App {
     }
 
     fn apply_session_settings_to_app(&mut self, session_id: &str) -> Result<()> {
+        self.restore_default_runtime_settings()?;
         if let Some(selection) = self.session_model_selection(session_id)? {
             self.model = selection.display_model;
             self.provider_model = selection.provider_model;
