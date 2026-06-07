@@ -266,13 +266,18 @@ static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new()
 static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
     OnceLock::new();
 static MANAGED_BROWSER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-static LOCAL_CDP_CONNECTIONS: OnceLock<Mutex<HashMap<String, Weak<CdpDispatcher>>>> =
+static LOCAL_CDP_CONNECTIONS: OnceLock<Mutex<HashMap<String, LocalCdpConnectionEntry>>> =
     OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 10 * 60 * 1_000;
 const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 128;
 const MANAGED_BROWSER_PROFILE_PREFIX: &str = "but-managed-browser.";
 const MANAGED_BROWSER_MARKER_FILE: &str = "BrowserUseManagedChrome.json";
+
+struct LocalCdpConnectionEntry {
+    connection: Weak<CdpDispatcher>,
+    connect_lock: Arc<Mutex<()>>,
+}
 
 struct BrowserScriptRun {
     id: String,
@@ -5865,14 +5870,33 @@ fn shared_local_cdp_connection(
 ) -> Result<Arc<CdpDispatcher>> {
     let key = shared_local_cdp_connection_key(endpoint);
     let registry = LOCAL_CDP_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    {
+    let connect_lock = {
         let mut registry = registry
             .lock()
             .expect("local CDP connection registry poisoned");
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        let entry = registry
+            .entry(key.clone())
+            .or_insert_with(LocalCdpConnectionEntry::empty);
+        if let Some(existing) = entry.connection.upgrade() {
             return Ok(existing);
         }
-        registry.remove(&key);
+        entry.connect_lock.clone()
+    };
+
+    let _connect_guard = connect_lock
+        .lock()
+        .expect("local CDP endpoint connect lock poisoned");
+
+    {
+        let registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        if let Some(existing) = registry
+            .get(&key)
+            .and_then(|entry| entry.connection.upgrade())
+        {
+            return Ok(existing);
+        }
     }
 
     let connection = CdpDispatcher::connect_with_timeout(&endpoint.ws_url, timeout)?;
@@ -5880,10 +5904,13 @@ fn shared_local_cdp_connection(
     let mut registry = registry
         .lock()
         .expect("local CDP connection registry poisoned");
-    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+    let entry = registry
+        .entry(key)
+        .or_insert_with(LocalCdpConnectionEntry::empty);
+    if let Some(existing) = entry.connection.upgrade() {
         return Ok(existing);
     }
-    registry.insert(key, Arc::downgrade(&connection));
+    entry.connection = Arc::downgrade(&connection);
     Ok(connection)
 }
 
@@ -5895,12 +5922,23 @@ fn remove_shared_local_cdp_connection(endpoint: &Endpoint, connection: &Arc<CdpD
     let mut registry = registry
         .lock()
         .expect("local CDP connection registry poisoned");
-    let remove = registry
-        .get(&key)
-        .and_then(Weak::upgrade)
-        .is_some_and(|cached| Arc::ptr_eq(&cached, connection));
-    if remove {
-        registry.remove(&key);
+    if let Some(entry) = registry.get_mut(&key) {
+        let remove = entry
+            .connection
+            .upgrade()
+            .is_some_and(|cached| Arc::ptr_eq(&cached, connection));
+        if remove {
+            entry.connection = Weak::new();
+        }
+    }
+}
+
+impl LocalCdpConnectionEntry {
+    fn empty() -> Self {
+        Self {
+            connection: Weak::new(),
+            connect_lock: Arc::new(Mutex::new(())),
+        }
     }
 }
 
