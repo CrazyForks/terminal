@@ -10,8 +10,6 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-#[cfg(not(test))]
-use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex, Once,
@@ -45,14 +43,17 @@ use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
+    codex_oauth_pkce, codex_oauth_state, load_codex_auth_file, ClaudeCodeOAuthCredential,
+    CodexAuth, CodexManagedAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, load_codex_auth_file,
-    parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
+    ClaudeCodeAuthorization, CodexAuthorization, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 #[cfg(test)]
 use browser_use_store::StoreNotifier;
@@ -166,7 +167,6 @@ pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
 const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
-const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
@@ -410,13 +410,13 @@ impl Drop for ClaudeCodeOAuthFlow {
 
 #[derive(Debug)]
 enum CodexLoginEvent {
-    Output(String),
-    Finished(Result<CodexAuth, String>),
+    Finished(Result<CodexManagedAuth, String>),
 }
 
 #[derive(Debug)]
 struct CodexLoginFlow {
     account: String,
+    url: String,
     output: String,
     started_at: Instant,
     stop_tx: mpsc::Sender<()>,
@@ -2363,11 +2363,6 @@ impl App {
         }
         for event in events {
             match event {
-                CodexLoginEvent::Output(text) => {
-                    if let Some(flow) = self.codex_login.as_mut() {
-                        flow.output.push_str(&strip_ansi(&text));
-                    }
-                }
                 CodexLoginEvent::Finished(result) => {
                     let account = self
                         .codex_login
@@ -2377,7 +2372,7 @@ impl App {
                     self.codex_login = None;
                     match result {
                         Ok(auth) => {
-                            self.store_codex_auth(&auth)?;
+                            self.store_codex_managed_auth(&auth)?;
                             self.codex_login_available = true;
                             self.account = account.clone();
                             self.persist_runtime_settings()?;
@@ -3519,21 +3514,18 @@ impl App {
         Ok(())
     }
 
-    /// The OpenAI auth-method rows: Sign in (OAuth), Codex (only when an external
-    /// login is detected), and API key.
+    /// The OpenAI auth-method rows: Codex OAuth and API key.
     fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
-        let mut rows = Vec::new();
-        if self.has_external_codex_login() {
-            rows.push(OpenAiAuthRow {
-                label: "Use detected Codex login".to_string(),
+        vec![
+            OpenAiAuthRow {
+                label: "Sign in with Codex OAuth".to_string(),
                 method: OpenAiAuthMethod::Codex,
-            });
-        }
-        rows.push(OpenAiAuthRow {
-            label: "Use an API key".to_string(),
-            method: OpenAiAuthMethod::ApiKey,
-        });
-        rows
+            },
+            OpenAiAuthRow {
+                label: "Use an API key".to_string(),
+                method: OpenAiAuthMethod::ApiKey,
+            },
+        ]
     }
 
     /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
@@ -3759,7 +3751,7 @@ impl App {
                 account_id,
             };
         }
-        if let Ok(auth) = load_codex_auth() {
+        if let Some(auth) = codex_auth_from_explicit_env() {
             return ProviderCredential::Oauth {
                 access_token: auth.access_token,
                 account_id: auth.account_id,
@@ -6940,18 +6932,26 @@ impl App {
                 return Ok(());
             }
         };
+        let auth_url = flow.url.clone();
         self.codex_login = Some(flow);
-        self.show_setup_result(
-            SetupResultKind::Pending,
-            account,
-            "Waiting for Codex device sign-in.".to_string(),
-        );
+        if let Some(flow) = self.codex_login.as_mut() {
+            flow.output.push_str(&auth_url);
+            flow.output.push('\n');
+        }
+        let message = match open_external_url(&auth_url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        self.show_setup_result(SetupResultKind::Pending, account, message);
         Ok(())
     }
 
     fn reopen_codex_device_auth_url(&mut self) {
-        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
-            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
+        let Some(url) = self.codex_login.as_ref().map(|flow| flow.url.clone()) else {
+            return;
+        };
+        let message = match open_external_url(&url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
             Err(error) => format!("Could not open browser automatically: {error}"),
         };
         if let Some(result) = self.setup_result.as_mut() {
@@ -6985,18 +6985,9 @@ impl App {
         Ok(())
     }
 
-    /// Whether a codex login exists OUTSIDE our own OAuth store keys (an external
-    /// `~/.codex/auth.json`, managed auth, or env). Drives the "Codex login
-    /// detected" provider row so it appears only for a pre-existing login.
-    fn has_external_codex_login(&self) -> bool {
-        load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
-    }
-
     fn setup_account_choices(&self) -> Result<Vec<&'static str>> {
         let mut choices = Vec::new();
-        if self.account_ready(ACCOUNT_CODEX)? {
-            choices.push(ACCOUNT_CODEX);
-        }
+        choices.push(ACCOUNT_CODEX);
         choices.extend([
             ACCOUNT_OPENAI,
             ACCOUNT_ANTHROPIC,
@@ -7870,20 +7861,49 @@ impl App {
         {
             return Ok(true);
         }
-        Ok(load_codex_managed_auth().is_ok()
-            || load_codex_auth().is_ok()
-            || codex_env_auth_present())
+        Ok(codex_env_auth_present())
     }
 
-    fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
+    fn store_codex_managed_auth(&self, auth: &CodexManagedAuth) -> Result<()> {
+        let snapshot = auth.current_snapshot()?;
         self.store
-            .set_setting("auth.codex.access_token", auth.access_token.trim())?;
+            .set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
         self.store
-            .set_setting("auth.codex.account_id", auth.account_id.trim())?;
-        self.store.delete_setting("auth.codex.id_token")?;
-        self.store.delete_setting("auth.codex.refresh_token")?;
-        self.store.delete_setting("auth.codex.source_path")?;
-        self.store.delete_setting("auth.codex.last_refresh")?;
+            .set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
+        if let Some(id_token) = snapshot
+            .id_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.id_token", id_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.id_token")?;
+        }
+        if let Some(refresh_token) = snapshot
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.refresh_token", refresh_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.refresh_token")?;
+        }
+        if let Some(source_path) = snapshot.source_path.as_ref() {
+            self.store.set_setting(
+                "auth.codex.source_path",
+                source_path.to_string_lossy().as_ref(),
+            )?;
+        } else {
+            self.store.delete_setting("auth.codex.source_path")?;
+        }
+        if let Some(last_refresh) = snapshot.last_refresh {
+            self.store
+                .set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
+        } else {
+            self.store.delete_setting("auth.codex.last_refresh")?;
+        }
         Ok(())
     }
 
@@ -7957,12 +7977,25 @@ impl App {
 const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
 fn codex_env_auth_present() -> bool {
+    codex_auth_from_explicit_env().is_some()
+}
+
+fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
+    if let Ok(path) = std::env::var("LLM_BROWSER_CODEX_AUTH_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_codex_auth_file(path).ok();
+        }
+    }
     if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_ok_and(|value| !value.trim().is_empty())
         && std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").is_ok_and(|value| !value.trim().is_empty())
     {
-        return true;
+        return Some(CodexAuth {
+            access_token: std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").ok()?,
+            account_id: std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").ok()?,
+        });
     }
-    std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
+    None
 }
 
 fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
@@ -8263,11 +8296,6 @@ fn account_kind(account: &str) -> &'static str {
     }
 }
 
-#[cfg(not(test))]
-fn app_codex_home(state_dir: &Path) -> PathBuf {
-    state_dir.join("codex-home")
-}
-
 fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
@@ -8431,68 +8459,30 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
 }
 
 #[cfg(not(test))]
-fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLoginFlow> {
-    let codex_home = app_codex_home(&state_dir);
-    std::fs::create_dir_all(&codex_home)
-        .with_context(|| format!("create app Codex home {}", codex_home.display()))?;
-    let auth_path = codex_home.join("auth.json");
-    let mut child = ProcessCommand::new("codex")
-        .args(["login", "--device-auth"])
-        .env("CODEX_HOME", &codex_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start `codex login --device-auth`")?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
-    if let Some(stdout) = stdout {
-        spawn_codex_output_reader(stdout, event_tx.clone());
-    }
-    if let Some(stderr) = stderr {
-        spawn_codex_output_reader(stderr, event_tx.clone());
-    }
     thread::Builder::new()
-        .name("browser-use-codex-login".to_string())
-        .spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
-                    "Codex device sign-in was cancelled".to_string(),
-                )));
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let result = if status.success() {
-                        load_codex_auth_file(&auth_path)
-                            .with_context(|| {
-                                format!(
-                                    "load app Codex auth after device sign-in from {}",
-                                    auth_path.display()
-                                )
-                            })
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        Err(format!("`codex login --device-auth` exited with {status}"))
-                    };
-                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
-                        "wait for Codex login process: {error}"
-                    ))));
-                    return;
-                }
-            }
+        .name("browser-use-codex-oauth".to_string())
+        .spawn(move || {
+            let result = wait_for_codex_oauth_credential(listener, verifier, state, stop_rx)
+                .map_err(|error| format!("{error:#}"));
+            let _ = event_tx.send(CodexLoginEvent::Finished(result));
         })
-        .context("spawn Codex device login watcher")?;
+        .context("spawn Codex OAuth callback listener")?;
     Ok(CodexLoginFlow {
         account,
+        url,
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -8501,31 +8491,99 @@ fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLo
 }
 
 #[cfg(not(test))]
-fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    let _ = event_tx.send(CodexLoginEvent::Output(text));
-                }
-                Err(_) => return,
-            }
+fn wait_for_codex_oauth_credential(
+    listener: TcpListener,
+    verifier: String,
+    expected_state: String,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexManagedAuth> {
+    let parsed = wait_for_codex_callback(listener, expected_state.as_str(), stop_rx)?;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
+}
+
+#[cfg(not(test))]
+fn wait_for_codex_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexAuthorization> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            anyhow::bail!("Codex OAuth sign-in was cancelled");
         }
-    });
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for Codex browser callback");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => return handle_codex_callback(&mut stream, expected_state),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("accept Codex OAuth callback"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if parsed.error.is_some() {
+        400
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Codex authentication completed. You can close this window.",
+        400 => parsed
+            .error_description
+            .as_deref()
+            .or(parsed.error.as_deref())
+            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
+        _ => "Codex callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        anyhow::bail!("{text}")
+    }
 }
 
 #[cfg(test)]
 fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (_verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
     let (stop_tx, _stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
     Ok(CodexLoginFlow {
         account,
+        url: codex_oauth_authorize_url(&challenge, &state),
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -8782,26 +8840,6 @@ fn unquote_env_value(value: &str) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            output.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    output
 }
 
 fn print_native_transcript(app: &mut App) -> Result<()> {
@@ -11675,14 +11713,10 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        if app
+        assert!(app
             .setup_account_choices()?
-            .contains(&settings::ACCOUNT_CODEX)
-        {
-            assert!(screen.contains("Continue with Codex login"));
-        } else {
-            assert!(!screen.contains("Codex login"));
-        }
+            .contains(&settings::ACCOUNT_CODEX));
+        assert!(screen.contains("Continue with Codex login"));
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
@@ -14117,7 +14151,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
+    fn codex_oauth_login_output_stores_auth_and_uses_default_model() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
 
@@ -14133,22 +14167,21 @@ wire_api = "responses"
             .and_then(|flow| flow.event_tx_guard.as_ref())
             .expect("test Codex login sender")
             .clone();
-        tx.send(CodexLoginEvent::Output(
-            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
-                .to_string(),
-        ))
-        .expect("send test Codex output");
 
-        assert!(app.drain_codex_login_notifications()?);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("https://auth.openai.com/codex/device"));
-        assert!(screen.contains("ABCD-EFGH"));
+        assert!(screen.contains("https://auth.openai.com/oauth/authorize"));
         assert!(!screen.contains("\u{1b}[94m"));
 
-        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
-            access_token: "codex-access".to_string(),
-            account_id: "codex-account".to_string(),
-        })))
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "codex-access",
+                "codex-account",
+                Some("codex-id".to_string()),
+                Some("codex-refresh".to_string()),
+                None,
+                Some("2026-01-01T00:00:00Z".to_string()),
+            ),
+        )))
         .expect("send test Codex auth result");
         assert!(app.drain_codex_login_notifications()?);
         assert_eq!(
@@ -14158,6 +14191,10 @@ wire_api = "responses"
         assert_eq!(
             app.store.get_setting("auth.codex.account_id")?,
             Some("codex-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("codex-refresh".to_string())
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
