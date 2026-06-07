@@ -1650,6 +1650,7 @@ fn render_composer(
                 text,
                 url: link.url,
                 fg: accent().fg.unwrap_or(ratatui::style::Color::Reset),
+                modifier: Modifier::UNDERLINED,
             });
         }
     }
@@ -1665,26 +1666,8 @@ fn render_composer(
             vertical: 0,
             horizontal: 2,
         });
-        let (status_line, live_link) =
-            composer_status_line(app, state, status_inner.width as usize);
+        let status_line = composer_status_line(app, state, status_inner.width as usize);
         frame.render_widget(Paragraph::new(status_line), status_inner);
-        // Record where the live URL landed so the caller can paint an OSC-8
-        // hyperlink over it after the frame is flushed (see LiveLinkOverlay).
-        if let Some(link) = live_link {
-            let col = status_inner.x.saturating_add(link.col as u16);
-            let max_visible = status_inner.right().saturating_sub(col) as usize;
-            let width = link.width.min(max_visible);
-            if width > 0 {
-                let text: String = link.text.chars().take(width).collect();
-                *app.live_link_overlay.borrow_mut() = Some(LiveLinkOverlay {
-                    col,
-                    row: status_inner.y,
-                    text,
-                    url: link.url,
-                    fg: muted().fg.unwrap_or(ratatui::style::Color::Reset),
-                });
-            }
-        }
     }
 }
 
@@ -1711,11 +1694,11 @@ fn composer_bottom_border(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if !browser.is_empty() || live_url.is_some() {
-        let live_label = "Open Live Browser";
-        let live_tag_w = live_label.chars().count() + 2;
-        let wants_live = live_url.is_some() && inner_w >= live_tag_w;
+        let live_label = LIVE_STATUS_LINK_TEXT;
+        let live_segment_w = live_label.chars().count() + 3;
+        let wants_live = live_url.is_some() && inner_w >= live_segment_w;
         let browser_budget = if wants_live {
-            inner_w.saturating_sub(live_tag_w + 3)
+            inner_w.saturating_sub(live_segment_w + 2)
         } else {
             inner_w.saturating_sub(4).max(1)
         };
@@ -1726,7 +1709,7 @@ fn composer_bottom_border(
             .as_ref()
             .map(|label| label.chars().count() + 2)
             .unwrap_or(0);
-        let tag_w = usize::from(wants_live) * live_tag_w + browser_tag_w;
+        let tag_w = usize::from(wants_live) * live_segment_w + browser_tag_w;
         let trail = 2usize.min(inner_w.saturating_sub(tag_w));
         let lead = inner_w.saturating_sub(tag_w + trail);
         spans.push(Span::styled("─".repeat(lead), border()));
@@ -1745,7 +1728,7 @@ fn composer_bottom_border(
                     url: url.to_string(),
                 });
             }
-            spans.push(Span::raw(" "));
+            spans.push(Span::raw("  "));
         }
         if let Some(label) = browser_label {
             let tag_style = if app.browser == BROWSER_USE_CLOUD
@@ -1767,15 +1750,15 @@ fn composer_bottom_border(
     (Line::from(spans), live_link)
 }
 
-/// Geometry of the clickable live-view link inside the status row, as built
-/// by `composer_status_line`. Columns are relative to the status row origin;
+/// Geometry of the clickable live-view link inside a rendered line. Columns are
+/// relative to that line's origin;
 /// the caller resolves them to absolute screen coordinates.
 struct LiveLink {
-    /// Column of the first URL cell, relative to the status row origin.
+    /// Column of the first live-link cell, relative to the status row origin.
     col: usize,
-    /// Visible width (in cells) of the truncated URL text.
+    /// Visible width (in cells) of the live-link text.
     width: usize,
-    /// The visible (possibly truncated) URL text actually drawn.
+    /// The visible live-link text actually drawn.
     text: String,
     /// The full, untruncated live-view URL to open on click.
     url: String,
@@ -1791,26 +1774,24 @@ struct LiveLink {
 /// cells, misaligned click region). Painting it post-draw, the way the
 /// manual modal overlay does, sidesteps the diff entirely.
 pub(crate) struct LiveLinkOverlay {
-    /// Absolute column of the first URL cell.
+    /// Absolute column of the first live-link cell.
     pub(crate) col: u16,
     /// Absolute row of the status line.
     pub(crate) row: u16,
-    /// The visible URL text to reprint between the OSC-8 open/close.
+    /// The visible live-link text to reprint between the OSC-8 open/close.
     pub(crate) text: String,
     /// The full URL bound as the hyperlink target.
     pub(crate) url: String,
-    /// Foreground color to reprint the text with (matches `muted()`).
+    /// Foreground color to reprint the text with.
     pub(crate) fg: ratatui::style::Color,
+    /// Text modifier to reprint the text with.
+    pub(crate) modifier: ratatui::style::Modifier,
 }
 
 /// Status row below the composer: active model and context-fill bar,
 /// plus running cost when there is one. Browser and live-browser links live on
 /// the box's bottom border, not here.
-fn composer_status_line(
-    app: &App,
-    state: &WorkbenchState,
-    width: usize,
-) -> (Line<'static>, Option<LiveLink>) {
+fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
@@ -1818,23 +1799,50 @@ fn composer_status_line(
         collaboration_mode_label(app.collaboration_mode).to_string(),
         muted(),
     ));
+
+    let optional_budget = |spans: &[Span<'_>]| width.saturating_sub(spans_text_width(spans));
+
     if let Some(goal) = app.goal_status_indicator_for_state(state) {
-        spans.push(status_separator());
-        spans.push(Span::styled(goal, muted()));
+        let available = optional_budget(&spans);
+        push_optional_status_spans(
+            &mut spans,
+            vec![status_separator(), Span::styled(goal, muted())],
+            available,
+        );
     }
     if let (Some(context_tokens), Some(context_budget_tokens)) =
         (usage.context_tokens, usage.context_budget_tokens)
     {
-        spans.push(status_separator());
-        spans.extend(context_bar_spans(context_tokens, context_budget_tokens));
+        let mut context_spans = vec![status_separator()];
+        context_spans.extend(context_bar_spans(context_tokens, context_budget_tokens));
+        let available = optional_budget(&spans);
+        push_optional_status_spans(&mut spans, context_spans, available);
     }
     if usage.cost_usd > 0.0 {
-        spans.push(status_separator());
-        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
+        let available = optional_budget(&spans);
+        push_optional_status_spans(
+            &mut spans,
+            vec![
+                status_separator(),
+                Span::styled(format!("${:.4}", usage.cost_usd), muted()),
+            ],
+            available,
+        );
     }
-    let _ = width;
-    (Line::from(spans), None)
+    Line::from(spans)
 }
+
+fn push_optional_status_spans(
+    spans: &mut Vec<Span<'static>>,
+    candidate: Vec<Span<'static>>,
+    available: usize,
+) {
+    if spans_text_width(&candidate) <= available {
+        spans.extend(candidate);
+    }
+}
+
+const LIVE_STATUS_LINK_TEXT: &str = "live browser";
 
 /// Dropdown rows used by the fused composer. No top/bottom rules and no
 /// hint footer — those are provided by the box around it. Each row is
@@ -1913,6 +1921,10 @@ fn context_bar_spans(used_tokens: i64, budget_tokens: i64) -> Vec<Span<'static>>
 
 fn status_separator() -> Span<'static> {
     Span::styled("  ·  ", dim())
+}
+
+fn spans_text_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the

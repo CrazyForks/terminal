@@ -5392,6 +5392,7 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
+        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5431,6 +5432,7 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
+            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5458,6 +5460,28 @@ impl App {
         }
         self.welcome_anim.throw();
         true
+    }
+
+    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
+        let overlay = self.live_link_overlay.borrow();
+        let link = overlay.as_ref()?;
+        if link.text.is_empty() || row != link.row {
+            return None;
+        }
+        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
+        let end = link.col.saturating_add(width);
+        if column < link.col || column >= end {
+            return None;
+        }
+        Some(link.url.clone())
+    }
+
+    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
+        let Some(url) = self.live_link_url_at(column, row) else {
+            return Ok(false);
+        };
+        self.request_open_browser_target(url)?;
+        Ok(true)
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -9287,6 +9311,12 @@ fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) 
         SetAttribute(Attribute::Reset),
         SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
         MoveTo(link.col, link.row),
+    )?;
+    if link.modifier.contains(Modifier::UNDERLINED) {
+        queue!(target, SetAttribute(Attribute::Underlined))?;
+    }
+    queue!(
+        target,
         Print(live_link_osc8(&link.url, &link.text)),
         ResetColor,
         SetAttribute(Attribute::Reset),
@@ -9458,9 +9488,17 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let logo_handled = matches!(kind, MouseEventKind::Down(_))
-                && app.handle_welcome_logo_click(column, row);
-            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
+            let is_button_down = matches!(kind, MouseEventKind::Down(_));
+            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
+            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
+            app.trace_mouse_event(
+                kind_label,
+                column,
+                row,
+                before_cursor,
+                logo_handled,
+                live_link_handled,
+            );
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -11257,7 +11295,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_status_link_does_not_capture_terminal_mouse() -> Result<()> {
+    fn live_status_link_uses_native_hyperlink_without_capturing_scroll() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.browser = BROWSER_USE_CLOUD.to_string();
@@ -11281,13 +11319,27 @@ mod redesign_tests {
             .live_link_overlay
             .borrow()
             .as_ref()
-            .map(|link| (link.col, link.row, link.url.clone()))
+            .map(|link| (link.col, link.row, link.text.clone(), link.url.clone()))
             .context("live link overlay")?;
-        assert_eq!(link.2, live_url);
-        assert!(
-            !app.should_capture_mouse(),
-            "live links must stay terminal-native so scrollback and text selection keep working"
-        );
+        assert_eq!(link.2, "live browser");
+        assert_eq!(link.3, live_url);
+        assert!(!app.should_capture_mouse());
+        assert!(app.handle_live_link_click(link.0, link.1)?);
+        assert!(app.handle_live_link_click(
+            link.0
+                .saturating_add(u16::try_from(link.2.chars().count()).unwrap_or(0))
+                .saturating_sub(1),
+            link.1,
+        )?);
+        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let targets = events
+            .iter()
+            .filter(|event| event.event_type == "browser.open_requested")
+            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![live_url, live_url]);
         Ok(())
     }
 
@@ -11317,7 +11369,7 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Open Live Browser"));
+        assert!(screen.contains("live browser"));
         assert!(screen.contains("Headless Chromium"));
         assert!(!screen.contains("live file:///tmp/browser-use-terminal/.capture.frames/live.html"));
         let link = app
@@ -11353,17 +11405,23 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id.clone());
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Open Live Browser"), "{screen}");
+        assert!(screen.contains("live browser"), "{screen}");
+        let footer = screen
+            .lines()
+            .find(|line| line.contains("live browser"))
+            .context("live browser footer")?;
+        assert!(
+            footer.chars().count() <= app.args.width as usize,
+            "footer overflowed configured width: {}\n{footer}",
+            footer.chars().count()
+        );
         let link = app
             .live_link_overlay
             .borrow()
             .as_ref()
             .map(|link| (link.text.clone(), link.url.clone()))
             .context("live link overlay")?;
-        assert_eq!(
-            link,
-            ("Open Live Browser".to_string(), live_url.to_string())
-        );
+        assert_eq!(link, ("live browser".to_string(), live_url.to_string()));
         Ok(())
     }
 
@@ -12860,6 +12918,52 @@ mod redesign_tests {
         assert!(!screen.contains("17.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
+        Ok(())
+    }
+
+    #[test]
+    fn composer_status_keeps_cloud_live_url_when_context_status_is_crowded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 66;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect crowded status"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {"input_tokens": 12345},
+                    "model_context_window": 100000
+                }
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"cost_usd": 0.0123}),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Browser Use Cloud"), "{screen}");
+        assert!(screen.contains("live browser"), "{screen}");
+        assert!(
+            !screen.contains("live https://live.browser-use"),
+            "{screen}"
+        );
         Ok(())
     }
 
