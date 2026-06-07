@@ -428,7 +428,14 @@ struct BrowserScriptDelta {
 pub struct BrowserSessionRegistry {
     sessions: Arc<Mutex<HashMap<String, BrowserSession>>>,
     checked_out_statuses: Arc<Mutex<HashMap<String, Value>>>,
+    checked_out_capture_snapshots: Arc<Mutex<HashMap<String, CaptureSessionSnapshot>>>,
     captures: Arc<Mutex<HashMap<String, SessionCaptureHandle>>>,
+}
+
+#[derive(Clone)]
+struct CaptureSessionSnapshot {
+    dispatcher: Arc<CdpDispatcher>,
+    target_id: String,
 }
 
 impl std::fmt::Debug for BrowserSessionRegistry {
@@ -438,6 +445,10 @@ impl std::fmt::Debug for BrowserSessionRegistry {
             .field(
                 "checked_out_session_count",
                 &self.checked_out_session_count(),
+            )
+            .field(
+                "checked_out_capture_snapshot_count",
+                &self.checked_out_capture_snapshot_count(),
             )
             .field("active_capture_count", &self.active_capture_count())
             .finish()
@@ -464,6 +475,13 @@ impl BrowserSessionRegistry {
         self.checked_out_statuses
             .lock()
             .expect("browser checked-out session registry poisoned")
+            .len()
+    }
+
+    fn checked_out_capture_snapshot_count(&self) -> usize {
+        self.checked_out_capture_snapshots
+            .lock()
+            .expect("browser checked-out capture snapshot registry poisoned")
             .len()
     }
 
@@ -513,6 +531,12 @@ impl BrowserSessionRegistry {
                 anyhow!("browser is not connected or is busy; run `browser status --json`")
             })?
         };
+        if let Some(snapshot) = capture_session_snapshot(&session) {
+            self.checked_out_capture_snapshots
+                .lock()
+                .expect("browser checked-out capture snapshot registry poisoned")
+                .insert(session_id.to_string(), snapshot);
+        }
         self.checked_out_statuses
             .lock()
             .expect("browser checked-out session registry poisoned")
@@ -532,7 +556,18 @@ impl BrowserSessionRegistry {
             .lock()
             .expect("browser checked-out session registry poisoned")
             .remove(session_id);
+        self.checked_out_capture_snapshots
+            .lock()
+            .expect("browser checked-out capture snapshot registry poisoned")
+            .remove(session_id);
     }
+}
+
+fn capture_session_snapshot(session: &BrowserSession) -> Option<CaptureSessionSnapshot> {
+    Some(CaptureSessionSnapshot {
+        dispatcher: session.connection.clone()?,
+        target_id: session.current_target_id.clone()?,
+    })
 }
 
 fn refresh_checked_out_status_health(status: &mut Value) {
@@ -9013,7 +9048,7 @@ fn session_capture_fps() -> f64 {
     std::env::var("LLM_BROWSER_CAPTURE_FPS")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(0.0)
+        .unwrap_or(2.0)
 }
 fn session_capture_quality() -> i64 {
     std::env::var("LLM_BROWSER_CAPTURE_QUALITY")
@@ -9023,6 +9058,9 @@ fn session_capture_quality() -> i64 {
 }
 
 fn local_capture_preview_live_url(artifact_dir: &Path) -> Option<String> {
+    if session_capture_fps() <= 0.0 {
+        return None;
+    }
     let frames_dir = artifact_dir.join(".capture.frames");
     ensure_capture_preview_files(&frames_dir).ok()?;
     Some(file_url_for_path(&frames_dir.join("live.html")))
@@ -9192,11 +9230,18 @@ fn session_capture_dispatcher(
     session_id: &str,
     session_registry: &BrowserSessionRegistry,
 ) -> Option<(Arc<CdpDispatcher>, String)> {
-    let sessions = session_registry.sessions.lock().ok()?;
-    let session = sessions.get(session_id)?;
-    let dispatcher = session.connection.clone()?;
-    let target = session.current_target_id.clone()?;
-    Some((dispatcher, target))
+    if let Ok(sessions) = session_registry.sessions.lock() {
+        if let Some(session) = sessions.get(session_id) {
+            if let Some(dispatcher) = session.connection.clone() {
+                if let Some(target) = session.current_target_id.clone() {
+                    return Some((dispatcher, target));
+                }
+            }
+        }
+    }
+    let snapshots = session_registry.checked_out_capture_snapshots.lock().ok()?;
+    let snapshot = snapshots.get(session_id)?;
+    Some((snapshot.dispatcher.clone(), snapshot.target_id.clone()))
 }
 
 fn write_capture_manifest(path: &Path, records: &[Value]) {
@@ -9644,6 +9689,15 @@ mod tests {
     use std::sync::MutexGuard;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_cdp_dispatcher() -> Arc<CdpDispatcher> {
+        let (tx, _rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
+        Arc::new(CdpDispatcher {
+            tx: Mutex::new(tx),
+            next_id: AtomicU64::new(1),
+            reader: Mutex::new(None),
+        })
+    }
 
     #[test]
     #[ignore = "manual measurement; needs STITCH_TEST_FRAMES_DIR"]
@@ -10423,6 +10477,7 @@ mod tests {
     #[test]
     fn managed_status_exposes_local_capture_preview_live_url() {
         let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
         let session = BrowserSession {
             mode: BrowserMode::Managed,
             owner: BrowserOwner::Rust,
@@ -10438,6 +10493,23 @@ mod tests {
             Some(file_url_for_path(&preview).as_str())
         );
         assert!(preview.exists());
+    }
+
+    #[test]
+    fn managed_status_omits_local_preview_when_capture_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "0")]);
+        let session = BrowserSession {
+            mode: BrowserMode::Managed,
+            owner: BrowserOwner::Rust,
+            artifact_dir: Some(temp.path().to_path_buf()),
+            current_target_id: Some("target-1".to_string()),
+            current_session_id: Some("session-1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(session.status_json()["live_url"].is_null());
+        assert!(!temp.path().join(".capture.frames/live.html").exists());
     }
 
     #[test]
@@ -10545,6 +10617,44 @@ mod tests {
         registry.return_session(session_id, session);
         assert_eq!(registry.checked_out_session_count(), 0);
         assert_eq!(registry.active_session_count(), 1);
+    }
+
+    #[test]
+    fn capture_dispatcher_uses_checked_out_session_snapshot() {
+        let registry = BrowserSessionRegistry::new();
+        let session_id = "checked-out-capture";
+        let dispatcher = test_cdp_dispatcher();
+        registry
+            .sessions
+            .lock()
+            .expect("browser session registry poisoned")
+            .insert(
+                session_id.to_string(),
+                BrowserSession {
+                    session_id: Some(session_id.to_string()),
+                    mode: BrowserMode::Managed,
+                    owner: BrowserOwner::Rust,
+                    connection: Some(dispatcher.clone()),
+                    current_target_id: Some("target-1".to_string()),
+                    current_session_id: Some("session-1".to_string()),
+                    ..Default::default()
+                },
+            );
+
+        let session = registry
+            .checkout_session(session_id)
+            .expect("checkout browser session");
+        assert_eq!(registry.active_session_count(), 0);
+        assert_eq!(registry.checked_out_session_count(), 1);
+        assert_eq!(registry.checked_out_capture_snapshot_count(), 1);
+
+        let (snapshot_dispatcher, target_id) =
+            session_capture_dispatcher(session_id, &registry).expect("capture snapshot");
+        assert!(Arc::ptr_eq(&snapshot_dispatcher, &dispatcher));
+        assert_eq!(target_id, "target-1");
+
+        registry.return_session(session_id, session);
+        assert_eq!(registry.checked_out_capture_snapshot_count(), 0);
     }
 
     #[test]
@@ -12525,14 +12635,14 @@ print("bridge retry ok")
     }
 
     #[test]
-    fn session_capture_is_opt_in_for_eval_speed() {
+    fn session_capture_defaults_to_live_preview_fps() {
         {
             let _env = EnvRestore::unset(&["LLM_BROWSER_CAPTURE_FPS"]);
-            assert_eq!(session_capture_fps(), 0.0);
+            assert_eq!(session_capture_fps(), 2.0);
         }
         {
-            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "2")]);
-            assert_eq!(session_capture_fps(), 2.0);
+            let _env = EnvRestore::set(&[("LLM_BROWSER_CAPTURE_FPS", "0")]);
+            assert_eq!(session_capture_fps(), 0.0);
         }
     }
 
@@ -12726,6 +12836,7 @@ print("bridge retry ok")
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-private-registry";
         let registry = BrowserScriptRunRegistry::new();
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let started = start_browser_script_with_registry(
             session_id,
             temp.path(),
@@ -12799,6 +12910,7 @@ print("bridge retry ok")
     fn browser_script_observe_returns_images_before_final_result() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-observe-image";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let code = r#"
 import pathlib, time
 path = pathlib.Path(outputs_dir()) / "before_failure.png"
@@ -12834,6 +12946,7 @@ print("finished")
     fn browser_script_observe_returns_summary_before_final_result() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-observe-summary";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let code = r#"
 # browser_summary:
 # {
@@ -12961,6 +13074,7 @@ print("finished")
     fn browser_status_marks_completed_background_scripts_for_observe() {
         let temp = tempfile::tempdir().unwrap();
         let session_id = "script-status-completed-runs";
+        let _env = EnvRestore::set(&[("BU_BROWSER_SCRIPT_INITIAL_WAIT_MS", "250")]);
         let started = start_browser_script(
             session_id,
             temp.path(),
@@ -13526,6 +13640,15 @@ print("large response ok", len(data["blob"]))
         )
         .unwrap();
         assert_eq!(connect.content["status"], "connected");
+        assert!(
+            connect
+                .events
+                .iter()
+                .find_map(|event| event["payload"]["live_url"].as_str())
+                .is_some_and(|url| url.ends_with("/.capture.frames/live.html")),
+            "{:?}",
+            connect.events
+        );
 
         let script = run_browser_script(
             session_id,
@@ -13591,6 +13714,20 @@ screenshot("managed_smoke")
         assert!(
             !script.images.is_empty(),
             "expected screenshot image artifact"
+        );
+        let latest = artifacts.join(".capture.frames/latest.jpg");
+        let saw_live_frame = (0..20).any(|_| {
+            if latest.metadata().is_ok_and(|metadata| metadata.len() > 0) {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(250));
+                false
+            }
+        });
+        assert!(
+            saw_live_frame,
+            "expected live preview frame at {}",
+            latest.display()
         );
 
         cleanup_session(session_id);
