@@ -1114,7 +1114,9 @@ def _nav_blocked_reason(url):
     parsed = urlparse(url or "")
     if parsed.scheme not in ("http", "https"):
         return None
-    host = (parsed.hostname or "").lower()
+    # Mirror the Rust nav guard: a trailing dot ("example.com.") is the same host,
+    # so strip it before matching — otherwise a denied domain could be bypassed.
+    host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return None
     if any(_nav_pattern_matches(host, p) for p in _NAV_DENY):

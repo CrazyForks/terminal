@@ -225,7 +225,10 @@ fn login_from_op_item(item: &Value) -> Option<ImportedLogin> {
     if username.is_some() && username == password {
         username = None;
     }
-    if username.is_none() && password.is_none() {
+    // Keep OTP-only items: a 1Password entry can carry just a 2FA seed (no
+    // username/password), and that seed should still import. Only skip entries
+    // with nothing usable at all.
+    if username.is_none() && password.is_none() && otpauth.is_none() {
         return None;
     }
     Some(ImportedLogin {
@@ -314,6 +317,23 @@ mod tests {
         let login = login_from_op_item(&item).unwrap();
         assert_eq!(login.username, None);
         assert_eq!(login.password.as_deref(), Some("s3cr3tvalue"));
+    }
+
+    #[test]
+    fn otp_only_item_is_imported() {
+        // A 1Password entry with only a 2FA seed (no username/password) must
+        // still import its otp — not be skipped.
+        let item = serde_json::json!({
+            "urls": [{"href": "https://github.com/login"}],
+            "fields": [
+                {"type": "OTP", "value": "otpauth://totp/GitHub?secret=TESTTESTTESTTESTTESTTESTTESTTEST"}
+            ]
+        });
+        let login = login_from_op_item(&item).expect("otp-only item should import");
+        assert_eq!(login.domain, "github.com");
+        assert_eq!(login.username, None);
+        assert_eq!(login.password, None);
+        assert!(login.otpauth.is_some());
     }
 
     #[test]

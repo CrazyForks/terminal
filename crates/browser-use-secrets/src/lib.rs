@@ -11,7 +11,7 @@
 //! [`InMemorySecretStore`] without touching disk.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,8 +71,17 @@ impl SecretMeta {
 }
 
 /// Build the store account string for a `(domain, placeholder)` pair.
+///
+/// `/` is the field separator, so it (and the `\` escape char) are escaped in
+/// each part. Without this, distinct pairs could collide — e.g. `("a/b", "c")`
+/// and `("a", "b/c")` would both render `a/b/c`. Inputs that contain neither
+/// character — normalized hostnames and validated placeholders — are emitted
+/// unchanged, so account strings already persisted on disk stay valid.
 pub fn account_for(domain: &str, placeholder: &str) -> String {
-    format!("{domain}/{placeholder}")
+    fn escape(part: &str) -> String {
+        part.replace('\\', "\\\\").replace('/', "\\/")
+    }
+    format!("{}/{}", escape(domain), escape(placeholder))
 }
 
 /// Errors from a [`SecretStore`].
@@ -139,6 +148,16 @@ impl SecretStore for InMemorySecretStore {
 /// store — encrypted at rest, no OS prompts, works headless on every platform.
 pub struct FileSecretStore {
     dir: std::path::PathBuf,
+}
+
+/// Serializes the load→modify→save sequence in `put`/`delete`. A fresh
+/// `FileSecretStore` is created per call (so a per-instance lock wouldn't help),
+/// and every instance points at the same on-disk file, so one process-wide lock
+/// prevents concurrent writers from clobbering each other's updates. (`save_map`
+/// writes via a temp file + atomic rename, so reads never need it.)
+fn file_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl FileSecretStore {
@@ -248,6 +267,11 @@ impl SecretStore for FileSecretStore {
     fn put(&self, meta: &SecretMeta, value: &str) -> SecretResult<()> {
         use aes_gcm::aead::Aead;
         use rand::RngCore;
+        // Hold the lock across key-creation, encryption, and load→modify→save.
+        // It must cover `cipher()` too: `load_or_create_key` is itself a racy
+        // check-then-create, so concurrent first writers could otherwise mint
+        // different keys and encrypt secrets under a key that's then overwritten.
+        let _guard = file_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let cipher = self.cipher()?;
         let mut nonce = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce);
@@ -287,6 +311,8 @@ impl SecretStore for FileSecretStore {
     }
 
     fn delete(&self, domain: &str, placeholder: &str) -> SecretResult<()> {
+        // Same load→modify→save lock as `put` (see `file_write_lock`).
+        let _guard = file_write_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut map = self.load_map()?;
         if map.remove(&account_for(domain, placeholder)).is_some() {
             self.save_map(&map)?;
@@ -461,5 +487,64 @@ mod tests {
         assert_eq!(SecretKind::parse("nonsense"), None);
         assert_eq!(SecretKind::Password.as_str(), "password");
         assert_eq!(SecretKind::Totp.as_str(), "totp");
+    }
+
+    #[test]
+    fn account_keys_cannot_collide_across_pairs() {
+        // A slash in either part must not let two distinct pairs share a key.
+        assert_ne!(account_for("a/b", "c"), account_for("a", "b/c"));
+        assert_ne!(account_for("a", "b"), account_for("a\\", "b"));
+        // Inputs without `/` or `\` are emitted unchanged, so keys already
+        // persisted on disk stay valid (backward compatibility).
+        assert_eq!(account_for("github.com", "password"), "github.com/password");
+        assert_eq!(account_for("\u{1}agentmail", "token"), "\u{1}agentmail/token");
+
+        // And the store actually keeps such pairs separate end-to-end.
+        let store = InMemorySecretStore::new();
+        store
+            .put(&meta("a/b", "c", SecretKind::Password), "first")
+            .unwrap();
+        store
+            .put(&meta("a", "b/c", SecretKind::Password), "second")
+            .unwrap();
+        assert_eq!(store.get("a/b", "c").unwrap().as_deref(), Some("first"));
+        assert_eq!(store.get("a", "b/c").unwrap().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn concurrent_writes_do_not_drop_secrets() {
+        // Regression: load→modify→save must be serialized, or parallel writers
+        // overwrite each other's entries. Each thread makes its own store
+        // (mirrors the per-call `value_store(...)`), all against one file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = FileSecretStore::new(&path);
+                    store
+                        .put(
+                            &meta("example.com", &format!("k{i}"), SecretKind::Password),
+                            &format!("v{i}"),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = FileSecretStore::new(&path);
+        for i in 0..16 {
+            assert_eq!(
+                store
+                    .get("example.com", &format!("k{i}"))
+                    .unwrap()
+                    .as_deref(),
+                Some(format!("v{i}").as_str()),
+                "secret k{i} was dropped by a concurrent write"
+            );
+        }
     }
 }
