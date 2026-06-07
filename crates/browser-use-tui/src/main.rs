@@ -6966,6 +6966,17 @@ impl App {
         }
         self.store
             .set_setting(auth_setting_key(&account), secret.trim())?;
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && !self.pending_model_search_after_auth
+            && self.pending_model_after_auth.is_none()
+            && self.setup_pending_account.as_deref() != Some(account.as_str());
+        if return_to_provider_auth {
+            self.api_key_account = None;
+            self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
+            self.open_surface(Surface::OpenAiAuth);
+            return Ok(());
+        }
         self.account = account.clone();
         self.persist_runtime_settings()?;
         self.api_key_account = None;
@@ -14654,6 +14665,41 @@ wire_api = "responses"
 
         app.handle_paste("new-openrouter-key");
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn change_provider_key_does_not_change_active_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-openai")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.model = "GPT-5.5".to_string();
+        app.provider_model = "gpt-5.5".to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        app.open_surface(Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(
             app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
             Some("new-openrouter-key")
