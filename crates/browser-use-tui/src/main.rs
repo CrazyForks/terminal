@@ -15774,7 +15774,7 @@ wire_api = "responses"
         );
         assert!(screen.contains("provider disconnected"), "{screen}");
         assert!(
-            screen.contains("Use /model to choose a different model or change your API key, then try again."),
+            screen.contains("Hint: use /model to choose a different model, then try again."),
             "{screen}"
         );
         assert_eq!(
