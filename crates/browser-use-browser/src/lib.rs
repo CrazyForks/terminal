@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -156,6 +156,16 @@ struct ManagedBrowser {
     child: Child,
     _profile_dir: Option<TempDir>,
     launch: ManagedLaunch,
+    marker_path: PathBuf,
+}
+
+impl Drop for ManagedBrowser {
+    fn drop(&mut self) {
+        unregister_managed_browser_pid(self.child.id());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.marker_path);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -255,9 +265,19 @@ static BROWSER_SESSIONS: OnceLock<BrowserSessionRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_RUNS: OnceLock<BrowserScriptRunRegistry> = OnceLock::new();
 static BROWSER_SCRIPT_OBSERVING: OnceLock<Mutex<HashMap<String, BrowserScriptObserveMarker>>> =
     OnceLock::new();
+static MANAGED_BROWSER_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static LOCAL_CDP_CONNECTIONS: OnceLock<Mutex<HashMap<String, LocalCdpConnectionEntry>>> =
+    OnceLock::new();
 static BROWSER_SCRIPT_RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
 const BROWSER_SCRIPT_COMPLETED_CACHE_TTL_MS: u128 = 10 * 60 * 1_000;
 const BROWSER_SCRIPT_COMPLETED_CACHE_MAX: usize = 128;
+const MANAGED_BROWSER_PROFILE_PREFIX: &str = "but-managed-browser.";
+const MANAGED_BROWSER_MARKER_FILE: &str = "BrowserUseManagedChrome.json";
+
+struct LocalCdpConnectionEntry {
+    connection: Weak<CdpDispatcher>,
+    connect_lock: Arc<Mutex<()>>,
+}
 
 struct BrowserScriptRun {
     id: String,
@@ -3560,7 +3580,7 @@ impl BrowserSession {
                 headless,
                 extra_args: extra_args.clone(),
             };
-            match launch_managed_browser(launch.clone()) {
+            match launch_managed_browser(launch.clone(), self.session_id.clone()) {
                 Ok((managed, http_url)) => {
                     launched = Some((launch, managed, http_url));
                     break;
@@ -3583,7 +3603,7 @@ impl BrowserSession {
         };
         let ws_url = resolve_ws_from_http(&http_url)?;
         self.managed = Some(managed);
-        self.connect_endpoint(
+        if let Err(error) = self.connect_endpoint(
             Endpoint {
                 kind: "cdp-url".to_string(),
                 http_url: Some(http_url),
@@ -3592,7 +3612,10 @@ impl BrowserSession {
             },
             BrowserMode::Managed,
             BrowserOwner::Rust,
-        )?;
+        ) {
+            self.stop_owned_managed();
+            return Err(error);
+        }
         self.browser_name = Some("Managed Chromium".to_string());
         self.profile = Some(match &launch.profile {
             ManagedProfile::Temp => "temp".to_string(),
@@ -3741,12 +3764,16 @@ impl BrowserSession {
         owner: BrowserOwner,
         attach_deadline: Instant,
     ) -> Result<()> {
-        let ws_url = endpoint.ws_url.clone();
-        let connection =
-            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?;
+        let shared_local = mode == BrowserMode::Local && owner == BrowserOwner::External;
+        let connection = if shared_local {
+            shared_local_cdp_connection(&endpoint, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+        } else {
+            let ws_url = endpoint.ws_url.clone();
+            CdpDispatcher::connect_with_timeout(&ws_url, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+        };
         self.reset_browser_profile_runtime();
         self.endpoint = Some(endpoint);
-        self.connection = Some(connection);
+        self.connection = Some(connection.clone());
         self.mode = mode;
         self.owner = owner;
         if self.mode != BrowserMode::RemoteCloud {
@@ -3758,6 +3785,11 @@ impl BrowserSession {
         self.last_target_id = None;
         self.last_session_id = None;
         if let Err(error) = self.attach_first_page_with_deadline(attach_deadline) {
+            if shared_local {
+                if let Some(endpoint) = self.endpoint.as_ref() {
+                    remove_shared_local_cdp_connection(endpoint, &connection);
+                }
+            }
             self.clear_failed_connection_state();
             return Err(error);
         }
@@ -3796,7 +3828,13 @@ impl BrowserSession {
             }
         }
         self.reset_browser_profile_runtime();
-        self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
+        self.connection = Some(
+            if self.mode == BrowserMode::Local && self.owner == BrowserOwner::External {
+                shared_local_cdp_connection(&endpoint, BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT)?
+            } else {
+                CdpDispatcher::connect(&endpoint.ws_url)?
+            },
+        );
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
             let _ = self.reattach_same_target();
@@ -5826,12 +5864,231 @@ fn resolve_ws_from_http(http_url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("{url} missing webSocketDebuggerUrl"))
 }
 
-fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, String)> {
-    let port = free_port()?;
+fn shared_local_cdp_connection(
+    endpoint: &Endpoint,
+    timeout: Duration,
+) -> Result<Arc<CdpDispatcher>> {
+    let key = shared_local_cdp_connection_key(endpoint);
+    let registry = LOCAL_CDP_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let connect_lock = {
+        let mut registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        let entry = registry
+            .entry(key.clone())
+            .or_insert_with(LocalCdpConnectionEntry::empty);
+        if let Some(existing) = entry.connection.upgrade() {
+            return Ok(existing);
+        }
+        entry.connect_lock.clone()
+    };
+
+    let _connect_guard = connect_lock
+        .lock()
+        .expect("local CDP endpoint connect lock poisoned");
+
+    {
+        let registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        if let Some(existing) = registry
+            .get(&key)
+            .and_then(|entry| entry.connection.upgrade())
+        {
+            return Ok(existing);
+        }
+    }
+
+    let connection = CdpDispatcher::connect_with_timeout(&endpoint.ws_url, timeout)?;
+
+    let mut registry = registry
+        .lock()
+        .expect("local CDP connection registry poisoned");
+    let entry = registry
+        .entry(key)
+        .or_insert_with(LocalCdpConnectionEntry::empty);
+    if let Some(existing) = entry.connection.upgrade() {
+        return Ok(existing);
+    }
+    entry.connection = Arc::downgrade(&connection);
+    Ok(connection)
+}
+
+fn remove_shared_local_cdp_connection(endpoint: &Endpoint, connection: &Arc<CdpDispatcher>) {
+    let key = shared_local_cdp_connection_key(endpoint);
+    let Some(registry) = LOCAL_CDP_CONNECTIONS.get() else {
+        return;
+    };
+    let mut registry = registry
+        .lock()
+        .expect("local CDP connection registry poisoned");
+    if let Some(entry) = registry.get_mut(&key) {
+        let remove = entry
+            .connection
+            .upgrade()
+            .is_some_and(|cached| Arc::ptr_eq(&cached, connection));
+        if remove {
+            entry.connection = Weak::new();
+        }
+    }
+}
+
+impl LocalCdpConnectionEntry {
+    fn empty() -> Self {
+        Self {
+            connection: Weak::new(),
+            connect_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+fn shared_local_cdp_connection_key(endpoint: &Endpoint) -> String {
+    endpoint
+        .http_url
+        .as_deref()
+        .unwrap_or(endpoint.ws_url.as_str())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ManagedBrowserMarker {
+    pid: u32,
+    port: u16,
+    executable: String,
+    profile_path: PathBuf,
+    owner_session_id: Option<String>,
+    started_at_ms: u128,
+}
+
+fn managed_browser_pid_registry() -> &'static Mutex<HashSet<u32>> {
+    MANAGED_BROWSER_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_managed_browser_pid(pid: u32) {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .insert(pid);
+}
+
+fn unregister_managed_browser_pid(pid: u32) {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .remove(&pid);
+}
+
+fn managed_browser_pid_active_in_process(pid: u32) -> bool {
+    managed_browser_pid_registry()
+        .lock()
+        .expect("managed browser pid registry poisoned")
+        .contains(&pid)
+}
+
+fn reap_stale_managed_browser_temp_profiles(owner_session_id: Option<&str>) {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(MANAGED_BROWSER_PROFILE_PREFIX) {
+            reap_stale_managed_browser_profile(&entry.path(), owner_session_id);
+        }
+    }
+}
+
+fn reap_stale_managed_browser_profile(profile_path: &Path, owner_session_id: Option<&str>) {
+    let marker_path = profile_path.join(MANAGED_BROWSER_MARKER_FILE);
+    let Ok(raw) = fs::read_to_string(&marker_path) else {
+        return;
+    };
+    let Ok(marker) = serde_json::from_str::<ManagedBrowserMarker>(&raw) else {
+        let _ = fs::remove_file(marker_path);
+        return;
+    };
+    if managed_browser_pid_active_in_process(marker.pid) {
+        return;
+    }
+    if marker.owner_session_id.as_deref() != owner_session_id {
+        return;
+    }
+    if process_command_matches_managed_marker(marker.pid, &marker.profile_path) {
+        terminate_process(marker.pid);
+    }
+    let _ = fs::remove_file(marker_path);
+    let active_path = profile_path.join("DevToolsActivePort");
+    let _ = fs::remove_file(active_path);
+}
+
+#[cfg(unix)]
+fn process_command_matches_managed_marker(pid: u32, profile_path: &Path) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let profile_path = profile_path.display().to_string();
+    command.contains("--remote-debugging-port=")
+        && (command.contains(&format!("--user-data-dir={profile_path}"))
+            || command.contains(&profile_path))
+}
+
+#[cfg(not(unix))]
+fn process_command_matches_managed_marker(_pid: u32, _profile_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) {
+    let pid = pid.to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    thread::sleep(Duration::from_millis(200));
+    let _ = Command::new("kill").args(["-KILL", &pid]).status();
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) {}
+
+fn write_managed_browser_marker(
+    profile_path: &Path,
+    launch: &ManagedLaunch,
+    child: &Child,
+    port: u16,
+    owner_session_id: Option<String>,
+) -> Result<PathBuf> {
+    let marker_path = profile_path.join(MANAGED_BROWSER_MARKER_FILE);
+    let marker = ManagedBrowserMarker {
+        pid: child.id(),
+        port,
+        executable: launch.executable.clone(),
+        profile_path: profile_path.to_path_buf(),
+        owner_session_id,
+        started_at_ms: unix_time_ms(),
+    };
+    let raw = serde_json::to_vec_pretty(&marker).context("serialize managed browser marker")?;
+    fs::write(&marker_path, raw)
+        .with_context(|| format!("write managed browser marker {}", marker_path.display()))?;
+    Ok(marker_path)
+}
+
+fn launch_managed_browser(
+    launch: ManagedLaunch,
+    owner_session_id: Option<String>,
+) -> Result<(ManagedBrowser, String)> {
     let (profile_path, temp_dir) = match &launch.profile {
         ManagedProfile::Temp => {
+            reap_stale_managed_browser_temp_profiles(owner_session_id.as_deref());
             let temp = tempfile::Builder::new()
-                .prefix("but-managed-browser.")
+                .prefix(MANAGED_BROWSER_PROFILE_PREFIX)
                 .tempdir()
                 .context("create managed browser temp profile")?;
             (temp.path().to_path_buf(), Some(temp))
@@ -5839,9 +6096,11 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         ManagedProfile::Path(path) => {
             fs::create_dir_all(path)
                 .with_context(|| format!("create managed browser profile {}", path.display()))?;
+            reap_stale_managed_browser_profile(path, owner_session_id.as_deref());
             (path.clone(), None)
         }
     };
+    let port = free_port()?;
     let mut args = vec![
         "--remote-debugging-address=127.0.0.1".to_string(),
         format!("--remote-debugging-port={port}"),
@@ -5870,6 +6129,22 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("launch managed browser {}", launch.executable))?;
+    register_managed_browser_pid(child.id());
+    let marker_path = match write_managed_browser_marker(
+        &profile_path,
+        &launch,
+        &child,
+        port,
+        owner_session_id.clone(),
+    ) {
+        Ok(marker_path) => marker_path,
+        Err(error) => {
+            unregister_managed_browser_pid(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
     let http_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_error = None;
@@ -5884,6 +6159,7 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
                         child,
                         _profile_dir: temp_dir,
                         launch,
+                        marker_path,
                     },
                     http_url,
                 ));
@@ -5894,8 +6170,10 @@ fn launch_managed_browser(launch: ManagedLaunch) -> Result<(ManagedBrowser, Stri
             }
         }
     }
+    unregister_managed_browser_pid(child.id());
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(marker_path);
     bail!(
         "managed browser DevTools did not become available: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
@@ -6668,7 +6946,7 @@ fn local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Vec<Value>> {
         headless: true,
         extra_args: vec!["--no-startup-window".to_string()],
     };
-    let (mut managed, http_url) = launch_managed_browser(launch)?;
+    let (mut managed, http_url) = launch_managed_browser(launch, None)?;
     let result = (|| -> Result<Vec<Value>> {
         let ws_url = resolve_ws_from_http(&http_url)?;
         let mut connection = CdpConnection::connect(&ws_url)?;
@@ -10254,6 +10532,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_local_cdp_connection_key_prefers_stable_http_endpoint() {
+        let endpoint = Endpoint {
+            kind: "devtools-active-port".to_string(),
+            http_url: Some("http://127.0.0.1:9222/".to_string()),
+            ws_url: "ws://127.0.0.1:9222/devtools/browser/changing-id".to_string(),
+            candidate_id: Some("local-1".to_string()),
+        };
+
+        assert_eq!(
+            shared_local_cdp_connection_key(&endpoint),
+            "http://127.0.0.1:9222"
+        );
+    }
+
+    #[test]
     fn cdp_protocol_errors_are_command_errors_not_websocket_drops() {
         let invalid_params = r#"CDP failed: {"code":-32602,"message":"Invalid parameters"}"#;
         assert_eq!(classify_browser_error(invalid_params), "cdp-command-error");
@@ -13381,6 +13674,78 @@ print("large response ok", len(data["blob"]))
             .as_deref()
             .unwrap()
             .contains("DevToolsActivePort"));
+    }
+
+    #[test]
+    fn active_managed_browser_marker_is_not_reaped() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let pid = std::process::id();
+        register_managed_browser_pid(pid);
+        let marker = ManagedBrowserMarker {
+            pid,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-session".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::write(
+            temp.path().join("DevToolsActivePort"),
+            "9\n/devtools/browser/stale\n",
+        )
+        .unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-session"));
+
+        unregister_managed_browser_pid(pid);
+        assert!(marker_path.exists());
+        assert!(temp.path().join("DevToolsActivePort").exists());
+    }
+
+    #[test]
+    fn stale_managed_browser_marker_removes_stale_port_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let marker = ManagedBrowserMarker {
+            pid: 999_999,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-session".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let active_path = temp.path().join("DevToolsActivePort");
+        fs::write(&active_path, "9\n/devtools/browser/stale\n").unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-session"));
+
+        assert!(!marker_path.exists());
+        assert!(!active_path.exists());
+    }
+
+    #[test]
+    fn managed_browser_marker_reaper_respects_owner_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker_path = temp.path().join(MANAGED_BROWSER_MARKER_FILE);
+        let marker = ManagedBrowserMarker {
+            pid: 999_999,
+            port: 9,
+            executable: "chrome".to_string(),
+            profile_path: temp.path().to_path_buf(),
+            owner_session_id: Some("owner-a".to_string()),
+            started_at_ms: 1,
+        };
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        let active_path = temp.path().join("DevToolsActivePort");
+        fs::write(&active_path, "9\n/devtools/browser/stale\n").unwrap();
+
+        reap_stale_managed_browser_profile(temp.path(), Some("owner-b"));
+
+        assert!(marker_path.exists());
+        assert!(active_path.exists());
     }
 
     #[test]
