@@ -112,11 +112,14 @@ pub fn has_secret_resolver() -> bool {
         .is_some()
 }
 
-/// Resolves an email-inbox op: `"address"` (the agent's inbox) or `"code"` (poll
-/// for the latest code). `Ok(None)` when unavailable / no code yet; `Err(msg)`
-/// carries the real failure (bad token, network, store lock) so it surfaces to
-/// the script instead of a misleading generic message.
-pub type EmailResolver = Arc<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
+/// Resolves an email-inbox op: `"address"` (the agent's inbox), `"inbox"` (list
+/// recent messages as a JSON array string; `arg` is an optional limit), or
+/// `"message"` (read one message's full body as a JSON object string; `arg` is
+/// the message id). `Ok(None)` when unavailable; `Err(msg)` carries the real
+/// failure (bad token, network, store lock) so it surfaces to the script instead
+/// of a misleading generic message.
+pub type EmailResolver =
+    Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, String> + Send + Sync>;
 
 fn email_resolver_slot() -> &'static Mutex<Option<EmailResolver>> {
     static SLOT: OnceLock<Mutex<Option<EmailResolver>>> = OnceLock::new();
@@ -138,9 +141,10 @@ pub fn has_email_resolver() -> bool {
         .is_some()
 }
 
-/// Run an email-inbox op; a returned `code` is recorded for redaction. `Err`
-/// carries the real failure for the script to report.
-pub(crate) fn email_for_session(session_id: &str, op: &str) -> Result<Option<String>, String> {
+/// Run an email-inbox op. The agent reads inbox content directly (codes, links,
+/// confirmations), so nothing here is redacted. `Err` carries the real failure
+/// for the script to report.
+pub(crate) fn email_for_session(op: &str, arg: Option<&str>) -> Result<Option<String>, String> {
     let resolver = match email_resolver_slot()
         .lock()
         .expect("email resolver poisoned")
@@ -149,29 +153,7 @@ pub(crate) fn email_for_session(session_id: &str, op: &str) -> Result<Option<Str
         Some(resolver) => resolver,
         None => return Ok(None),
     };
-    let value = resolver(op)?;
-    if op == "code" {
-        if let Some(code) = &value {
-            record_redaction_needle(session_id, code, "email_code");
-        }
-    }
-    Ok(value)
-}
-
-/// Record a value to scrub from this session's model-visible output.
-pub(crate) fn record_redaction_needle(session_id: &str, value: &str, label: &str) {
-    if value.is_empty() {
-        return;
-    }
-    fetched_values()
-        .lock()
-        .expect("fetched secret cache poisoned")
-        .entry(session_id.to_string())
-        .or_default()
-        .insert(
-            (format!("\u{1}{label}"), label.to_string()),
-            value.to_string(),
-        );
+    resolver(op, arg)
 }
 
 /// Per-session cache of values already fetched this session, keyed by

@@ -244,15 +244,23 @@ pub fn resolve_script_security(store: &Store) -> Result<ScriptSecurity> {
     let metas = list_secrets(store)?;
     let (global_allow, global_deny) = list_domains(store)?;
 
+    // Secret domains are folded into the allow-list ONLY to keep them reachable
+    // when the user has an explicit allow-list. Having saved secrets must NOT, by
+    // itself, turn on allow-list enforcement — otherwise importing a login would
+    // silently block every other site (an empty `/domains` allow means
+    // unrestricted browsing). Deny rules always apply regardless.
+    let enforce_allow = !global_allow.is_empty();
     let mut secrets = Vec::new();
     let mut allow = global_allow;
     for meta in &metas {
-        if !allow.iter().any(|d| d == &meta.domain) {
-            allow.push(meta.domain.clone());
-        }
-        for extra in &meta.allowed_domains {
-            if !allow.iter().any(|d| d == extra) {
-                allow.push(extra.clone());
+        if enforce_allow {
+            if !allow.iter().any(|d| d == &meta.domain) {
+                allow.push(meta.domain.clone());
+            }
+            for extra in &meta.allowed_domains {
+                if !allow.iter().any(|d| d == extra) {
+                    allow.push(extra.clone());
+                }
             }
         }
         secrets.push(ScriptSecret {
@@ -336,37 +344,19 @@ credential on its real login form, never in a search box or an unrelated field."
         ));
     }
 
-    if email_2fa_configured(store) {
-        block.push_str(
-            "\n\n## Email inbox\n\n\
-You have your own disposable inbox. `email_address()` returns its address — enter \
-it into ANY email field (account sign-ups, services, logins), not only 2FA flows. \
-After an email is triggered, `email_code()` reads the arriving verification/2FA/\
-one-time code and you fill it in; the code is redacted from your output.",
-        );
-    } else {
-        block.push_str(
-            "\n\n## Email verification / 2FA (not set up)\n\n\
-This isn't configured yet, but it can be. When a task reaches an email field for \
-sign-up/login, or needs a code/link sent by email, tell the user CONCRETELY what \
-turning it on would let you do — don't just say 'automation can be enabled'. Spell \
-it out, e.g.: \"I can generate a disposable email address, enter it in the sign-up \
-form myself, then read the verification/2FA code straight from that inbox and \
-finish — you won't have to check your email or give me an address.\" Then say they \
-can turn it on by running `/email` in the terminal (paste a free AgentMail API key \
-from agentmail.to), and ask how they'd like to proceed. You have no inbox until \
-it's set up.",
-        );
-    }
+    // Email-inbox usage (email_address / email_inbox / email_message) lives in
+    // the general browser_script tool prompt so it's always present, not gated on
+    // config.
 
     if let Ok((allow, deny)) = list_domains(store) {
         if !allow.is_empty() || !deny.is_empty() {
             block.push_str(
                 "\n\n## Site navigation policy\n\n\
-The user has restricted which sites you may visit. If a navigation is blocked by \
-this policy, you cannot change it yourself — briefly tell the user that the site \
-is blocked and that they can allow it by running `/domains`, then continue with \
-whatever you can still do.",
+The user has restricted which sites you may visit. Call `nav_policy()` in \
+browser_script to see the allowed/denied sites and plan within them. If a \
+navigation is blocked, you cannot change the policy yourself — briefly tell the \
+user that the site is blocked and that they can allow it by running `/domains` \
+(or adjust the task), then continue with whatever you can still do.",
             );
         }
     }
@@ -401,16 +391,32 @@ pub fn install_script_security(store: &Store, session_id: &str) -> Result<()> {
     // Re-opens the store each call so token/inbox changes apply without restart.
     if !browser_use_browser::has_email_resolver() {
         let state_dir = store.state_dir().to_path_buf();
-        browser_use_browser::set_email_resolver(std::sync::Arc::new(move |op: &str| {
-            let store = Store::open(&state_dir).map_err(|err| format!("open store: {err}"))?;
-            match op {
-                "address" => agentmail_inbox_address(&store)
-                    .map(Some)
-                    .map_err(|err| format!("{err:#}")),
-                "code" => agentmail_latest_code(&store).map_err(|err| format!("{err:#}")),
-                _ => Ok(None),
-            }
-        }));
+        browser_use_browser::set_email_resolver(std::sync::Arc::new(
+            move |op: &str, arg: Option<&str>| {
+                let store = Store::open(&state_dir).map_err(|err| format!("open store: {err}"))?;
+                match op {
+                    "address" => agentmail_inbox_address(&store)
+                        .map(Some)
+                        .map_err(|err| format!("{err:#}")),
+                    "inbox" => {
+                        let limit = arg.and_then(|s| s.parse::<u32>().ok()).unwrap_or(20);
+                        agentmail_messages(&store, limit)
+                            .map(Some)
+                            .map_err(|err| format!("{err:#}"))
+                    }
+                    "message" => {
+                        let message_id = arg.unwrap_or("");
+                        if message_id.is_empty() {
+                            return Err("reading a message requires a message_id".to_string());
+                        }
+                        agentmail_message(&store, message_id)
+                            .map(Some)
+                            .map_err(|err| format!("{err:#}"))
+                    }
+                    _ => Ok(None),
+                }
+            },
+        ));
     }
     Ok(())
 }
@@ -510,11 +516,21 @@ pub fn agentmail_inbox_address(store: &Store) -> Result<String> {
     Ok(address)
 }
 
-/// Poll AgentMail for the latest one-time code in the agent's inbox.
-pub fn agentmail_latest_code(store: &Store) -> Result<Option<String>> {
+/// List the agent's inbox messages (newest first) as a JSON array string.
+pub fn agentmail_messages(store: &Store, limit: u32) -> Result<String> {
     let token = agentmail_token(store).ok_or_else(|| anyhow!("no AgentMail token configured"))?;
     let inbox = agentmail_inbox_address(store)?;
-    super::email_2fa::AgentMail::new(token).latest_code(&inbox)
+    let messages = super::email_2fa::AgentMail::new(token).list_messages(&inbox, limit)?;
+    serde_json::to_string(&messages).map_err(|err| anyhow!("serialize messages: {err}"))
+}
+
+/// Read one inbox message's full body (subject, sender, text + html) as a JSON
+/// object string.
+pub fn agentmail_message(store: &Store, message_id: &str) -> Result<String> {
+    let token = agentmail_token(store).ok_or_else(|| anyhow!("no AgentMail token configured"))?;
+    let inbox = agentmail_inbox_address(store)?;
+    let message = super::email_2fa::AgentMail::new(token).get_message(&inbox, message_id)?;
+    serde_json::to_string(&message).map_err(|err| anyhow!("serialize message: {err}"))
 }
 
 /// Test/diagnostic helper: an in-memory secret store.
@@ -691,6 +707,40 @@ mod tests {
     }
 
     #[test]
+    fn secrets_without_explicit_allow_do_not_restrict_navigation() {
+        // Regression: importing/saving a login must NOT silently engage the
+        // allow-list and block all other sites. With no `/domains` allow set,
+        // nav_allow stays empty (unrestricted) even though a secret exists.
+        let (store, _dir) = temp_store();
+        let secret_store = InMemorySecretStore::new();
+        set_secret(
+            &store,
+            &secret_store,
+            "github.com",
+            "password",
+            SecretKind::Password,
+            vec!["*.okta.com".to_string()],
+            "pw",
+        )
+        .unwrap();
+
+        let security = resolve_script_security(&store).unwrap();
+        assert!(
+            security.nav_allow.is_empty(),
+            "saved secrets must not create an allow-list: {:?}",
+            security.nav_allow
+        );
+        assert!(security.nav_deny.is_empty());
+        assert_eq!(security.secrets.len(), 1); // still tracked for substitution
+
+        // A deny-only policy still works without forcing an allow-list.
+        add_domain(&store, "evil.com", false).unwrap();
+        let security = resolve_script_security(&store).unwrap();
+        assert!(security.nav_allow.is_empty());
+        assert!(security.nav_deny.contains(&"evil.com".to_string()));
+    }
+
+    #[test]
     fn domain_list_management() {
         let (store, _dir) = temp_store();
         add_domain(&store, "a.com", true).unwrap();
@@ -711,11 +761,9 @@ mod tests {
     fn prompt_context_lists_names_not_values() {
         let (store, _dir) = temp_store();
         let secret_store = InMemorySecretStore::new();
-        // With nothing configured, the only context is the offer to set up email
-        // automation (no saved-credentials block).
-        let empty = secrets_prompt_context(&store).expect("email-automation offer");
-        assert!(empty.contains("not set up"));
-        assert!(!empty.contains("Saved credentials"));
+        // Nothing configured → no dynamic context (email usage lives in the
+        // general browser_script prompt, not here).
+        assert!(secrets_prompt_context(&store).is_none());
 
         set_secret(
             &store,
@@ -812,8 +860,13 @@ mod tests {
         )
         .unwrap();
         let _ = &secret_store;
+        // An explicit allow-list is what activates folding; assert the secret's
+        // host is normalized (port stripped) both as the tracked secret domain
+        // and when folded into that allow-list.
+        add_domain(&store, "example.com", true).unwrap();
         let security = resolve_script_security(&store).unwrap();
         assert!(security.nav_allow.contains(&"github.com".to_string()));
+        assert!(!security.nav_allow.contains(&"github.com:443".to_string()));
         assert_eq!(security.secrets.len(), 1);
         assert_eq!(security.secrets[0].domain, "github.com");
     }

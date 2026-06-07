@@ -1,5 +1,7 @@
-//! Email one-time-code 2FA via AgentMail: provision an inbox, then poll it for
-//! the arriving verification code.
+//! AgentMail inbox access: provision the agent's disposable inbox, list its
+//! messages, and read a message's full body. General-purpose — the agent reads
+//! whatever it needs (verification codes, magic links, confirmations); no
+//! special-casing of 2FA here.
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
@@ -61,15 +63,19 @@ impl AgentMail {
         })
     }
 
-    /// Return the most recent one-time code found in the inbox, if any.
-    pub fn latest_code(&self, inbox_id: &str) -> Result<Option<String>> {
+    /// List recent messages, newest first, as lightweight metadata. The list
+    /// endpoint returns `subject` + `preview` but no full body — read a specific
+    /// message with [`get_message`](Self::get_message) when the preview isn't
+    /// enough.
+    pub fn list_messages(&self, inbox_id: &str, limit: u32) -> Result<Vec<Value>> {
         let token = self.token.clone();
         let inbox = inbox_id.to_string();
+        let limit = limit.clamp(1, 50).to_string();
         Self::off_runtime(move || {
             let resp = reqwest::blocking::Client::new()
                 .get(format!("{BASE_URL}/inboxes/{inbox}/messages"))
                 .bearer_auth(&token)
-                .query(&[("limit", "10")])
+                .query(&[("limit", limit.as_str())])
                 .send()
                 .map_err(|err| anyhow!("AgentMail list-messages request failed: {err}"))?;
             let status = resp.status();
@@ -82,88 +88,110 @@ impl AgentMail {
             let messages = body
                 .get("messages")
                 .and_then(Value::as_array)
-                .cloned()
+                .map(|items| items.iter().map(summarize_message).collect())
                 .unwrap_or_default();
-            // Newest first; return the first message that yields a code.
-            for message in &messages {
-                let subject = message.get("subject").and_then(Value::as_str).unwrap_or("");
-                let text = message
-                    .get("extracted_text")
-                    .and_then(Value::as_str)
-                    .or_else(|| message.get("text").and_then(Value::as_str))
-                    .unwrap_or("");
-                if let Some(code) = extract_otp(subject, text) {
-                    return Ok(Some(code));
-                }
+            Ok(messages)
+        })
+    }
+
+    /// Fetch one message's full content (subject, sender, text + html body). The
+    /// message id contains characters like `<`, `>`, and `@`, so it must be
+    /// percent-encoded as a path segment.
+    pub fn get_message(&self, inbox_id: &str, message_id: &str) -> Result<Value> {
+        let token = self.token.clone();
+        let inbox = inbox_id.to_string();
+        let message_id = message_id.to_string();
+        Self::off_runtime(move || {
+            let mut url = reqwest::Url::parse(&format!("{BASE_URL}/inboxes/{inbox}/messages"))
+                .map_err(|err| anyhow!("AgentMail message URL invalid: {err}"))?;
+            url.path_segments_mut()
+                .map_err(|_| anyhow!("AgentMail message URL is not a base"))?
+                .push(&message_id);
+            let resp = reqwest::blocking::Client::new()
+                .get(url)
+                .bearer_auth(&token)
+                .send()
+                .map_err(|err| anyhow!("AgentMail get-message request failed: {err}"))?;
+            let status = resp.status();
+            let body: Value = resp
+                .json()
+                .map_err(|err| anyhow!("AgentMail message response not JSON: {err}"))?;
+            if !status.is_success() {
+                bail!("AgentMail message error ({})", status.as_u16());
             }
-            Ok(None)
+            Ok(full_message(&body))
         })
     }
 }
 
-/// Extract an OTP from an email. 6-digit codes (the common length) are tried
-/// first so years/counts don't win over a real code; keyword-adjacent matches
-/// before bare ones.
-pub fn extract_otp(subject: &str, body: &str) -> Option<String> {
-    let haystack = format!("{subject}\n{body}");
-    let kw =
-        r"(?i)code|verification|verify|one[\s-]?time|passcode|otp|\bpin\b|security|authenticat";
+/// Project a list-endpoint message down to the fields the agent reads (no body).
+fn summarize_message(message: &Value) -> Value {
+    let pick = |key: &str| message.get(key).and_then(Value::as_str).unwrap_or("");
+    serde_json::json!({
+        "message_id": pick("message_id"),
+        "from": pick("from"),
+        "to": message.get("to").cloned().unwrap_or(Value::Null),
+        "subject": pick("subject"),
+        "preview": pick("preview"),
+        "timestamp": pick("timestamp"),
+    })
+}
 
-    let first_capture = |pattern: &str| -> Option<String> {
-        regex::Regex::new(pattern)
-            .ok()
-            .and_then(|re| re.captures(&haystack))
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+/// Project a single-message response down to the fields the agent reads,
+/// including the full text and html body (preferring AgentMail's cleaned
+/// `extracted_*` variants).
+fn full_message(message: &Value) -> Value {
+    let pick = |key: &str| message.get(key).and_then(Value::as_str).unwrap_or("");
+    let body = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| message.get(*key).and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
     };
-
-    let patterns = [
-        format!(r"(?:{kw})[^0-9]{{0,24}}(\d{{6}})\b"),
-        format!(r"\b(\d{{6}})[^0-9]{{0,24}}(?:{kw})"),
-        r"\b(\d{6})\b".to_string(),
-        format!(r"(?:{kw})[^0-9]{{0,24}}(\d{{4,8}})\b"),
-        format!(r"\b(\d{{4,8}})[^0-9]{{0,24}}(?:{kw})"),
-        r"\b(\d{4,8})\b".to_string(),
-    ];
-    patterns.iter().find_map(|p| first_capture(p))
+    serde_json::json!({
+        "message_id": pick("message_id"),
+        "from": pick("from"),
+        "to": message.get("to").cloned().unwrap_or(Value::Null),
+        "subject": pick("subject"),
+        "preview": pick("preview"),
+        "timestamp": pick("timestamp"),
+        "text": body(&["extracted_text", "text"]),
+        "html": body(&["extracted_html", "html"]),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn extracts_code_after_keyword() {
-        assert_eq!(
-            extract_otp(
-                "Your verification code",
-                "Your code is 482913. It expires in 10 minutes."
-            ),
-            Some("482913".to_string())
-        );
+    fn summarize_keeps_preview_and_drops_body() {
+        let raw = json!({
+            "message_id": "<abc@x>",
+            "from": "Mock <m@x>",
+            "subject": "Your verification code",
+            "preview": "Your verification code is 997545.",
+            "timestamp": "2026-06-06T22:47:00.000Z",
+            "text": "ignored by the list projection",
+        });
+        let s = summarize_message(&raw);
+        assert_eq!(s["preview"], "Your verification code is 997545.");
+        assert_eq!(s["subject"], "Your verification code");
+        assert!(s.get("text").is_none());
     }
 
     #[test]
-    fn extracts_code_before_keyword() {
-        assert_eq!(
-            extract_otp("Sign in", "839201 is your one-time passcode."),
-            Some("839201".to_string())
-        );
-    }
-
-    #[test]
-    fn prefers_six_digit_code_over_unrelated_numbers() {
-        // Year 2026 and "10" should not win over the 6-digit code.
-        assert_eq!(
-            extract_otp(
-                "Verify",
-                "© 2026. Use 4029 31? No — your code: 715342 (valid 10 min)."
-            ),
-            Some("715342".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_none_without_a_code() {
-        assert_eq!(extract_otp("Welcome", "Thanks for signing up!"), None);
+    fn full_message_prefers_extracted_body() {
+        let raw = json!({
+            "message_id": "<abc@x>",
+            "subject": "Hi",
+            "text": "raw body",
+            "extracted_text": "clean body",
+            "html": "<p>x</p>",
+        });
+        let f = full_message(&raw);
+        assert_eq!(f["text"], "clean body");
+        assert_eq!(f["html"], "<p>x</p>");
     }
 }

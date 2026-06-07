@@ -7868,12 +7868,19 @@ fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) ->
             let value = secrets_runtime::fetch_secret_for_session(&session_id, domain, name)?;
             Ok(json!({ "value": value }))
         }
-        // Email-OTP 2FA: `op` is "address" (the agent's inbox) or "code" (poll for
-        // the latest one-time code). Returns `value: null` when not yet available.
+        // Email inbox access. `op` is "address" (the agent's inbox address),
+        // "inbox" (list recent messages; `limit` optional), or "message" (read
+        // one message's full body; requires `message_id`). For "inbox"/"message"
+        // the value is a JSON string the helper parses. `value: null` when no
+        // inbox is configured.
         "email" => {
             let op = request.get("op").and_then(Value::as_str).unwrap_or("");
-            let session_id = session.session_id.clone().unwrap_or_default();
-            match secrets_runtime::email_for_session(&session_id, op) {
+            let arg = match op {
+                "message" => request.get("message_id").and_then(Value::as_str),
+                "inbox" => request.get("limit").and_then(Value::as_str),
+                _ => None,
+            };
+            match secrets_runtime::email_for_session(op, arg) {
                 Ok(value) => Ok(json!({ "value": value })),
                 Err(error) => Ok(json!({ "value": null, "error": error })),
             }

@@ -28,6 +28,7 @@ js(expression_or_function_source, *args, target_id=None, returnByValue=True)
 new_tab(url="about:blank")
 goto_url(url)
 page_info()
+nav_policy(url=None)
 
 capture_screenshot(...)
 screenshot(label="screenshot", full=False)
@@ -71,6 +72,7 @@ last_domain_skills(include_content=False)
 Usage guidance:
 
 - First navigation should usually be `new_tab(url)`, not `goto_url(url)`, because `goto_url(url)` mutates the current controlled tab. Both helpers send the CDP navigation command, perform a bounded readiness check, and emit a labeled `navigation` output with `status`, `page_info`, `page_state`, and `next_step`. If that output says `navigation_ready` and `page_info.url` is the expected page, trust it and inspect/extract from the current page instead of navigating to the same URL again. If you chain more work in the same script after navigation, explicitly wait or poll for the specific selector/state you need before reading/clicking.
+- If a navigation is blocked by the user's `/domains` policy (the error says so), call `nav_policy()` to see the allowed/denied sites and plan within them; pass a URL (`nav_policy("example.com")`) to check before navigating. If the task can't be completed within the policy, tell the user which site is blocked and suggest they allow it with `/domains` or adjust the task — don't keep retrying the blocked host.
 - Keep keyboard semantics browser-harness/Rod aligned: `press_key(...)` simulates physical keys or shortcuts, while `type_text(...)` inserts/pastes text into the focused element with `Input.insertText`.
 - For React/Vue/Svelte/controlled inputs, prefer `fill_input(selector, text)` over direct DOM value assignment. It focuses the element, clears with Cmd/Ctrl+A plus Backspace, types through physical key events, then fires final `input`/`change` events.
 - Do not combine `Input.dispatchKeyEvent` carrying printable `text` with a manual `char` event for the same character; that double-inserts text in Chrome.
@@ -151,5 +153,9 @@ emit_output(records, label="records")
 - For list/profile extraction, filter the candidate list before navigating when the list page already contains enough information, such as employee versus contractor. Do not visit rows that cannot affect the final answer.
 - Poll for record readiness, not for nullable answer fields. If the app cache or DOM record for a person exists but `birthday`, phone, address, or another optional field is missing/null, record that value as missing and continue instead of waiting for the optional field to appear.
 - For long extraction or verification loops, prefer bounded chunks with checkpoints written to files. Use one global deadline plus per-item micro timeouts; check the global deadline before every navigation, wait, and sleep. If a chunk fails with a usable-page diagnosis, shrink the next chunk and resume from the last checkpoint.
+
+Signing in / sign-ups: before signing up with a new email, check whether you're already logged in (you often drive the user's own profile) or have a saved credential for the site (listed under "Saved credentials") — if so, use it. If there's no existing login, ask the user whether to sign in with their own account (they save it via `/secrets`) or have you create a disposable account (you generate a throwaway inbox with `email_address()` and read its verification emails yourself), and wait for their choice. For the disposable path, fill the email field with `email_address()`, submit, then read the code with `email_inbox()` (newest-first; `preview` already holds the code; `email_message(message_id)` has the full `text`/`html` for magic links).
+
+CRITICAL for emailed codes — do the read-and-fill in ONE browser_script call. Each call is a fresh Python process and loses your variables, so a code you read in one call is gone in the next; if you split it you'll end up typing a fabricated default. In a single script: poll `email_inbox()` until the new message arrives, extract the digits from its `preview`, type them into the code field, and submit — all in that one call. Never type a code you didn't just read from the inbox this call; a value like `123456` or `000000` is a placeholder/guess, not a real code — if you can't read one, say so instead of submitting a guess.
 
 Do not call runtime-management helpers here. There is no `browser_connect`, `browser_status`, `browser_doctor`, or `browser_recover` helper in this tool. Those are intentionally only in the `browser` tool so the model can reason about browser lifecycle explicitly.

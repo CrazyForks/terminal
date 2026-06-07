@@ -1130,6 +1130,30 @@ def _nav_blocked_reason(url):
     return None
 
 
+def nav_policy(url=None):
+    """Inspect the user's site-navigation policy (set via `/domains`), so you know
+    where you may go instead of discovering blocks by hitting them.
+
+    Returns {"restricted": bool, "allow": [...], "deny": [...]}. An empty policy
+    (`restricted` False) means every site is allowed. Pass a `url` or bare domain
+    to also get {"allowed": bool, "reason": str|None} for that target. If the task
+    needs a site the policy blocks, tell the user it's blocked and suggest they
+    allow it with `/domains` (or adjust the task) — you can't change the policy."""
+    policy = {
+        "restricted": bool(_NAV_ALLOW or _NAV_DENY),
+        "allow": list(_NAV_ALLOW),
+        "deny": list(_NAV_DENY),
+    }
+    if url is not None:
+        target = str(url)
+        if "//" not in target:
+            target = "https://" + target
+        reason = _nav_blocked_reason(target)
+        policy["allowed"] = reason is None
+        policy["reason"] = reason
+    return policy
+
+
 def _secret_current_domain():
     try:
         url = current_tab().get("url", "") or ""
@@ -1252,17 +1276,21 @@ except NameError:
     _EMAIL_AVAILABLE = False
 
 
+def _email_unavailable():
+    return RuntimeError(
+        "No email inbox is configured. Ask the user to set one up with `/email` in the terminal."
+    )
+
+
 def email_address():
     """Return the agent's disposable inbox address — a real inbox the agent owns.
 
     Use it as the email for ANY flow that sends mail: account sign-ups, magic
     sign-in links, newsletters, confirmations — not only 2FA. Type it into an
-    email/username field, then read incoming mail with email_code() (for a
-    verification/2FA code). Raises if no inbox is configured."""
+    email/username field, then read the arriving mail with email_inbox() /
+    email_message(). Raises if no inbox is configured."""
     if not _EMAIL_AVAILABLE:
-        raise RuntimeError(
-            "No email inbox is configured. Ask the user to set one up with `/email` in the terminal."
-        )
+        raise _email_unavailable()
     resp = _bridge({"kind": "email", "op": "address"})
     err = resp.get("error")
     if err:
@@ -1273,28 +1301,49 @@ def email_address():
     return address
 
 
-def email_code(timeout=120):
-    """Poll the agent's email inbox for the latest one-time / verification code,
-    returning the digits. Waits up to `timeout` seconds for the email to arrive.
+def email_inbox(limit=20):
+    """List recent messages in the agent's inbox, newest first.
 
-    Call this AFTER triggering the email (submitting the form). Example:
-        type_text(email_address()); click(submit)
-        fill_input("#code", email_code())"""
+    Returns a list of dicts with `message_id`, `from`, `to`, `subject`,
+    `preview`, and `timestamp`. `preview` is the start of the body and usually
+    already contains a verification code; for the full body (e.g. a magic link)
+    pass the `message_id` to email_message(). Read whatever the task needs — this
+    is a normal inbox, not just for 2FA.
+
+    Newly-sent mail takes a few seconds to arrive; poll if you just triggered it:
+        before = {m["message_id"] for m in email_inbox()}
+        # ...submit the form...
+        for _ in range(40):
+            new = [m for m in email_inbox() if m["message_id"] not in before]
+            if new:
+                break
+            time.sleep(3)
+    """
     if not _EMAIL_AVAILABLE:
-        raise RuntimeError(
-            "No email inbox is configured. Ask the user to set one up with `/email` in the terminal."
-        )
-    deadline = _time.time() + max(1, int(timeout))
-    while _time.time() < deadline:
-        resp = _bridge({"kind": "email", "op": "code"})
-        err = resp.get("error")
-        if err:
-            raise RuntimeError(f"email inbox unavailable: {err}")
-        code = resp.get("value")
-        if code:
-            return code
-        _time.sleep(3)
-    raise RuntimeError(f"no email code arrived within {int(timeout)}s.")
+        raise _email_unavailable()
+    resp = _bridge({"kind": "email", "op": "inbox", "limit": str(int(limit))})
+    err = resp.get("error")
+    if err:
+        raise RuntimeError(f"email inbox unavailable: {err}")
+    raw = resp.get("value")
+    return json.loads(raw) if raw else []
+
+
+def email_message(message_id):
+    """Read one inbox message's full content by its `message_id` (from
+    email_inbox()). Returns a dict with `subject`, `from`, `to`, `timestamp`,
+    `preview`, `text` (plain body), and `html` (raw HTML, e.g. for magic
+    links)."""
+    if not _EMAIL_AVAILABLE:
+        raise _email_unavailable()
+    resp = _bridge({"kind": "email", "op": "message", "message_id": str(message_id)})
+    err = resp.get("error")
+    if err:
+        raise RuntimeError(f"email message unavailable: {err}")
+    raw = resp.get("value")
+    if not raw:
+        raise RuntimeError(f"message {message_id!r} not found in inbox.")
+    return json.loads(raw)
 
 
 _LOGIN_URL_MARKERS = ("login", "signin", "sign-in", "sign_in", "/auth", "sso", "logon")

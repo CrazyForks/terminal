@@ -6,7 +6,7 @@ use browser_use_secrets::SecretKind;
 use browser_use_store::Store;
 use serde_json::Value;
 
-use super::secrets_admin::{normalize_domain, read_secret_value, set_secret_active};
+use super::secrets_admin::{list_secrets, normalize_domain, read_secret_value, set_secret_active};
 
 /// A normalized login from 1Password.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,8 +56,21 @@ pub fn otpauth_seed(otpauth: &str) -> Option<String> {
 
 /// Sync logins into the store, writing only new/changed values.
 pub fn import_logins(store: &Store, logins: &[ImportedLogin]) -> ImportStats {
+    // Deduplicate against what's actually LISTED in saved secrets (the metadata
+    // the TUI shows), NOT the encrypted value store. A user can delete an
+    // imported login (which removes its metadata) and expect a re-import to bring
+    // it back; gating on metadata makes that work and ignores any orphaned value
+    // a prior delete may have left behind (set_secret_active overwrites it).
+    let listed: std::collections::HashSet<(String, String)> = list_secrets(store)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|meta| (meta.domain, meta.placeholder))
+        .collect();
     let mut stats = ImportStats::default();
     for login in logins {
+        // Match the normalization set_secret applies, so the listed-set lookup
+        // and value read use the same key the secret is stored under.
+        let domain = normalize_domain(&login.domain);
         let mut desired: Vec<(&str, String, SecretKind)> = Vec::new();
         if let Some(username) = &login.username {
             desired.push(("username", username.clone(), SecretKind::Password));
@@ -77,13 +90,22 @@ pub fn import_logins(store: &Store, logins: &[ImportedLogin]) -> ImportStats {
         let mut wrote_any = false;
         let mut failed_any = false;
         for (name, value, kind) in &desired {
-            let existing = read_secret_value(store, &login.domain, name);
-            if existing.is_some() {
+            // "Exists" means it's currently listed — not just that an (orphaned)
+            // value happens to sit in the encrypted store.
+            let is_listed = listed.contains(&(domain.clone(), (*name).to_string()));
+            if is_listed {
                 existed_any = true;
             }
-            if existing.as_deref() != Some(value.as_str()) {
+            // Only compare values for change-detection when it's actually listed;
+            // an unlisted login is treated as new and (re)written.
+            let current = if is_listed {
+                read_secret_value(store, &domain, name)
+            } else {
+                None
+            };
+            if current.as_deref() != Some(value.as_str()) {
                 // Only count new/changed once the write actually succeeds.
-                if set_secret_active(store, &login.domain, name, *kind, Vec::new(), value).is_ok() {
+                if set_secret_active(store, &domain, name, *kind, Vec::new(), value).is_ok() {
                     wrote_any = true;
                     stats.secrets_written += 1;
                 } else {
@@ -366,5 +388,36 @@ mod tests {
             read_secret_value(&store, "github.com", "password").as_deref(),
             Some("newpass99")
         );
+    }
+
+    #[test]
+    fn deleted_login_reimports_even_with_orphaned_value() {
+        let (store, _dir) = temp_store();
+        let logins = vec![ImportedLogin {
+            domain: "github.com".to_string(),
+            username: Some("me@example.com".to_string()),
+            password: Some("hunter2pass".to_string()),
+            otpauth: None,
+        }];
+        assert_eq!(import_logins(&store, &logins).new_logins, 1);
+
+        // Simulate the user deleting the login from the saved-secrets list while a
+        // value lingers in the encrypted store (the orphan case): drop only the
+        // metadata the TUI lists from.
+        for (key, _) in store.list_settings().unwrap() {
+            if key.starts_with(super::super::secrets_admin::SECRETS_META_PREFIX) {
+                store.delete_setting(&key).unwrap();
+            }
+        }
+        assert!(list_secrets(&store).unwrap().is_empty());
+        // Orphaned value still present — the old value-based dedup said "unchanged".
+        assert!(read_secret_value(&store, "github.com", "password").is_some());
+
+        // New behavior: not listed ⇒ treated as new and re-imported.
+        let again = import_logins(&store, &logins);
+        assert_eq!(again.new_logins, 1);
+        assert_eq!(again.unchanged_logins, 0);
+        assert!(again.secrets_written >= 1);
+        assert_eq!(list_secrets(&store).unwrap().len(), 2); // username + password back
     }
 }
