@@ -12516,6 +12516,81 @@ print("fill_input cdp/browser-harness events ok")
     }
 
     #[test]
+    fn browser_script_fill_input_waits_briefly_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-fill-input-default-wait",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+events = []
+query_count = 0
+
+def cdp(method, **params):
+    global query_count
+    events.append((method, params))
+    if method == "DOM.getDocument":
+        return {"root": {"nodeId": 1}}
+    if method == "DOM.querySelector":
+        query_count += 1
+        assert params["selector"] == "#late", params
+        return {"nodeId": 0 if query_count < 3 else 2}
+    if method == "DOM.getBoxModel":
+        return {"model": {"border": [0, 0, 20, 0, 20, 20, 0, 20]}}
+    return {}
+
+fill_input("#late", "ok")
+assert query_count == 3, query_count
+assert ("Input.insertText", {"text": "ok"}) in events, events
+print("fill_input default wait ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("fill_input default wait ok"));
+    }
+
+    #[test]
+    fn browser_script_email_inbox_filters_after_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-email-inbox-sent-after",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+_EMAIL_AVAILABLE = True
+messages = [
+    {"message_id": "new", "timestamp": "2026-06-07T12:00:01.000Z", "preview": "code 222222"},
+    {"message_id": "old", "timestamp": "2026-06-07T11:59:59.000Z", "preview": "code 111111"},
+]
+
+def _bridge(message):
+    assert message["kind"] == "email", message
+    assert message["op"] == "inbox", message
+    return {"value": json.dumps(messages)}
+
+now = current_datetime()
+assert now["utc"].endswith("Z"), now
+assert isinstance(now["unix"], float), now
+
+recent = email_inbox(sent_after="2026-06-07T12:00:00.000Z")
+assert [m["message_id"] for m in recent] == ["new"], recent
+
+recent_from_unix_ms = email_inbox(sent_after="1780833600000")
+assert [m["message_id"] for m in recent_from_unix_ms] == ["new"], recent_from_unix_ms
+print("email_inbox sent_after ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("email_inbox sent_after ok"));
+    }
+
+    #[test]
     fn browser_script_type_text_maps_to_insert_text_and_fill_input_missing_selector_errors() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -12536,7 +12611,7 @@ def js(expression, *args, **kwargs):
     return False
 
 try:
-    fill_input("#missing", "hello")
+    fill_input("#missing", "hello", timeout=0)
 except RuntimeError as exc:
     assert "element not found" in str(exc), exc
 else:

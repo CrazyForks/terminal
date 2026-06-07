@@ -18,6 +18,7 @@ import time as _time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 
@@ -1284,6 +1285,15 @@ def _email_unavailable():
     )
 
 
+def current_datetime():
+    """Return the current time in model-friendly forms for timestamp comparisons."""
+    now = datetime.now(timezone.utc)
+    return {
+        "utc": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "unix": now.timestamp(),
+    }
+
+
 def email_address():
     """Return the agent's disposable inbox address — a real inbox the agent owns.
 
@@ -1303,7 +1313,31 @@ def email_address():
     return address
 
 
-def email_inbox(limit=20):
+def _parse_email_timestamp(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        number = float(text)
+        if number > 10_000_000_000:
+            number = number / 1000.0
+        return datetime.fromtimestamp(number, tz=timezone.utc)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def email_inbox(limit=20, sent_after=None):
     """List recent messages in the agent's inbox, newest first.
 
     Returns a list of dicts with `message_id`, `from`, `to`, `subject`,
@@ -1312,11 +1346,16 @@ def email_inbox(limit=20):
     pass the `message_id` to email_message(). Read whatever the task needs — this
     is a normal inbox, not just for 2FA.
 
-    Newly-sent mail takes a few seconds to arrive; poll if you just triggered it:
-        before = {m["message_id"] for m in email_inbox()}
+    `sent_after` may be an RFC3339/ISO timestamp (for example from
+    current_datetime()["utc"]) or a unix timestamp. It filters returned messages
+    by their inbox `timestamp`, so the model can decide what counts as new.
+
+    Newly-sent mail takes a few seconds to arrive. The model can record time or
+    IDs before submitting the form, then poll for messages after that point:
+        started_at = current_datetime()["utc"]
         # ...submit the form...
         for _ in range(40):
-            new = [m for m in email_inbox() if m["message_id"] not in before]
+            new = email_inbox(sent_after=started_at)
             if new:
                 break
             time.sleep(3)
@@ -1328,7 +1367,15 @@ def email_inbox(limit=20):
     if err:
         raise RuntimeError(f"email inbox unavailable: {err}")
     raw = resp.get("value")
-    return json.loads(raw) if raw else []
+    messages = json.loads(raw) if raw else []
+    cutoff = _parse_email_timestamp(sent_after)
+    if cutoff is None:
+        return messages
+    return [
+        message
+        for message in messages
+        if (parsed := _parse_email_timestamp(message.get("timestamp"))) is not None and parsed > cutoff
+    ]
 
 
 def email_message(message_id):
@@ -1544,7 +1591,7 @@ def _focus_selector_like_user(selector, timeout=0.0):
         return False
 
 
-def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
+def fill_input(selector, text, clear=True, clear_first=None, timeout=3.0):
     """Fill an input by focusing it through CDP, then using browser input events."""
     if clear_first is not None:
         clear = clear_first
