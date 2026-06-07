@@ -15757,6 +15757,11 @@ wire_api = "responses"
         )?;
         app.store.append_event(
             &session.id,
+            "stream_error",
+            serde_json::json!({"message": "provider disconnected"}),
+        )?;
+        app.store.append_event(
+            &session.id,
             "session.failed",
             serde_json::json!({"error": "provider disconnected"}),
         )?;
@@ -15768,11 +15773,62 @@ wire_api = "responses"
             "{screen}"
         );
         assert!(screen.contains("provider disconnected"), "{screen}");
+        assert!(
+            screen.contains("Hint: use /model to choose a different model, then try again."),
+            "{screen}"
+        );
         assert_eq!(
             screen
                 .matches("I found the transcript handoff issue.")
                 .count(),
             1,
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_session_after_model_response_does_not_show_model_hint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I can inspect it with a tool."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"tool_call_count": 1, "text_delta_chars": 29}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.failed",
+            serde_json::json!({"name": "shell", "error": "command failed"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "command failed"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("command failed"), "{screen}");
+        assert!(
+            !screen.contains("Hint: use /model to choose a different model, then try again."),
             "{screen}"
         );
         Ok(())
