@@ -5864,15 +5864,25 @@ fn shared_local_cdp_connection(
     timeout: Duration,
 ) -> Result<Arc<CdpDispatcher>> {
     let key = shared_local_cdp_connection_key(endpoint);
-    let mut registry = LOCAL_CDP_CONNECTIONS
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    let registry = LOCAL_CDP_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut registry = registry
+            .lock()
+            .expect("local CDP connection registry poisoned");
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        registry.remove(&key);
+    }
+
+    let connection = CdpDispatcher::connect_with_timeout(&endpoint.ws_url, timeout)?;
+
+    let mut registry = registry
         .lock()
         .expect("local CDP connection registry poisoned");
     if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
         return Ok(existing);
     }
-    registry.remove(&key);
-    let connection = CdpDispatcher::connect_with_timeout(&endpoint.ws_url, timeout)?;
     registry.insert(key, Arc::downgrade(&connection));
     Ok(connection)
 }
