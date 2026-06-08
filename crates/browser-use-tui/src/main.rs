@@ -4433,12 +4433,20 @@ impl App {
 
     fn close_surface(&mut self) {
         self.close_slash_palette();
-        if matches!(self.surface, Surface::SetupConfirm | Surface::SetupResult) {
+        if matches!(
+            self.surface,
+            Surface::SetupConfirm
+                | Surface::SetupResult
+                | Surface::SetupCloud
+                | Surface::SetupCloudSuccess
+        ) {
             self.setup_pending_account = None;
             self.setup_result = None;
             self.claude_code_oauth = None;
             self.codex_login = None;
             self.browser_use_cloud_login = None;
+            self.pending_cookie_sync_after_auth = false;
+            self.pending_setup_after_cookie_sync = false;
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
@@ -15444,6 +15452,54 @@ mod redesign_tests {
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::CookieSync);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_onboarding_escape_from_connected_clears_pending_setup() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.pending_cookie_sync_after_auth = true;
+            app.pending_setup_after_cookie_sync = true;
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupCloudSuccess);
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+            assert_eq!(app.surface, Surface::Main);
+            assert!(!app.pending_cookie_sync_after_auth);
+            assert!(!app.pending_setup_after_cookie_sync);
+            assert!(app.browser_use_cloud_login.is_none());
             Ok(())
         })();
         if let Some(value) = saved {
