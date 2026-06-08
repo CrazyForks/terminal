@@ -136,7 +136,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // live URL is actually drawn. Prevents a stale link after disconnect.
     *app.live_link_overlay.borrow_mut() = None;
 
-    if app.is_first_run_setup_visible().unwrap_or(false) {
+    if app.is_first_run_setup_visible().unwrap_or(false) || app.is_setup_cookie_sync_visible() {
         app.modal_background = None;
         let state = app
             .workbench_state()
@@ -1368,6 +1368,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Setup => ("Setup", "Choose how to run Browser Use"),
         Surface::SetupConfirm => ("Setup", "Confirm provider"),
         Surface::SetupResult => ("Setup", "Connection result"),
+        Surface::SetupCloud => ("Setup", "Choose your browser backend"),
         Surface::Account => ("Authenticate", "Sign in to a model provider"),
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
@@ -1426,7 +1427,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Telemetry => "Enter:save | Esc:cancel",
         Surface::History => "Type to filter | Enter:open | Esc:close",
         Surface::Messages => "Enter:edit | Esc:close",
-        Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
+        Surface::Setup | Surface::SetupConfirm | Surface::SetupCloud => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
@@ -1479,6 +1480,7 @@ fn surface_lines(
         Surface::Setup => setup_lines(app, width),
         Surface::SetupConfirm => setup_confirm_lines(app),
         Surface::SetupResult => setup_result_lines(app, width),
+        Surface::SetupCloud => setup_cloud_lines(app),
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
@@ -2293,6 +2295,32 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn setup_cloud_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled("One-Click Browser Use Cloud Setup?", bold())),
+        Line::from(""),
+        Line::from("  Cloud browsers are:"),
+        Line::from(""),
+        Line::from("  > free"),
+        Line::from("  > automatically solve captchas"),
+        Line::from("  > sync local cookies so you stay logged in"),
+        Line::from("  > avoid local Chrome permission prompts"),
+        Line::from(""),
+        selected("Yes", 0, app.selected_row),
+        selected("No", 1, app.selected_row),
+    ];
+    if app.browser_use_cloud_key_ready().unwrap_or(false) {
+        lines.insert(
+            2,
+            Line::from(Span::styled(
+                "  Browser Use Cloud is already connected.",
+                done(),
+            )),
+        );
+    }
+    lines
+}
+
 fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let Some(result) = app.setup_result.as_ref() else {
         return vec![
@@ -2362,6 +2390,36 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     push_wrapped_prefixed_text(&mut lines, "  ", &line, width);
                 }
             }
+        } else if result.account == BROWSER_USE_CLOUD {
+            if let Some(seconds) = app.browser_use_cloud_login_elapsed_seconds() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Waiting for cloud approval ({seconds}s)."),
+                    muted(),
+                )));
+            }
+            if let Some(error) = app.browser_use_cloud_open_error() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Could not open browser automatically: {error}"),
+                    failed(),
+                )));
+            } else {
+                lines.push(Line::from("  Browser sign-in opened."));
+            }
+            if let Some(authorization) = app.browser_use_cloud_authorization() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("  Browser authorization link:"));
+                push_wrapped_prefixed_text(
+                    &mut lines,
+                    "    ",
+                    &authorization.authorization_uri,
+                    width,
+                );
+                lines.push(Line::from(""));
+                lines.push(Line::from("  Callback listener:"));
+                push_wrapped_prefixed_text(&mut lines, "    ", &authorization.redirect_uri, width);
+            } else {
+                lines.push(Line::from("  Requesting browser sign-in..."));
+            }
         } else {
             if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
                 lines.push(Line::from(Span::styled(
@@ -2386,7 +2444,7 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.extend([
             Line::from(""),
             selected(
-                if result.account == ACCOUNT_CODEX {
+                if result.account == ACCOUNT_CODEX || result.account == BROWSER_USE_CLOUD {
                     "Open sign-in page"
                 } else {
                     "Open browser again"
@@ -3414,7 +3472,12 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         CookieSyncStatus::NeedsAuth => {
             lines.push(Line::from("  Browser Use Cloud key is missing."));
             lines.push(Line::from(""));
-            lines.push(selected("Add Browser Use key", 0, app.selected_row));
+            let label = if app.pending_setup_after_cookie_sync {
+                "Sign in to Browser Use Cloud"
+            } else {
+                "Add Browser Use key"
+            };
+            lines.push(selected(label, 0, app.selected_row));
         }
         CookieSyncStatus::LoadingProfiles => {
             lines.push(Line::from("  Scanning local Chromium profiles..."));
@@ -3454,14 +3517,24 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
             push_completed_cookie_sync_message(&mut lines, message, body_width);
             lines.push(Line::from(""));
-            lines.push(selected("Close", 0, app.selected_row));
+            let label = if app.pending_setup_after_cookie_sync {
+                "Continue"
+            } else {
+                "Close"
+            };
+            lines.push(selected(label, 0, app.selected_row));
         }
         CookieSyncStatus::Failed(error) => {
             lines.push(Line::from(Span::styled("Failed", bold())));
             lines.push(Line::from(""));
             push_wrapped_cookie_sync_message(&mut lines, error, body_width);
             lines.push(Line::from(""));
-            lines.push(selected("Close", 0, app.selected_row));
+            let label = if app.pending_setup_after_cookie_sync {
+                "Continue without cookie sync"
+            } else {
+                "Close"
+            };
+            lines.push(selected(label, 0, app.selected_row));
         }
     }
     lines
