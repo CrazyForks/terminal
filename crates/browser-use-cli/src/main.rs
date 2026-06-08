@@ -61,13 +61,14 @@ use browser_use_protocol::{
     session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
-    codex_oauth_pkce, codex_oauth_state, exchange_claude_code_authorization_code,
-    exchange_codex_authorization_code, load_codex_auth, load_codex_auth_file,
-    load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
-    parse_codex_authorization_input, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
-    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
-    CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH, CODEX_CALLBACK_PORT,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_callback_page,
+    codex_callback_status, codex_oauth_authorize_url, codex_oauth_pkce, codex_oauth_state,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code, load_codex_auth,
+    load_codex_auth_file, load_codex_managed_auth, load_codex_managed_auth_file,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_runtime::{
@@ -3856,34 +3857,19 @@ fn handle_codex_callback(
         .and_then(|line| line.split_whitespace().nth(1))
         .context("parse Codex OAuth callback request")?;
     let parsed = parse_codex_authorization_input(path);
-    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
-        404
-    } else if parsed.error.is_some() {
-        400
-    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
-        400
-    } else {
-        200
-    };
-    let text = match status {
-        200 => "Codex authentication completed. You can close this window.",
-        400 => parsed
-            .error_description
-            .as_deref()
-            .or(parsed.error.as_deref())
-            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
-        _ => "Codex callback route not found.",
-    };
-    let body = format!("<html><body><p>{text}</p></body></html>");
+    let status = codex_callback_status(path, expected_state, &parsed);
+    let page = codex_callback_page(status, &parsed);
     let response = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        page.status_text,
+        page.body.len(),
+        page.body
     );
     stream.write_all(response.as_bytes()).ok();
     if status == 200 {
         Ok(parsed)
     } else {
-        bail!("{text}")
+        bail!("{}", page.message)
     }
 }
 
