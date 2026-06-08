@@ -10,8 +10,6 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-#[cfg(not(test))]
-use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex, Once,
@@ -45,14 +43,17 @@ use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, codex_oauth_authorize_url,
+    codex_oauth_pkce, codex_oauth_state, load_codex_auth_file, ClaudeCodeOAuthCredential,
+    CodexAuth, CodexManagedAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, load_codex_auth_file,
-    parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    exchange_claude_code_authorization_code, exchange_codex_authorization_code,
+    parse_claude_code_authorization_input, parse_codex_authorization_input,
+    ClaudeCodeAuthorization, CodexAuthorization, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
+    CODEX_CALLBACK_PORT,
 };
 #[cfg(test)]
 use browser_use_store::StoreNotifier;
@@ -130,9 +131,9 @@ use settings::{
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, RecommendedModel,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
+    AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -158,20 +159,22 @@ const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Synthetic assistant nudge shown when user submits a task with no API key.
 const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
-You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
-free — or add your own key with /auth.";
+You can get one free at cloud.browser-use.com and add it with /auth.";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_EVENT: &str = "session.cloud_promo";
 pub(crate) const LOCAL_CHROME_CLOUD_PROMO_TEXT: &str =
     "[tip] Use a Cloud browser to avoid manual permissions and get automatic captcha-solving! [cloud.browser-use.com]";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
+/// Max saved-secret rows shown at once in `/secrets` before the list scrolls
+/// within its own container (and the search box appears).
+const SECRETS_VISIBLE_ROWS: usize = 6;
+
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
 const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
-const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
 const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
 const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
@@ -195,6 +198,7 @@ const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
 #[cfg(not(test))]
 const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
+const SESSION_SETTINGS_EVENT: &str = "session.settings";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
 const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
@@ -286,6 +290,9 @@ enum Surface {
     History,
     Messages,
     Developer,
+    Secrets,
+    Domains,
+    Email,
     Feedback,
     FeedbackThanks,
 }
@@ -311,6 +318,9 @@ impl Surface {
                 | Self::History
                 | Self::Messages
                 | Self::Developer
+                | Self::Secrets
+                | Self::Domains
+                | Self::Email
                 | Self::Feedback
         )
     }
@@ -325,7 +335,15 @@ impl Surface {
     /// of these is active the composer must not also be rendered underneath —
     /// the popup itself is the input field, with its own cursor.
     fn is_text_input_popup(self) -> bool {
-        matches!(self, Self::ApiKey | Self::Telemetry | Self::ModelSearch)
+        matches!(
+            self,
+            Self::ApiKey
+                | Self::Telemetry
+                | Self::ModelSearch
+                | Self::Secrets
+                | Self::Domains
+                | Self::Email
+        )
     }
 
     fn uses_main_view(self) -> bool {
@@ -340,24 +358,24 @@ enum ModelSearchEntry {
     Item(String),
 }
 
-/// A row on the provider screen. `submenu` rows (OpenAI) open a sub-dialogue of
-/// auth methods; other rows connect their `account` directly.
+/// A row on the provider screen.
 struct ProviderRow {
     label: String,
     account: &'static str,
-    submenu: bool,
 }
 
 /// The OpenAI auth methods shown in the sub-dialogue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenAiAuthMethod {
+enum ProviderAuthMethod {
     Codex,
     ApiKey,
+    ChangeApiKey,
+    ChangeOAuth,
 }
 
-struct OpenAiAuthRow {
+struct ProviderAuthRow {
     label: String,
-    method: OpenAiAuthMethod,
+    method: ProviderAuthMethod,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -439,13 +457,13 @@ impl Drop for ClaudeCodeOAuthFlow {
 
 #[derive(Debug)]
 enum CodexLoginEvent {
-    Output(String),
-    Finished(Result<CodexAuth, String>),
+    Finished(Result<CodexManagedAuth, String>),
 }
 
 #[derive(Debug)]
 struct CodexLoginFlow {
     account: String,
+    url: String,
     output: String,
     started_at: Instant,
     stop_tx: mpsc::Sender<()>,
@@ -567,6 +585,7 @@ struct DefaultProfileEvent {
 struct DefaultProfileState {
     status: DefaultProfileStatus,
     profiles: Vec<CookieSyncProfile>,
+    browsers: Vec<String>,
     current_profile_id: Option<String>,
     rx: Option<mpsc::Receiver<DefaultProfileEvent>>,
 }
@@ -576,10 +595,19 @@ impl Default for DefaultProfileState {
         Self {
             status: DefaultProfileStatus::Loading,
             profiles: Vec::new(),
+            browsers: Vec::new(),
             current_profile_id: None,
             rx: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserSelectRow {
+    Local(String),
+    ChromiumHeaded,
+    ChromiumHeadless,
+    Cloud,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -711,7 +739,6 @@ enum AppCommand {
     Reload,
     Update,
     SaveAccount(String),
-    SelectProvider(&'static str),
     SelectRecommended(usize),
     OpenModelSearch,
     SaveCustomModel(String),
@@ -1022,6 +1049,15 @@ struct SessionModelSelection {
     model_provider_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRuntimeSettings {
+    browser: String,
+    browser_local_label: Option<String>,
+    browser_profile_id: Option<String>,
+    browser_profile_label: Option<String>,
+    collaboration_mode: CollaborationModeKind,
+}
+
 // ── Typewriter animation ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1166,8 +1202,167 @@ impl RecordingGoalSink {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The three fields of the `/secrets` add form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretField {
+    Domain,
+    Name,
+    Value,
+}
+
+/// What the `/secrets` panel selection is on: a saved row (which can be deleted)
+/// or one of the add-form fields (which can be typed into). ↑/↓/Tab move through
+/// the saved rows then the form fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretFocus {
+    /// The live search box (shown when the saved list is long / filtered). Stays
+    /// focusable even when the filter has zero matches.
+    Search,
+    Saved(usize),
+    Field(SecretField),
+}
+
+/// The `/secrets` panel state: the add form (Domain / Name / Value) plus which
+/// row/field is selected. The focused field's text lives in the shared
+/// `composer` (so editing + paste work); the other two are parked here.
+struct SecretForm {
+    domain: String,
+    name: String,
+    value: String,
+    focus: SecretFocus,
+    /// Forces the saved kind to TOTP regardless of the name — set when editing an
+    /// existing 2FA secret so re-saving doesn't downgrade it to a password.
+    totp: bool,
+    /// When editing an existing secret, its original `(domain, name)`. The row is
+    /// hidden from the list while editing but only removed once the edit is saved
+    /// (so cancelling with Esc doesn't lose it).
+    editing_original: Option<(String, String)>,
+}
+
+impl SecretForm {
+    fn new() -> Self {
+        Self {
+            domain: String::new(),
+            name: String::new(),
+            value: String::new(),
+            focus: SecretFocus::Field(SecretField::Domain),
+            editing_original: None,
+            totp: false,
+        }
+    }
+
+    fn field(&self, field: SecretField) -> &str {
+        match field {
+            SecretField::Domain => &self.domain,
+            SecretField::Name => &self.name,
+            SecretField::Value => &self.value,
+        }
+    }
+
+    fn set_field(&mut self, field: SecretField, text: String) {
+        match field {
+            SecretField::Domain => self.domain = text,
+            SecretField::Name => self.name = text,
+            SecretField::Value => self.value = text,
+        }
+    }
+
+    fn focused_field(&self) -> Option<SecretField> {
+        match self.focus {
+            SecretFocus::Field(field) => Some(field),
+            SecretFocus::Search | SecretFocus::Saved(_) => None,
+        }
+    }
+}
+
+/// Whether an `/domains` rule allows or blocks navigation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DomainMode {
+    Allow,
+    Deny,
+}
+
+impl DomainMode {
+    fn toggled(self) -> Self {
+        match self {
+            DomainMode::Allow => DomainMode::Deny,
+            DomainMode::Deny => DomainMode::Allow,
+        }
+    }
+}
+
+/// `/domains` selection: a saved rule row, the Allow/Deny toggle, or the
+/// add-rule domain input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DomainFocus {
+    Saved(usize),
+    Mode,
+    Input,
+}
+
+/// `/domains` panel state: the add form (a domain input + Allow/Deny mode) and
+/// which row/field is selected. Mirrors [`SecretForm`]; the focused input's live
+/// text lives in the shared `composer`.
+struct DomainForm {
+    input: String,
+    mode: DomainMode,
+    focus: DomainFocus,
+}
+
+impl DomainForm {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            mode: DomainMode::Allow,
+            focus: DomainFocus::Input,
+        }
+    }
+}
+
+type ImportOutcome =
+    std::result::Result<browser_use_agent::tools::handlers::secrets_import::ImportStats, String>;
+
+/// Why a 1Password import can't run — drives which setup guidance is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpSetupIssue {
+    /// The `op` CLI binary isn't installed / on PATH.
+    NotInstalled,
+    /// `op` is installed but no account is signed in.
+    NotSignedIn,
+}
+
+/// A password import running on a background thread (so the UI can animate).
+struct SecretImport {
+    label: String,
+    started: Instant,
+    rx: mpsc::Receiver<ImportOutcome>,
+    /// `Some` once the worker finishes.
+    outcome: Option<ImportOutcome>,
+    settled_at: Option<Instant>,
+}
+
 struct App {
     store: Store,
+    /// Cached `/secrets` panel contents (metadata only — never values).
+    secrets_list: Vec<browser_use_agent::tools::handlers::secrets_admin::Meta>,
+    /// The in-progress add form while the `/secrets` surface is open.
+    secret_form: Option<SecretForm>,
+    /// Live filter over the saved-secrets list (by domain or name).
+    secrets_search: String,
+    /// 1Password setup guidance to show (CLI not installed vs. not signed in).
+    op_setup_hint: Option<OpSetupIssue>,
+    /// Secrets surface opened solely for an import → Esc goes back in one press.
+    secret_import_standalone: bool,
+    /// A running / just-finished password import (drives the animation).
+    secret_import: Option<SecretImport>,
+    /// Cached `/domains` panel contents.
+    domains_allow: Vec<String>,
+    domains_deny: Vec<String>,
+    /// The `/domains` add form + selection (mirrors `secret_form`).
+    domain_form: Option<DomainForm>,
+    /// Whether email-2FA (AgentMail) is configured — cached for the `/email`
+    /// panel so the renderer doesn't touch the store.
+    email_configured: bool,
     store_rx: mpsc::Receiver<StoreNotification>,
     clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
     clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
@@ -1212,6 +1407,7 @@ struct App {
     provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
+    browser_local_label: Option<String>,
     browser_profile_label: Option<String>,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<ModelChoice>,
@@ -1229,6 +1425,7 @@ struct App {
     pending_cookie_sync_after_auth: bool,
     pending_setup_after_cookie_sync: bool,
     browser_notice: Option<String>,
+    browser_select_chromium_expanded: bool,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
@@ -2071,6 +2268,48 @@ fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionMode
     })
 }
 
+fn session_runtime_settings_from_event(event: &EventRecord) -> Option<SessionRuntimeSettings> {
+    if event.event_type != SESSION_SETTINGS_EVENT {
+        return None;
+    }
+    let browser = event
+        .payload
+        .get("browser")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let browser_local_label = event
+        .payload
+        .get("browser_local_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_id = event
+        .payload
+        .get("browser_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let browser_profile_label = event
+        .payload
+        .get("browser_profile_label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let collaboration_mode = event
+        .payload
+        .get("collaboration_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(collaboration_mode_from_setting)
+        .unwrap_or(CollaborationModeKind::Default);
+    Some(SessionRuntimeSettings {
+        browser,
+        browser_local_label,
+        browser_profile_id,
+        browser_profile_label,
+        collaboration_mode,
+    })
+}
+
 impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
@@ -2197,6 +2436,7 @@ impl App {
         let browser = store
             .get_setting("browser")?
             .unwrap_or_else(|| args.browser.clone());
+        let browser_local_label = browser_local_label_from_store(&store)?;
         let browser_profile_label = browser_profile_label_from_store(&store)?;
         let selected_row = 0;
         let codex_login_available = Self::probe_codex_login_available(&store)?;
@@ -2231,6 +2471,7 @@ impl App {
             provider_fetch: None,
             collaboration_mode,
             browser,
+            browser_local_label,
             browser_profile_label,
             api_key_account: None,
             pending_model_after_auth: None,
@@ -2245,7 +2486,18 @@ impl App {
             pending_cookie_sync_after_auth: false,
             pending_setup_after_cookie_sync: false,
             browser_notice: None,
+            browser_select_chromium_expanded: false,
             status_notice: None,
+            secrets_list: Vec::new(),
+            secret_form: None,
+            secrets_search: String::new(),
+            op_setup_hint: None,
+            secret_import_standalone: false,
+            secret_import: None,
+            domains_allow: Vec::new(),
+            domains_deny: Vec::new(),
+            domain_form: None,
+            email_configured: false,
             agent_backend,
             quit_hint_until: None,
             escape_stop_until: None,
@@ -2268,6 +2520,9 @@ impl App {
             feedback_thanks_started: None,
             setup_cloud_success_started: None,
         };
+        if let Some(session_id) = app.selected_session_id.clone() {
+            app.apply_session_settings_to_app(&session_id)?;
+        }
         app.refresh_cached_projection();
         if resumed_from_reexec {
             app.status_notice = Some(if app.selected_session_id.is_some() {
@@ -2340,7 +2595,7 @@ impl App {
         while let Ok(notification) = self.store_rx.try_recv() {
             drained_any = true;
             if notification == StoreNotification::SettingsChanged {
-                changed |= self.refresh_browser_profile_label()?;
+                changed |= self.refresh_visible_runtime_settings()?;
             }
             changed |= self
                 .state_cache
@@ -2425,11 +2680,6 @@ impl App {
         }
         for event in events {
             match event {
-                CodexLoginEvent::Output(text) => {
-                    if let Some(flow) = self.codex_login.as_mut() {
-                        flow.output.push_str(&strip_ansi(&text));
-                    }
-                }
                 CodexLoginEvent::Finished(result) => {
                     let account = self
                         .codex_login
@@ -2439,7 +2689,7 @@ impl App {
                     self.codex_login = None;
                     match result {
                         Ok(auth) => {
-                            self.store_codex_auth(&auth)?;
+                            self.store_codex_managed_auth(&auth)?;
                             self.codex_login_available = true;
                             self.account = account.clone();
                             self.persist_runtime_settings()?;
@@ -2572,7 +2822,15 @@ impl App {
             Ok(value) => match value.get("status").and_then(serde_json::Value::as_str) {
                 Some("needs-user-action") | Some("ok") | None => {
                     self.default_profile.profiles = cookie_sync_profiles_from_value(&value);
-                    if let Some(current) = self.default_profile.current_profile_id.as_deref() {
+                    self.default_profile.browsers = local_browser_choices_from_value(&value)
+                        .unwrap_or_else(|| {
+                            local_browser_choices_from_profiles(&self.default_profile.profiles)
+                        });
+                    self.default_profile.status = DefaultProfileStatus::Ready;
+                    if self.surface == Surface::BrowserSelect {
+                        self.sync_browser_select_cursor_to_current();
+                    } else if let Some(current) = self.default_profile.current_profile_id.as_deref()
+                    {
                         if let Some(index) = self
                             .default_profile
                             .profiles
@@ -2582,7 +2840,6 @@ impl App {
                             self.selected_row = index;
                         }
                     }
-                    self.default_profile.status = DefaultProfileStatus::Ready;
                 }
                 Some("failed") => {
                     let error = value
@@ -2658,7 +2915,7 @@ impl App {
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let mut changed = self.state_cache.refresh_all(&self.store)?;
-        changed |= self.refresh_browser_profile_label()?;
+        changed |= self.refresh_visible_runtime_settings()?;
         if changed {
             self.refresh_cached_projection();
         }
@@ -3456,12 +3713,13 @@ impl App {
         // Open the model picker on the currently active model
         self.selected_row = match surface {
             Surface::Provider => self.current_provider_screen_index().unwrap_or(0),
+            Surface::Account => self.current_auth_surface_index().unwrap_or(0),
             Surface::Model => self.current_model_surface_index().unwrap_or(0),
             Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
             Surface::OpenAiAuth => self
-                .current_openai_method()
+                .current_provider_auth_method()
                 .and_then(|method| {
-                    self.openai_auth_rows()
+                    self.provider_auth_rows()
                         .iter()
                         .position(|row| row.method == method)
                 })
@@ -3486,6 +3744,13 @@ impl App {
         }
     }
 
+    fn current_auth_surface_index(&self) -> Option<usize> {
+        self.api_key_account
+            .as_deref()
+            .or(Some(self.account.as_str()))
+            .and_then(|account| AUTH_CHOICES.iter().position(|choice| *choice == account))
+    }
+
     /// Whether the model screen shows the trailing "enter a custom model" row,
     /// which only applies to OpenRouter (a passthrough that serves any model id).
     fn model_surface_has_custom_row(&self) -> bool {
@@ -3508,30 +3773,25 @@ impl App {
             .position(|choice| self.model == choice.display && self.account == choice.account)
     }
 
-    /// The provider/auth rows shown beneath the recommended quick-picks. OpenAI
-    /// splits into "sign in" (OAuth) and "API key"; the "Codex login (detected)"
-    /// row appears only when an external codex login is present.
+    /// The provider/auth rows shown beneath the recommended quick-picks. Each
+    /// provider appears once and opens a provider-specific auth/model menu.
     fn provider_rows(&self) -> Vec<ProviderRow> {
         vec![
             ProviderRow {
                 label: "OpenAI".to_string(),
-                account: ACCOUNT_CODEX,
-                submenu: true,
+                account: ACCOUNT_OPENAI,
             },
             ProviderRow {
-                label: "Anthropic · API key".to_string(),
+                label: "Anthropic".to_string(),
                 account: ACCOUNT_ANTHROPIC,
-                submenu: false,
             },
             ProviderRow {
-                label: "OpenRouter · API key".to_string(),
+                label: "OpenRouter".to_string(),
                 account: ACCOUNT_OPENROUTER,
-                submenu: false,
             },
             ProviderRow {
-                label: "DeepSeek · API key".to_string(),
+                label: "DeepSeek".to_string(),
                 account: ACCOUNT_DEEPSEEK,
-                submenu: false,
             },
         ]
     }
@@ -3541,10 +3801,19 @@ impl App {
         if !self.model_configured {
             return false;
         }
-        if row.submenu {
+        if row.account == ACCOUNT_OPENAI {
             self.account == ACCOUNT_CODEX || self.account == ACCOUNT_OPENAI
         } else {
             self.account == row.account
+        }
+    }
+
+    fn provider_row_connected(&self, row: &ProviderRow) -> bool {
+        if row.account == ACCOUNT_OPENAI {
+            self.account_ready(ACCOUNT_CODEX).unwrap_or(false)
+                || self.account_ready(ACCOUNT_OPENAI).unwrap_or(false)
+        } else {
+            self.account_ready(row.account).unwrap_or(false)
         }
     }
 
@@ -3601,7 +3870,7 @@ impl App {
     }
 
     /// Provider screen selection: a recommended quick-pick (top rows) or a
-    /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
+    /// provider row (lower rows).
     fn provider_surface_select(&mut self) -> Result<()> {
         let rec_count = self.recommended_models().len();
         if self.selected_row < rec_count {
@@ -3610,56 +3879,167 @@ impl App {
         }
         let rows = self.provider_rows();
         if let Some(row) = rows.get(self.selected_row - rec_count) {
-            if row.submenu {
-                self.open_surface(Surface::OpenAiAuth);
-            } else {
-                let account = row.account;
-                self.dispatch(AppCommand::SelectProvider(account))?;
-            }
+            self.selected_provider = Some(row.account);
+            self.open_surface(Surface::OpenAiAuth);
         }
         Ok(())
     }
 
-    /// The OpenAI auth-method rows: Sign in (OAuth), Codex (only when an external
-    /// login is detected), and API key.
-    fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
-        let mut rows = Vec::new();
-        if self.has_external_codex_login() {
-            rows.push(OpenAiAuthRow {
-                label: "Use detected Codex login".to_string(),
-                method: OpenAiAuthMethod::Codex,
-            });
+    fn provider_auth_account(&self) -> &'static str {
+        match self.selected_provider {
+            Some(ACCOUNT_CODEX) => ACCOUNT_OPENAI,
+            Some(account) => account,
+            None => ACCOUNT_OPENAI,
         }
-        rows.push(OpenAiAuthRow {
-            label: "Use an API key".to_string(),
-            method: OpenAiAuthMethod::ApiKey,
-        });
+    }
+
+    fn provider_auth_label(&self) -> &'static str {
+        match self.provider_auth_account() {
+            ACCOUNT_OPENAI => "OpenAI",
+            ACCOUNT_ANTHROPIC => "Anthropic",
+            ACCOUNT_OPENROUTER => "OpenRouter",
+            ACCOUNT_DEEPSEEK => "DeepSeek",
+            _ => "Provider",
+        }
+    }
+
+    fn provider_auth_api_key_ready(&self, account: &str) -> bool {
+        match account {
+            ACCOUNT_OPENAI => self
+                .has_stored_or_env(
+                    "auth.openai.api_key",
+                    &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_OPENROUTER => self
+                .has_stored_or_env(
+                    "auth.openrouter.api_key",
+                    &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_DEEPSEEK => self
+                .has_stored_or_env(
+                    "auth.deepseek.api_key",
+                    &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_ANTHROPIC => self
+                .has_stored_or_env(
+                    "auth.anthropic.api_key",
+                    &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                )
+                .unwrap_or(false),
+            _ => self.account_ready(account).unwrap_or(false),
+        }
+    }
+
+    /// Provider auth menu rows. OpenAI can route through Codex login or an
+    /// OpenAI API key; other providers route through their API key.
+    fn provider_auth_rows(&self) -> Vec<ProviderAuthRow> {
+        let account = self.provider_auth_account();
+        let mut rows = Vec::new();
+        let api_key_ready = self.provider_auth_api_key_ready(account);
+        let current = self.current_provider_auth_method();
+        let api_rows = |label: &str, include_change: bool| {
+            let mut rows = vec![ProviderAuthRow {
+                label: label.to_string(),
+                method: ProviderAuthMethod::ApiKey,
+            }];
+            if include_change {
+                rows.push(ProviderAuthRow {
+                    label: format!("Change {} API key", self.provider_auth_label()),
+                    method: ProviderAuthMethod::ChangeApiKey,
+                });
+            }
+            rows
+        };
+        if account == ACCOUNT_OPENAI {
+            let codex_ready = self.account_ready(ACCOUNT_CODEX).unwrap_or(false);
+            let codex_rows = || {
+                if codex_ready {
+                    vec![
+                        ProviderAuthRow {
+                            label: "Select model with current login".to_string(),
+                            method: ProviderAuthMethod::Codex,
+                        },
+                        ProviderAuthRow {
+                            label: "Change OpenAI OAuth".to_string(),
+                            method: ProviderAuthMethod::ChangeOAuth,
+                        },
+                    ]
+                } else {
+                    vec![ProviderAuthRow {
+                        label: "Sign in with Codex OAuth".to_string(),
+                        method: ProviderAuthMethod::Codex,
+                    }]
+                }
+            };
+            let api_label = if api_key_ready {
+                "Select model with current key"
+            } else {
+                "Use an API key"
+            };
+            let mut openai_api_rows = api_rows(api_label, api_key_ready);
+            if current == Some(ProviderAuthMethod::Codex) || !api_key_ready {
+                rows.extend(codex_rows());
+                rows.append(&mut openai_api_rows);
+            } else {
+                rows.append(&mut openai_api_rows);
+                rows.extend(codex_rows());
+            }
+            return rows;
+        }
+        if api_key_ready {
+            rows.extend(api_rows("Select model with current key", true));
+        } else {
+            rows.extend(api_rows("Use an API key", false));
+        }
         rows
     }
 
-    /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
-    fn current_openai_method(&self) -> Option<OpenAiAuthMethod> {
+    /// The provider auth method currently in use (highlighted in the sub-dialogue).
+    fn current_provider_auth_method(&self) -> Option<ProviderAuthMethod> {
         if !self.model_configured {
             return None;
         }
-        if self.account == ACCOUNT_OPENAI {
-            return Some(OpenAiAuthMethod::ApiKey);
-        }
-        if self.account == ACCOUNT_CODEX {
-            return Some(OpenAiAuthMethod::Codex);
+        let account = self.provider_auth_account();
+        if account == ACCOUNT_OPENAI {
+            if self.account == ACCOUNT_CODEX {
+                return Some(ProviderAuthMethod::Codex);
+            }
+            if self.provider_auth_api_key_ready(ACCOUNT_OPENAI) {
+                return Some(ProviderAuthMethod::ApiKey);
+            }
+            if self.account_ready(ACCOUNT_CODEX).unwrap_or(false) {
+                return Some(ProviderAuthMethod::Codex);
+            }
+        } else if self.provider_auth_api_key_ready(account) {
+            return Some(ProviderAuthMethod::ApiKey);
         }
         None
     }
 
-    /// OpenAI sub-dialogue Enter: route the chosen method through auth-first.
-    fn openai_auth_select(&mut self) -> Result<()> {
-        let rows = self.openai_auth_rows();
+    /// Provider auth menu Enter: route the chosen method through auth-first.
+    fn provider_auth_select(&mut self) -> Result<()> {
+        let account = self.provider_auth_account();
+        let rows = self.provider_auth_rows();
         let Some(method) = rows.get(self.selected_row).map(|row| row.method) else {
             return Ok(());
         };
         match method {
-            OpenAiAuthMethod::ApiKey => self.select_provider(ACCOUNT_OPENAI),
-            OpenAiAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ApiKey => self.select_provider(account),
+            ProviderAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+            ProviderAuthMethod::ChangeApiKey => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_entry(account.to_string());
+                Ok(())
+            }
+            ProviderAuthMethod::ChangeOAuth => {
+                self.pending_model_after_auth = None;
+                self.pending_model_search_after_auth = false;
+                self.start_auth_flow(ACCOUNT_CODEX.to_string())
+            }
         }
     }
 
@@ -3860,7 +4240,7 @@ impl App {
                 account_id,
             };
         }
-        if let Ok(auth) = load_codex_auth() {
+        if let Some(auth) = codex_auth_from_explicit_env() {
             return ProviderCredential::Oauth {
                 access_token: auth.access_token,
                 account_id: auth.account_id,
@@ -4098,7 +4478,11 @@ impl App {
         // Auth-nudge: when the account is not ready, route ALL submissions
         // (including follow-ups to a non-running session) through the nudge
         // path so we never dispatch work to an agent that can't start.
-        let account_not_ready = !self.account_ready(&self.account)?
+        let skip_account_gate_for_non_provider_followup =
+            matches!(self.agent_backend, AgentBackend::Fake | AgentBackend::None)
+                && self.selected_session_id.is_some();
+        let account_not_ready = (!skip_account_gate_for_non_provider_followup
+            && !self.account_ready(&self.account)?)
             || (self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()?);
         if account_not_ready {
             let submission = self.take_composer_submission();
@@ -4157,6 +4541,8 @@ impl App {
         // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
+        self.append_session_model_selection(&session.id, &self.current_model_selection())?;
+        self.append_current_session_runtime_settings(&session.id)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -4188,6 +4574,7 @@ impl App {
         self.selected_session_id = Some(session.id.clone());
         self.pending_auth_resume = Some(session.id.clone());
         self.native_history.reset_with_clear();
+        self.drain_store_notifications()?;
         Ok(())
     }
 
@@ -4286,12 +4673,16 @@ impl App {
             AppCommand::ReconnectBrowser => self.request_reconnect_browser()?,
             AppCommand::NewTask => {
                 self.selected_session_id = None;
+                self.restore_default_runtime_settings()?;
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
             AppCommand::OpenHistory => self.open_surface(Surface::History),
             AppCommand::SelectHistory(session_id) => {
                 self.selected_session_id = Some(session_id);
+                if let Some(session_id) = self.selected_session_id.clone() {
+                    self.apply_session_settings_to_app(&session_id)?;
+                }
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
@@ -4311,16 +4702,19 @@ impl App {
                 }
                 self.collaboration_mode = mode;
                 self.persist_runtime_settings()?;
+                self.stamp_selected_inactive_session_settings()?;
             }
-            AppCommand::SignIn => self.open_surface(Surface::Account),
+            AppCommand::SignIn => {
+                self.selected_provider = None;
+                self.open_surface(Surface::Account);
+            }
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
-            AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::ChangeBrowser => self.open_browser_select()?,
             AppCommand::ChangeDefaultProfile => self.open_default_profile()?,
             AppCommand::SyncCookies => self.open_cookie_sync()?,
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
-            AppCommand::SelectProvider(account) => self.select_provider(account)?,
             AppCommand::SelectRecommended(index) => self.select_recommended(index)?,
             AppCommand::OpenModelSearch => self.open_model_search()?,
             AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
@@ -4348,6 +4742,7 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
+        self.append_current_session_runtime_settings(&session.id)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
         self.append_pending_initial_goal_to_session(&session.id)?;
@@ -4590,8 +4985,12 @@ impl App {
         let backend = selection.backend;
         let model = selection.provider_model.clone();
         let model_provider_id = selection.model_provider_id.clone();
-        let browser = self.browser.clone();
-        let collaboration_mode = self.collaboration_mode;
+        let runtime_settings = self.session_runtime_settings_or_current(&session_id)?;
+        let browser = runtime_settings.browser.clone();
+        let browser_profile_id = runtime_settings.browser_profile_id.clone();
+        let browser_profile_label = runtime_settings.browser_profile_label.clone();
+        let browser_local_browser = runtime_settings.browser_local_label.clone();
+        let collaboration_mode = runtime_settings.collaboration_mode;
         let config_profile = self.args.config_profile.clone();
         let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
@@ -4602,6 +5001,9 @@ impl App {
             model,
             model_provider_id,
             browser,
+            browser_profile_id,
+            browser_profile_label,
+            browser_local_browser,
             collaboration_mode,
             config_profile,
             config_overrides,
@@ -5070,15 +5472,72 @@ impl App {
                 self.escape_stop_until = None;
                 self.cancel_secret_entry();
             }
-            // Model search: Esc goes back to the provider screen.
+            // /import-passwords opened Secrets just for the import → Esc goes back.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && self.secret_import_standalone => {
+                self.escape_stop_until = None;
+                self.op_setup_hint = None;
+                self.secret_import = None;
+                self.secret_import_standalone = false;
+                self.close_surface();
+            }
+            // Secrets: Esc dismisses the op-CLI setup guidance first.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && self.op_setup_hint.is_some() => {
+                self.escape_stop_until = None;
+                self.op_setup_hint = None;
+            }
+            // Secrets: a non-empty search filter is cleared first (like History).
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && !self.secrets_search.is_empty() => {
+                self.escape_stop_until = None;
+                self.secrets_search.clear();
+                self.clamp_secret_focus();
+            }
+            // Secrets: if the form has any text, a first Esc clears it; a second
+            // Esc (empty form) closes the panel via the generic handler below.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Secrets && !self.secret_form_is_empty() => {
+                self.escape_stop_until = None;
+                self.secret_form = Some(SecretForm::new());
+                self.composer.clear();
+                self.status_notice = Some("Cleared.".to_string());
+            }
+            // Domains: a first Esc clears a typed-but-unsaved domain; a second
+            // (empty input) closes the panel via the generic handler below.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Domains
+                && (!self.composer.input().is_empty()
+                    || self
+                        .domain_form
+                        .as_ref()
+                        .is_some_and(|form| !form.input.is_empty())) =>
+            {
+                self.escape_stop_until = None;
+                if let Some(form) = self.domain_form.as_mut() {
+                    form.input.clear();
+                }
+                self.composer.clear();
+            }
+            // Model search: Esc goes back to the provider auth menu for the
+            // provider being searched.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::ModelSearch => {
                 self.escape_stop_until = None;
                 self.composer.clear();
-                self.open_surface(Surface::Provider);
+                if self.selected_provider.is_some() {
+                    self.open_surface(Surface::OpenAiAuth);
+                } else {
+                    self.open_surface(Surface::Provider);
+                }
             }
-            // OpenAI auth sub-dialogue: Esc goes back to the provider list.
+            // Provider auth menu: Esc goes back to the provider list.
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::OpenAiAuth => {
@@ -5116,6 +5575,110 @@ impl App {
                 ..
             } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
             _ if self.is_first_run_setup_visible()? => {}
+            // Ctrl-O imports logins live from 1Password.
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } if self.surface == Surface::Secrets => self.start_1password_import(),
+            // Secrets form: Tab/▼ move to the next field, Shift-Tab/▲ to the
+            // previous one. (Must come before the generic Tab=open-history arm.)
+            KeyEvent {
+                code: KeyCode::Tab | KeyCode::Down,
+                ..
+            } if self.surface == Surface::Secrets => self.secret_form_move_focus(true),
+            KeyEvent {
+                code: KeyCode::BackTab | KeyCode::Up,
+                ..
+            } if self.surface == Surface::Secrets => self.secret_form_move_focus(false),
+            // Delete removes the highlighted saved secret. Backspace also removes
+            // it (macOS "delete" key) — but only when the search box isn't shown,
+            // where Backspace edits the filter instead.
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } if self.surface == Surface::Secrets && self.secret_focus_is_saved() => {
+                self.secret_delete_focused()
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Secrets
+                && self.secret_focus_is_saved()
+                && !self.secrets_search_active() =>
+            {
+                self.secret_delete_focused()
+            }
+            // Typing on the search box / a saved row filters the list (form-field
+            // typing is unaffected — handled by the composer below).
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.surface == Surface::Secrets
+                && self.secret_focus_can_search()
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.secrets_search.push(ch);
+                if let Some(form) = self.secret_form.as_mut() {
+                    form.focus = SecretFocus::Search;
+                }
+                self.clamp_secret_focus();
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Secrets && self.secret_focus_can_search() => {
+                self.secrets_search.pop();
+                if let Some(form) = self.secret_form.as_mut() {
+                    form.focus = SecretFocus::Search;
+                }
+                self.clamp_secret_focus();
+            }
+            // Domains form: Tab/▼/▲ move; ←/→/Space toggle Allow/Deny (or a rule);
+            // Del removes a highlighted rule.
+            KeyEvent {
+                code: KeyCode::Tab | KeyCode::Down,
+                ..
+            } if self.surface == Surface::Domains => self.domain_form_move_focus(true),
+            KeyEvent {
+                code: KeyCode::BackTab | KeyCode::Up,
+                ..
+            } if self.surface == Surface::Domains => self.domain_form_move_focus(false),
+            KeyEvent {
+                code: KeyCode::Left | KeyCode::Right | KeyCode::Char(' '),
+                ..
+            } if self.surface == Surface::Domains
+                && !matches!(
+                    self.domain_form.as_ref().map(|form| form.focus),
+                    Some(DomainFocus::Input)
+                ) =>
+            {
+                self.domain_toggle_mode()
+            }
+            // Backspace too: on macOS the "delete" key sends Backspace. Safe here
+            // because the composer is empty while a rule row is focused.
+            KeyEvent {
+                code: KeyCode::Delete | KeyCode::Backspace,
+                ..
+            } if self.surface == Surface::Domains && self.domain_focus_is_saved() => {
+                self.domain_delete_focused()
+            }
+            // Block stray typing when not on the domain input.
+            KeyEvent {
+                code: KeyCode::Char(_),
+                modifiers,
+                ..
+            } if self.surface == Surface::Domains
+                && !matches!(
+                    self.domain_form.as_ref().map(|form| form.focus),
+                    Some(DomainFocus::Input)
+                )
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) => {}
             KeyEvent {
                 code: KeyCode::BackTab,
                 ..
@@ -5244,9 +5807,15 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if (matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
-                || (self.surface == Surface::ModelSearch
-                    && self.model_search_has_filter_input()))
+            _ if (matches!(
+                self.surface,
+                Surface::ApiKey
+                    | Surface::Telemetry
+                    | Surface::Secrets
+                    | Surface::Domains
+                    | Surface::Email
+            ) || (self.surface == Surface::ModelSearch
+                && self.model_search_has_filter_input()))
                 && self.handle_api_key_key(key) => {}
             // A leading `/` opens the slash palette popup. Once the composer
             // has text, slash is regular prompt input.
@@ -5368,7 +5937,11 @@ impl App {
                     self.prompt_history.reset_navigation();
                 }
             }
-            Surface::ApiKey | Surface::Telemetry => {
+            Surface::ApiKey
+            | Surface::Telemetry
+            | Surface::Secrets
+            | Surface::Domains
+            | Surface::Email => {
                 self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
@@ -5511,6 +6084,7 @@ impl App {
         row: u16,
         before_cursor: usize,
         logo_handled: bool,
+        live_link_handled: bool,
     ) {
         let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
             return;
@@ -5550,6 +6124,7 @@ impl App {
             "before_cursor": before_cursor,
             "after_cursor": self.composer.cursor_index(),
             "logo_handled": logo_handled,
+            "live_link_handled": live_link_handled,
             "line_lengths": line_lengths,
         });
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -5579,6 +6154,28 @@ impl App {
         true
     }
 
+    fn live_link_url_at(&self, column: u16, row: u16) -> Option<String> {
+        let overlay = self.live_link_overlay.borrow();
+        let link = overlay.as_ref()?;
+        if link.text.is_empty() || row != link.row {
+            return None;
+        }
+        let width = u16::try_from(link.text.chars().count()).unwrap_or(u16::MAX);
+        let end = link.col.saturating_add(width);
+        if column < link.col || column >= end {
+            return None;
+        }
+        Some(link.url.clone())
+    }
+
+    fn handle_live_link_click(&mut self, column: u16, row: u16) -> Result<bool> {
+        let Some(url) = self.live_link_url_at(column, row) else {
+            return Ok(false);
+        };
+        self.request_open_browser_target(url)?;
+        Ok(true)
+    }
+
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -5593,12 +6190,9 @@ impl App {
             Surface::SetupCloud => self.execute_setup_cloud_selection()?,
             Surface::SetupCloudSuccess => self.continue_after_setup_cloud_success()?,
             Surface::Account => {
-                let account = ACCOUNT_CHOICES
-                    .get(
-                        self.selected_row
-                            .min(ACCOUNT_CHOICES.len().saturating_sub(1)),
-                    )
-                    .unwrap_or(&ACCOUNT_CHOICES[0])
+                let account = AUTH_CHOICES
+                    .get(self.selected_row.min(AUTH_CHOICES.len().saturating_sub(1)))
+                    .unwrap_or(&AUTH_CHOICES[0])
                     .to_string();
                 self.dispatch(AppCommand::SaveAccount(account))?;
             }
@@ -5617,7 +6211,7 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Provider => self.provider_surface_select()?,
-            Surface::OpenAiAuth => self.openai_auth_select()?,
+            Surface::OpenAiAuth => self.provider_auth_select()?,
             Surface::Model => self.model_surface_select()?,
             Surface::ModelSearch => self.model_search_select()?,
             Surface::Mode => {
@@ -5638,6 +6232,12 @@ impl App {
                 self.dispatch(AppCommand::SaveDefaultProfile(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
+            Surface::Secrets => self.secrets_surface_enter()?,
+            Surface::Domains => self.domains_surface_enter()?,
+            Surface::Email => match self.selected_row.min(1) {
+                0 => self.save_agentmail_token(),
+                _ => self.close_surface(),
+            },
             Surface::Context | Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
@@ -5686,7 +6286,18 @@ impl App {
             return Ok(());
         };
         if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
+            if self.has_codex_login()? {
+                self.codex_login_available = true;
+                self.account = account.clone();
+                self.persist_runtime_settings()?;
+                self.show_setup_result(
+                    SetupResultKind::Success,
+                    account,
+                    "Connected with Codex auth.".to_string(),
+                );
+            } else {
+                self.start_codex_auth(account)?;
+            }
         } else if is_claude_code_account(&account) {
             self.account = account.clone();
             self.persist_runtime_settings()?;
@@ -5794,18 +6405,7 @@ impl App {
     }
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
-        if self.account_ready(&account)? {
-            self.account = account.clone();
-            self.persist_runtime_settings()?;
-            self.show_setup_result(
-                SetupResultKind::Success,
-                account,
-                "Connected with Codex auth.".to_string(),
-            );
-        } else {
-            self.start_codex_device_login(account)?;
-        }
-        Ok(())
+        self.start_codex_device_login(account)
     }
 
     fn show_setup_result(&mut self, kind: SetupResultKind, account: String, message: String) {
@@ -5856,7 +6456,10 @@ impl App {
         let Some(session) = self.store.load_session(&session_id)? else {
             return Ok(());
         };
-        if session.status.is_active() {
+        let events = self.store.events_for_session(&session_id)?;
+        if session.status.is_active()
+            && !self.session_events_are_waiting_for_auth(&session_id, &events)
+        {
             // Agent already running — just navigate.
             self.selected_session_id = Some(session_id);
             self.native_history.reset_with_clear();
@@ -5950,12 +6553,631 @@ impl App {
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::SyncCookies => self.dispatch(AppCommand::SyncCookies)?,
+            PaletteAction::ManageSecrets => self.open_secrets_surface(),
+            PaletteAction::ImportPasswords => {
+                self.open_secrets_surface();
+                self.secret_import_standalone = true;
+                self.start_1password_import();
+            }
+            PaletteAction::ManageDomains => self.open_domains_surface(),
+            PaletteAction::ConfigureEmail => self.open_email_surface(),
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
             PaletteAction::Feedback => self.dispatch(AppCommand::OpenFeedback)?,
         }
         Ok(false)
+    }
+
+    fn refresh_secrets(&mut self) {
+        self.secrets_list =
+            browser_use_agent::tools::handlers::secrets_admin::list_secrets(&self.store)
+                .unwrap_or_default();
+    }
+
+    fn refresh_domains(&mut self) {
+        let (allow, deny) =
+            browser_use_agent::tools::handlers::secrets_admin::list_domains(&self.store)
+                .unwrap_or_default();
+        self.domains_allow = allow;
+        self.domains_deny = deny;
+    }
+
+    fn open_secrets_surface(&mut self) {
+        self.secret_form = Some(SecretForm::new());
+        self.secrets_search.clear();
+        self.op_setup_hint = None;
+        self.secret_import_standalone = false;
+        self.composer.clear();
+        self.refresh_secrets();
+        self.status_notice = None;
+        self.open_surface(Surface::Secrets);
+    }
+
+    /// Spawn the import worker and start the animation.
+    fn spawn_secret_import(
+        &mut self,
+        label: &str,
+        job: impl FnOnce(
+                &Store,
+            ) -> anyhow::Result<
+                browser_use_agent::tools::handlers::secrets_import::ImportStats,
+            > + Send
+            + 'static,
+    ) {
+        if self.secret_import.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let state_dir = self.store.state_dir().to_path_buf();
+        std::thread::spawn(move || {
+            let outcome: ImportOutcome = (|| {
+                let store = Store::open(&state_dir).map_err(|err| err.to_string())?;
+                job(&store).map_err(|err| format!("{err:#}"))
+            })();
+            let _ = tx.send(outcome);
+        });
+        self.secret_import = Some(SecretImport {
+            label: label.to_string(),
+            started: Instant::now(),
+            rx,
+            outcome: None,
+            settled_at: None,
+        });
+        self.composer.clear();
+    }
+
+    fn start_1password_import(&mut self) {
+        // Guide the user to install the CLI rather than flashing a failed import.
+        if !browser_use_agent::tools::handlers::secrets_import::op_available() {
+            self.op_setup_hint = Some(OpSetupIssue::NotInstalled);
+            self.status_notice = None;
+            return;
+        }
+        self.spawn_secret_import("1Password", |store| {
+            browser_use_agent::tools::handlers::secrets_import::import_1password(store)
+        });
+    }
+
+    /// Poll the import worker; reveal the result, then auto-dismiss. Returns true
+    /// if a redraw is warranted.
+    fn drain_secret_import(&mut self) -> bool {
+        let mut redraw = false;
+        let mut dismiss = false;
+        let mut not_signed_in = false;
+        let mut succeeded = false;
+        if let Some(import) = self.secret_import.as_mut() {
+            if import.outcome.is_none() {
+                if let Ok(outcome) = import.rx.try_recv() {
+                    // "Not signed in" gets the persistent guidance panel, not a banner.
+                    match &outcome {
+                        Err(message) if message.contains("signed in") => not_signed_in = true,
+                        Ok(_) => succeeded = true,
+                        _ => {}
+                    }
+                    import.outcome = Some(outcome);
+                    import.settled_at = Some(Instant::now());
+                    redraw = true;
+                }
+            } else if import
+                .settled_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(2400))
+            {
+                dismiss = true;
+            }
+        }
+        if succeeded {
+            // Show the imported secrets right away, not on auto-dismiss.
+            self.refresh_secrets();
+        }
+        if not_signed_in {
+            self.secret_import = None;
+            self.op_setup_hint = Some(OpSetupIssue::NotSignedIn);
+            redraw = true;
+        }
+        if dismiss {
+            self.secret_import = None;
+            self.refresh_secrets();
+            redraw = true;
+        }
+        redraw
+    }
+
+    /// True while an import is actively running (keeps the spinner animating).
+    fn should_animate_import(&self) -> bool {
+        self.secret_import
+            .as_ref()
+            .is_some_and(|import| import.outcome.is_none())
+    }
+
+    fn open_domains_surface(&mut self) {
+        self.domain_form = Some(DomainForm::new());
+        self.composer.clear();
+        self.refresh_domains();
+        self.status_notice = None;
+        self.open_surface(Surface::Domains);
+    }
+
+    fn open_email_surface(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        self.email_configured = sa::email_2fa_configured(&self.store);
+        self.composer.clear();
+        self.selected_row = 0;
+        self.status_notice = None;
+        self.open_surface(Surface::Email);
+    }
+
+    /// Store the pasted AgentMail token. The inbox is provisioned lazily the first
+    /// time the agent calls `email_address()`, so this stays a fast local write.
+    fn save_agentmail_token(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let token = self.composer.take_trimmed();
+        if token.is_empty() {
+            self.status_notice = Some("Paste your AgentMail API key first.".to_string());
+            return;
+        }
+        match sa::set_agentmail_token(&self.store, &token) {
+            Ok(()) => {
+                self.email_configured = true;
+                self.close_surface();
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+    }
+
+    /// Saved rules as `(domain, is_allow)`, allow-list first. `DomainFocus::Saved`
+    /// indexes into this.
+    pub(crate) fn domain_rows(&self) -> Vec<(String, bool)> {
+        self.domains_allow
+            .iter()
+            .map(|d| (d.clone(), true))
+            .chain(self.domains_deny.iter().map(|d| (d.clone(), false)))
+            .collect()
+    }
+
+    fn domain_focus_order(&self) -> Vec<DomainFocus> {
+        let mut order: Vec<DomainFocus> = (0..self.domain_rows().len())
+            .map(DomainFocus::Saved)
+            .collect();
+        // Domain first, then Mode — matches the /secrets field order and the
+        // natural "allow <domain>" reading.
+        order.push(DomainFocus::Input);
+        order.push(DomainFocus::Mode);
+        order
+    }
+
+    fn domain_focus_is_saved(&self) -> bool {
+        matches!(
+            self.domain_form.as_ref().map(|form| form.focus),
+            Some(DomainFocus::Saved(_))
+        )
+    }
+
+    /// Move selection, parking/loading the input text in the composer.
+    fn domain_set_focus(&mut self, next: DomainFocus) {
+        let current = self.composer.input().to_string();
+        let load = match self.domain_form.as_mut() {
+            Some(form) => {
+                if matches!(form.focus, DomainFocus::Input) {
+                    form.input = current;
+                }
+                form.focus = next;
+                matches!(next, DomainFocus::Input).then(|| form.input.clone())
+            }
+            None => return,
+        };
+        match load {
+            Some(text) => self.composer.set_input(text),
+            None => self.composer.clear(),
+        }
+    }
+
+    fn domain_form_move_focus(&mut self, forward: bool) {
+        let order = self.domain_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let current = self.domain_form.as_ref().map(|form| form.focus);
+        let idx = current
+            .and_then(|focus| order.iter().position(|o| *o == focus))
+            .unwrap_or(0);
+        // Clamp at the ends (don't wrap): with only two form fields, wrapping
+        // makes ↑ from the top field jump to the bottom one, which reads as
+        // inverted arrows.
+        let next = if forward {
+            (idx + 1).min(order.len() - 1)
+        } else {
+            idx.saturating_sub(1)
+        };
+        self.domain_set_focus(order[next]);
+    }
+
+    /// ←/→/Space: on the Mode toggle, switch Allow/Deny; on a saved rule, move it
+    /// between the allow and deny lists.
+    fn domain_toggle_mode(&mut self) {
+        match self.domain_form.as_ref().map(|form| form.focus) {
+            Some(DomainFocus::Mode) => {
+                if let Some(form) = self.domain_form.as_mut() {
+                    form.mode = form.mode.toggled();
+                }
+            }
+            Some(DomainFocus::Saved(idx)) => self.domain_toggle_rule(idx),
+            _ => {}
+        }
+    }
+
+    /// Flip a saved rule between allow and deny. Adds to the target list FIRST and
+    /// only removes from the old list once that succeeds, so a failed write can
+    /// never silently drop the rule.
+    fn domain_toggle_rule(&mut self, idx: usize) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let Some((domain, was_allow)) = self.domain_rows().get(idx).cloned() else {
+            return;
+        };
+        match sa::add_domain(&self.store, &domain, !was_allow) {
+            Ok(_) => {
+                if let Err(error) = sa::remove_domain(&self.store, &domain, was_allow) {
+                    self.status_notice = Some(format!("Error: {error}"));
+                } else {
+                    self.status_notice = None;
+                }
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_domains();
+        self.clamp_domain_focus();
+    }
+
+    fn domain_delete_focused(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.domain_form.as_ref().map(|form| form.focus) {
+            Some(DomainFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some((domain, is_allow)) = self.domain_rows().get(idx).cloned() else {
+            return;
+        };
+        match sa::remove_domain(&self.store, &domain, is_allow) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_domains();
+        self.clamp_domain_focus();
+    }
+
+    fn clamp_domain_focus(&mut self) {
+        let len = self.domain_rows().len();
+        if let Some(form) = self.domain_form.as_mut() {
+            if let DomainFocus::Saved(idx) = form.focus {
+                form.focus = if len == 0 {
+                    DomainFocus::Input
+                } else {
+                    DomainFocus::Saved(idx.min(len - 1))
+                };
+            }
+        }
+    }
+
+    fn secret_form_is_empty(&self) -> bool {
+        let composer_empty = self.composer.input().is_empty();
+        match self.secret_form.as_ref() {
+            Some(form) => {
+                composer_empty
+                    && form.domain.is_empty()
+                    && form.name.is_empty()
+                    && form.value.is_empty()
+            }
+            None => composer_empty,
+        }
+    }
+
+    /// Saved secrets after applying the live search filter (by domain or name).
+    /// `SecretFocus::Saved(i)` indexes into this filtered view.
+    pub(crate) fn secrets_view(
+        &self,
+    ) -> Vec<browser_use_agent::tools::handlers::secrets_admin::Meta> {
+        let query = self.secrets_search.trim().to_ascii_lowercase();
+        // Hide the row currently being edited (it's pulled into the form, but not
+        // yet removed from storage).
+        let editing = self
+            .secret_form
+            .as_ref()
+            .and_then(|form| form.editing_original.clone());
+        self.secrets_list
+            .iter()
+            .filter(|meta| {
+                if let Some((domain, name)) = &editing {
+                    if &meta.domain == domain && &meta.placeholder == name {
+                        return false;
+                    }
+                }
+                query.is_empty()
+                    || meta.domain.to_ascii_lowercase().contains(&query)
+                    || meta.placeholder.to_ascii_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the search box should be shown (enough saved secrets, or a query
+    /// is already active).
+    pub(crate) fn secrets_search_active(&self) -> bool {
+        self.secrets_list.len() > SECRETS_VISIBLE_ROWS || !self.secrets_search.is_empty()
+    }
+
+    /// Re-clamp focus after the filter changes. A highlighted row that filtered
+    /// out drops back to the (still-editable) search box; a focused search box
+    /// that's no longer shown moves into the list/form.
+    fn clamp_secret_focus(&mut self) {
+        let len = self.secrets_view().len();
+        let search_active = self.secrets_search_active();
+        if let Some(form) = self.secret_form.as_mut() {
+            match form.focus {
+                SecretFocus::Saved(idx) => {
+                    form.focus = if len == 0 {
+                        if search_active {
+                            SecretFocus::Search
+                        } else {
+                            SecretFocus::Field(SecretField::Domain)
+                        }
+                    } else {
+                        SecretFocus::Saved(idx.min(len - 1))
+                    };
+                }
+                SecretFocus::Search if !search_active => {
+                    form.focus = if len > 0 {
+                        SecretFocus::Saved(0)
+                    } else {
+                        SecretFocus::Field(SecretField::Domain)
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The selectable items in the `/secrets` panel, in order: the search box (when
+    /// shown), each filtered saved row, then the three add-form fields.
+    fn secret_focus_order(&self) -> Vec<SecretFocus> {
+        let mut order: Vec<SecretFocus> = Vec::new();
+        if self.secrets_search_active() {
+            order.push(SecretFocus::Search);
+        }
+        order.extend((0..self.secrets_view().len()).map(SecretFocus::Saved));
+        order.push(SecretFocus::Field(SecretField::Domain));
+        order.push(SecretFocus::Field(SecretField::Name));
+        order.push(SecretFocus::Field(SecretField::Value));
+        order
+    }
+
+    fn secret_focus_is_saved(&self) -> bool {
+        matches!(
+            self.secret_form.as_ref().map(|form| form.focus),
+            Some(SecretFocus::Saved(_))
+        )
+    }
+
+    /// Whether typing should edit the search filter (on the search box, or on a
+    /// saved row while the search box is shown).
+    fn secret_focus_can_search(&self) -> bool {
+        match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Search) => true,
+            Some(SecretFocus::Saved(_)) => self.secrets_search_active(),
+            _ => false,
+        }
+    }
+
+    /// Set selection to `next`, parking the currently-focused field's live text
+    /// (held in the composer) and loading the newly-focused field's text into the
+    /// composer (or clearing it when selecting a saved row).
+    fn secret_set_focus(&mut self, next: SecretFocus) {
+        let current_text = self.composer.input().to_string();
+        let load = match self.secret_form.as_mut() {
+            Some(form) => {
+                if let SecretFocus::Field(field) = form.focus {
+                    form.set_field(field, current_text);
+                }
+                form.focus = next;
+                match next {
+                    SecretFocus::Field(field) => Some(form.field(field).to_string()),
+                    SecretFocus::Search | SecretFocus::Saved(_) => None,
+                }
+            }
+            None => return,
+        };
+        match load {
+            Some(text) => self.composer.set_input(text),
+            None => self.composer.clear(),
+        }
+    }
+
+    /// Move the selection through the saved rows and form fields.
+    fn secret_form_move_focus(&mut self, forward: bool) {
+        let order = self.secret_focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let current = self
+            .secret_form
+            .as_ref()
+            .map(|form| form.focus)
+            .unwrap_or(SecretFocus::Field(SecretField::Domain));
+        let idx = order
+            .iter()
+            .position(|focus| *focus == current)
+            .unwrap_or(0);
+        let next = if forward {
+            order[(idx + 1) % order.len()]
+        } else {
+            order[(idx + order.len() - 1) % order.len()]
+        };
+        self.secret_set_focus(next);
+    }
+
+    /// Delete the highlighted saved secret (when a saved row is selected).
+    fn secret_delete_focused(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some(meta) = self.secrets_view().get(idx).cloned() else {
+            return;
+        };
+        match sa::remove_secret_active(&self.store, &meta.domain, &meta.placeholder) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        self.refresh_secrets();
+        // Keep the selection sensible after the row disappears.
+        let len = self.secrets_view().len();
+        if let Some(form) = self.secret_form.as_mut() {
+            form.focus = if len == 0 {
+                SecretFocus::Field(SecretField::Domain)
+            } else {
+                SecretFocus::Saved(idx.min(len - 1))
+            };
+        }
+    }
+
+    /// Enter on a highlighted saved row: pull that secret into the add form for
+    /// editing (domain + name + its current value) and remove it from the saved
+    /// list. Re-saving (Enter on the filled form) writes it back; Esc discards.
+    fn edit_focused_secret(&mut self) {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let idx = match self.secret_form.as_ref().map(|form| form.focus) {
+            Some(SecretFocus::Saved(idx)) => idx,
+            _ => return,
+        };
+        let Some(meta) = self.secrets_view().get(idx).cloned() else {
+            return;
+        };
+        // Read the current value (from the encrypted file) so the user can keep
+        // it without retyping. The original is left in storage and only removed
+        // once the edit is saved (Esc cancels without data loss).
+        let value =
+            sa::read_secret_value(&self.store, &meta.domain, &meta.placeholder).unwrap_or_default();
+        self.secrets_search.clear();
+
+        let mut form = SecretForm::new();
+        form.domain = meta.domain.clone();
+        form.name = meta.placeholder.clone();
+        form.value = value;
+        form.totp = matches!(meta.kind, sa::Kind::Totp);
+        form.editing_original = Some((meta.domain, meta.placeholder));
+        form.focus = SecretFocus::Field(SecretField::Domain);
+        self.composer.set_input(form.domain.clone());
+        self.secret_form = Some(form);
+        self.status_notice =
+            Some("Editing — change fields and Enter to save, Esc to discard.".to_string());
+    }
+
+    /// Enter in the `/secrets` panel: on a saved row, edit it; on a field, commit
+    /// and save once domain+name+value are all filled.
+    fn secrets_surface_enter(&mut self) -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        // On a saved row, pull it into the form for editing.
+        if self.secret_focus_is_saved() {
+            self.edit_focused_secret();
+            return Ok(());
+        }
+        // Commit whatever is in the composer into the focused field.
+        let current_text = self.composer.input().to_string();
+        let (domain, name, value, form_totp, editing_original) = match self.secret_form.as_mut() {
+            Some(form) => {
+                if let Some(field) = form.focused_field() {
+                    form.set_field(field, current_text);
+                }
+                (
+                    form.domain.clone(),
+                    form.name.clone(),
+                    form.value.clone(),
+                    form.totp,
+                    form.editing_original.clone(),
+                )
+            }
+            None => return Ok(()),
+        };
+
+        let domain_t = domain.trim();
+        let name_t = name.trim();
+        if domain_t.is_empty() || name_t.is_empty() || value.is_empty() {
+            // Not ready to save — advance to the next field so the user can fill
+            // it in. (Value is kept untrimmed; it may contain whitespace.)
+            self.secret_form_move_focus(true);
+            self.status_notice = Some("Fill in domain, name, and value.".to_string());
+            return Ok(());
+        }
+
+        // `form_totp` (set when editing a 2FA secret) keeps the TOTP kind even if
+        // the name wouldn't otherwise be detected as 2FA.
+        let totp = form_totp
+            || matches!(name_t, "otp" | "2fa" | "totp")
+            || name_t.ends_with("bu_2fa_code");
+        let kind = if totp {
+            sa::Kind::Totp
+        } else {
+            sa::Kind::Password
+        };
+        match sa::set_secret_active(&self.store, domain_t, name_t, kind, Vec::new(), &value) {
+            Ok(_) => {
+                // If editing renamed the secret, remove the original now that the
+                // new one is safely written.
+                if let Some((od, on)) = &editing_original {
+                    if od != domain_t || on != name_t {
+                        let _ = sa::remove_secret_active(&self.store, od, on);
+                    }
+                }
+                // The updated saved-secrets list is the confirmation; no notice.
+                self.status_notice = None;
+                self.refresh_secrets();
+                // Reset the form so the (now updated) list shows and the next
+                // secret can be entered from a clean Domain field.
+                self.secret_form = Some(SecretForm::new());
+                self.composer.clear();
+            }
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        Ok(())
+    }
+
+    /// Handle Enter in the `/domains` surface: `allow|deny <domain>`,
+    /// `rm allow|deny <domain>`, or `clear`.
+    fn domains_surface_enter(&mut self) -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let focus = self.domain_form.as_ref().map(|form| form.focus);
+        // On a saved rule, Enter flips it between allow and deny.
+        if let Some(DomainFocus::Saved(idx)) = focus {
+            self.domain_toggle_rule(idx);
+            return Ok(());
+        }
+        // Otherwise add the typed domain (live text is in the composer when the
+        // Input field is focused, else parked on the form).
+        let domain = if matches!(focus, Some(DomainFocus::Input)) {
+            self.composer.take_trimmed()
+        } else {
+            self.domain_form
+                .as_ref()
+                .map(|form| form.input.trim().to_string())
+                .unwrap_or_default()
+        };
+        if domain.is_empty() {
+            return Ok(());
+        }
+        let allow = matches!(
+            self.domain_form.as_ref().map(|form| form.mode),
+            Some(DomainMode::Allow)
+        );
+        match sa::add_domain(&self.store, &domain, allow) {
+            Ok(_) => self.status_notice = None,
+            Err(error) => self.status_notice = Some(format!("Error: {error}")),
+        }
+        if let Some(form) = self.domain_form.as_mut() {
+            form.input.clear();
+        }
+        self.composer.clear();
+        self.refresh_domains();
+        Ok(())
     }
 
     fn run_update(&mut self) -> Result<()> {
@@ -6227,6 +7449,10 @@ impl App {
             self.start_codex_auth(account)?;
             return Ok(());
         }
+        if account == BROWSER_USE_CLOUD {
+            self.start_auth_flow(account)?;
+            return Ok(());
+        }
         self.account = account.clone();
         self.start_auth_flow(account)?;
         Ok(())
@@ -6303,15 +7529,7 @@ impl App {
         // No top "Model set to X" notice — the active model already shows in the
         // composer status line at the bottom.
         self.status_notice = None;
-        if let Some(session_id) = self.selected_session_id.as_deref() {
-            if self
-                .store
-                .load_session(session_id)?
-                .is_some_and(|session| !session.status.is_active())
-            {
-                self.append_session_model_selection(session_id, &self.current_model_selection())?;
-            }
-        }
+        self.stamp_selected_inactive_session_settings()?;
         self.close_surface();
         // If a nudge session is waiting for auth, start it now that the
         // account and model are confirmed ready.
@@ -6327,6 +7545,133 @@ impl App {
             backend: self.agent_backend,
             model_provider_id: self.model_provider_id.clone(),
         }
+    }
+
+    fn current_runtime_settings(&self) -> Result<SessionRuntimeSettings> {
+        Ok(SessionRuntimeSettings {
+            browser: self.browser.clone(),
+            browser_local_label: self.browser_local_label.clone(),
+            browser_profile_id: self
+                .default_profile
+                .current_profile_id
+                .clone()
+                .or(self.current_local_profile_id_for_settings()?),
+            browser_profile_label: self.browser_profile_label.clone(),
+            collaboration_mode: self.collaboration_mode,
+        })
+    }
+
+    fn session_runtime_settings_or_current(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeSettings> {
+        Ok(self
+            .session_runtime_settings(session_id)?
+            .unwrap_or(self.current_runtime_settings()?))
+    }
+
+    fn session_runtime_settings(&self, session_id: &str) -> Result<Option<SessionRuntimeSettings>> {
+        Ok(self
+            .store
+            .events_for_session(session_id)?
+            .iter()
+            .rev()
+            .find_map(session_runtime_settings_from_event))
+    }
+
+    fn append_session_runtime_settings(
+        &self,
+        session_id: &str,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<()> {
+        self.store.append_event(
+            session_id,
+            SESSION_SETTINGS_EVENT,
+            serde_json::json!({
+                "browser": settings.browser,
+                "browser_local_label": settings.browser_local_label,
+                "browser_profile_id": settings.browser_profile_id,
+                "browser_profile_label": settings.browser_profile_label,
+                "collaboration_mode": collaboration_mode_setting_value(settings.collaboration_mode),
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn append_current_session_runtime_settings(&self, session_id: &str) -> Result<()> {
+        self.append_session_runtime_settings(session_id, &self.current_runtime_settings()?)
+    }
+
+    fn stamp_selected_inactive_session_settings(&self) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .store
+            .load_session(session_id)?
+            .is_some_and(|session| !session.status.is_active())
+        {
+            self.append_session_model_selection(session_id, &self.current_model_selection())?;
+            self.append_current_session_runtime_settings(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn apply_session_settings_to_app(&mut self, session_id: &str) -> Result<()> {
+        self.restore_default_runtime_settings()?;
+        if let Some(selection) = self.session_model_selection(session_id)? {
+            self.model = selection.display_model;
+            self.provider_model = selection.provider_model;
+            self.account = selection.account;
+            self.agent_backend = selection.backend;
+            self.model_provider_id = selection.model_provider_id;
+            self.model_configured = true;
+        }
+        if let Some(settings) = self.session_runtime_settings(session_id)? {
+            self.browser = settings.browser;
+            self.browser_local_label = settings.browser_local_label;
+            self.browser_profile_label = settings.browser_profile_label;
+            self.default_profile.current_profile_id = settings.browser_profile_id;
+            self.collaboration_mode = settings.collaboration_mode;
+        }
+        Ok(())
+    }
+
+    fn restore_default_runtime_settings(&mut self) -> Result<()> {
+        self.account = self
+            .store
+            .get_setting("account")?
+            .unwrap_or_else(|| self.args.account.clone());
+        self.agent_backend = self
+            .store
+            .get_setting("agent.backend")?
+            .and_then(|value| AgentBackend::from_setting(&value))
+            .unwrap_or(self.args.agent);
+        if let Some(model) = self.store.get_setting("model")? {
+            self.model = model;
+        }
+        if let Some(provider_model) = self.store.get_setting("provider.model")? {
+            self.provider_model = provider_model;
+        }
+        self.model_provider_id = self
+            .store
+            .get_setting("provider.id")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| Some(model_provider_id_for_backend(self.agent_backend).to_string()));
+        self.collaboration_mode = self
+            .store
+            .get_setting(COLLABORATION_MODE_SETTING)?
+            .and_then(|value| collaboration_mode_from_setting(&value))
+            .unwrap_or_else(|| self.args.collaboration_mode.into());
+        self.browser = self
+            .store
+            .get_setting("browser")?
+            .unwrap_or_else(|| self.args.browser.clone());
+        self.browser_local_label = browser_local_label_from_store(&self.store)?;
+        self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
+        Ok(())
     }
 
     fn parsed_config_overrides(&self) -> Result<ConfigOverrides> {
@@ -6759,17 +8104,42 @@ impl App {
     }
 
     fn save_browser(&mut self, index: usize) -> Result<()> {
-        let choice = BROWSER_CHOICES
-            .get(index.min(BROWSER_CHOICES.len().saturating_sub(1)))
-            .unwrap_or(&BROWSER_CHOICES[0]);
+        match self.browser_select_row(index) {
+            Some(BrowserSelectRow::Local(browser_name))
+                if browser_name.eq_ignore_ascii_case("Chromium") =>
+            {
+                if self.browser_select_chromium_expanded {
+                    return self.save_local_browser(browser_name);
+                }
+                self.browser_select_chromium_expanded = true;
+                self.selected_row = index.saturating_add(1);
+                return Ok(());
+            }
+            Some(BrowserSelectRow::Local(browser_name)) => {
+                return self.save_local_browser(browser_name);
+            }
+            Some(BrowserSelectRow::ChromiumHeaded) => {
+                return self.save_browser_backend("Managed Chromium");
+            }
+            Some(BrowserSelectRow::ChromiumHeadless) => {
+                return self.save_browser_backend("Headless Chromium");
+            }
+            Some(BrowserSelectRow::Cloud) | None => {
+                return self.save_browser_backend(BROWSER_USE_CLOUD);
+            }
+        }
+    }
+
+    fn save_browser_backend(&mut self, choice: &str) -> Result<()> {
         let previous_browser = self.browser.clone();
-        self.browser = (*choice).to_string();
+        self.browser = choice.to_string();
         self.store.set_setting(
             BROWSER_PREFERENCE_MODE_SETTING,
-            browser_preference_mode_for_backend(&self.browser),
+            browser_preference_mode_for_choice(choice),
         )?;
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
@@ -6778,7 +8148,6 @@ impl App {
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
         }
-        self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
             self.close_surface();
@@ -6808,6 +8177,129 @@ impl App {
         self.track_browser_selected();
         self.persist_runtime_settings()?;
         self.append_browser_backend_change_if_needed(&previous_browser)
+    }
+
+    fn save_local_browser(&mut self, browser_name: String) -> Result<()> {
+        let previous_browser = self.browser.clone();
+        self.browser = BROWSER_LOCAL_CHROME.to_string();
+        self.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "local")?;
+        self.store
+            .set_setting("browser.preference.browser", &browser_name)?;
+        self.store
+            .set_setting("browser.preference.browser_label", &browser_name)?;
+        self.browser_local_label = Some(browser_name.clone());
+        if !self.current_profile_matches_browser(&browser_name) {
+            self.store.delete_setting("browser.preference.profile")?;
+            self.store
+                .delete_setting("browser.preference.profile_label")?;
+            self.browser_profile_label = None;
+            self.default_profile.current_profile_id = None;
+        }
+        self.track_browser_selected();
+        self.persist_runtime_settings()?;
+        self.stamp_selected_inactive_session_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)?;
+        if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
+            self.complete_setup()?;
+            self.close_surface();
+        } else if !self.setup_complete {
+            self.open_surface(Surface::Setup);
+        } else {
+            self.close_surface();
+        }
+        Ok(())
+    }
+
+    fn browser_select_local_browsers(&self) -> Vec<String> {
+        self.default_profile.browsers.clone()
+    }
+
+    fn browser_select_local_browser_count(&self) -> usize {
+        self.browser_select_rows()
+            .into_iter()
+            .take_while(|row| !matches!(row, BrowserSelectRow::Cloud))
+            .count()
+    }
+
+    pub(crate) fn browser_select_rows(&self) -> Vec<BrowserSelectRow> {
+        let mut rows = Vec::new();
+        match &self.default_profile.status {
+            DefaultProfileStatus::Ready => {
+                for browser in self.browser_select_local_browsers() {
+                    let is_chromium = browser.eq_ignore_ascii_case("Chromium");
+                    rows.push(BrowserSelectRow::Local(browser));
+                    if is_chromium && self.browser_select_chromium_expanded {
+                        rows.push(BrowserSelectRow::ChromiumHeaded);
+                        rows.push(BrowserSelectRow::ChromiumHeadless);
+                    }
+                }
+            }
+            DefaultProfileStatus::Loading | DefaultProfileStatus::Failed(_) => {}
+        }
+        rows.push(BrowserSelectRow::Cloud);
+        rows
+    }
+
+    fn browser_select_row(&self, index: usize) -> Option<BrowserSelectRow> {
+        self.browser_select_rows().get(index).cloned()
+    }
+
+    fn sync_browser_select_cursor_to_current(&mut self) {
+        let rows = self.browser_select_rows();
+        let current_local_browser = self.current_local_browser_label();
+        if let Some(index) = rows.iter().position(|row| match row {
+            BrowserSelectRow::Local(browser) => {
+                self.browser == BROWSER_LOCAL_CHROME
+                    && current_local_browser
+                        .as_deref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(browser))
+            }
+            BrowserSelectRow::ChromiumHeaded => self.browser == "Managed Chromium",
+            BrowserSelectRow::ChromiumHeadless => self.browser == "Headless Chromium",
+            BrowserSelectRow::Cloud => self.browser == BROWSER_USE_CLOUD,
+        }) {
+            self.selected_row = index;
+        } else {
+            self.selected_row = 0;
+        }
+    }
+
+    pub(crate) fn current_local_browser_label(&self) -> Option<String> {
+        if let Some(label) = self
+            .browser_local_label
+            .as_deref()
+            .filter(|label| !label.trim().is_empty())
+        {
+            return Some(label.to_string());
+        }
+        let current = self.default_profile.current_profile_id.as_deref()?;
+        if let Some(profile) = self
+            .default_profile
+            .profiles
+            .iter()
+            .find(|profile| profile.id == current)
+        {
+            return Some(profile.browser_name.clone());
+        }
+        browser_name_from_profile_id(current).map(ToOwned::to_owned)
+    }
+
+    fn current_profile_matches_browser(&self, browser_name: &str) -> bool {
+        let Some(current) = self.default_profile.current_profile_id.as_deref() else {
+            return true;
+        };
+        if let Some(profile) = self
+            .default_profile
+            .profiles
+            .iter()
+            .find(|profile| profile.id == current)
+        {
+            return profile.browser_name.eq_ignore_ascii_case(browser_name);
+        }
+        browser_name_from_profile_id(current)
+            .map(|current_browser| current_browser.eq_ignore_ascii_case(browser_name))
+            .unwrap_or(true)
     }
 
     fn append_browser_backend_change_if_needed(&mut self, previous_browser: &str) -> Result<()> {
@@ -6860,6 +8352,17 @@ impl App {
         }
         self.store
             .set_setting(auth_setting_key(&account), secret.trim())?;
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && !self.pending_model_search_after_auth
+            && self.pending_model_after_auth.is_none()
+            && self.setup_pending_account.as_deref() != Some(account.as_str());
+        if return_to_provider_auth {
+            self.api_key_account = None;
+            self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
+            self.open_surface(Surface::OpenAiAuth);
+            return Ok(());
+        }
         self.account = account.clone();
         self.persist_runtime_settings()?;
         self.api_key_account = None;
@@ -7008,18 +8511,26 @@ impl App {
                 return Ok(());
             }
         };
+        let auth_url = flow.url.clone();
         self.codex_login = Some(flow);
-        self.show_setup_result(
-            SetupResultKind::Pending,
-            account,
-            "Waiting for Codex device sign-in.".to_string(),
-        );
+        if let Some(flow) = self.codex_login.as_mut() {
+            flow.output.push_str(&auth_url);
+            flow.output.push('\n');
+        }
+        let message = match open_external_url(&auth_url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        self.show_setup_result(SetupResultKind::Pending, account, message);
         Ok(())
     }
 
     fn reopen_codex_device_auth_url(&mut self) {
-        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
-            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
+        let Some(url) = self.codex_login.as_ref().map(|flow| flow.url.clone()) else {
+            return;
+        };
+        let message = match open_external_url(&url) {
+            Ok(()) => "Waiting for Codex OAuth sign-in.".to_string(),
             Err(error) => format!("Could not open browser automatically: {error}"),
         };
         if let Some(result) = self.setup_result.as_mut() {
@@ -7053,18 +8564,9 @@ impl App {
         Ok(())
     }
 
-    /// Whether a codex login exists OUTSIDE our own OAuth store keys (an external
-    /// `~/.codex/auth.json`, managed auth, or env). Drives the "Codex login
-    /// detected" provider row so it appears only for a pre-existing login.
-    fn has_external_codex_login(&self) -> bool {
-        load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
-    }
-
     fn setup_account_choices(&self) -> Result<Vec<&'static str>> {
         let mut choices = Vec::new();
-        if self.account_ready(ACCOUNT_CODEX)? {
-            choices.push(ACCOUNT_CODEX);
-        }
+        choices.push(ACCOUNT_CODEX);
         choices.extend([
             ACCOUNT_OPENAI,
             ACCOUNT_ANTHROPIC,
@@ -7075,6 +8577,12 @@ impl App {
     }
 
     fn cancel_auth_entry(&mut self) {
+        let return_to_provider_auth = self.setup_complete
+            && self.selected_provider.is_some()
+            && self
+                .api_key_account
+                .as_deref()
+                .is_some_and(|account| account != BROWSER_USE_CLOUD);
         self.api_key_account = None;
         self.pending_model_after_auth = None;
         self.pending_model_search_after_auth = false;
@@ -7084,7 +8592,12 @@ impl App {
             self.setup_pending_account = None;
             self.setup_result = None;
         }
-        self.cancel_secret_entry();
+        self.composer.clear();
+        if return_to_provider_auth {
+            self.open_surface(Surface::OpenAiAuth);
+        } else {
+            self.close_surface();
+        }
     }
 
     fn start_telemetry_entry(&mut self) {
@@ -7188,7 +8701,7 @@ impl App {
     fn setup_row_count(&self) -> usize {
         self.setup_account_choices()
             .map(|choices| choices.len())
-            .unwrap_or_else(|_| ACCOUNT_CHOICES.len().saturating_sub(1))
+            .unwrap_or_else(|_| AUTH_CHOICES.len().saturating_sub(1))
     }
 
     fn cookie_sync_row_count(&self) -> usize {
@@ -7199,6 +8712,10 @@ impl App {
             | CookieSyncStatus::Failed(_) => 1,
             CookieSyncStatus::LoadingProfiles | CookieSyncStatus::Syncing => 0,
         }
+    }
+
+    fn browser_select_row_count(&self) -> usize {
+        self.browser_select_rows().len()
     }
 
     fn default_profile_row_count(&self) -> usize {
@@ -7260,6 +8777,16 @@ impl App {
         self.start_cookie_sync_profile_load()
     }
 
+    fn open_browser_select(&mut self) -> Result<()> {
+        self.open_surface(Surface::BrowserSelect);
+        self.browser_select_chromium_expanded = matches!(
+            self.browser.as_str(),
+            "Headless Chromium" | "Managed Chromium"
+        );
+        self.status_notice = None;
+        self.start_local_browser_load()
+    }
+
     fn open_default_profile(&mut self) -> Result<()> {
         self.open_surface(Surface::DefaultProfile);
         self.status_notice = None;
@@ -7269,10 +8796,34 @@ impl App {
     fn start_default_profile_load(&mut self) -> Result<()> {
         self.default_profile.status = DefaultProfileStatus::Loading;
         self.default_profile.profiles.clear();
-        self.default_profile.current_profile_id = self
+        self.default_profile.browsers.clear();
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
+        self.spawn_default_profile_load("browser local profiles --json")
+    }
+
+    fn start_local_browser_load(&mut self) -> Result<()> {
+        self.default_profile.status = DefaultProfileStatus::Loading;
+        self.default_profile.profiles.clear();
+        self.default_profile.browsers.clear();
+        self.default_profile.current_profile_id = self.current_local_profile_id_for_settings()?;
+        self.spawn_default_profile_load("browser local browsers --json")
+    }
+
+    fn current_local_profile_id_for_settings(&self) -> Result<Option<String>> {
+        let mode = self
             .store
-            .get_setting("browser.preference.profile")?
-            .filter(|value| !value.trim().is_empty());
+            .get_setting("browser.preference.mode")?
+            .or_else(|| self.store.get_setting("browser").ok().flatten())
+            .unwrap_or_else(|| "local".to_string());
+        if !is_local_browser_mode_setting(&mode) {
+            return Ok(None);
+        }
+        self.store
+            .get_setting("browser.preference.profile")
+            .map(|profile| profile.filter(|value| !value.trim().is_empty()))
+    }
+
+    fn spawn_default_profile_load(&mut self, command: &'static str) -> Result<()> {
         let cwd = std::env::current_dir()?;
         let artifact_root = self.store.state_dir().join("profile-settings-artifacts");
         fs::create_dir_all(&artifact_root)?;
@@ -7284,7 +8835,7 @@ impl App {
                     "tui-profile-settings",
                     &cwd,
                     &artifact_root,
-                    "browser local profiles --json",
+                    command,
                     None,
                 )
                 .map_err(|error| format!("{error:#}"));
@@ -7316,11 +8867,14 @@ impl App {
         };
         self.store
             .set_setting("browser.preference.profile", &profile.id)?;
+        self.store.set_setting("browser.preference.mode", "local")?;
+        self.store.set_setting("browser", "Local Chrome")?;
         let profile_label = human_profile_label(&profile);
         self.store
             .set_setting("browser.preference.profile_label", &profile_label)?;
         self.browser_profile_label = Some(profile_label.clone());
         self.default_profile.current_profile_id = Some(profile.id.clone());
+        self.stamp_selected_inactive_session_settings()?;
         self.status_notice = Some(format!("Default Chrome profile: {profile_label}"));
         self.close_surface();
         Ok(())
@@ -7356,17 +8910,65 @@ impl App {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
         }
-        match self.browser_profile_label.as_deref() {
-            Some(profile) => format!("{} · {}", self.browser, concise_profile_label(&profile)),
-            None => self.browser.clone(),
+        match (
+            self.browser_local_label.as_deref(),
+            self.browser_profile_label.as_deref(),
+        ) {
+            (Some(browser), Some(profile)) => format!(
+                "{} · {} · {}",
+                self.browser,
+                browser,
+                concise_profile_label(profile)
+            ),
+            (Some(browser), None) => format!("{} · {}", self.browser, browser),
+            (None, Some(profile)) => {
+                format!("{} · {}", self.browser, concise_profile_label(profile))
+            }
+            (None, None) => self.browser.clone(),
         }
     }
 
-    fn refresh_browser_profile_label(&mut self) -> Result<bool> {
-        let next = browser_profile_label_from_store(&self.store)?;
-        let changed = self.browser_profile_label != next;
-        self.browser_profile_label = next;
-        Ok(changed)
+    fn refresh_visible_runtime_settings(&mut self) -> Result<bool> {
+        if let Some(session_id) = self.selected_session_id.clone() {
+            let before = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            self.apply_session_settings_to_app(&session_id)?;
+            let after = (
+                self.model.clone(),
+                self.provider_model.clone(),
+                self.account.clone(),
+                self.agent_backend,
+                self.model_provider_id.clone(),
+                self.browser.clone(),
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+                self.default_profile.current_profile_id.clone(),
+                self.collaboration_mode,
+            );
+            Ok(before != after)
+        } else {
+            let before = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            self.browser_local_label = browser_local_label_from_store(&self.store)?;
+            self.browser_profile_label = browser_profile_label_from_store(&self.store)?;
+            let after = (
+                self.browser_local_label.clone(),
+                self.browser_profile_label.clone(),
+            );
+            Ok(before != after)
+        }
     }
 
     fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
@@ -7585,15 +9187,17 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::SetupCloud => 2,
             Surface::SetupCloudSuccess => 0,
-            Surface::Account => ACCOUNT_CHOICES.len(),
+            Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
+            Surface::Email => 2,
+            Surface::Secrets | Surface::Domains => 0,
             Surface::Provider => self.recommended_models().len() + self.provider_rows().len(),
-            Surface::OpenAiAuth => self.openai_auth_rows().len(),
+            Surface::OpenAiAuth => self.provider_auth_rows().len(),
             Surface::Model => self.model_surface_row_count(),
             Surface::ModelSearch => self.model_search_row_count(),
             Surface::Mode => 2,
             Surface::Browser => 3,
-            Surface::BrowserSelect => BROWSER_CHOICES.len(),
+            Surface::BrowserSelect => self.browser_select_row_count(),
             Surface::DefaultProfile => self.default_profile_row_count(),
             Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::Context | Surface::Goal => 0,
@@ -7766,6 +9370,9 @@ impl App {
         let Some(session) = state.current_session.as_ref() else {
             return ProductState::Ready;
         };
+        if self.session_is_waiting_for_auth(&session.id) {
+            return ProductState::Result;
+        }
         if session.status.is_active() {
             ProductState::Running
         } else if session.status == SessionStatus::Cancelled {
@@ -7811,6 +9418,7 @@ impl App {
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
+            BROWSER_USE_CLOUD => self.browser_use_cloud_key_ready()?,
             account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
             ACCOUNT_CODEX => self.has_codex_login()?,
             _ => false,
@@ -7819,6 +9427,62 @@ impl App {
 
     fn auth_notice(&self) -> Result<Option<String>> {
         self.auth_notice_for_selection(&self.current_model_selection())
+    }
+
+    pub(crate) fn session_is_waiting_for_auth(&self, session_id: &str) -> bool {
+        self.session_events_are_waiting_for_auth(
+            session_id,
+            self.cached_events_for_session(session_id),
+        )
+    }
+
+    pub(crate) fn session_events_are_waiting_for_auth(
+        &self,
+        session_id: &str,
+        events: &[EventRecord],
+    ) -> bool {
+        let Some(nudge_seq) = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.session_id == session_id
+                    && event.event_type == "session.notice"
+                    && event
+                        .payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(NO_KEY_NUDGE_TEXT)
+            })
+            .map(|event| event.seq)
+        else {
+            return false;
+        };
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "agent.run.started" | "session.done" | "session.failed" | "session.cancelled"
+                )
+        }) {
+            return false;
+        }
+        if events.iter().any(|event| {
+            event.session_id == session_id
+                && event.seq > nudge_seq
+                && event.event_type == "session.status"
+                && event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running")
+        }) {
+            return false;
+        }
+        self.pending_auth_resume.as_deref() == Some(session_id)
+            || !events.iter().any(|event| {
+                event.session_id == session_id && event.event_type == "agent.run.started"
+            })
     }
 
     fn auth_notice_for_selection(
@@ -7934,20 +9598,49 @@ impl App {
         {
             return Ok(true);
         }
-        Ok(load_codex_managed_auth().is_ok()
-            || load_codex_auth().is_ok()
-            || codex_env_auth_present())
+        Ok(codex_env_auth_present())
     }
 
-    fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
+    fn store_codex_managed_auth(&self, auth: &CodexManagedAuth) -> Result<()> {
+        let snapshot = auth.current_snapshot()?;
         self.store
-            .set_setting("auth.codex.access_token", auth.access_token.trim())?;
+            .set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
         self.store
-            .set_setting("auth.codex.account_id", auth.account_id.trim())?;
-        self.store.delete_setting("auth.codex.id_token")?;
-        self.store.delete_setting("auth.codex.refresh_token")?;
-        self.store.delete_setting("auth.codex.source_path")?;
-        self.store.delete_setting("auth.codex.last_refresh")?;
+            .set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
+        if let Some(id_token) = snapshot
+            .id_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.id_token", id_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.id_token")?;
+        }
+        if let Some(refresh_token) = snapshot
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.refresh_token", refresh_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.refresh_token")?;
+        }
+        if let Some(source_path) = snapshot.source_path.as_ref() {
+            self.store.set_setting(
+                "auth.codex.source_path",
+                source_path.to_string_lossy().as_ref(),
+            )?;
+        } else {
+            self.store.delete_setting("auth.codex.source_path")?;
+        }
+        if let Some(last_refresh) = snapshot.last_refresh {
+            self.store
+                .set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
+        } else {
+            self.store.delete_setting("auth.codex.last_refresh")?;
+        }
         Ok(())
     }
 
@@ -8041,12 +9734,25 @@ impl App {
 const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
 fn codex_env_auth_present() -> bool {
+    codex_auth_from_explicit_env().is_some()
+}
+
+fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
+    if let Ok(path) = std::env::var("LLM_BROWSER_CODEX_AUTH_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_codex_auth_file(path).ok();
+        }
+    }
     if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_ok_and(|value| !value.trim().is_empty())
         && std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").is_ok_and(|value| !value.trim().is_empty())
     {
-        return true;
+        return Some(CodexAuth {
+            access_token: std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").ok()?,
+            account_id: std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").ok()?,
+        });
     }
-    std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
+    None
 }
 
 fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
@@ -8072,6 +9778,14 @@ fn concise_profile_label(label: &str) -> String {
 }
 
 fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
+    let mode = store
+        .get_setting("browser.preference.mode")?
+        .or_else(|| store.get_setting("browser").ok().flatten())
+        .unwrap_or_else(|| "local".to_string())
+        .to_string();
+    if !is_local_browser_mode_setting(&mode) {
+        return Ok(None);
+    }
     Ok(store
         .get_setting("browser.preference.profile_label")?
         .filter(|label| !label.trim().is_empty())
@@ -8084,12 +9798,40 @@ fn browser_profile_label_from_store(store: &Store) -> Result<Option<String>> {
         }))
 }
 
-fn browser_preference_mode_for_backend(browser: &str) -> &'static str {
-    if browser == BROWSER_USE_CLOUD {
-        "cloud"
-    } else {
-        "local"
+fn browser_local_label_from_store(store: &Store) -> Result<Option<String>> {
+    Ok(store
+        .get_setting("browser.preference.browser_label")?
+        .or_else(|| {
+            store
+                .get_setting("browser.preference.browser")
+                .ok()
+                .flatten()
+        })
+        .filter(|label| !label.trim().is_empty()))
+}
+
+fn browser_name_from_profile_id(profile_id: &str) -> Option<&'static str> {
+    let prefix = profile_id.split_once(':')?.0;
+    match prefix.to_ascii_lowercase().as_str() {
+        "google-chrome" => Some("Google Chrome"),
+        "chromium" => Some("Chromium"),
+        "microsoft-edge" => Some("Microsoft Edge"),
+        "microsoft-edge-beta" => Some("Microsoft Edge Beta"),
+        "microsoft-edge-dev" => Some("Microsoft Edge Dev"),
+        "microsoft-edge-canary" => Some("Microsoft Edge Canary"),
+        "brave" => Some("Brave"),
+        _ => None,
     }
+}
+
+fn is_local_browser_mode_setting(mode: &str) -> bool {
+    matches!(
+        mode.trim()
+            .to_ascii_lowercase()
+            .replace(['_', ' '], "-")
+            .as_str(),
+        "local" | "local-chrome"
+    )
 }
 
 pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
@@ -8099,6 +9841,61 @@ pub(crate) fn human_profile_label(profile: &CookieSyncProfile) -> String {
     } else {
         profile_name
     }
+}
+
+fn local_browser_choices_from_profiles(profiles: &[CookieSyncProfile]) -> Vec<String> {
+    let mut browsers = Vec::new();
+    for profile in profiles {
+        let browser = profile.browser_name.trim();
+        if browser.is_empty() {
+            continue;
+        }
+        if !browsers
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(browser))
+        {
+            browsers.push(browser.to_string());
+        }
+    }
+    sort_local_browser_choices(&mut browsers);
+    browsers
+}
+
+fn local_browser_choices_from_value(value: &serde_json::Value) -> Option<Vec<String>> {
+    let browsers = value.get("browsers")?.as_array()?;
+    let mut names = Vec::new();
+    for browser in browsers {
+        let Some(name) = browser
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_string());
+        }
+    }
+    sort_local_browser_choices(&mut names);
+    Some(names)
+}
+
+fn sort_local_browser_choices(browsers: &mut [String]) {
+    browsers.sort_by(|a, b| local_browser_sort_key(a).cmp(&local_browser_sort_key(b)));
+}
+
+fn local_browser_sort_key(browser: &str) -> (u8, String) {
+    let normalized = browser.trim().to_ascii_lowercase();
+    let rank = match normalized.as_str() {
+        "google chrome" => 0,
+        "chromium" => 1,
+        _ => 2,
+    };
+    (rank, normalized)
 }
 
 fn cookie_sync_profile_from_value(value: &serde_json::Value) -> Option<CookieSyncProfile> {
@@ -8257,17 +10054,22 @@ fn account_kind(account: &str) -> &'static str {
     }
 }
 
-#[cfg(not(test))]
-fn app_codex_home(state_dir: &Path) -> PathBuf {
-    state_dir.join("codex-home")
-}
-
 fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
         "Headless Chromium" => "headless",
+        "Managed Chromium" => "managed",
         BROWSER_USE_CLOUD => "cloud",
         _ => "other",
+    }
+}
+
+fn browser_preference_mode_for_choice(browser: &str) -> &'static str {
+    match browser {
+        "Headless Chromium" => "managed-headless",
+        "Managed Chromium" => "managed-headed",
+        BROWSER_USE_CLOUD => "cloud",
+        _ => "local",
     }
 }
 
@@ -8415,68 +10217,30 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
 }
 
 #[cfg(not(test))]
-fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLoginFlow> {
-    let codex_home = app_codex_home(&state_dir);
-    std::fs::create_dir_all(&codex_home)
-        .with_context(|| format!("create app Codex home {}", codex_home.display()))?;
-    let auth_path = codex_home.join("auth.json");
-    let mut child = ProcessCommand::new("codex")
-        .args(["login", "--device-auth"])
-        .env("CODEX_HOME", &codex_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start `codex login --device-auth`")?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
+    let url = codex_oauth_authorize_url(&challenge, &state);
+    let listener =
+        TcpListener::bind((CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT)).with_context(|| {
+            format!("bind Codex OAuth callback on {CODEX_CALLBACK_HOST}:{CODEX_CALLBACK_PORT}")
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Codex OAuth callback listener")?;
     let (stop_tx, stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
-    if let Some(stdout) = stdout {
-        spawn_codex_output_reader(stdout, event_tx.clone());
-    }
-    if let Some(stderr) = stderr {
-        spawn_codex_output_reader(stderr, event_tx.clone());
-    }
     thread::Builder::new()
-        .name("browser-use-codex-login".to_string())
-        .spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
-                    "Codex device sign-in was cancelled".to_string(),
-                )));
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let result = if status.success() {
-                        load_codex_auth_file(&auth_path)
-                            .with_context(|| {
-                                format!(
-                                    "load app Codex auth after device sign-in from {}",
-                                    auth_path.display()
-                                )
-                            })
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        Err(format!("`codex login --device-auth` exited with {status}"))
-                    };
-                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
-                        "wait for Codex login process: {error}"
-                    ))));
-                    return;
-                }
-            }
+        .name("browser-use-codex-oauth".to_string())
+        .spawn(move || {
+            let result = wait_for_codex_oauth_credential(listener, verifier, state, stop_rx)
+                .map_err(|error| format!("{error:#}"));
+            let _ = event_tx.send(CodexLoginEvent::Finished(result));
         })
-        .context("spawn Codex device login watcher")?;
+        .context("spawn Codex OAuth callback listener")?;
     Ok(CodexLoginFlow {
         account,
+        url,
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -8485,31 +10249,99 @@ fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLo
 }
 
 #[cfg(not(test))]
-fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    let _ = event_tx.send(CodexLoginEvent::Output(text));
-                }
-                Err(_) => return,
-            }
+fn wait_for_codex_oauth_credential(
+    listener: TcpListener,
+    verifier: String,
+    expected_state: String,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexManagedAuth> {
+    let parsed = wait_for_codex_callback(listener, expected_state.as_str(), stop_rx)?;
+    let auth_code = parsed
+        .code
+        .context("Codex authorization code was missing")?;
+    exchange_codex_authorization_code(&auth_code, &verifier)
+}
+
+#[cfg(not(test))]
+fn wait_for_codex_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<CodexAuthorization> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            anyhow::bail!("Codex OAuth sign-in was cancelled");
         }
-    });
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for Codex browser callback");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => return handle_codex_callback(&mut stream, expected_state),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("accept Codex OAuth callback"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_codex_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<CodexAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Codex OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Codex OAuth callback request")?;
+    let parsed = parse_codex_authorization_input(path);
+    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
+        404
+    } else if parsed.error.is_some() {
+        400
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Codex authentication completed. You can close this window.",
+        400 => parsed
+            .error_description
+            .as_deref()
+            .or(parsed.error.as_deref())
+            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
+        _ => "Codex callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        anyhow::bail!("{text}")
+    }
 }
 
 #[cfg(test)]
 fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let (_verifier, challenge) = codex_oauth_pkce();
+    let state = codex_oauth_state();
     let (stop_tx, _stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
     Ok(CodexLoginFlow {
         account,
+        url: codex_oauth_authorize_url(&challenge, &state),
         output: String::new(),
         started_at: Instant::now(),
         stop_tx,
@@ -9147,26 +10979,6 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            output.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    output
-}
-
 fn print_native_transcript(app: &mut App) -> Result<()> {
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
@@ -9228,6 +11040,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_default_profile_notifications()?;
             draw_needed |= app.drain_provider_fetch()?;
             draw_needed |= app.drain_feedback_notifications()?;
+            draw_needed |= app.drain_secret_import();
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -9260,6 +11073,10 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.should_animate_live_spinner() {
                 poll_interval = poll_interval.min(LIVE_SPINNER_TICK_INTERVAL);
             }
+            // Keep the password-import spinner smooth while the worker runs.
+            if app.should_animate_import() {
+                poll_interval = poll_interval.min(Duration::from_millis(80));
+            }
             // Keep redrawing while the typewriter is animating even after the
             // logo physics settle to rest (logo stops driving redraws then).
             if app.is_home_examples_active() {
@@ -9283,6 +11100,10 @@ fn run_terminal(mut app: App) -> Result<()> {
                     app.tick_live_spinner();
                     draw_needed = true;
                     last_live_spinner_tick = Instant::now();
+                }
+                // Advance the password-import spinner (frame derived from elapsed).
+                if app.should_animate_import() {
+                    draw_needed = true;
                 }
                 // Advance the typewriter placeholder animation while on the home screen
                 // with an empty composer and no session history.
@@ -9626,6 +11447,12 @@ fn draw_live_link_overlay(target: &mut CrosstermBackend<io::Stdout>, app: &App) 
         SetAttribute(Attribute::Reset),
         SetForegroundColor(ratatui_color_to_crossterm(link.fg)),
         MoveTo(link.col, link.row),
+    )?;
+    if link.modifier.contains(Modifier::UNDERLINED) {
+        queue!(target, SetAttribute(Attribute::Underlined))?;
+    }
+    queue!(
+        target,
         Print(live_link_osc8(&link.url, &link.text)),
         ResetColor,
         SetAttribute(Attribute::Reset),
@@ -9797,9 +11624,17 @@ fn handle_terminal_event(
         }) => {
             let kind_label = mouse_event_kind_label(kind);
             let before_cursor = app.composer.cursor_index();
-            let logo_handled = matches!(kind, MouseEventKind::Down(_))
-                && app.handle_welcome_logo_click(column, row);
-            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
+            let is_button_down = matches!(kind, MouseEventKind::Down(_));
+            let logo_handled = is_button_down && app.handle_welcome_logo_click(column, row);
+            let live_link_handled = is_button_down && app.handle_live_link_click(column, row)?;
+            app.trace_mouse_event(
+                kind_label,
+                column,
+                row,
+                before_cursor,
+                logo_handled,
+                live_link_handled,
+            );
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -10708,6 +12543,442 @@ mod redesign_tests {
         Ok(app)
     }
 
+    fn plain_lines(lines: &[ratatui::text::Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn secrets_panel_shows_form_and_list() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        assert_eq!(app.surface, Surface::Secrets);
+
+        let panel = plain_lines(&render::secrets_lines(&app)).join("\n");
+        // Separate labeled fields, the saved list, and the 2FA tip are all shown.
+        assert!(panel.contains("Saved secrets:"));
+        assert!(panel.contains("Add a secret:"));
+        assert!(panel.contains("Domain"));
+        assert!(panel.contains("Name"));
+        assert!(panel.contains("Value"));
+        assert!(panel.contains("\"otp\" for a 2FA code"));
+
+        // Caret invariant: exactly one rendered line is the focused field's row
+        // (`"  " + focused content`), so the masked caret lands only there.
+        let target = format!("  {}", render::secrets_input_field(&app));
+        let matches = plain_lines(&render::secrets_lines(&app))
+            .iter()
+            .filter(|l| l.starts_with(&target))
+            .count();
+        assert_eq!(matches, 1, "exactly one row must match the caret target");
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_value_field_is_masked() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        // Move focus to the Value field and type — it must render as bullets.
+        app.secret_form_move_focus(true); // -> Name
+        app.secret_form_move_focus(true); // -> Value
+        app.handle_paste("hunter2pass");
+        let panel = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(!panel.contains("hunter2pass"));
+        assert!(panel.contains("••••••"));
+        Ok(())
+    }
+
+    #[test]
+    fn domains_panel_is_a_form_with_a_rules_list() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        sa::add_domain(&app.store, "github.com", true).unwrap();
+        sa::add_domain(&app.store, "ads.example.com", false).unwrap();
+        app.open_domains_surface();
+        assert_eq!(app.surface, Surface::Domains);
+
+        let text = plain_lines(&render::domains_lines(&app)).join("\n");
+        assert!(text.contains("Rules (2)"));
+        assert!(text.contains("github.com"));
+        assert!(text.contains("Allowed"));
+        assert!(text.contains("ads.example.com"));
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("Add a rule:"));
+        assert!(text.contains("Mode"));
+
+        // Exactly one line carries the caret target (the focused Domain input).
+        let target = format!("  {}", render::domains_input_field(&app));
+        let caret_lines = plain_lines(&render::domains_lines(&app))
+            .iter()
+            .filter(|l| l.starts_with(&target))
+            .count();
+        assert_eq!(caret_lines, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn domains_caret_lands_on_the_domain_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_domains_surface(); // default focus = Domain input
+        app.handle_paste("git"); // give the field some text to anchor the caret
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret should be visible while the Domain field is focused");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Domain"),
+            "caret at row {} = {:?}; full dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        assert!(
+            !caret_row.contains("Add a rule"),
+            "caret landed on the heading: {caret_row:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn email_surface_setup_and_save() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        assert_eq!(app.surface, Surface::Email);
+
+        // Unconfigured: shows where to get the key + how to set it up.
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("agentmail.to"));
+        assert!(text.contains("Save key"));
+        assert!(!app.email_configured);
+
+        // Paste a key on the Save row + Enter → stored, panel closes.
+        app.handle_paste("fake-agentmail-key");
+        app.execute_surface_selection()?;
+        assert!(app.email_configured);
+        assert_eq!(
+            sa::agentmail_token(&app.store).as_deref(),
+            Some("fake-agentmail-key")
+        );
+
+        // Reopening now shows the configured state.
+        app.open_email_surface();
+        let text = plain_lines(&render::email_lines(&app)).join("\n");
+        assert!(text.contains("Configured"));
+        Ok(())
+    }
+
+    #[test]
+    fn email_caret_lands_on_the_key_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_email_surface();
+        app.handle_paste("abc");
+        let (dump, cursor) = render::render_dump_with_cursor(&mut app)?;
+        let cursor = cursor.expect("caret visible on the key field");
+        let rows: Vec<&str> = dump.lines().collect();
+        let caret_row = rows.get(cursor.y as usize).copied().unwrap_or("");
+        assert!(
+            caret_row.contains("Key"),
+            "caret at row {} = {:?}; dump:\n{}",
+            cursor.y,
+            caret_row,
+            dump
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn domains_form_add_toggle_delete() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_domains_surface();
+
+        // Focused on the input (Allow mode) → type + Enter adds an allow rule.
+        app.handle_paste("github.com");
+        app.domains_surface_enter()?;
+        assert_eq!(app.domain_rows(), vec![("github.com".to_string(), true)]);
+
+        // Select the row, Enter toggles it to Block.
+        app.domain_set_focus(DomainFocus::Saved(0));
+        app.domains_surface_enter()?;
+        assert_eq!(app.domain_rows(), vec![("github.com".to_string(), false)]);
+
+        // The macOS "delete" key (Backspace) on the highlighted row removes it.
+        app.domain_set_focus(DomainFocus::Saved(0));
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        assert!(app.domain_rows().is_empty());
+
+        // Mode toggle switches the add-mode.
+        app.domain_set_focus(DomainFocus::Mode);
+        app.domain_toggle_mode();
+        assert!(matches!(
+            app.domain_form.as_ref().unwrap().mode,
+            DomainMode::Deny
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_form_focus_parks_each_field() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Field(SecretField::Domain)
+        ));
+
+        // Type into Domain, Tab to Name: the domain is parked, composer cleared.
+        app.handle_paste("github.com");
+        app.secret_form_move_focus(true);
+        {
+            let form = app.secret_form.as_ref().unwrap();
+            assert_eq!(form.domain, "github.com");
+            assert!(matches!(form.focus, SecretFocus::Field(SecretField::Name)));
+        }
+        assert_eq!(app.composer.input(), "");
+
+        // Type into Name, Tab back to Domain: the parked domain reloads into the
+        // composer for editing.
+        app.handle_paste("password");
+        app.secret_form_move_focus(false); // -> Domain
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Field(SecretField::Domain)
+        ));
+        assert_eq!(app.composer.input(), "github.com");
+        assert_eq!(app.secret_form.as_ref().unwrap().name, "password");
+        Ok(())
+    }
+
+    #[test]
+    fn saved_secrets_scroll_and_search() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        for i in 0..10 {
+            sa::set_secret_active(
+                &app.store,
+                &format!("site{i}.example.com"),
+                "password",
+                sa::Kind::Password,
+                vec![],
+                &format!("pw{i}"),
+            )
+            .unwrap();
+        }
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 10);
+
+        // Long list → search box + scrolled window (not all 10 rows shown).
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("Saved secrets (10)"));
+        assert!(text.contains("Search:"));
+        assert!(text.contains("more below"));
+        let rows = plain_lines(&render::secrets_lines(&app))
+            .iter()
+            .filter(|l| l.contains("••••••"))
+            .count();
+        assert!(
+            rows <= SECRETS_VISIBLE_ROWS,
+            "rows {rows} should be windowed"
+        );
+
+        // Filtering narrows to matching rows.
+        app.secrets_search = "site3".to_string();
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("site3.example.com"));
+        assert!(!text.contains("site7.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_no_matches_stays_editable() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        for i in 0..8 {
+            sa::set_secret_active(
+                &app.store,
+                &format!("site{i}.example.com"),
+                "password",
+                sa::Kind::Password,
+                vec![],
+                &format!("pw{i}"),
+            )
+            .unwrap();
+        }
+        app.open_secrets_surface();
+        // Highlight a saved row, then type a query that matches nothing.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        for ch in "zzznope".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?;
+        }
+        assert!(app.secrets_view().is_empty());
+        // Focus stays on the search box (not dropped into the form), so it's still
+        // editable — the previously-broken case.
+        assert!(matches!(
+            app.secret_form.as_ref().unwrap().focus,
+            SecretFocus::Search
+        ));
+
+        // Backspacing recovers — matches come back.
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?;
+        }
+        assert!(app.secrets_search.is_empty());
+        assert_eq!(app.secrets_view().len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn op_setup_hint_shows_download_link() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_secrets_surface();
+
+        // Not installed → download link.
+        app.op_setup_hint = Some(OpSetupIssue::NotInstalled);
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("1Password CLI not installed"));
+        assert!(text.contains("1password.com/downloads/command-line"));
+
+        // Installed but not signed in → sign-in steps, no download link.
+        app.op_setup_hint = Some(OpSetupIssue::NotSignedIn);
+        let text = plain_lines(&render::secrets_lines(&app)).join("\n");
+        assert!(text.contains("not signed in"));
+        assert!(text.contains("Integrate with 1Password CLI"));
+        assert!(text.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+        assert!(!text.contains("downloads/command-line"));
+        Ok(())
+    }
+
+    #[test]
+    fn editing_a_saved_secret_loads_form_and_hides_row() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let seed = "TESTTESTTESTTESTTESTTESTTESTTEST";
+        sa::set_secret_active(
+            &app.store,
+            "github.com",
+            "otp",
+            sa::Kind::Totp,
+            vec![],
+            seed,
+        )
+        .unwrap();
+
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 1);
+
+        // Select the saved row and press Enter → edit.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        app.secrets_surface_enter()?;
+
+        // It's pulled into the form (value + totp preserved); still in storage but
+        // hidden from the view until the edit is saved (Esc would not lose it).
+        assert_eq!(app.secrets_list.len(), 1, "original kept until save");
+        assert!(app.secrets_view().is_empty(), "edited row hidden from view");
+        let form = app.secret_form.as_ref().unwrap();
+        assert_eq!(form.domain, "github.com");
+        assert_eq!(form.name, "otp");
+        assert_eq!(form.value, seed);
+        assert!(form.totp, "TOTP kind preserved for editing");
+        assert_eq!(
+            form.editing_original,
+            Some(("github.com".to_string(), "otp".to_string()))
+        );
+
+        // Re-saving writes it back (same key → overwrite, still one secret).
+        app.secret_set_focus(SecretFocus::Field(SecretField::Value));
+        app.secrets_surface_enter()?;
+        assert_eq!(app.secrets_list.len(), 1);
+        assert!(matches!(app.secrets_list[0].kind, sa::Kind::Totp));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_an_edit_keeps_the_original() -> Result<()> {
+        use browser_use_agent::tools::handlers::secrets_admin as sa;
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        sa::set_secret_active(
+            &app.store,
+            "github.com",
+            "password",
+            sa::Kind::Password,
+            vec![],
+            "pw",
+        )
+        .unwrap();
+
+        app.open_secrets_surface();
+        app.secret_set_focus(SecretFocus::Saved(0));
+        app.secrets_surface_enter()?; // edit
+                                      // Cancel: first Esc clears the form (and the edit state) — original intact.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+        assert_eq!(app.secrets_list.len(), 1, "original not lost on cancel");
+        assert_eq!(
+            sa::read_secret_value(&app.store, "github.com", "password").as_deref(),
+            Some("pw")
+        );
+        assert!(app.secret_form.as_ref().unwrap().editing_original.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_delete_highlighted_saved_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Seed two metadata rows directly (no keychain needed for the delete to
+        // remove the metadata; the keychain delete tolerates a missing entry).
+        for name in ["password", "otp"] {
+            let meta = serde_json::json!({
+                "domain": "github.com", "placeholder": name,
+                "kind": if name == "otp" { "totp" } else { "password" },
+                "allowed_domains": [],
+            });
+            app.store.set_setting(
+                &format!("secrets.meta.github.com/{name}"),
+                &serde_json::to_string(&meta)?,
+            )?;
+        }
+        app.open_secrets_surface();
+        assert_eq!(app.secrets_list.len(), 2);
+
+        // Select the first saved row and delete it.
+        app.secret_set_focus(SecretFocus::Saved(0));
+        assert!(app.secret_focus_is_saved());
+        app.secret_delete_focused();
+        assert_eq!(app.secrets_list.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn paste_reaches_secrets_and_domains_inputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.open_secrets_surface();
+        app.handle_paste("github.com password");
+        assert_eq!(app.composer.input(), "github.com password");
+
+        app.open_domains_surface(); // clears the composer
+        assert_eq!(app.composer.input(), "");
+        app.handle_paste("allow github.com");
+        assert_eq!(app.composer.input(), "allow github.com");
+        Ok(())
+    }
+
     // Run with: cargo test -p browser-use-tui timing_drain_store_notifications_in_session -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -11596,7 +13867,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_status_link_does_not_capture_terminal_mouse() -> Result<()> {
+    fn live_status_link_uses_native_hyperlink_without_capturing_scroll() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.browser = BROWSER_USE_CLOUD.to_string();
@@ -11620,13 +13891,109 @@ mod redesign_tests {
             .live_link_overlay
             .borrow()
             .as_ref()
-            .map(|link| (link.col, link.row, link.url.clone()))
+            .map(|link| (link.col, link.row, link.text.clone(), link.url.clone()))
             .context("live link overlay")?;
-        assert_eq!(link.2, live_url);
+        assert_eq!(link.2, "live browser");
+        assert_eq!(link.3, live_url);
+        assert!(!app.should_capture_mouse());
+        assert!(app.handle_live_link_click(link.0, link.1)?);
+        assert!(app.handle_live_link_click(
+            link.0
+                .saturating_add(u16::try_from(link.2.chars().count()).unwrap_or(0))
+                .saturating_sub(1),
+            link.1,
+        )?);
+        assert!(!app.handle_live_link_click(link.0.saturating_sub(1), link.1)?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let targets = events
+            .iter()
+            .filter(|event| event.event_type == "browser.open_requested")
+            .filter_map(|event| event.payload.get("target").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![live_url, live_url]);
+        Ok(())
+    }
+
+    #[test]
+    fn headless_chromium_live_status_link_uses_local_preview_url() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = "Headless Chromium".to_string();
+        app.store.set_setting("browser", "Headless Chromium")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": live_url}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Done"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("live browser"));
+        assert!(screen.contains("Headless Chromium"));
+        assert!(!screen.contains("live file:///tmp/browser-use-terminal/.capture.frames/live.html"));
+        let link = app
+            .live_link_overlay
+            .borrow()
+            .as_ref()
+            .map(|link| link.url.clone())
+            .context("live link overlay")?;
+        assert_eq!(link, live_url);
+        Ok(())
+    }
+
+    #[test]
+    fn live_browser_link_stays_visible_in_narrow_footer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 64;
+        app.args.height = 16;
+        app.browser = "Headless Chromium".to_string();
+        app.store.set_setting("browser", "Headless Chromium")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": live_url}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("live browser"), "{screen}");
+        let footer = screen
+            .lines()
+            .find(|line| line.contains("live browser"))
+            .context("live browser footer")?;
         assert!(
-            !app.should_capture_mouse(),
-            "live links must stay terminal-native so scrollback and text selection keep working"
+            footer.chars().count() <= app.args.width as usize,
+            "footer overflowed configured width: {}\n{footer}",
+            footer.chars().count()
         );
+        let link = app
+            .live_link_overlay
+            .borrow()
+            .as_ref()
+            .map(|link| (link.text.clone(), link.url.clone()))
+            .context("live link overlay")?;
+        assert_eq!(link, ("live browser".to_string(), live_url.to_string()));
         Ok(())
     }
 
@@ -11697,6 +14064,9 @@ mod redesign_tests {
             | Surface::SetupResult
             | Surface::SetupCloud
             | Surface::SetupCloudSuccess => "Setup",
+            Surface::Secrets => "Secrets",
+            Surface::Domains => "Domains",
+            Surface::Email => "Email inbox",
             Surface::Feedback | Surface::FeedbackThanks => "Feedback",
             Surface::Main => "",
         }
@@ -11969,14 +14339,10 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        if app
+        assert!(app
             .setup_account_choices()?
-            .contains(&settings::ACCOUNT_CODEX)
-        {
-            assert!(screen.contains("Continue with Codex login"));
-        } else {
-            assert!(!screen.contains("Codex login"));
-        }
+            .contains(&settings::ACCOUNT_CODEX));
+        assert!(screen.contains("Continue with Codex login"));
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
@@ -12251,7 +14617,8 @@ mod redesign_tests {
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use Cloud . needs key"));
+            assert!(screen.contains("Browser Use Cloud"));
+            assert!(screen.contains("needs Browser Use key"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -12314,6 +14681,15 @@ mod redesign_tests {
                 Some(session_id.as_str()),
                 "pending_auth_resume should point to the nudge session"
             );
+            let screen = render_dump(&mut app)?;
+            assert!(
+                screen.contains("It looks like you don't have an API key set up yet"),
+                "nudge should render as committed assistant text"
+            );
+            assert!(
+                !screen.contains("Working..."),
+                "blocked auth nudge must not render as active work: {screen}"
+            );
             Ok(())
         })();
         if let Some(value) = saved {
@@ -12322,6 +14698,56 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn selected_session_keeps_browser_profile_while_new_task_uses_latest_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.setup_complete = true;
+        app.model_configured = true;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Google Chrome".to_string());
+        app.browser_profile_label = Some("Work".to_string());
+        app.default_profile.current_profile_id = Some("google-chrome:Work".to_string());
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.append_current_session_runtime_settings(&session.id)?;
+        app.append_session_model_selection(&session.id, &app.current_model_selection())?;
+
+        app.store.set_setting("browser", BROWSER_LOCAL_CHROME)?;
+        app.store.set_setting("browser.preference.mode", "local")?;
+        app.store
+            .set_setting("browser.preference.browser", "Brave")?;
+        app.store
+            .set_setting("browser.preference.browser_label", "Brave")?;
+        app.store
+            .set_setting("browser.preference.profile", "brave:Personal")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Personal")?;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = Some("Brave".to_string());
+        app.browser_profile_label = Some("Personal".to_string());
+        app.default_profile.current_profile_id = Some("brave:Personal".to_string());
+
+        app.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Google Chrome"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Work"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("google-chrome:Work")
+        );
+
+        app.dispatch(AppCommand::NewTask)?;
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Personal"));
+        assert_eq!(
+            app.default_profile.current_profile_id.as_deref(),
+            Some("brave:Personal")
+        );
+        Ok(())
     }
 
     #[test]
@@ -12341,10 +14767,7 @@ mod redesign_tests {
             )?;
             app.selected_session_id = Some(session.id.clone());
             app.open_surface(Surface::BrowserSelect);
-            app.selected_row = BROWSER_CHOICES
-                .iter()
-                .position(|browser| *browser == BROWSER_USE_CLOUD)
-                .context("cloud browser choice")?;
+            app.selected_row = app.browser_select_local_browser_count();
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::SetupResult);
@@ -12369,6 +14792,222 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn browser_select_can_choose_detected_local_browser() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("browser.preference.profile", "chromium:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+        app.browser_profile_label = Some("Default".to_string());
+        app.default_profile.current_profile_id = Some("chromium:Default".to_string());
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Chromium".to_string()];
+        app.default_profile.profiles = vec![
+            CookieSyncProfile {
+                id: "google-chrome:Default".to_string(),
+                display_name: "Google Chrome - Default".to_string(),
+                browser_name: "Google Chrome".to_string(),
+                profile_name: "Default".to_string(),
+            },
+            CookieSyncProfile {
+                id: "chromium:Default".to_string(),
+                display_name: "Chromium - Default".to_string(),
+                browser_name: "Chromium".to_string(),
+                profile_name: "Default".to_string(),
+            },
+        ];
+
+        app.save_browser(0)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser")?
+                .as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser_label")?
+                .as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("local")
+        );
+        assert_eq!(app.store.get_setting("browser.preference.profile")?, None);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Google Chrome"));
+        assert_eq!(app.browser_profile_label, None);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_select_can_choose_chromium_managed_modes_without_notice() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Chromium".to_string()];
+        app.store.set_setting("browser.preference.mode", "local")?;
+
+        app.save_browser(0)?;
+        assert!(app.browser_select_chromium_expanded);
+        assert_eq!(app.selected_row, 1);
+
+        app.save_browser(1)?;
+        assert_eq!(app.browser, "Managed Chromium");
+        assert_eq!(app.status_notice, None);
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("managed-headed")
+        );
+
+        app.save_browser(2)?;
+        assert_eq!(app.browser, "Headless Chromium");
+        assert_eq!(app.status_notice, None);
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("managed-headless")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expanded_chromium_parent_selects_local_chromium() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("browser.preference.profile", "chromium:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+        app.browser_profile_label = Some("Default".to_string());
+        app.default_profile.current_profile_id = Some("chromium:Default".to_string());
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Chromium".to_string()];
+        app.default_profile.profiles = vec![CookieSyncProfile {
+            id: "chromium:Default".to_string(),
+            display_name: "Chromium - Default".to_string(),
+            browser_name: "Chromium".to_string(),
+            profile_name: "Default".to_string(),
+        }];
+
+        app.save_browser(0)?;
+        assert!(app.browser_select_chromium_expanded);
+        assert_eq!(app.selected_row, 1);
+
+        app.selected_row = 0;
+        app.save_browser(0)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser")?
+                .as_deref(),
+            Some("Chromium")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.browser_label")?
+                .as_deref(),
+            Some("Chromium")
+        );
+        assert_eq!(
+            app.store.get_setting("browser.preference.mode")?.as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile")?
+                .as_deref(),
+            Some("chromium:Default")
+        );
+        assert_eq!(app.browser_local_label.as_deref(), Some("Chromium"));
+        assert_eq!(app.browser_profile_label.as_deref(), Some("Default"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_browser_choices_keep_chromium_as_single_browser() {
+        let value = serde_json::json!({
+            "browsers": [
+                {
+                    "name": "Chromium",
+                    "browser_path": "/tmp/chromium",
+                    "profile_count": 0,
+                    "managed_headed": true,
+                    "managed_headless": true
+                },
+                {
+                    "name": "Google Chrome",
+                    "browser_path": "/tmp/chrome",
+                    "profile_count": 1,
+                    "managed_headed": false,
+                    "managed_headless": false
+                }
+            ]
+        });
+
+        assert_eq!(
+            local_browser_choices_from_value(&value),
+            Some(vec!["Google Chrome".to_string(), "Chromium".to_string()])
+        );
+    }
+
+    #[test]
+    fn browser_select_starts_on_current_and_labels_recommended() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.surface = Surface::BrowserSelect;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = None;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Brave".to_string()];
+        app.default_profile.current_profile_id = Some("brave:Default".to_string());
+
+        app.sync_browser_select_cursor_to_current();
+
+        assert_eq!(app.selected_row, 1);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Google Chrome  recommended"));
+        assert!(!screen.contains("current"));
+        Ok(())
+    }
+
+    #[test]
+    fn browser_select_infers_current_local_browser_from_profile_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.browser_local_label = None;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string(), "Brave".to_string()];
+        app.default_profile.current_profile_id = Some("brave:Default".to_string());
+        app.store
+            .set_setting("browser.preference.profile", "brave:Default")?;
+        app.store
+            .set_setting("browser.preference.profile_label", "Default")?;
+
+        app.save_browser(1)?;
+
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(app.browser_local_label.as_deref(), Some("Brave"));
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile")?
+                .as_deref(),
+            Some("brave:Default")
+        );
+        assert_eq!(
+            app.store
+                .get_setting("browser.preference.profile_label")?
+                .as_deref(),
+            Some("Default")
+        );
+        Ok(())
     }
 
     #[test]
@@ -12572,6 +15211,8 @@ mod redesign_tests {
             app.setup_complete = true;
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
+            app.open_surface(Surface::BrowserSelect);
+            app.selected_row = app.browser_select_local_browser_count();
 
             app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             assert_eq!(app.surface, Surface::ApiKey);
@@ -12682,6 +15323,51 @@ mod redesign_tests {
             assert!(events
                 .iter()
                 .any(|event| event.event_type == "browser.backend_changed"));
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn auth_surface_can_save_browser_use_cloud_key_without_changing_model_account() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let original_account = app.account.clone();
+
+            app.open_surface(Surface::Account);
+            app.selected_row = settings::AUTH_CHOICES
+                .iter()
+                .position(|account| *account == BROWSER_USE_CLOUD)
+                .context("Browser Use Cloud auth row")?;
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use Cloud"));
+            assert!(screen.contains("needs key"));
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            app.set_input("bu-auth-surface-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+                    .as_deref(),
+                Some("bu-auth-surface-key")
+            );
+            assert_eq!(app.account, original_account);
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert!(app.browser_use_cloud_key_ready()?);
             Ok(())
         })();
         if let Some(value) = saved {
@@ -12821,6 +15507,27 @@ mod redesign_tests {
         assert!(screen.contains("Google Chrome - Reagan"));
         assert!(!screen.contains("PROVIDERS"));
         assert!(!screen.contains("Continue with Codex"));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_surface_selects_browser_use_cloud_current_auth_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cloud_row = settings::AUTH_CHOICES
+            .iter()
+            .position(|account| *account == BROWSER_USE_CLOUD)
+            .context("Browser Use Cloud auth row")?;
+
+        app.account = BROWSER_USE_CLOUD.to_string();
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
+        app.account = settings::ACCOUNT_DEEPSEEK.to_string();
+        app.api_key_account = Some(BROWSER_USE_CLOUD.to_string());
+        app.open_surface(Surface::Account);
+        assert_eq!(app.selected_row, cloud_row);
+
         Ok(())
     }
 
@@ -13097,6 +15804,52 @@ mod redesign_tests {
         assert!(!screen.contains("17.3k/100k"));
         assert!(!screen.contains("999/60k"));
         assert!(screen.contains("$0.0123"));
+        Ok(())
+    }
+
+    #[test]
+    fn composer_status_keeps_cloud_live_url_when_context_status_is_crowded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.width = 66;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store.set_setting("browser", BROWSER_USE_CLOUD)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect crowded status"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {"input_tokens": 12345},
+                    "model_context_window": 100000
+                }
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"cost_usd": 0.0123}),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Browser Use Cloud"), "{screen}");
+        assert!(screen.contains("live browser"), "{screen}");
+        assert!(
+            !screen.contains("live https://live.browser-use"),
+            "{screen}"
+        );
         Ok(())
     }
 
@@ -13445,6 +16198,46 @@ mod redesign_tests {
 
         assert!(screen.contains(BROWSER_USE_CLOUD));
         Ok(())
+    }
+
+    #[test]
+    fn composer_browser_tag_is_red_when_cloud_key_is_missing() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.browser = BROWSER_USE_CLOUD.to_string();
+
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) == crate::theme::failed().fg),
+                "missing-key cloud browser tag should use failed color: {colors:?}"
+            );
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test-key")?;
+            let colors = render::render_text_foregrounds(&mut app, BROWSER_USE_CLOUD)?;
+            assert!(!colors.is_empty(), "cloud browser tag should render");
+            assert!(
+                colors
+                    .iter()
+                    .all(|color| Some(*color) != crate::theme::failed().fg),
+                "key-present cloud browser tag should not use failed color: {colors:?}"
+            );
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
     }
 
     #[test]
@@ -13812,6 +16605,9 @@ mod redesign_tests {
     fn slash_palette_layers_over_running_content() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        // The command palette grew an item; give the fixture a couple more rows
+        // (real terminals have them) so the running transcript still shows under it.
+        app.args.height = 32;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
@@ -14337,7 +17133,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
+    fn codex_oauth_login_output_stores_auth_and_uses_default_model() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
 
@@ -14353,22 +17149,21 @@ wire_api = "responses"
             .and_then(|flow| flow.event_tx_guard.as_ref())
             .expect("test Codex login sender")
             .clone();
-        tx.send(CodexLoginEvent::Output(
-            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
-                .to_string(),
-        ))
-        .expect("send test Codex output");
 
-        assert!(app.drain_codex_login_notifications()?);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("https://auth.openai.com/codex/device"));
-        assert!(screen.contains("ABCD-EFGH"));
+        assert!(screen.contains("https://auth.openai.com/oauth/authorize"));
         assert!(!screen.contains("\u{1b}[94m"));
 
-        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
-            access_token: "codex-access".to_string(),
-            account_id: "codex-account".to_string(),
-        })))
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "codex-access",
+                "codex-account",
+                Some("codex-id".to_string()),
+                Some("codex-refresh".to_string()),
+                None,
+                Some("2026-01-01T00:00:00Z".to_string()),
+            ),
+        )))
         .expect("send test Codex auth result");
         assert!(app.drain_codex_login_notifications()?);
         assert_eq!(
@@ -14378,6 +17173,10 @@ wire_api = "responses"
         assert_eq!(
             app.store.get_setting("auth.codex.account_id")?,
             Some("codex-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("codex-refresh".to_string())
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
@@ -14405,6 +17204,57 @@ wire_api = "responses"
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_selection_reauthenticates_over_stored_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.store
+            .set_setting("auth.codex.access_token", "old-access")?;
+        app.store
+            .set_setting("auth.codex.account_id", "old-account")?;
+        app.store
+            .set_setting("auth.codex.refresh_token", "old-refresh")?;
+
+        app.start_auth_flow(settings::ACCOUNT_CODEX.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .codex_login
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test Codex login sender")
+            .clone();
+
+        tx.send(CodexLoginEvent::Finished(Ok(
+            CodexManagedAuth::from_stored_parts(
+                "new-access",
+                "new-account",
+                Some("new-id".to_string()),
+                Some("new-refresh".to_string()),
+                None,
+                Some("2026-01-02T00:00:00Z".to_string()),
+            ),
+        )))
+        .expect("send test Codex auth result");
+        assert!(app.drain_codex_login_notifications()?);
+        assert_eq!(
+            app.store.get_setting("auth.codex.access_token")?,
+            Some("new-access".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.account_id")?,
+            Some("new-account".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.refresh_token")?,
+            Some("new-refresh".to_string())
+        );
         Ok(())
     }
 
@@ -14481,33 +17331,127 @@ wire_api = "responses"
         assert!(screen.contains("providers"), "{screen}");
         assert!(screen.contains(RECOMMENDED_MODELS[0].display), "{screen}");
         assert!(screen.contains("OpenAI"), "{screen}");
-        assert!(screen.contains("Anthropic · API key"), "{screen}");
-        assert!(screen.contains("OpenRouter · API key"), "{screen}");
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
         Ok(())
     }
 
     #[test]
-    fn provider_rows_collapse_openai_into_a_submenu() -> Result<()> {
+    fn provider_rows_are_single_menu_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app = ready_app(&temp)?;
         let rows = app.provider_rows();
-        // OpenAI is a single row that opens the auth sub-dialogue.
-        let openai = rows
-            .iter()
-            .find(|row| row.label == "OpenAI")
-            .expect("OpenAI row");
-        assert!(openai.submenu);
-        assert_eq!(openai.account, settings::ACCOUNT_CODEX);
-        // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
-        assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
-        // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
+        assert_eq!(rows.len(), 4);
         assert!(rows
             .iter()
-            .any(|row| row.label == "Anthropic · API key"
-                && row.account == settings::ACCOUNT_ANTHROPIC));
-        assert!(!rows
+            .any(|row| { row.label == "OpenAI" && row.account == settings::ACCOUNT_OPENAI }));
+        assert!(rows
             .iter()
-            .any(|row| row.label.contains("Anthropic · sign in")));
+            .any(|row| { row.label == "Anthropic" && row.account == settings::ACCOUNT_ANTHROPIC }));
+        assert!(rows.iter().any(|row| {
+            row.label == "OpenRouter" && row.account == settings::ACCOUNT_OPENROUTER
+        }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.label == "DeepSeek" && row.account == settings::ACCOUNT_DEEPSEEK }));
+        assert!(!rows.iter().any(|row| row.label.contains("API key")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_auth_menu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+
+        let rows = app.provider_rows();
+        let provider_row = rows
+            .iter()
+            .position(|row| row.label == "OpenRouter")
+            .context("OpenRouter provider row")?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("connected"), "{screen}");
+        assert!(!screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = RECOMMENDED_MODELS.len() + provider_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter"), "{screen}");
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(!screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenRouter API key"), "{screen}");
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenRouter use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+
+        app.open_surface(Surface::OpenAiAuth);
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENROUTER)
+        );
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn change_provider_key_does_not_change_active_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-openai")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.model = "GPT-5.5".to_string();
+        app.provider_model = "gpt-5.5".to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        app.open_surface(Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenRouter change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        app.handle_paste("new-openrouter-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
+        assert_eq!(
+            app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
+            Some("new-openrouter-key")
+        );
         Ok(())
     }
 
@@ -14548,16 +17492,254 @@ wire_api = "responses"
         app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
         app.execute_surface_selection()?;
         assert_eq!(app.surface, Surface::OpenAiAuth);
-        // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
-        // login). The API-key method is always offered.
-        let methods: Vec<OpenAiAuthMethod> = app
-            .openai_auth_rows()
+        let methods: Vec<ProviderAuthMethod> = app
+            .provider_auth_rows()
             .iter()
             .map(|row| row.method)
             .collect();
-        assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::ApiKey));
+        assert!(methods.contains(&ProviderAuthMethod::Codex));
+        Ok(())
+    }
+
+    #[test]
+    fn connected_openai_auth_submenu_offers_key_replacement() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        let change_row = rows
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("OpenAI change-key row")?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use an API key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        app.selected_row = change_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+
+        app.handle_paste("new-openai-key");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(
+            app.store.get_setting("auth.openai.api_key")?.as_deref(),
+            Some("new-openai-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_api_key_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[2].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[2].label, "Sign in with Codex OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeOAuth));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_oauth_auth_menu_defaults_to_current_login() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        assert!(!rows
+            .iter()
+            .any(|row| row.method == ProviderAuthMethod::ChangeApiKey));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_auth_menu_shows_change_rows_only_for_existing_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openai.api_key", "old-openai-key")?;
+        app.store
+            .set_setting("auth.codex.access_token", "codex-test-token")?;
+        app.store
+            .set_setting("auth.codex.account_id", "codex-test-account")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_OPENAI);
+
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        assert_eq!(rows[1].label, "Change OpenAI API key");
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::Codex
+                && row.label == "Select model with current login"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.method == ProviderAuthMethod::ChangeOAuth && row.label == "Change OpenAI OAuth"
+        }));
+
+        app.account = settings::ACCOUNT_CODEX.to_string();
+        app.open_surface(Surface::OpenAiAuth);
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::Codex);
+        assert_eq!(rows[0].label, "Select model with current login");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeOAuth);
+        assert_eq!(rows[1].label, "Change OpenAI OAuth");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_auth_menu_defaults_to_current_key() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_ANTHROPIC.to_string();
+        app.selected_provider = Some(settings::ACCOUNT_ANTHROPIC);
+
+        app.open_surface(Surface::OpenAiAuth);
+
+        let rows = app.provider_auth_rows();
+        assert_eq!(app.selected_row, 0);
+        assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey);
+        assert_eq!(rows[0].label, "Select model with current key");
+        assert_eq!(rows[1].method, ProviderAuthMethod::ChangeApiKey);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_api_key_providers_default_to_current_key_even_when_not_active() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "old-openrouter-key")?;
+        app.store
+            .set_setting("auth.deepseek.api_key", "old-deepseek-key")?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+
+        for account in [
+            settings::ACCOUNT_ANTHROPIC,
+            settings::ACCOUNT_OPENROUTER,
+            settings::ACCOUNT_DEEPSEEK,
+        ] {
+            app.selected_provider = Some(account);
+            app.open_surface(Surface::OpenAiAuth);
+
+            let rows = app.provider_auth_rows();
+            assert_eq!(app.selected_row, 0, "{account}");
+            assert_eq!(rows[0].method, ProviderAuthMethod::ApiKey, "{account}");
+            assert_eq!(rows[0].label, "Select model with current key", "{account}");
+            assert_eq!(
+                app.current_provider_auth_method(),
+                Some(ProviderAuthMethod::ApiKey)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_search_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store.set_setting("auth.openai.api_key", "sk-test")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ApiKey)
+            .context("OpenAI use-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Select model with current key"), "{screen}");
+        assert!(screen.contains("Change OpenAI API key"), "{screen}");
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Provider);
+        Ok(())
+    }
+
+    #[test]
+    fn api_key_escape_returns_to_provider_auth_menu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.anthropic.api_key", "old-anthropic-key")?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        let anthropic_row = app
+            .provider_rows()
+            .iter()
+            .position(|row| row.account == settings::ACCOUNT_ANTHROPIC)
+            .context("Anthropic provider row")?;
+        app.selected_row = RECOMMENDED_MODELS.len() + anthropic_row;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+
+        app.selected_row = app
+            .provider_auth_rows()
+            .iter()
+            .position(|row| row.method == ProviderAuthMethod::ChangeApiKey)
+            .context("Anthropic change-key row")?;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ApiKey);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Anthropic"), "{screen}");
+        assert!(screen.contains("Change Anthropic API key"), "{screen}");
         Ok(())
     }
 
@@ -14845,7 +18027,7 @@ wire_api = "responses"
             Surface::CookieSync,
         ] {
             app.open_surface(surface);
-            if surface == Surface::DefaultProfile {
+            if matches!(surface, Surface::BrowserSelect | Surface::DefaultProfile) {
                 app.default_profile.status = DefaultProfileStatus::Ready;
                 app.default_profile.profiles = vec![
                     CookieSyncProfile {
@@ -14861,14 +18043,17 @@ wire_api = "responses"
                         profile_name: "Personal".to_string(),
                     },
                 ];
+                app.default_profile.browsers =
+                    local_browser_choices_from_profiles(&app.default_profile.profiles);
             }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
                 Surface::SetupCloud => 2,
-                Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Account => AUTH_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
-                Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::Browser => 3,
+                Surface::BrowserSelect => app.browser_select_row_count(),
                 Surface::DefaultProfile => app.default_profile_row_count(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
@@ -15043,11 +18228,15 @@ wire_api = "responses"
         )?;
         app.selected_session_id = Some(session.id.clone());
 
-        let local_index = BROWSER_CHOICES
-            .iter()
-            .position(|choice| *choice == BROWSER_LOCAL_CHROME)
-            .context("local browser choice")?;
-        app.save_browser(local_index)?;
+        app.default_profile.status = DefaultProfileStatus::Ready;
+        app.default_profile.browsers = vec!["Google Chrome".to_string()];
+        app.default_profile.profiles = vec![CookieSyncProfile {
+            id: "google-chrome:Default".to_string(),
+            display_name: "Google Chrome - Default".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            profile_name: "Default".to_string(),
+        }];
+        app.save_browser(0)?;
         let state = app.workbench_state()?;
         assert_eq!(state.browser.backend, BROWSER_LOCAL_CHROME);
         assert_eq!(state.browser.live_url, None);
@@ -15801,6 +18990,11 @@ wire_api = "responses"
         )?;
         app.store.append_event(
             &session.id,
+            "stream_error",
+            serde_json::json!({"message": "provider disconnected"}),
+        )?;
+        app.store.append_event(
+            &session.id,
             "session.failed",
             serde_json::json!({"error": "provider disconnected"}),
         )?;
@@ -15812,11 +19006,62 @@ wire_api = "responses"
             "{screen}"
         );
         assert!(screen.contains("provider disconnected"), "{screen}");
+        assert!(
+            screen.contains("Hint: use /model to choose a different model, then try again."),
+            "{screen}"
+        );
         assert_eq!(
             screen
                 .matches("I found the transcript handoff issue.")
                 .count(),
             1,
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_session_after_model_response_does_not_show_model_hint() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I can inspect it with a tool."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"tool_call_count": 1, "text_delta_chars": 29}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.failed",
+            serde_json::json!({"name": "shell", "error": "command failed"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "command failed"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("command failed"), "{screen}");
+        assert!(
+            !screen.contains("Hint: use /model to choose a different model, then try again."),
             "{screen}"
         );
         Ok(())
@@ -19261,6 +22506,16 @@ wire_api = "responses"
             Some(session_id.as_str()),
             "pending_auth_resume should be set to the nudge session id"
         );
+        assert!(app.session_is_waiting_for_auth(&session_id));
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("It looks like you don't have an API key set up yet"),
+            "nudge should render as committed assistant text"
+        );
+        assert!(
+            !screen.contains("Working..."),
+            "blocked auth nudge must not render as active work: {screen}"
+        );
         // Composer should be cleared.
         assert!(app.composer.is_empty());
         Ok(())
@@ -19311,6 +22566,19 @@ wire_api = "responses"
             app.pending_auth_resume.is_none(),
             "pending_auth_resume should be cleared after resume"
         );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "session.status"
+                    && event
+                        .payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("running")
+            }),
+            "auth resume should mark the blocked nudge session running"
+        );
+        assert!(!app.session_events_are_waiting_for_auth(&session.id, &events));
         // The nudge session should be selected.
         assert_eq!(
             app.selected_session_id.as_deref(),

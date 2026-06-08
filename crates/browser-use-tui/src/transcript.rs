@@ -250,7 +250,7 @@ enum TranscriptKind {
         style: NodeStyle,
     },
     Error {
-        text: String,
+        lines: Vec<String>,
     },
     Cancelled {
         title: String,
@@ -328,12 +328,9 @@ impl TranscriptNode {
             } => {
                 tool_image_display_lines(path.as_deref(), label.as_deref(), *took_screenshot, width)
             }
-            TranscriptKind::Error { text } => grouped_lines(
-                "error",
-                &[friendly_error_message(text)],
-                NodeStyle::Failed,
-                width,
-            ),
+            TranscriptKind::Error { lines } => {
+                grouped_lines("error", lines, NodeStyle::Failed, width)
+            }
             TranscriptKind::Cancelled { title, text, style } => {
                 grouped_lines(title, std::slice::from_ref(text), *style, width)
             }
@@ -393,12 +390,9 @@ impl TranscriptNode {
                 *took_screenshot,
                 width,
             ),
-            TranscriptKind::Error { text } => native_grouped_lines(
-                "error",
-                &[friendly_error_message(text)],
-                NodeStyle::Failed,
-                width,
-            ),
+            TranscriptKind::Error { lines } => {
+                native_grouped_lines("error", lines, NodeStyle::Failed, width)
+            }
             TranscriptKind::Cancelled { title, text, style } => {
                 native_grouped_lines(title, std::slice::from_ref(text), *style, width)
             }
@@ -456,11 +450,18 @@ impl TranscriptNode {
                 label,
                 took_screenshot,
             } => tool_image_plain_lines(path.as_deref(), label.as_deref(), *took_screenshot),
-            TranscriptKind::Error { text } => {
-                vec![
-                    "• error".to_string(),
-                    format!("{GROUP_VALUE_LAST_PREFIX}{}", friendly_error_message(text)),
-                ]
+            TranscriptKind::Error { lines } => {
+                let mut out = vec!["• error".to_string()];
+                let last_idx = lines.len().saturating_sub(1);
+                out.extend(lines.iter().enumerate().map(|(idx, line)| {
+                    let prefix = if idx == last_idx {
+                        GROUP_VALUE_LAST_PREFIX
+                    } else {
+                        GROUP_VALUE_RAIL_PREFIX
+                    };
+                    format!("{prefix}{line}")
+                }));
+                out
             }
             TranscriptKind::Cancelled { title, text, .. } => {
                 vec![
@@ -774,7 +775,9 @@ fn build_transcript_model_from_events(
 
     let has_live_subagent_work = active_child_session_count(app, &session.id) > 0
         || pending_agent_mailbox_count(app, &session.id) > 0;
-    let active = if session.status.is_active() || has_live_subagent_work {
+    let active = if app.session_events_are_waiting_for_auth(&session.id, events) {
+        None
+    } else if session.status.is_active() || has_live_subagent_work {
         active_node_for_session(app, state, session, events)
     } else {
         None
@@ -1303,13 +1306,12 @@ fn committed_node_for_event(
             })
         }
         "session.failed" => {
-            let text =
-                payload_string(event, "error").unwrap_or_else(|| "The task failed.".to_string());
+            let lines = session_failed_error_lines(root, events, event);
             let node = TranscriptNode {
                 id,
                 seq: event.seq,
                 revision: event.seq.max(0) as u64,
-                kind: TranscriptKind::Error { text },
+                kind: TranscriptKind::Error { lines },
             };
             Some(with_streaming_commentary_before_event(
                 root, events, event, node,
@@ -1683,6 +1685,52 @@ fn committed_node_for_event(
         | "command.cleaned_up" => None,
         _ => None,
     }
+}
+
+const MODEL_FAILURE_CHANGE_MODEL_HINT: &str =
+    "Hint: use /model to choose a different model, then try again.";
+
+fn session_failed_error_lines(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> Vec<String> {
+    let text = payload_string(event, "error").unwrap_or_else(|| "The task failed.".to_string());
+    let mut lines = vec![friendly_error_message(&text)];
+    if failed_after_model_request_without_response(root, events, event) {
+        lines.push(MODEL_FAILURE_CHANGE_MODEL_HINT.to_string());
+    }
+    lines
+}
+
+fn failed_after_model_request_without_response(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> bool {
+    let Some(event_idx) = events.iter().position(|candidate| {
+        candidate.session_id == event.session_id
+            && candidate.seq == event.seq
+            && candidate.event_type == event.event_type
+    }) else {
+        return false;
+    };
+
+    let prior = &events[..event_idx];
+    let Some(turn_start_idx) = prior.iter().rposition(|candidate| {
+        candidate.session_id == root.id
+            && matches!(
+                candidate.event_type.as_str(),
+                "model.turn.request" | "model.turn.retry"
+            )
+    }) else {
+        return false;
+    };
+
+    let turn_events = &prior[turn_start_idx..];
+    !turn_events.iter().any(|candidate| {
+        candidate.session_id == root.id && candidate.event_type == "model.turn.response"
+    })
 }
 
 fn push_committed_node(committed: &mut Vec<TranscriptNode>, node: TranscriptNode) {
@@ -5214,7 +5262,11 @@ fn is_useful_source_for_backend(source: &str, backend: &str) -> bool {
 }
 
 fn browser_backend_supports_live_url(backend: &str) -> bool {
-    backend.to_ascii_lowercase().contains("cloud")
+    let backend = backend.to_ascii_lowercase();
+    backend.contains("cloud")
+        || backend.contains("managed")
+        || backend.contains("headless chromium")
+        || backend.contains("managed chromium")
 }
 
 fn is_cloud_live_url(source: &str) -> bool {
@@ -8052,6 +8104,33 @@ mod tests {
             group_label_style("run", NodeStyle::Normal),
             group_label_style("explored", NodeStyle::Normal)
         );
+    }
+
+    #[test]
+    fn source_for_state_keeps_headless_chromium_live_preview() {
+        let live_url = "file:///tmp/browser-use-terminal/.capture.frames/live.html";
+        let state = WorkbenchState {
+            setup_complete: true,
+            current_session: None,
+            task: None,
+            result: None,
+            failure: None,
+            activity: Vec::new(),
+            transcript: Vec::new(),
+            browser: browser_use_protocol::BrowserSummary {
+                backend: "Headless Chromium".to_string(),
+                status: "connected".to_string(),
+                title: None,
+                url: None,
+                live_url: Some(live_url.to_string()),
+                tabs: None,
+                viewport: None,
+            },
+            telemetry: browser_use_protocol::TelemetrySummary::default(),
+            history: Vec::new(),
+        };
+
+        assert_eq!(source_for_state(&state).as_deref(), Some(live_url));
     }
 
     #[test]
