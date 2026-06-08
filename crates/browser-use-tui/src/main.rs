@@ -9355,6 +9355,11 @@ impl App {
     }
 
     fn should_animate_live_spinner(&mut self) -> bool {
+        if self.surface == Surface::CookieSync
+            && matches!(self.cookie_sync.status, CookieSyncStatus::Syncing)
+        {
+            return true;
+        }
         if !self.native_scrollback_is_active() {
             return false;
         }
@@ -9384,6 +9389,9 @@ impl App {
     }
 
     fn product_state(&self, state: &WorkbenchState) -> ProductState {
+        if !self.setup_complete && self.surface == Surface::ModelSearch {
+            return ProductState::Ready;
+        }
         if !self.setup_complete && state.history.is_empty() && state.current_session.is_none() {
             return ProductState::SetupNeeded;
         }
@@ -15167,6 +15175,7 @@ mod redesign_tests {
 
         let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 100));
 
+        assert!(plain.contains("⠋ Syncing all cookies from Google Chrome - Reagan"));
         assert!(plain.contains("Syncing all cookies from Google Chrome - Reagan"));
         assert!(!plain.contains("google-chrome:Default"));
     }
@@ -15181,7 +15190,7 @@ mod redesign_tests {
 
         let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 18));
 
-        assert!(plain.contains("  Syncing all"));
+        assert!(plain.contains("Syncing all"));
         assert!(plain.contains("  cookies from"));
         assert!(plain.contains("  Alpha Beta"));
         for line in plain.lines().filter(|line| line.starts_with("  ")) {
@@ -15426,7 +15435,8 @@ mod redesign_tests {
             assert_eq!(app.surface, Surface::SetupCloudSuccess);
 
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use Cloud is connected"));
+            assert!(screen.contains("Browser Use Cloud connected"));
+            assert!(!screen.contains("Browser Use Cloud is connected"));
             assert!(screen.contains("Continue to cookie sync?"));
             assert!(screen.contains("> Yes"));
             assert!(screen.contains("  Skip"));
@@ -15487,6 +15497,11 @@ mod redesign_tests {
             assert!(!app.pending_setup_after_cookie_sync);
             assert_eq!(app.browser, BROWSER_USE_CLOUD);
             assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Model"));
+            assert!(!screen.contains("PROVIDERS"));
+            assert!(!screen.contains("Continue with Codex login"));
             Ok(())
         })();
         if let Some(value) = saved {

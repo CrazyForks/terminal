@@ -2480,8 +2480,6 @@ fn setup_cloud_lines(app: &App) -> Vec<Line<'static>> {
 
 fn setup_cloud_connected_lines(app: &App) -> Vec<Line<'static>> {
     vec![
-        Line::from(Span::styled("Browser Use Cloud is connected", done())),
-        Line::from(""),
         Line::from(Span::styled("Continue to cookie sync?", bold())),
         Line::from(""),
         selected("Yes", 0, app.selected_row),
@@ -3767,9 +3765,10 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .selected_profile_label
                 .as_deref()
                 .unwrap_or("selected profile");
+            let spinner = IMPORT_SPINNER[app.live_spinner_frame % IMPORT_SPINNER.len()];
             push_wrapped_cookie_sync_paragraph(
                 &mut lines,
-                &format!("Syncing all cookies from {profile}..."),
+                &format!("{spinner} Syncing all cookies from {profile}..."),
                 body_width,
             );
         }
