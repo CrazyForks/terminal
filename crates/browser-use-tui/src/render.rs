@@ -2421,7 +2421,7 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     if account == ACCOUNT_CODEX {
         lines.extend([
             Line::from("  A local Codex login is already available."),
-            Line::from("  Continue to choose a model for this login."),
+            Line::from("  Continue to Browser Use Cloud setup."),
             Line::from("  No API key is required."),
         ]);
     } else if is_claude_code_account(account) {
@@ -2512,20 +2512,12 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         } else if app.setup_complete {
             "  Continue keeps your current model."
         } else {
-            "  Continue to choose a model."
+            "  Continue to Browser Use Cloud setup."
         };
         lines.extend([
             Line::from(Span::styled(next_message, muted())),
             Line::from(""),
-            selected(
-                if app.setup_complete {
-                    "Continue"
-                } else {
-                    "Choose model"
-                },
-                0,
-                app.selected_row,
-            ),
+            selected("Continue", 0, app.selected_row),
         ]);
     } else if is_pending {
         if result.account == ACCOUNT_CODEX {

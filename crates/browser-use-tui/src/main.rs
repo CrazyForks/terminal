@@ -6398,10 +6398,8 @@ impl App {
         self.pending_setup_after_cookie_sync = false;
         self.pending_cookie_sync_after_auth = false;
         self.select_local_chrome()?;
-        self.complete_setup()?;
         self.status_notice = None;
-        self.close_surface();
-        Ok(())
+        self.open_setup_model_selection()
     }
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
@@ -6440,10 +6438,17 @@ impl App {
             return self.save_model_with_choice(choice);
         }
         if !self.setup_complete {
-            let account = self.account.clone();
-            return self.open_provider_model_search(&account);
+            self.status_notice = None;
+            self.open_surface(Surface::SetupCloud);
+            return Ok(());
         }
         self.advance_after_auth()
+    }
+
+    fn open_setup_model_selection(&mut self) -> Result<()> {
+        self.pending_model_search_after_auth = false;
+        let account = self.account.clone();
+        self.open_provider_model_search(&account)
     }
 
     /// If a nudge session is waiting for auth, start its agent and navigate to
@@ -7473,8 +7478,14 @@ impl App {
 
     fn advance_after_auth(&mut self) -> Result<()> {
         // The /model provider flow connects first, then lets the user choose from
-        // the provider's live model list. First-run setup keeps auto-picking a
-        // default so onboarding stays one step.
+        // the provider's live model list. First-run setup asks for the Browser
+        // Use Cloud choice before model selection so cookie sync can happen up
+        // front.
+        if !self.setup_complete {
+            self.status_notice = None;
+            self.open_surface(Surface::SetupCloud);
+            return Ok(());
+        }
         if self.pending_model_search_after_auth {
             self.pending_model_search_after_auth = false;
             let account = self.account.clone();
@@ -7523,7 +7534,8 @@ impl App {
         let completing_setup = !self.setup_complete;
         if completing_setup {
             self.status_notice = None;
-            self.open_surface(Surface::SetupCloud);
+            self.complete_setup()?;
+            self.close_surface();
             return Ok(());
         }
         // No top "Model set to X" notice — the active model already shows in the
@@ -9006,8 +9018,8 @@ impl App {
         if self.pending_setup_after_cookie_sync {
             self.pending_setup_after_cookie_sync = false;
             self.pending_cookie_sync_after_auth = false;
-            self.complete_setup()?;
             self.status_notice = notice;
+            return self.open_setup_model_selection();
         }
         self.close_surface();
         Ok(())
@@ -14396,16 +14408,9 @@ mod redesign_tests {
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
-        assert!(!app.setup_complete);
-        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
-
-        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::SetupCloud);
         assert!(!app.setup_complete);
         assert_eq!(app.account, "Codex login");
-        assert_eq!(app.model, "gpt-5.5");
-        assert_eq!(app.provider_model, "gpt-5.5");
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("One-Click Browser Use Cloud Setup?"));
         assert!(screen.contains("> free"));
@@ -14415,8 +14420,17 @@ mod redesign_tests {
 
         app.selected_row = 1;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+
+        app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert_eq!(app.account, "Codex login");
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(
             app.store
@@ -15344,16 +15358,9 @@ mod redesign_tests {
             let mut app = ready_app(&temp)?;
             let original_account = app.account.clone();
 
-            app.open_surface(Surface::Account);
-            app.selected_row = settings::AUTH_CHOICES
-                .iter()
-                .position(|account| *account == BROWSER_USE_CLOUD)
-                .context("Browser Use Cloud auth row")?;
+            app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             let screen = render_dump(&mut app)?;
             assert!(screen.contains("Browser Use Cloud"));
-            assert!(screen.contains("needs key"));
-
-            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
             assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
             app.set_input("bu-auth-surface-key".to_string());
@@ -15428,10 +15435,9 @@ mod redesign_tests {
     }
 
     #[test]
-    fn onboarding_cookie_sync_completion_sets_cloud_profile_and_finishes_setup() -> Result<()> {
+    fn onboarding_cookie_sync_opens_model_selection_after_cloud_profile() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
-        app.model_configured = true;
         app.account = settings::ACCOUNT_OPENAI.to_string();
         app.store
             .set_setting("auth.openai.api_key", "sk-test-key")?;
@@ -15476,10 +15482,17 @@ mod redesign_tests {
 
         app.execute_surface_selection()?;
 
-        assert_eq!(app.surface, Surface::Main);
-        assert!(app.setup_complete);
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
         assert!(!app.pending_setup_after_cookie_sync);
         assert_eq!(app.browser, BROWSER_USE_CLOUD);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "gpt-5.5");
         Ok(())
     }
 
@@ -15555,6 +15568,13 @@ mod redesign_tests {
         assert!(!app.setup_complete);
         app.selected_row = 1;
         app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        let default_model = app
+            .default_model_for_account(settings::ACCOUNT_OPENROUTER)
+            .context("default OpenRouter model")?;
+        app.save_model(default_model)?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
@@ -17180,13 +17200,19 @@ wire_api = "responses"
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("Continue to choose a model."));
-        assert!(screen.contains("> Choose model"));
+        assert!(screen.contains("Continue to Browser Use Cloud setup."));
+        assert!(screen.contains("> Continue"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.surface, Surface::SetupCloud);
         assert!(!app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_CODEX);
+
+        app.selected_row = 1;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
         assert_eq!(
             app.model_search_rows(),
@@ -17195,14 +17221,10 @@ wire_api = "responses"
         assert!(!app.model_search_has_filter_input());
 
         app.save_provider_model("gpt-5.5".to_string())?;
-        assert_eq!(app.surface, Surface::SetupCloud);
-        assert!(!app.setup_complete);
-        assert_eq!(app.model, "gpt-5.5");
-        assert_eq!(app.provider_model, "gpt-5.5");
-        app.selected_row = 1;
-        app.execute_surface_selection()?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
     }
@@ -17965,20 +17987,22 @@ wire_api = "responses"
         );
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.surface, Surface::SetupCloud);
         assert!(!app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+
+        app.selected_row = 1;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
 
         app.save_provider_model("gpt-5.5".to_string())?;
-        assert_eq!(app.surface, Surface::SetupCloud);
-        assert!(!app.setup_complete);
-        assert_eq!(app.model, "gpt-5.5");
-        assert_eq!(app.provider_model, "gpt-5.5");
-        app.selected_row = 1;
-        app.execute_surface_selection()?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert_eq!(app.model, "gpt-5.5");
+        assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
     }
