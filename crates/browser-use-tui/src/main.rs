@@ -49,11 +49,11 @@ use browser_use_providers::{
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, exchange_codex_authorization_code,
-    parse_claude_code_authorization_input, parse_codex_authorization_input,
-    ClaudeCodeAuthorization, CodexAuthorization, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT, CODEX_CALLBACK_HOST, CODEX_CALLBACK_PATH,
-    CODEX_CALLBACK_PORT,
+    codex_callback_page, codex_callback_status, exchange_claude_code_authorization_code,
+    exchange_codex_authorization_code, parse_claude_code_authorization_input,
+    parse_codex_authorization_input, ClaudeCodeAuthorization, CodexAuthorization,
+    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    CODEX_CALLBACK_HOST, CODEX_CALLBACK_PORT,
 };
 #[cfg(test)]
 use browser_use_store::StoreNotifier;
@@ -9923,34 +9923,19 @@ fn handle_codex_callback(
         .and_then(|line| line.split_whitespace().nth(1))
         .context("parse Codex OAuth callback request")?;
     let parsed = parse_codex_authorization_input(path);
-    let status = if !path.starts_with(CODEX_CALLBACK_PATH) {
-        404
-    } else if parsed.error.is_some() {
-        400
-    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
-        400
-    } else {
-        200
-    };
-    let text = match status {
-        200 => "Codex authentication completed. You can close this window.",
-        400 => parsed
-            .error_description
-            .as_deref()
-            .or(parsed.error.as_deref())
-            .unwrap_or("Codex authentication failed: missing code or state mismatch."),
-        _ => "Codex callback route not found.",
-    };
-    let body = format!("<html><body><p>{text}</p></body></html>");
+    let status = codex_callback_status(path, expected_state, &parsed);
+    let page = codex_callback_page(status, &parsed);
     let response = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        page.status_text,
+        page.body.len(),
+        page.body
     );
     stream.write_all(response.as_bytes()).ok();
     if status == 200 {
         Ok(parsed)
     } else {
-        anyhow::bail!("{text}")
+        anyhow::bail!("{}", page.message)
     }
 }
 
