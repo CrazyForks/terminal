@@ -27,6 +27,12 @@ if [[ -z "$TARGET_TRIPLE" ]]; then
         *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
       esac
       ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$(uname -m)" in
+        x86_64|amd64) TARGET_TRIPLE="x86_64-pc-windows-msvc" ;;
+        *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+      esac
+      ;;
     *)
       echo "unsupported OS: $(uname -s)" >&2
       exit 1

@@ -56,6 +56,10 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -80,10 +84,18 @@ jobs:
           python -m venv .browser-use-core-smoke
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             smoke_python=".browser-use-core-smoke/Scripts/python.exe"
+            smoke_bin=".browser-use-core-smoke/Scripts"
+            terminal_script="$smoke_bin/browser-use-terminal.exe"
+            tui_script="$smoke_bin/but.exe"
           else
             smoke_python=".browser-use-core-smoke/bin/python"
+            smoke_bin=".browser-use-core-smoke/bin"
+            terminal_script="$smoke_bin/browser-use-terminal"
+            tui_script="$smoke_bin/but"
           fi
           "$smoke_python" -m pip install "$wheel"
+          "$terminal_script" --version
+          "$tui_script" --version
           "$smoke_python" - <<'PY'
           import json
           import os

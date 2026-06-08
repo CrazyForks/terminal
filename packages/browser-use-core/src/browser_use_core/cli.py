@@ -36,7 +36,8 @@ def _ensure_agent_ripgrep(repo_root: Path) -> None:
         return
     dest = repo_root / "target" / "debug" / "agent-tools"
     rg = dest / "rg"
-    if rg.exists():
+    rg_exe = dest / "rg.exe"
+    if rg.exists() or rg_exe.exists():
         return
     subprocess.run(
         [str(script), str(dest)],

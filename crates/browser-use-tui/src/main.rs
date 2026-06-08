@@ -9107,6 +9107,14 @@ impl Command for EnableMouseClickCapture {
         // The welcome logo only needs button press/release coordinates.
         f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h"))
     }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mouse click capture is not implemented for legacy Windows terminals",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
