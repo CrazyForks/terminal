@@ -2401,9 +2401,9 @@ fn setup_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
 
 fn setup_welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let label = if app.selected_row == 0 && app.setup_cta_caret_visible {
-        "> Get started"
+        "> Get started [enter]"
     } else {
-        "  Get started"
+        "  Get started [enter]"
     };
     vec![centered_line(
         label,
