@@ -87,6 +87,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const MESSAGE_KIND_INITIAL: &str = "initial";
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
@@ -95,6 +96,13 @@ const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
 const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+
+#[derive(Clone, Debug, Default)]
+struct MessageAnalytics {
+    provider_kind: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
 
 fn should_color_stdout() -> bool {
     io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
@@ -1473,11 +1481,22 @@ fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
 fn start(store: &Store, text: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let task = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &task.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    let analytics = MessageAnalytics::default();
+    capture_user_message(
+        store,
+        "cli",
+        &task.id,
+        task.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     maybe_append_message_history(&task.id, &text, &cwd, &AgentRunOptions::default());
     println!("{}", task.id);
     Ok(())
@@ -1490,11 +1509,22 @@ fn run_new_session_from_config(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    let analytics = message_analytics_for_config(&config);
+    capture_user_message(
+        store,
+        "cli",
+        &session.id,
+        session.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     maybe_append_message_history(&session.id, &text, &cwd, &config.options);
     let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
@@ -2031,13 +2061,24 @@ fn child_request_fork_mode(raw: Option<&str>) -> Result<ForkMode> {
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    store.append_event(
+    let input_record = store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
         .with_fake_result(fake_agent_result_text(&text, python_code.as_deref()));
+    let analytics = message_analytics_for_config(&config);
+    capture_user_message(
+        store,
+        "cli",
+        &session.id,
+        session.parent_id.is_some(),
+        MESSAGE_KIND_INITIAL,
+        input_record.seq,
+        &text,
+        analytics,
+    );
     let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
@@ -2679,6 +2720,82 @@ fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRe
     session_was_interrupted(events)
 }
 
+fn message_analytics_for_config(config: &ProviderRunConfig) -> MessageAnalytics {
+    MessageAnalytics {
+        provider_kind: Some(analytics_provider_kind_for_backend(config.backend).to_string()),
+        provider: Some(provider_id_for_backend(config.backend).to_string()),
+        model: Some(config.model.clone()),
+    }
+}
+
+fn analytics_provider_kind_for_backend(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "subscription",
+        ProviderBackend::Openai
+        | ProviderBackend::Anthropic
+        | ProviderBackend::Openrouter
+        | ProviderBackend::Deepseek => "api_key",
+        ProviderBackend::Fake | ProviderBackend::None => "other",
+    }
+}
+
+fn provider_id_for_backend(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "codex",
+        ProviderBackend::Openai => "openai",
+        ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Deepseek => "deepseek",
+        ProviderBackend::Fake => "fake",
+        ProviderBackend::None => "none",
+    }
+}
+
+fn append_message_analytics(properties: &mut serde_json::Value, analytics: MessageAnalytics) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
+    for (key, value) in [
+        ("provider_kind", analytics.provider_kind),
+        ("provider", analytics.provider),
+    ] {
+        if let Some(value) = value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            object.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if let Some(raw_model) = analytics
+        .model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let simple_model = simple_model_id(&raw_model);
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(simple_model.clone()),
+        );
+        if simple_model != raw_model {
+            object.insert(
+                "provider_model".to_string(),
+                serde_json::Value::String(raw_model),
+            );
+        }
+    }
+}
+
+fn simple_model_id(model: &str) -> String {
+    model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .replace('_', "-")
+        .to_ascii_lowercase()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_user_message(
     store: &Store,
@@ -2688,6 +2805,7 @@ fn capture_user_message(
     kind: &str,
     seq: i64,
     text: &str,
+    analytics: MessageAnalytics,
 ) {
     let trimmed = text.trim();
     let char_count = trimmed.chars().count();
@@ -2697,20 +2815,18 @@ fn capture_user_message(
         trimmed.split_whitespace().count()
     };
     let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
-    capture_async(
-        store,
-        "bu:tui user_message",
-        serde_json::json!({
-            "surface": surface,
-            "session_id": session_id,
-            "is_subagent": is_subagent,
-            "kind": kind,
-            "seq": seq,
-            "char_count": char_count,
-            "word_count": word_count,
-            "approx_tokens": approx_tokens,
-        }),
-    );
+    let mut properties = serde_json::json!({
+        "surface": surface,
+        "session_id": session_id,
+        "is_subagent": is_subagent,
+        "kind": kind,
+        "seq": seq,
+        "char_count": char_count,
+        "word_count": word_count,
+        "approx_tokens": approx_tokens,
+    });
+    append_message_analytics(&mut properties, analytics);
+    capture_async(store, "bu:tui user_message", properties);
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
@@ -2724,6 +2840,7 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
             MESSAGE_KIND_FOLLOWUP,
             seq,
             &text,
+            MessageAnalytics::default(),
         );
         maybe_append_message_history(
             task_id,
@@ -2747,6 +2864,7 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
         MESSAGE_KIND_FOLLOWUP,
         followup_record.seq,
         &text,
+        MessageAnalytics::default(),
     );
     maybe_append_message_history(
         task_id,
