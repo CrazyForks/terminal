@@ -10,7 +10,7 @@ class PlatformWheel(bdist_wheel):
     def finalize_options(self) -> None:
         super().finalize_options()
         self.root_is_pure = False
-        plat_name = os.environ.get("BROWSER_USE_RUST_PLAT_NAME")
+        plat_name = os.environ.get("BROWSER_USE_CORE_PLAT_NAME")
         if plat_name:
             self.plat_name = plat_name
 

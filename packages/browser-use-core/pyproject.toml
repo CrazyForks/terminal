@@ -3,9 +3,9 @@ requires = ["setuptools>=70.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "browser-use-rust"
+name = "browser-use-core"
 version = "0.13.0"
-description = "Packaged Browser Use Rust runtime binaries and Python worker resources."
+description = "Packaged Browser Use Rust terminal binaries and Python worker resources."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 dependencies = [
@@ -23,9 +23,9 @@ dependencies = [
 ]
 
 [project.scripts]
-browser-use-terminal = "browser_use_rust.cli:main"
-but = "browser_use_rust.cli:tui_main"
-browser-use-terminal-ui = "browser_use_rust.cli:tui_main"
+browser-use-terminal = "browser_use_core.cli:main"
+but = "browser_use_core.cli:tui_main"
+browser-use-terminal-ui = "browser_use_core.cli:tui_main"
 
 [tool.setuptools.package-dir]
 "" = "src"
@@ -34,7 +34,7 @@ browser-use-terminal-ui = "browser_use_rust.cli:tui_main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-browser_use_rust = [
+browser_use_core = [
   "bin/*",
   "bin/agent-tools/*",
   "python/llm_browser_worker/*.py",

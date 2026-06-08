@@ -5,11 +5,11 @@ from pathlib import Path
 
 
 class BinaryNotFoundError(FileNotFoundError):
-    """Raised when a packaged Browser Use Rust binary cannot be found."""
+    """Raised when a packaged Browser Use terminal binary cannot be found."""
 
 
 def binary_path(binary: str = "browser-use-terminal") -> str:
-    """Return the absolute path to a packaged Browser Use Rust binary."""
+    """Return the absolute path to a packaged Browser Use terminal binary."""
 
     binary_name = _binary_name(binary)
     package_dir = _package_dir()
@@ -28,7 +28,7 @@ def binary_path(binary: str = "browser-use-terminal") -> str:
             return str(candidate)
 
     searched = "\n".join(f"  - {path}" for path in candidates)
-    raise BinaryNotFoundError(f"Could not find Browser Use Rust binary '{binary_name}'. Searched:\n{searched}")
+    raise BinaryNotFoundError(f"Could not find Browser Use terminal binary '{binary_name}'. Searched:\n{searched}")
 
 
 def _package_dir() -> Path:

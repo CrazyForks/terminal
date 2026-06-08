@@ -1,27 +1,27 @@
-name: browser-use-rust wheels
+name: browser-use-core wheels
 
 on:
   pull_request:
     paths:
-      - ".github/workflows/browser-use-rust-wheels.yml"
+      - ".github/workflows/browser-use-core-wheels.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
-      - "packages/browser-use-rust/**"
+      - "packages/browser-use-core/**"
       - "python/llm_browser_worker/**"
-      - "scripts/build-browser-use-rust-wheel.sh"
+      - "scripts/build-browser-use-core-wheel.sh"
       - "scripts/install-agent-ripgrep.sh"
   push:
     branches:
       - main
     paths:
-      - ".github/workflows/browser-use-rust-wheels.yml"
+      - ".github/workflows/browser-use-core-wheels.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
-      - "packages/browser-use-rust/**"
+      - "packages/browser-use-core/**"
       - "python/llm_browser_worker/**"
-      - "scripts/build-browser-use-rust-wheel.sh"
+      - "scripts/build-browser-use-core-wheel.sh"
       - "scripts/install-agent-ripgrep.sh"
   workflow_dispatch:
 
@@ -38,9 +38,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: python -m pip install -e packages/browser-use-rust pytest
+        run: python -m pip install -e packages/browser-use-core pytest
       - name: Run package tests
-        run: python -m pytest -q packages/browser-use-rust/tests
+        run: python -m pytest -q packages/browser-use-core/tests
 
   build:
     name: build ${{ matrix.target }}
@@ -75,17 +75,17 @@ jobs:
         run: python -m pip install build
       - name: Build wheel
         shell: bash
-        run: TARGET_TRIPLE=${{ matrix.target }} OUT_DIR=dist scripts/build-browser-use-rust-wheel.sh
+        run: TARGET_TRIPLE=${{ matrix.target }} OUT_DIR=dist scripts/build-browser-use-core-wheel.sh
       - name: Smoke installed wheel
         shell: bash
         run: |
           set -euo pipefail
-          wheel="$(ls dist/browser_use_rust-*.whl)"
-          python -m venv .browser-use-rust-smoke
+          wheel="$(ls dist/browser_use_core-*.whl)"
+          python -m venv .browser-use-core-smoke
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            smoke_python=".browser-use-rust-smoke/Scripts/python.exe"
+            smoke_python=".browser-use-core-smoke/Scripts/python.exe"
           else
-            smoke_python=".browser-use-rust-smoke/bin/python"
+            smoke_python=".browser-use-core-smoke/bin/python"
           fi
           "$smoke_python" -m pip install "$wheel"
           "$smoke_python" - <<'PY'
@@ -94,9 +94,9 @@ jobs:
           import subprocess
           import sys
 
-          import browser_use_rust
+          import browser_use_core
 
-          binary = browser_use_rust.binary_path("browser-use-terminal")
+          binary = browser_use_core.binary_path("browser-use-terminal")
           assert os.path.exists(binary), binary
           subprocess.run([binary, "--version"], check=True)
           proc = subprocess.run(
@@ -126,5 +126,5 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: browser-use-rust-${{ matrix.target }}
-          path: dist/browser_use_rust-*.whl
+          name: browser-use-core-${{ matrix.target }}
+          path: dist/browser_use_core-*.whl

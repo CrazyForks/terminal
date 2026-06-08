@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGE_SRC="$ROOT/packages/browser-use-rust"
+PACKAGE_SRC="$ROOT/packages/browser-use-core"
 TARGET_TRIPLE="${TARGET_TRIPLE:-}"
 OUT_DIR="${OUT_DIR:-"$ROOT/dist"}"
 BUILD_DIR="${BUILD_DIR:-}"
@@ -72,36 +72,36 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$STAGE/src/browser_use_rust/bin" "$STAGE/src/browser_use_rust/python" "$OUT_DIR"
+mkdir -p "$STAGE/src/browser_use_core/bin" "$STAGE/src/browser_use_core/python" "$OUT_DIR"
 cp "$PACKAGE_SRC/pyproject.toml" "$STAGE/pyproject.toml"
 cp "$PACKAGE_SRC/setup.py" "$STAGE/setup.py"
 cp "$PACKAGE_SRC/README.md" "$STAGE/README.md"
-cp "$PACKAGE_SRC/src/browser_use_rust/"*.py "$STAGE/src/browser_use_rust/"
-cp "$BUILD_DIR/but$EXE_SUFFIX" "$STAGE/src/browser_use_rust/bin/but$EXE_SUFFIX"
-cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_rust/bin/browser-use-terminal$EXE_SUFFIX"
-cp -R "$ROOT/python/llm_browser_worker" "$STAGE/src/browser_use_rust/python/llm_browser_worker"
+cp "$PACKAGE_SRC/src/browser_use_core/"*.py "$STAGE/src/browser_use_core/"
+cp "$BUILD_DIR/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX"
+cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX"
+cp -R "$ROOT/python/llm_browser_worker" "$STAGE/src/browser_use_core/python/llm_browser_worker"
 
-find "$STAGE/src/browser_use_rust/python" -type d -name __pycache__ -prune -exec rm -rf {} +
-find "$STAGE/src/browser_use_rust/python" -type f -name '*.pyc' -delete
+find "$STAGE/src/browser_use_core/python" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$STAGE/src/browser_use_core/python" -type f -name '*.pyc' -delete
 
-if [[ "${BROWSER_USE_RUST_SKIP_RIPGREP:-0}" == "1" ]]; then
-  mkdir -p "$STAGE/src/browser_use_rust/bin/agent-tools"
+if [[ "${BROWSER_USE_CORE_SKIP_RIPGREP:-0}" == "1" ]]; then
+  mkdir -p "$STAGE/src/browser_use_core/bin/agent-tools"
   if [[ "$EXE_SUFFIX" == ".exe" ]]; then
-    cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_rust/bin/agent-tools/rg.exe"
+    cp "$BUILD_DIR/browser-use-terminal$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/agent-tools/rg.exe"
   else
-    printf '#!/bin/sh\n' >"$STAGE/src/browser_use_rust/bin/agent-tools/rg"
+    printf '#!/bin/sh\n' >"$STAGE/src/browser_use_core/bin/agent-tools/rg"
   fi
 else
-  "$ROOT/scripts/install-agent-ripgrep.sh" "$STAGE/src/browser_use_rust/bin/agent-tools" "$TARGET_TRIPLE"
+  "$ROOT/scripts/install-agent-ripgrep.sh" "$STAGE/src/browser_use_core/bin/agent-tools" "$TARGET_TRIPLE"
 fi
 
-chmod 0755 "$STAGE/src/browser_use_rust/bin/but$EXE_SUFFIX" "$STAGE/src/browser_use_rust/bin/browser-use-terminal$EXE_SUFFIX"
-if [[ -d "$STAGE/src/browser_use_rust/bin/agent-tools" ]]; then
-  find "$STAGE/src/browser_use_rust/bin/agent-tools" -type f -exec chmod 0755 {} +
+chmod 0755 "$STAGE/src/browser_use_core/bin/but$EXE_SUFFIX" "$STAGE/src/browser_use_core/bin/browser-use-terminal$EXE_SUFFIX"
+if [[ -d "$STAGE/src/browser_use_core/bin/agent-tools" ]]; then
+  find "$STAGE/src/browser_use_core/bin/agent-tools" -type f -exec chmod 0755 {} +
 fi
 
 if command -v uv >/dev/null 2>&1; then
-  BROWSER_USE_RUST_PLAT_NAME="$PLAT_NAME" uv build --wheel --out-dir "$OUT_DIR" "$STAGE"
+  BROWSER_USE_CORE_PLAT_NAME="$PLAT_NAME" uv build --wheel --out-dir "$OUT_DIR" "$STAGE"
 else
-  BROWSER_USE_RUST_PLAT_NAME="$PLAT_NAME" python -m build --wheel --outdir "$OUT_DIR" "$STAGE"
+  BROWSER_USE_CORE_PLAT_NAME="$PLAT_NAME" python -m build --wheel --outdir "$OUT_DIR" "$STAGE"
 fi
