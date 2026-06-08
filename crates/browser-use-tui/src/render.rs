@@ -216,6 +216,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             app.modal_background = None;
             render_feedback_thanks(frame, area, app);
         }
+        Surface::SetupCloudSuccess => {
+            app.modal_background = None;
+            render_setup_cloud_success(frame, area, app);
+        }
         surface => {
             app.modal_background = None;
             let state = app
@@ -1369,6 +1373,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::SetupConfirm => ("Setup", "Confirm provider"),
         Surface::SetupResult => ("Setup", "Connection result"),
         Surface::SetupCloud => ("Setup", "Choose your browser backend"),
+        Surface::SetupCloudSuccess => ("Setup", ""),
         Surface::Account => ("Authenticate", "Sign in to a model provider"),
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
@@ -1428,6 +1433,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::History => "Type to filter | Enter:open | Esc:close",
         Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm | Surface::SetupCloud => "Enter:continue | Esc:back",
+        Surface::SetupCloudSuccess => "",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
@@ -1500,6 +1506,7 @@ fn surface_lines(
         Surface::Developer => developer_lines(app, state),
         Surface::Feedback => feedback_lines(app),
         Surface::FeedbackThanks => Vec::new(),
+        Surface::SetupCloudSuccess => Vec::new(),
         Surface::Main => Vec::new(),
     }
 }
@@ -2512,11 +2519,18 @@ const FEEDBACK_THANKS_FACE_FRAME_0: &str = r"\(•◡•)/";
 const FEEDBACK_THANKS_FACE_FRAME_1: &str = r"/(•◡•)\";
 const FEEDBACK_THANKS_MESSAGE: &str = "Thanks for the feedback!";
 const FEEDBACK_THANKS_HINT: &str = "press any key to continue";
+const SETUP_CLOUD_SUCCESS_MESSAGE: &str = "Browser Use Cloud is connected";
+const SETUP_CLOUD_SUCCESS_HINT: &str = "press any key to sync cookies";
 
-fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_success_character(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    started_at: Option<std::time::Instant>,
+    message: &str,
+    hint: &str,
+) {
     frame.render_widget(Clear, frame.area());
-    let elapsed_ms = app
-        .feedback_thanks_started
+    let elapsed_ms = started_at
         .map(|t| t.elapsed().as_millis() as u64)
         .unwrap_or(0);
     let frame_idx = (elapsed_ms / crate::FEEDBACK_THANKS_FRAME_MS) % 2;
@@ -2529,9 +2543,9 @@ fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let content_lines: Vec<Line<'static>> = vec![
         centered_line(face, w, accent()),
         Line::from(""),
-        centered_line(FEEDBACK_THANKS_MESSAGE, w, accent()),
+        centered_line(message, w, accent()),
         Line::from(""),
-        centered_line(FEEDBACK_THANKS_HINT, w, muted()),
+        centered_line(hint, w, muted()),
     ];
     let content_h = content_lines.len() as u16;
     let top_pad = area.height.saturating_sub(content_h) / 2;
@@ -2544,6 +2558,26 @@ fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
     frame.render_widget(Paragraph::new(content_lines), chunks[1]);
+}
+
+fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    render_success_character(
+        frame,
+        area,
+        app.feedback_thanks_started,
+        FEEDBACK_THANKS_MESSAGE,
+        FEEDBACK_THANKS_HINT,
+    );
+}
+
+fn render_setup_cloud_success(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    render_success_character(
+        frame,
+        area,
+        app.setup_cloud_success_started,
+        SETUP_CLOUD_SUCCESS_MESSAGE,
+        SETUP_CLOUD_SUCCESS_HINT,
+    );
 }
 
 fn line_width(line: &Line<'_>) -> usize {
