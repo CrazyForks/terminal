@@ -434,9 +434,10 @@ fn render_main(
                 app.status_notice.is_some(),
                 cloud_home_banner_lines(app, body_width).map_or(0, |lines| lines.len()),
             )),
-            ProductState::SetupNeeded => {
+            ProductState::SetupNeeded if !app.setup_started => {
                 Some(setup_logo_screen_rect(body_content_rect, app.setup_started))
             }
+            ProductState::SetupNeeded => None,
             ProductState::Running
             | ProductState::Result
             | ProductState::Failed
