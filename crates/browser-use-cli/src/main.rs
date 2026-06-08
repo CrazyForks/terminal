@@ -4908,6 +4908,11 @@ struct BrowserUseSdkTerminalFrameRenderer {
     final_text: Option<String>,
 }
 
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameProjection {
+    sessions: HashMap<String, BrowserUseSdkTerminalFrameRenderer>,
+}
+
 impl BrowserUseSdkPresentationProjection {
     fn apply(&mut self, event: &RuntimeEvent) -> Vec<Value> {
         let Some(session_id) = event.session_id.as_ref().map(|id| id.as_str().to_string()) else {
@@ -5181,6 +5186,21 @@ impl BrowserUseSdkTerminalFrameRenderer {
             return None;
         }
         Some(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"))
+    }
+}
+
+impl BrowserUseSdkTerminalFrameProjection {
+    fn apply(&mut self, session_id: Option<&str>, event: &Value) -> Option<String> {
+        let key = session_id.unwrap_or("<unknown>").to_string();
+        let renderer = self.sessions.entry(key.clone()).or_default();
+        let frame = renderer.apply(event);
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("agent.completed")
+        ) {
+            self.sessions.remove(&key);
+        }
+        frame
     }
 }
 
@@ -5468,7 +5488,7 @@ fn sdk_server_stdio() -> Result<()> {
                     .context("build sdk event runtime")?;
                 rt.block_on(async move {
                     let mut sdk_projection = BrowserUseSdkPresentationProjection::default();
-                    let mut terminal_renderer = BrowserUseSdkTerminalFrameRenderer::default();
+                    let mut terminal_renderer = BrowserUseSdkTerminalFrameProjection::default();
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
@@ -5536,7 +5556,9 @@ fn sdk_server_stdio() -> Result<()> {
                                     if response_tx.send(notification).is_err() {
                                         break;
                                     }
-                                    if let Some(text) = terminal_renderer.apply(&sdk_event) {
+                                    if let Some(text) =
+                                        terminal_renderer.apply(session_id.as_deref(), &sdk_event)
+                                    {
                                         let notification = serde_json::json!({
                                             "jsonrpc": "2.0",
                                             "method": "agent.terminal_frame",
@@ -9980,6 +10002,64 @@ command = "test-mcp"
         assert_eq!(completed[1]["success"], true);
 
         Ok(())
+    }
+
+    #[test]
+    fn sdk_terminal_frames_keep_interleaved_sessions_isolated() {
+        let mut frames = BrowserUseSdkTerminalFrameProjection::default();
+
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        let browser_params = json!({"url": "https://example.com"}).to_string();
+        assert!(frames
+            .apply(
+                Some("session-a"),
+                &json!({
+                    "type": "action.started",
+                    "name": "browser",
+                    "params_preview": browser_params
+                })
+            )
+            .unwrap()
+            .contains("browser"));
+
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.started", "step": 1})
+            )
+            .unwrap()
+            .contains("Step 1"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "final_result", "text": "session b final", "success": true})
+            )
+            .unwrap()
+            .contains("session b final"));
+        assert!(frames
+            .apply(
+                Some("session-b"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 500})
+            )
+            .unwrap()
+            .contains("0.50s"));
+
+        let session_a_completion = frames
+            .apply(
+                Some("session-a"),
+                &json!({"type": "step.completed", "step": 1, "duration_ms": 1200}),
+            )
+            .unwrap();
+        assert!(
+            session_a_completion.contains("1 action · 1.20s"),
+            "session A action count must not be reset by session B: {session_a_completion}"
+        );
     }
 
     #[test]
