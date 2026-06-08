@@ -80,6 +80,10 @@ use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+#[cfg(not(test))]
+use reqwest::Url;
+#[cfg(not(test))]
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use signal_hook::consts::signal::SIGUSR2;
 
@@ -171,6 +175,28 @@ pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
 const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
+const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
+const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
+const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
+const BROWSER_PREFERENCE_MODE_SETTING: &str = "browser.preference.mode";
+const BROWSER_PREFERENCE_PROFILE_SETTING: &str = "browser.preference.profile";
+const BROWSER_PREFERENCE_PROFILE_LABEL_SETTING: &str = "browser.preference.profile_label";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_API_URL_ENV: &str = "BROWSER_USE_CLOUD_API_URL";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_DEFAULT_API_URL: &str = "https://api.browser-use.com";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_LOCAL_API_URL: &str = "http://localhost:8000";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_LOCAL_APP_URL: &str = "http://localhost:3000";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE: &str = "authorization_code";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
+#[cfg(not(test))]
+const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const SESSION_SETTINGS_EVENT: &str = "session.settings";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
@@ -245,6 +271,8 @@ enum Surface {
     Setup,
     SetupConfirm,
     SetupResult,
+    SetupCloud,
+    SetupCloudSuccess,
     Account,
     ApiKey,
     Telemetry,
@@ -445,6 +473,48 @@ struct CodexLoginFlow {
 }
 
 impl Drop for CodexLoginFlow {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserUseCloudAuthorizationStart {
+    pub(crate) authorization_uri: String,
+    pub(crate) redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserUseCloudCredential {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug)]
+enum BrowserUseCloudLoginEvent {
+    Started {
+        authorization: BrowserUseCloudAuthorizationStart,
+        browser_open_error: Option<String>,
+    },
+    Finished(Result<BrowserUseCloudCredential, String>),
+}
+
+#[derive(Debug)]
+struct BrowserUseCloudLoginFlow {
+    account: String,
+    started_at: Instant,
+    stop_tx: mpsc::Sender<()>,
+    rx: mpsc::Receiver<BrowserUseCloudLoginEvent>,
+    authorization: Option<BrowserUseCloudAuthorizationStart>,
+    browser_open_error: Option<String>,
+    #[cfg(test)]
+    event_tx_guard: Option<mpsc::Sender<BrowserUseCloudLoginEvent>>,
+}
+
+impl Drop for BrowserUseCloudLoginFlow {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
     }
@@ -1349,9 +1419,11 @@ struct App {
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
     codex_login: Option<CodexLoginFlow>,
+    browser_use_cloud_login: Option<BrowserUseCloudLoginFlow>,
     cookie_sync: CookieSyncState,
     default_profile: DefaultProfileState,
     pending_cookie_sync_after_auth: bool,
+    pending_setup_after_cookie_sync: bool,
     browser_notice: Option<String>,
     browser_select_chromium_expanded: bool,
     status_notice: Option<String>,
@@ -2407,9 +2479,11 @@ impl App {
             setup_result: None,
             claude_code_oauth: None,
             codex_login: None,
+            browser_use_cloud_login: None,
             cookie_sync: CookieSyncState::default(),
             default_profile: DefaultProfileState::default(),
             pending_cookie_sync_after_auth: false,
+            pending_setup_after_cookie_sync: false,
             browser_notice: None,
             browser_select_chromium_expanded: false,
             status_notice: None,
@@ -2637,6 +2711,52 @@ impl App {
         Ok(true)
     }
 
+    fn drain_browser_use_cloud_login_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(flow) = self.browser_use_cloud_login.as_ref() {
+            while let Ok(event) = flow.rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        for event in events {
+            match event {
+                BrowserUseCloudLoginEvent::Started {
+                    authorization,
+                    browser_open_error,
+                } => {
+                    if let Some(flow) = self.browser_use_cloud_login.as_mut() {
+                        flow.authorization = Some(authorization);
+                        flow.browser_open_error = browser_open_error;
+                    }
+                }
+                BrowserUseCloudLoginEvent::Finished(result) => {
+                    let account = self
+                        .browser_use_cloud_login
+                        .as_ref()
+                        .map(|flow| flow.account.clone())
+                        .unwrap_or_else(|| BROWSER_USE_CLOUD.to_string());
+                    self.browser_use_cloud_login = None;
+                    match result {
+                        Ok(credential) => {
+                            self.complete_browser_use_cloud_device_auth(&credential)?;
+                        }
+                        Err(error) => {
+                            self.show_setup_result(
+                                SetupResultKind::Failure,
+                                account,
+                                format!("Browser Use Cloud sign-in failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn drain_clipboard_paste_notifications(&mut self) -> Result<bool> {
         let mut changed = false;
         while let Ok(event) = self.clipboard_paste_rx.try_recv() {
@@ -2746,6 +2866,14 @@ impl App {
                     self.apply_cookie_sync_profile_load(value);
                 }
                 CookieSyncCommandKind::SyncProfile => {
+                    if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                        if let Err(error) = self.remember_synced_cloud_profile(&value) {
+                            self.cookie_sync.status = CookieSyncStatus::Failed(format!(
+                                "Cookie sync completed, but the Cloud profile could not be saved: {error:#}"
+                            ));
+                            return;
+                        }
+                    }
                     self.cookie_sync.status =
                         cookie_sync_result_status(&value).unwrap_or_else(|| {
                             CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string())
@@ -4305,11 +4433,20 @@ impl App {
 
     fn close_surface(&mut self) {
         self.close_slash_palette();
-        if matches!(self.surface, Surface::SetupConfirm | Surface::SetupResult) {
+        if matches!(
+            self.surface,
+            Surface::SetupConfirm
+                | Surface::SetupResult
+                | Surface::SetupCloud
+                | Surface::SetupCloudSuccess
+        ) {
             self.setup_pending_account = None;
             self.setup_result = None;
             self.claude_code_oauth = None;
             self.codex_login = None;
+            self.browser_use_cloud_login = None;
+            self.pending_cookie_sync_after_auth = false;
+            self.pending_setup_after_cookie_sync = false;
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
@@ -5858,6 +5995,12 @@ impl App {
             && self.composer.is_empty())
     }
 
+    fn is_setup_cookie_sync_visible(&self) -> bool {
+        !self.setup_complete
+            && self.pending_setup_after_cookie_sync
+            && self.surface == Surface::CookieSync
+    }
+
     /// True when the centered welcome screen is showing — drives the
     /// animation-tick redraw so the BU logo can spin while idle.
     fn is_welcome_surface(&self) -> bool {
@@ -6046,6 +6189,8 @@ impl App {
             Surface::Setup => self.execute_first_run_setup_selection()?,
             Surface::SetupConfirm => self.execute_setup_confirm_selection()?,
             Surface::SetupResult => self.execute_setup_result_selection()?,
+            Surface::SetupCloud => self.execute_setup_cloud_selection()?,
+            Surface::SetupCloudSuccess => self.execute_setup_cloud_connected_selection()?,
             Surface::Account => {
                 let account = AUTH_CHOICES
                     .get(self.selected_row.min(AUTH_CHOICES.len().saturating_sub(1)))
@@ -6179,6 +6324,8 @@ impl App {
             SetupResultKind::Failure if self.selected_row.min(1) == 0 => {
                 if result.account == ACCOUNT_CODEX {
                     self.start_codex_auth(result.account)?;
+                } else if result.account == BROWSER_USE_CLOUD {
+                    self.start_browser_use_cloud_browser_login(result.account)?;
                 } else if is_claude_code_account(&result.account) {
                     self.start_claude_code_oauth(result.account)?;
                 } else {
@@ -6189,6 +6336,8 @@ impl App {
             SetupResultKind::Pending if self.selected_row.min(1) == 0 => {
                 if result.account == ACCOUNT_CODEX {
                     self.reopen_codex_device_auth_url();
+                } else if result.account == BROWSER_USE_CLOUD {
+                    self.reopen_browser_use_cloud_auth_url();
                 } else {
                     self.reopen_claude_code_oauth_url();
                 }
@@ -6197,6 +6346,7 @@ impl App {
             SetupResultKind::Pending => {
                 self.claude_code_oauth = None;
                 self.codex_login = None;
+                self.browser_use_cloud_login = None;
                 self.setup_result = None;
                 self.setup_pending_account = None;
                 self.close_surface();
@@ -6228,6 +6378,32 @@ impl App {
         Ok(())
     }
 
+    fn execute_setup_cloud_selection(&mut self) -> Result<()> {
+        match self.selected_row.min(1) {
+            0 => self.start_setup_cloud_onboarding(),
+            _ => self.decline_setup_cloud_onboarding(),
+        }
+    }
+
+    fn start_setup_cloud_onboarding(&mut self) -> Result<()> {
+        self.pending_setup_after_cookie_sync = true;
+        self.pending_cookie_sync_after_auth = true;
+        if self.browser_use_cloud_key_ready()? {
+            self.select_browser_use_cloud()?;
+            self.show_setup_cloud_success();
+            return Ok(());
+        }
+        self.start_auth_flow(BROWSER_USE_CLOUD.to_string())
+    }
+
+    fn decline_setup_cloud_onboarding(&mut self) -> Result<()> {
+        self.pending_setup_after_cookie_sync = false;
+        self.pending_cookie_sync_after_auth = false;
+        self.select_local_chrome()?;
+        self.status_notice = None;
+        self.open_setup_model_selection()
+    }
+
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
         self.start_codex_device_login(account)
     }
@@ -6243,6 +6419,36 @@ impl App {
         self.open_surface(Surface::SetupResult);
     }
 
+    fn show_setup_cloud_success(&mut self) {
+        self.setup_result = None;
+        self.setup_pending_account = None;
+        self.status_notice = None;
+        self.open_surface(Surface::SetupCloudSuccess);
+    }
+
+    fn continue_after_setup_cloud_success(&mut self) -> Result<()> {
+        self.open_cookie_sync()
+    }
+
+    fn execute_setup_cloud_connected_selection(&mut self) -> Result<()> {
+        match self.selected_row.min(1) {
+            0 => self.continue_after_setup_cloud_success(),
+            _ => self.skip_setup_cookie_sync_after_cloud_auth(),
+        }
+    }
+
+    fn skip_setup_cookie_sync_after_cloud_auth(&mut self) -> Result<()> {
+        self.pending_cookie_sync_after_auth = false;
+        if self.pending_setup_after_cookie_sync {
+            self.pending_setup_after_cookie_sync = false;
+            self.status_notice = None;
+            return self.open_setup_model_selection();
+        }
+        self.status_notice = None;
+        self.close_surface();
+        Ok(())
+    }
+
     fn continue_after_setup_success(&mut self, account: String) -> Result<()> {
         self.setup_result = None;
         self.setup_pending_account = None;
@@ -6251,10 +6457,17 @@ impl App {
             return self.save_model_with_choice(choice);
         }
         if !self.setup_complete {
-            let account = self.account.clone();
-            return self.open_provider_model_search(&account);
+            self.status_notice = None;
+            self.open_surface(Surface::SetupCloud);
+            return Ok(());
         }
         self.advance_after_auth()
+    }
+
+    fn open_setup_model_selection(&mut self) -> Result<()> {
+        self.pending_model_search_after_auth = false;
+        let account = self.account.clone();
+        self.open_provider_model_search(&account)
     }
 
     /// If a nudge session is waiting for auth, start its agent and navigate to
@@ -7284,8 +7497,14 @@ impl App {
 
     fn advance_after_auth(&mut self) -> Result<()> {
         // The /model provider flow connects first, then lets the user choose from
-        // the provider's live model list. First-run setup keeps auto-picking a
-        // default so onboarding stays one step.
+        // the provider's live model list. First-run setup asks for the Browser
+        // Use Cloud choice before model selection so cookie sync can happen up
+        // front.
+        if !self.setup_complete {
+            self.status_notice = None;
+            self.open_surface(Surface::SetupCloud);
+            return Ok(());
+        }
         if self.pending_model_search_after_auth {
             self.pending_model_search_after_auth = false;
             let account = self.account.clone();
@@ -7333,11 +7552,10 @@ impl App {
         }
         let completing_setup = !self.setup_complete;
         if completing_setup {
-            if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
-                self.browser = BROWSER_LOCAL_CHROME.to_string();
-            }
+            self.status_notice = None;
             self.complete_setup()?;
-            self.persist_runtime_settings()?;
+            self.close_surface();
+            return Ok(());
         }
         // No top "Model set to X" notice — the active model already shows in the
         // composer status line at the bottom.
@@ -7947,7 +8165,7 @@ impl App {
         let previous_browser = self.browser.clone();
         self.browser = choice.to_string();
         self.store.set_setting(
-            "browser.preference.mode",
+            BROWSER_PREFERENCE_MODE_SETTING,
             browser_preference_mode_for_choice(choice),
         )?;
         self.track_browser_selected();
@@ -7972,10 +8190,31 @@ impl App {
         Ok(())
     }
 
+    fn select_browser_use_cloud(&mut self) -> Result<()> {
+        let previous_browser = self.browser.clone();
+        self.browser = BROWSER_USE_CLOUD.to_string();
+        self.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "cloud")?;
+        self.track_browser_selected();
+        self.persist_runtime_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)
+    }
+
+    fn select_local_chrome(&mut self) -> Result<()> {
+        let previous_browser = self.browser.clone();
+        self.browser = BROWSER_LOCAL_CHROME.to_string();
+        self.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "local")?;
+        self.track_browser_selected();
+        self.persist_runtime_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)
+    }
+
     fn save_local_browser(&mut self, browser_name: String) -> Result<()> {
         let previous_browser = self.browser.clone();
         self.browser = BROWSER_LOCAL_CHROME.to_string();
-        self.store.set_setting("browser.preference.mode", "local")?;
+        self.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "local")?;
         self.store
             .set_setting("browser.preference.browser", &browser_name)?;
         self.store
@@ -8124,14 +8363,8 @@ impl App {
         }
         if account == BROWSER_USE_CLOUD {
             let return_to_cookie_sync = self.pending_cookie_sync_after_auth;
-            self.store
-                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, secret.trim())?;
-            if !return_to_cookie_sync {
-                let previous_browser = self.browser.clone();
-                self.browser = BROWSER_USE_CLOUD.to_string();
-                self.persist_runtime_settings()?;
-                self.append_browser_backend_change_if_needed(&previous_browser)?;
-            }
+            self.store_browser_use_cloud_api_key(secret.trim(), None)?;
+            self.select_browser_use_cloud()?;
             self.api_key_account = None;
             self.pending_cookie_sync_after_auth = false;
             if return_to_cookie_sync {
@@ -8181,6 +8414,10 @@ impl App {
 
     fn start_auth_flow(&mut self, account: String) -> Result<()> {
         self.track_auth_provider_selected(&account);
+        if account == BROWSER_USE_CLOUD {
+            self.start_browser_use_cloud_browser_login(account)?;
+            return Ok(());
+        }
         if account == ACCOUNT_CODEX {
             self.start_codex_auth(account)?;
             return Ok(());
@@ -8207,6 +8444,47 @@ impl App {
         self.api_key_account = Some(account);
         self.composer.clear();
         self.open_surface(Surface::ApiKey);
+    }
+
+    fn start_browser_use_cloud_browser_login(&mut self, account: String) -> Result<()> {
+        self.api_key_account = None;
+        self.composer.clear();
+        self.browser_use_cloud_login = None;
+        let flow = match start_browser_use_cloud_login_flow(account.clone()) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    account,
+                    format!("Could not start Browser Use Cloud sign-in: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
+        self.browser_use_cloud_login = Some(flow);
+        self.show_setup_result(
+            SetupResultKind::Pending,
+            account,
+            "Waiting for Browser Use Cloud sign-in.".to_string(),
+        );
+        Ok(())
+    }
+
+    fn reopen_browser_use_cloud_auth_url(&mut self) {
+        let Some(url) = self.browser_use_cloud_login.as_ref().and_then(|flow| {
+            flow.authorization
+                .as_ref()
+                .map(|authorization| authorization.authorization_uri.clone())
+        }) else {
+            return;
+        };
+        let message = match open_external_url(&url) {
+            Ok(()) => "Waiting for Browser Use Cloud sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        if let Some(result) = self.setup_result.as_mut() {
+            result.message = message;
+        }
     }
 
     fn start_claude_code_oauth(&mut self, account: String) -> Result<()> {
@@ -8340,6 +8618,7 @@ impl App {
         self.pending_model_after_auth = None;
         self.pending_model_search_after_auth = false;
         self.pending_cookie_sync_after_auth = false;
+        self.pending_setup_after_cookie_sync = false;
         if !self.setup_complete {
             self.setup_pending_account = None;
             self.setup_result = None;
@@ -8372,6 +8651,73 @@ impl App {
             .set_setting(LAMINAR_API_KEY_SETTING, secret.trim())?;
         self.status_notice = Some("Saved Laminar API key.".to_string());
         self.open_surface(Surface::Developer);
+        Ok(())
+    }
+
+    fn store_browser_use_cloud_api_key(
+        &self,
+        api_key: &str,
+        credential: Option<&BrowserUseCloudCredential>,
+    ) -> Result<()> {
+        self.store
+            .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, api_key.trim())?;
+        if let Some(credential) = credential {
+            self.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "cli_login")?;
+            self.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING, &credential.api_key_id)?;
+            self.store.set_setting(
+                BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
+                &credential.project_id,
+            )?;
+            if let Some(expires_at) = credential.expires_at.as_deref() {
+                self.store
+                    .set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
+            } else {
+                self.store
+                    .delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+            }
+            self.store.set_setting(
+                BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING,
+                &serde_json::to_string(&credential.scopes)?,
+            )?;
+        } else {
+            self.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "manual")?;
+            self.store
+                .delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+            self.store
+                .delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+            self.store
+                .delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+            self.store
+                .delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+        }
+        Ok(())
+    }
+
+    fn complete_browser_use_cloud_device_auth(
+        &mut self,
+        credential: &BrowserUseCloudCredential,
+    ) -> Result<()> {
+        let return_to_cookie_sync = self.pending_cookie_sync_after_auth;
+        self.store_browser_use_cloud_api_key(&credential.api_key, Some(credential))?;
+        self.select_browser_use_cloud()?;
+        self.api_key_account = None;
+        self.pending_cookie_sync_after_auth = false;
+        if return_to_cookie_sync {
+            self.show_setup_cloud_success();
+            return Ok(());
+        }
+        self.show_setup_result(
+            SetupResultKind::Success,
+            BROWSER_USE_CLOUD.to_string(),
+            format!(
+                "Connected Browser Use Cloud project {}.",
+                credential.project_id
+            ),
+        );
+        self.maybe_resume_pending_nudge_session()?;
         Ok(())
     }
 
@@ -8565,6 +8911,32 @@ impl App {
         Ok(())
     }
 
+    fn remember_synced_cloud_profile(&mut self, value: &serde_json::Value) -> Result<()> {
+        let Some(cloud_profile) = value.get("cloud_profile") else {
+            return Ok(());
+        };
+        let Some(profile_id) = cloud_profile
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        let profile_label = cloud_profile
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(profile_id);
+        self.store
+            .set_setting(BROWSER_PREFERENCE_PROFILE_SETTING, profile_id)?;
+        self.store
+            .set_setting(BROWSER_PREFERENCE_PROFILE_LABEL_SETTING, profile_label)?;
+        self.browser_profile_label = Some(profile_label.to_string());
+        Ok(())
+    }
+
     pub(crate) fn browser_status_label(&self) -> String {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
@@ -8652,12 +9024,24 @@ impl App {
         match &self.cookie_sync.status {
             CookieSyncStatus::NeedsAuth => self.start_cookie_sync_auth(),
             CookieSyncStatus::Ready => self.start_cookie_sync_for_selected_profile(),
-            CookieSyncStatus::Completed(_) | CookieSyncStatus::Failed(_) => {
-                self.close_surface();
-                Ok(())
-            }
+            CookieSyncStatus::Completed(_) => self.finish_cookie_sync_or_close(None),
+            CookieSyncStatus::Failed(_) => self.finish_cookie_sync_or_close(Some(
+                "Browser Use Cloud selected. Cookie sync can be retried later with /sync-cookies."
+                    .to_string(),
+            )),
             CookieSyncStatus::LoadingProfiles | CookieSyncStatus::Syncing => Ok(()),
         }
+    }
+
+    fn finish_cookie_sync_or_close(&mut self, notice: Option<String>) -> Result<()> {
+        if self.pending_setup_after_cookie_sync {
+            self.pending_setup_after_cookie_sync = false;
+            self.pending_cookie_sync_after_auth = false;
+            self.status_notice = notice;
+            return self.open_setup_model_selection();
+        }
+        self.close_surface();
+        Ok(())
     }
 
     fn start_cookie_sync_auth(&mut self) -> Result<()> {
@@ -8832,6 +9216,8 @@ impl App {
             Surface::Setup => self.setup_row_count(),
             Surface::SetupConfirm => 2,
             Surface::SetupResult => self.setup_result_row_count(),
+            Surface::SetupCloud => 2,
+            Surface::SetupCloudSuccess => 2,
             Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Email => 2,
@@ -8860,7 +9246,7 @@ impl App {
 
     fn setup_result_row_count(&self) -> usize {
         match self.setup_result.as_ref().map(|result| &result.kind) {
-            Some(SetupResultKind::Failure) => 2,
+            Some(SetupResultKind::Failure | SetupResultKind::Pending) => 2,
             _ => 1,
         }
     }
@@ -8977,6 +9363,11 @@ impl App {
     }
 
     fn should_animate_live_spinner(&mut self) -> bool {
+        if self.surface == Surface::CookieSync
+            && matches!(self.cookie_sync.status, CookieSyncStatus::Syncing)
+        {
+            return true;
+        }
         if !self.native_scrollback_is_active() {
             return false;
         }
@@ -9006,6 +9397,9 @@ impl App {
     }
 
     fn product_state(&self, state: &WorkbenchState) -> ProductState {
+        if !self.setup_complete && self.surface == Surface::ModelSearch {
+            return ProductState::Ready;
+        }
         if !self.setup_complete && state.history.is_empty() && state.current_session.is_none() {
             return ProductState::SetupNeeded;
         }
@@ -9338,6 +9732,26 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn browser_use_cloud_login_elapsed_seconds(&self) -> Option<u64> {
+        self.browser_use_cloud_login
+            .as_ref()
+            .map(|flow| flow.started_at.elapsed().as_secs())
+    }
+
+    pub(crate) fn browser_use_cloud_authorization(
+        &self,
+    ) -> Option<&BrowserUseCloudAuthorizationStart> {
+        self.browser_use_cloud_login
+            .as_ref()
+            .and_then(|flow| flow.authorization.as_ref())
+    }
+
+    pub(crate) fn browser_use_cloud_open_error(&self) -> Option<&str> {
+        self.browser_use_cloud_login
+            .as_ref()
+            .and_then(|flow| flow.browser_open_error.as_deref())
+    }
+
     fn laminar_status(&self) -> Result<String> {
         if self
             .store
@@ -9615,6 +10029,7 @@ fn run_standalone_browser_command_with_browser_use_api_key(
 ) -> Result<serde_json::Value> {
     let options = browser_use_browser::BrowserCommandOptions {
         browser_use_api_key: api_key,
+        browser_use_api_url: Some(browser_use_cloud_api_base_url()),
     };
     Ok(browser_use_browser::run_browser_command_with_options(
         label,
@@ -9957,6 +10372,385 @@ fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexL
 }
 
 #[cfg(not(test))]
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudBrowserStartResponse {
+    authorization_uri: String,
+    expires_in: u64,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudBrowserStartRequest<'a> {
+    client_id: &'a str,
+    response_type: &'a str,
+    redirect_uri: &'a str,
+    code_challenge: &'a str,
+    code_challenge_method: &'a str,
+    state: &'a str,
+    device_name: Option<String>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudAuthorizationCodeTokenRequest<'a> {
+    grant_type: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+    client_id: &'a str,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenResponse {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenError {
+    error: String,
+    error_description: Option<String>,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserUseCloudAuthorization {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[cfg(not(test))]
+fn browser_use_cloud_api_base_url() -> String {
+    if let Some(url) = std::env::var(BROWSER_USE_CLOUD_API_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return normalize_browser_use_cloud_url(&url);
+    }
+
+    if browser_use_cloud_local_dev_available() {
+        return BROWSER_USE_CLOUD_LOCAL_API_URL.to_string();
+    }
+
+    BROWSER_USE_CLOUD_DEFAULT_API_URL.to_string()
+}
+
+#[cfg(test)]
+fn browser_use_cloud_api_base_url() -> String {
+    "https://api.browser-use.com".to_string()
+}
+
+#[cfg(not(test))]
+fn normalize_browser_use_cloud_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+#[cfg(not(test))]
+fn browser_use_cloud_local_dev_available() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+
+    browser_use_cloud_local_backend_available(&client)
+        && browser_use_cloud_local_frontend_available(&client)
+}
+
+#[cfg(not(test))]
+fn browser_use_cloud_local_backend_available(client: &reqwest::blocking::Client) -> bool {
+    let version_ok = client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/browser-use-version"
+        ))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !version_ok {
+        return false;
+    }
+
+    client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/cloud/cli-auth/device/0000-0000"
+        ))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+#[cfg(not(test))]
+fn browser_use_cloud_local_frontend_available(client: &reqwest::blocking::Client) -> bool {
+    client
+        .head(format!("{BROWSER_USE_CLOUD_LOCAL_APP_URL}/device"))
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+#[cfg(not(test))]
+fn browser_use_cloud_device_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(test))]
+fn start_browser_use_cloud_login_flow(account: String) -> Result<BrowserUseCloudLoginFlow> {
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("browser-use-cloud-login".to_string())
+        .spawn(move || {
+            let result = run_browser_use_cloud_login(stop_rx, event_tx.clone());
+            let _ = event_tx.send(BrowserUseCloudLoginEvent::Finished(result));
+        })
+        .context("spawn Browser Use Cloud browser login worker")?;
+    Ok(BrowserUseCloudLoginFlow {
+        account,
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+        authorization: None,
+        browser_open_error: None,
+    })
+}
+
+#[cfg(not(test))]
+fn run_browser_use_cloud_login(
+    stop_rx: mpsc::Receiver<()>,
+    event_tx: mpsc::Sender<BrowserUseCloudLoginEvent>,
+) -> Result<BrowserUseCloudCredential, String> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("build Browser Use Cloud auth client: {error}"))?;
+    let (code_verifier, code_challenge) = claude_code_oauth_pkce();
+    let (state, _) = claude_code_oauth_pkce();
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("bind Browser Use Cloud callback on 127.0.0.1: {error}"))?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        listener
+            .local_addr()
+            .map_err(|error| format!("read Browser Use Cloud callback address: {error}"))?
+            .port(),
+        BROWSER_USE_CLOUD_CALLBACK_PATH
+    );
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("configure Browser Use Cloud callback listener: {error}"))?;
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/browser"))
+        .json(&BrowserUseCloudBrowserStartRequest {
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: &redirect_uri,
+            code_challenge: &code_challenge,
+            code_challenge_method: "S256",
+            state: &state,
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .map_err(|error| format!("start Browser Use Cloud browser authorization: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("start Browser Use Cloud browser authorization: {error}"))?
+        .json::<BrowserUseCloudBrowserStartResponse>()
+        .map_err(|error| format!("parse Browser Use Cloud browser authorization: {error}"))?;
+
+    let authorization = BrowserUseCloudAuthorizationStart {
+        authorization_uri: start.authorization_uri.clone(),
+        redirect_uri: redirect_uri.clone(),
+    };
+    let browser_open_error = open_external_url(&start.authorization_uri)
+        .err()
+        .map(|error| error.to_string());
+    let _ = event_tx.send(BrowserUseCloudLoginEvent::Started {
+        authorization,
+        browser_open_error,
+    });
+
+    let authorization = wait_for_browser_use_cloud_callback(
+        listener,
+        state.as_str(),
+        stop_rx,
+        Duration::from_secs(start.expires_in.max(1)),
+    )
+    .map_err(|error| format!("Browser Use Cloud callback failed: {error:#}"))?;
+    if authorization.state.as_deref() != Some(&state) {
+        return Err("Browser Use Cloud OAuth state mismatch".to_string());
+    }
+    if let Some(error) = authorization.error {
+        let description = authorization
+            .error_description
+            .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string());
+        return Err(format!("{description} ({error})"));
+    }
+    let code = authorization
+        .code
+        .ok_or_else(|| "Browser Use Cloud authorization code was missing".to_string())?;
+
+    let response = client
+        .post(format!("{base_url}/cloud/cli-auth/token"))
+        .json(&BrowserUseCloudAuthorizationCodeTokenRequest {
+            grant_type: BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            code_verifier: &code_verifier,
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+        })
+        .send()
+        .map_err(|error| format!("exchange Browser Use Cloud authorization code: {error}"))?;
+    if response.status().is_success() {
+        let token = response
+            .json::<BrowserUseCloudTokenResponse>()
+            .map_err(|error| format!("parse Browser Use Cloud browser token: {error}"))?;
+        return Ok(BrowserUseCloudCredential {
+            api_key: token.api_key,
+            api_key_id: token.api_key_id,
+            project_id: token.project_id,
+            expires_at: token.expires_at,
+            scopes: token.scopes,
+        });
+    }
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+        BrowserUseCloudTokenError {
+            error: "server_error".to_string(),
+            error_description: Some(format!(
+                "Browser Use Cloud returned {status} during authorization code exchange"
+            )),
+        },
+    );
+    Err(error
+        .error_description
+        .unwrap_or_else(|| format!("Browser Use Cloud sign-in failed: {}", error.error)))
+}
+
+#[cfg(test)]
+fn start_browser_use_cloud_login_flow(account: String) -> Result<BrowserUseCloudLoginFlow> {
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    Ok(BrowserUseCloudLoginFlow {
+        account,
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+        authorization: None,
+        browser_open_error: None,
+        event_tx_guard: Some(event_tx),
+    })
+}
+
+#[cfg(not(test))]
+fn wait_for_browser_use_cloud_callback(
+    listener: TcpListener,
+    expected_state: &str,
+    stop_rx: mpsc::Receiver<()>,
+    timeout: Duration,
+) -> Result<BrowserUseCloudAuthorization> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            anyhow::bail!("Browser Use Cloud sign-in was cancelled");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for Browser Use Cloud browser approval");
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                return handle_browser_use_cloud_callback(&mut stream, expected_state);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("accept Browser Use Cloud OAuth callback"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn handle_browser_use_cloud_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<BrowserUseCloudAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Browser Use Cloud OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Browser Use Cloud OAuth callback request")?;
+    let parsed = parse_browser_use_cloud_authorization_path(path)?;
+    let callback_path = Url::parse(&format!("http://127.0.0.1{path}"))
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+    let status = if callback_path != BROWSER_USE_CLOUD_CALLBACK_PATH {
+        404
+    } else if parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else if parsed.code.is_none() && parsed.error.is_none() {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 if parsed.error.is_some() => {
+            "Browser Use Cloud authorization was cancelled. You can close this window."
+        }
+        200 => "Browser Use Cloud authentication completed. You can close this window.",
+        400 => "Browser Use Cloud authentication failed: missing code or state mismatch.",
+        _ => "Browser Use Cloud callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        anyhow::bail!("{text}")
+    }
+}
+
+#[cfg(not(test))]
+fn parse_browser_use_cloud_authorization_path(path: &str) -> Result<BrowserUseCloudAuthorization> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .context("parse Browser Use Cloud OAuth callback URL")?;
+    let mut authorization = BrowserUseCloudAuthorization::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => authorization.code = Some(value.into_owned()),
+            "state" => authorization.state = Some(value.into_owned()),
+            "error" => authorization.error = Some(value.into_owned()),
+            "error_description" => authorization.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(authorization)
+}
+
+#[cfg(not(test))]
 fn wait_for_claude_code_oauth_credential(
     listener: TcpListener,
     verifier: String,
@@ -10261,6 +11055,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
             draw_needed |= app.drain_codex_login_notifications()?;
+            draw_needed |= app.drain_browser_use_cloud_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
             draw_needed |= app.drain_default_profile_notifications()?;
@@ -10341,11 +11136,13 @@ fn run_terminal(mut app: App) -> Result<()> {
                     }
                     last_typewriter_tick = Instant::now();
                 }
-                // Handle FeedbackThanks animation and auto-dismiss.
+                // Handle the shared waving-character animation. Feedback
+                // thanks auto-dismisses; Cloud setup success waits for input.
                 if app.should_animate_feedback_thanks() {
-                    if app
-                        .feedback_thanks_started
-                        .is_some_and(|t| t.elapsed() >= FEEDBACK_THANKS_AUTO_DISMISS)
+                    if app.surface == Surface::FeedbackThanks
+                        && app
+                            .feedback_thanks_started
+                            .is_some_and(|t| t.elapsed() >= FEEDBACK_THANKS_AUTO_DISMISS)
                     {
                         app.surface = Surface::Main;
                         app.feedback_thanks_started = None;
@@ -13283,7 +14080,11 @@ mod redesign_tests {
             Surface::Developer => "Developer",
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
-            Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
+            Surface::Setup
+            | Surface::SetupConfirm
+            | Surface::SetupResult
+            | Surface::SetupCloud
+            | Surface::SetupCloudSuccess => "Setup",
             Surface::Secrets => "Secrets",
             Surface::Domains => "Domains",
             Surface::Email => "Email inbox",
@@ -13616,9 +14417,22 @@ mod redesign_tests {
         assert!(!app.setup_complete);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupCloud);
+        assert!(!app.setup_complete);
+        assert_eq!(app.account, "Codex login");
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("One-Click Browser Use Cloud Setup?"));
+        assert!(screen.contains("> free"));
+        assert!(screen.contains("> automatically solve captchas"));
+        assert!(screen.contains("> sync local cookies so you stay logged in"));
+        assert!(screen.contains("> avoid local Chrome permission prompts"));
+
+        app.selected_row = 1;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ModelSearch);
         assert!(!app.setup_complete);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
 
         app.save_provider_model("gpt-5.5".to_string())?;
         assert_eq!(app.surface, Surface::Main);
@@ -13627,6 +14441,12 @@ mod redesign_tests {
         assert_eq!(app.model, "gpt-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        assert_eq!(
+            app.store
+                .get_setting(BROWSER_PREFERENCE_MODE_SETTING)?
+                .as_deref(),
+            Some("local")
+        );
         assert!(app.status_notice.is_none());
         let screen = render_dump(&mut app)?;
         // After setup the home screen shows either the typewriter example placeholder
@@ -13973,8 +14793,12 @@ mod redesign_tests {
             app.selected_row = app.browser_select_local_browser_count();
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-            assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            assert_eq!(app.surface, Surface::SetupResult);
+            assert_eq!(
+                app.setup_result.as_ref().map(|result| &result.kind),
+                Some(&SetupResultKind::Pending)
+            );
+            assert!(app.browser_use_cloud_login.is_some());
 
             let events = app.store.events_for_session(&session.id)?;
             assert!(events
@@ -14226,7 +15050,7 @@ mod redesign_tests {
             )?;
             app.selected_session_id = Some(session.id.clone());
 
-            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             app.set_input("bu-test-key".to_string());
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
 
@@ -14268,8 +15092,12 @@ mod redesign_tests {
 
             app.execute_surface_selection()?;
 
-            assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            assert_eq!(app.surface, Surface::SetupResult);
+            assert_eq!(
+                app.setup_result.as_ref().map(|result| &result.kind),
+                Some(&SetupResultKind::Pending)
+            );
+            assert!(app.browser_use_cloud_login.is_some());
             assert!(app.pending_cookie_sync_after_auth);
             assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
             Ok(())
@@ -14340,6 +15168,7 @@ mod redesign_tests {
 
         let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 100));
 
+        assert!(plain.contains("⠋ Syncing all cookies from Google Chrome - Reagan"));
         assert!(plain.contains("Syncing all cookies from Google Chrome - Reagan"));
         assert!(!plain.contains("google-chrome:Default"));
     }
@@ -14354,7 +15183,7 @@ mod redesign_tests {
 
         let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 18));
 
-        assert!(plain.contains("  Syncing all"));
+        assert!(plain.contains("Syncing all"));
         assert!(plain.contains("  cookies from"));
         assert!(plain.contains("  Alpha Beta"));
         for line in plain.lines().filter(|line| line.starts_with("  ")) {
@@ -14409,7 +15238,7 @@ mod redesign_tests {
             app.open_surface(Surface::BrowserSelect);
             app.selected_row = app.browser_select_local_browser_count();
 
-            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             assert_eq!(app.surface, Surface::ApiKey);
             assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
             app.set_input("bu-test-key".to_string());
@@ -14421,7 +15250,103 @@ mod redesign_tests {
                 Some("bu-test-key")
             );
             assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_PREFERENCE_MODE_SETTING)?
+                    .as_deref(),
+                Some("cloud")
+            );
             assert!(app.browser_use_cloud_key_ready()?);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_browser_auth_stores_key_after_approval() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "browser.state",
+                serde_json::json!({"url": "https://example.com", "title": "Example"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            assert_eq!(app.surface, Surface::SetupResult);
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+            tx.send(BrowserUseCloudLoginEvent::Started {
+                authorization: BrowserUseCloudAuthorizationStart {
+                    authorization_uri:
+                        "https://cloud.browser-use.com/device/authorize?state=test-state"
+                            .to_string(),
+                    redirect_uri: "http://127.0.0.1:54321/browser-use-cloud/callback".to_string(),
+                },
+                browser_open_error: None,
+            })?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser authorization link"));
+            assert!(screen.contains("https://cloud.browser-use.com/device/authorize"));
+            assert!(screen.contains("Callback listener"));
+            assert!(screen.contains("http://127.0.0.1:54321/browser-use-cloud/callback"));
+            assert!(!screen.contains("Code:"));
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: Some("2026-09-01T00:00:00Z".to_string()),
+                    scopes: vec!["*:*:*".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+                    .as_deref(),
+                Some("bu-device-key")
+            );
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?
+                    .as_deref(),
+                Some("cli_login")
+            );
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_PREFERENCE_MODE_SETTING)?
+                    .as_deref(),
+                Some("cloud")
+            );
+            assert_eq!(
+                app.setup_result.as_ref().map(|result| &result.kind),
+                Some(&SetupResultKind::Success)
+            );
+            let events = app.store.events_for_session(&session.id)?;
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "browser.backend_changed"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -14443,16 +15368,9 @@ mod redesign_tests {
             let mut app = ready_app(&temp)?;
             let original_account = app.account.clone();
 
-            app.open_surface(Surface::Account);
-            app.selected_row = settings::AUTH_CHOICES
-                .iter()
-                .position(|account| *account == BROWSER_USE_CLOUD)
-                .context("Browser Use Cloud auth row")?;
+            app.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             let screen = render_dump(&mut app)?;
             assert!(screen.contains("Browser Use Cloud"));
-            assert!(screen.contains("needs key"));
-
-            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
             assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
             app.set_input("bu-auth-surface-key".to_string());
@@ -14475,6 +15393,253 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn browser_use_cloud_onboarding_confirms_before_cookie_sync() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.pending_cookie_sync_after_auth = true;
+            app.pending_setup_after_cookie_sync = true;
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupCloudSuccess);
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use Cloud connected"));
+            assert!(!screen.contains("Browser Use Cloud is connected"));
+            assert!(screen.contains("Continue to cookie sync?"));
+            assert!(screen.contains("> Yes"));
+            assert!(screen.contains("  Skip"));
+            assert!(!screen.contains("Import local browser cookies to Browser Use Cloud"));
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::CookieSync);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_onboarding_escape_from_connected_clears_pending_setup() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.pending_cookie_sync_after_auth = true;
+            app.pending_setup_after_cookie_sync = true;
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupCloudSuccess);
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+            assert_eq!(app.surface, Surface::Main);
+            assert!(!app.pending_cookie_sync_after_auth);
+            assert!(!app.pending_setup_after_cookie_sync);
+            assert!(app.browser_use_cloud_login.is_none());
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_onboarding_skip_cookie_sync_opens_model_selection() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = App::new(args(&temp))?;
+            app.account = settings::ACCOUNT_OPENAI.to_string();
+            app.store
+                .set_setting("auth.openai.api_key", "sk-test-key")?;
+            app.pending_cookie_sync_after_auth = true;
+            app.pending_setup_after_cookie_sync = true;
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupCloudSuccess);
+
+            app.selected_row = 1;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(app.surface, Surface::ModelSearch);
+            assert!(!app.setup_complete);
+            assert!(!app.pending_setup_after_cookie_sync);
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Model"));
+            assert!(!screen.contains("PROVIDERS"));
+            assert!(!screen.contains("Continue with Codex login"));
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn onboarding_cookie_sync_opens_model_selection_after_cloud_profile() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.store
+            .set_setting("auth.openai.api_key", "sk-test-key")?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+        app.store
+            .set_setting(BROWSER_PREFERENCE_MODE_SETTING, "cloud")?;
+        app.pending_setup_after_cookie_sync = true;
+        app.open_surface(Surface::CookieSync);
+
+        app.apply_cookie_sync_event(CookieSyncEvent {
+            kind: CookieSyncCommandKind::SyncProfile,
+            result: Ok(serde_json::json!({
+                "status": "ok",
+                "synced": true,
+                "synced_cookie_count": 3,
+                "profile": {
+                    "display_name": "Google Chrome - Reagan"
+                },
+                "cloud_profile": {
+                    "id": "cloud_profile_123",
+                    "name": "Google Chrome - Reagan"
+                }
+            })),
+        });
+
+        assert!(matches!(
+            app.cookie_sync.status,
+            CookieSyncStatus::Completed(_)
+        ));
+        assert_eq!(
+            app.store
+                .get_setting(BROWSER_PREFERENCE_PROFILE_SETTING)?
+                .as_deref(),
+            Some("cloud_profile_123")
+        );
+        assert_eq!(
+            app.store
+                .get_setting(BROWSER_PREFERENCE_PROFILE_LABEL_SETTING)?
+                .as_deref(),
+            Some("Google Chrome - Reagan")
+        );
+
+        app.execute_surface_selection()?;
+
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert!(!app.pending_setup_after_cookie_sync);
+        assert_eq!(app.browser, BROWSER_USE_CLOUD);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
+
+        app.save_provider_model("gpt-5.5".to_string())?;
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+        assert_eq!(app.model, "gpt-5.5");
+        Ok(())
+    }
+
+    #[test]
+    fn onboarding_cookie_sync_renders_as_setup_page_not_provider_popup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.model_configured = true;
+        app.account = settings::ACCOUNT_OPENAI.to_string();
+        app.pending_setup_after_cookie_sync = true;
+        app.open_surface(Surface::CookieSync);
+        app.cookie_sync.status = CookieSyncStatus::Ready;
+        app.cookie_sync.profiles = vec![CookieSyncProfile {
+            id: "google-chrome:Default".to_string(),
+            display_name: "Google Chrome - Reagan".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            profile_name: "Default".to_string(),
+        }];
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("Cookie Sync"));
+        assert!(screen.contains("Import local browser cookies to Browser Use Cloud"));
+        assert!(screen.contains("LOCAL PROFILES"));
+        assert!(screen.contains("Google Chrome - Reagan"));
+        assert!(!screen.contains("PROVIDERS"));
+        assert!(!screen.contains("Continue with Codex"));
+        Ok(())
     }
 
     #[test]
@@ -14518,6 +15683,17 @@ mod redesign_tests {
             app.store.get_setting("auth.openrouter.api_key")?.as_deref(),
             Some("sk-or-v1-test")
         );
+        assert_eq!(app.surface, Surface::SetupCloud);
+        assert!(!app.setup_complete);
+        app.selected_row = 1;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+        let default_model = app
+            .default_model_for_account(settings::ACCOUNT_OPENROUTER)
+            .context("default OpenRouter model")?;
+        app.save_model(default_model)?;
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
@@ -16143,13 +17319,19 @@ wire_api = "responses"
         );
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("Continue to choose a model."));
-        assert!(screen.contains("> Choose model"));
+        assert!(screen.contains("Continue to Browser Use Cloud setup."));
+        assert!(screen.contains("> Continue"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.surface, Surface::SetupCloud);
         assert!(!app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_CODEX);
+
+        app.selected_row = 1;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_CODEX));
         assert_eq!(
             app.model_search_rows(),
@@ -16162,6 +17344,7 @@ wire_api = "responses"
         assert!(app.setup_complete);
         assert_eq!(app.model, "gpt-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
     }
 
@@ -16923,9 +18106,15 @@ wire_api = "responses"
         );
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.surface, Surface::SetupCloud);
         assert!(!app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENAI);
+
+        app.selected_row = 1;
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert!(!app.setup_complete);
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
 
         app.save_provider_model("gpt-5.5".to_string())?;
@@ -16933,6 +18122,7 @@ wire_api = "responses"
         assert!(app.setup_complete);
         assert_eq!(app.model, "gpt-5.5");
         assert_eq!(app.provider_model, "gpt-5.5");
+        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         Ok(())
     }
 
@@ -16970,6 +18160,7 @@ wire_api = "responses"
         let mut app = ready_app(&temp)?;
         for surface in [
             Surface::Setup,
+            Surface::SetupCloud,
             Surface::Account,
             Surface::Model,
             Surface::Mode,
@@ -17000,6 +18191,7 @@ wire_api = "responses"
             }
             let count = match surface {
                 Surface::Setup => app.setup_row_count(),
+                Surface::SetupCloud => 2,
                 Surface::Account => AUTH_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,

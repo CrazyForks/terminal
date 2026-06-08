@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -83,6 +83,7 @@ use browser_use_runtime::{
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
 use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -93,6 +94,39 @@ const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
 const SDK_JSON_RPC_FRAME_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const SDK_HISTORY_EVENTS_HEAD_COUNT: usize = 20;
 const SDK_HISTORY_EVENTS_INITIAL_TAIL_COUNT: usize = 400;
+
+fn should_color_stdout() -> bool {
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn ansi(text: impl AsRef<str>, code: &str) -> String {
+    let text = text.as_ref();
+    if should_color_stdout() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn cli_heading(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_code(text: impl AsRef<str>) -> String {
+    ansi(text, "1;38;5;208")
+}
+
+fn cli_link(text: impl AsRef<str>) -> String {
+    ansi(text, "4;38;5;39")
+}
+
+fn cli_muted(text: impl AsRef<str>) -> String {
+    ansi(text, "2")
+}
+
+fn cli_success(text: impl AsRef<str>) -> String {
+    ansi(text, "1;32")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -575,6 +609,8 @@ enum AuthCommand {
         #[arg(long)]
         code: Option<String>,
         #[arg(long)]
+        device_code: bool,
+        #[arg(long)]
         no_browser: bool,
     },
     ImportCodex {
@@ -583,6 +619,8 @@ enum AuthCommand {
     },
     Logout {
         account: AuthAccount,
+        #[arg(long)]
+        local_only: bool,
     },
 }
 
@@ -3028,6 +3066,7 @@ fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Val
     let artifact_root = cli_browser_artifact_root(store)?;
     let options = browser_use_browser::BrowserCommandOptions {
         browser_use_api_key,
+        browser_use_api_url: Some(browser_use_cloud_api_base_url()),
     };
     Ok(browser_use_browser::run_browser_command_with_options(
         "cli-browser",
@@ -3320,7 +3359,20 @@ fn is_secret_setting(key: &str) -> bool {
 }
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+const BROWSER_USE_CLOUD_API_KEY_ID_SETTING: &str = "auth.browser_use_cloud.api_key_id";
+const BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING: &str = "auth.browser_use_cloud.api_key_source";
+const BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING: &str = "auth.browser_use_cloud.project_id";
+const BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING: &str = "auth.browser_use_cloud.expires_at";
+const BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING: &str = "auth.browser_use_cloud.scopes";
 const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
+const BROWSER_USE_CLOUD_API_URL_ENV: &str = "BROWSER_USE_CLOUD_API_URL";
+const BROWSER_USE_CLOUD_DEFAULT_API_URL: &str = "https://api.browser-use.com";
+const BROWSER_USE_CLOUD_LOCAL_API_URL: &str = "http://localhost:8000";
+const BROWSER_USE_CLOUD_LOCAL_APP_URL: &str = "http://localhost:3000";
+const BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE: &str = "authorization_code";
+const BROWSER_USE_CLOUD_CLIENT_ID: &str = "browser-use-terminal";
+const BROWSER_USE_CLOUD_CALLBACK_PATH: &str = "/browser-use-cloud/callback";
 
 fn secrets(store: &Store, command: SecretsCommand) -> Result<()> {
     use browser_use_agent::tools::handlers::secrets_admin as sa;
@@ -3539,6 +3591,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         } => auth_login(
             store,
@@ -3547,6 +3600,7 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             access_token,
             account_id,
             code,
+            device_code,
             no_browser,
         ),
         AuthCommand::ImportCodex { input } => {
@@ -3573,8 +3627,11 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             println!("Codex login: imported account {}", auth.account_id);
             Ok(())
         }
-        AuthCommand::Logout { account } => {
-            auth_logout(store, account)?;
+        AuthCommand::Logout {
+            account,
+            local_only,
+        } => {
+            auth_logout(store, account, local_only)?;
             println!("{}: logged out", auth_account_label(account));
             Ok(())
         }
@@ -3596,6 +3653,68 @@ fn print_auth_line(label: &str, connected: bool) {
     println!("{label}: {status}");
 }
 
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudDeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceStartRequest {
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudDeviceTokenRequest<'a> {
+    grant_type: &'a str,
+    device_code: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudBrowserStartRequest<'a> {
+    client_id: &'a str,
+    response_type: &'a str,
+    redirect_uri: &'a str,
+    code_challenge: &'a str,
+    code_challenge_method: &'a str,
+    state: &'a str,
+    device_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudBrowserStartResponse {
+    authorization_uri: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserUseCloudAuthorizationCodeTokenRequest<'a> {
+    grant_type: &'a str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    code_verifier: &'a str,
+    client_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenResponse {
+    api_key: String,
+    api_key_id: String,
+    project_id: String,
+    expires_at: Option<String>,
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserUseCloudTokenError {
+    error: String,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
+
 fn auth_login(
     store: &Store,
     account: AuthAccount,
@@ -3603,16 +3722,43 @@ fn auth_login(
     access_token: Option<String>,
     account_id: Option<String>,
     code: Option<String>,
+    device_code: bool,
     no_browser: bool,
 ) -> Result<()> {
     match account {
         AuthAccount::BrowserUseCloud => {
-            let api_key =
-                read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
-            let key = api_key_setting(account).context("account does not use an API key")?;
-            store.set_setting(key, api_key.trim())?;
+            if let Some(api_key) = api_key {
+                let api_key = read_required_secret(
+                    Some(api_key),
+                    &format!("{} API key", auth_account_label(account)),
+                )?;
+                store_browser_use_cloud_api_key(store, api_key.trim(), None)?;
+                println!(
+                    "{}: connected (stored API key)",
+                    auth_account_label(account)
+                );
+                return Ok(());
+            }
+            if code.is_some() {
+                bail!(
+                    "auth login browser-use-cloud uses --device-code for manual sign-in; --code is for Claude Code OAuth"
+                );
+            }
+            let credential = if device_code {
+                browser_use_cloud_device_login(!no_browser)?
+            } else {
+                browser_use_cloud_browser_login(!no_browser)?
+            };
+            store_browser_use_cloud_api_key(store, &credential.api_key, Some(&credential))?;
             store.set_setting("browser", "Browser Use Cloud")?;
-            println!("{}: connected (stored)", auth_account_label(account));
+            println!(
+                "{} {}",
+                cli_success(format!(
+                    "{}: connected to project",
+                    auth_account_label(account)
+                )),
+                credential.project_id
+            );
             Ok(())
         }
         AuthAccount::Openai
@@ -3658,7 +3804,338 @@ fn auth_login(
     }
 }
 
-fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
+fn browser_use_cloud_api_base_url() -> String {
+    if let Some(url) = std::env::var(BROWSER_USE_CLOUD_API_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return normalize_browser_use_cloud_url(&url);
+    }
+
+    if browser_use_cloud_local_dev_available() {
+        return BROWSER_USE_CLOUD_LOCAL_API_URL.to_string();
+    }
+
+    BROWSER_USE_CLOUD_DEFAULT_API_URL.to_string()
+}
+
+fn normalize_browser_use_cloud_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn browser_use_cloud_local_dev_available() -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(700))
+        .build()
+    else {
+        return false;
+    };
+
+    browser_use_cloud_local_backend_available(&client)
+        && browser_use_cloud_local_frontend_available(&client)
+}
+
+fn browser_use_cloud_local_backend_available(client: &reqwest::blocking::Client) -> bool {
+    let version_ok = client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/browser-use-version"
+        ))
+        .send()
+        .is_ok_and(|response| response.status().is_success());
+    if !version_ok {
+        return false;
+    }
+
+    client
+        .get(format!(
+            "{BROWSER_USE_CLOUD_LOCAL_API_URL}/cloud/cli-auth/device/0000-0000"
+        ))
+        .send()
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+fn browser_use_cloud_local_frontend_available(client: &reqwest::blocking::Client) -> bool {
+    client
+        .head(format!("{BROWSER_USE_CLOUD_LOCAL_APP_URL}/device"))
+        .send()
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn browser_use_cloud_device_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn browser_use_cloud_browser_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let (code_verifier, code_challenge) = claude_code_oauth_pkce();
+    let (state, _) = claude_code_oauth_pkce();
+    let (tx, rx) = mpsc::channel();
+    let (_callback, redirect_uri) = start_browser_use_cloud_callback_server(state.clone(), tx)?;
+
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/browser"))
+        .json(&BrowserUseCloudBrowserStartRequest {
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+            response_type: "code",
+            redirect_uri: &redirect_uri,
+            code_challenge: &code_challenge,
+            code_challenge_method: "S256",
+            state: &state,
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud browser authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud browser authorization")?
+        .json::<BrowserUseCloudBrowserStartResponse>()
+        .context("parse Browser Use Cloud browser authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.authorization_uri)
+    );
+    println!(
+        "{}",
+        cli_muted(format!(
+            "Waiting for browser approval on {redirect_uri} ..."
+        ))
+    );
+    println!();
+    println!(
+        "{}",
+        cli_muted("If the browser does not open, open the URL above.")
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.authorization_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let authorization = rx
+        .recv_timeout(Duration::from_secs(start.expires_in.max(1)))
+        .context("timed out waiting for Browser Use Cloud browser approval")??;
+    if authorization.state.as_deref() != Some(&state) {
+        bail!("Browser Use Cloud OAuth state mismatch");
+    }
+    if let Some(error) = authorization.error {
+        let description = authorization
+            .error_description
+            .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string());
+        bail!("{description} ({error})");
+    }
+    let code = authorization
+        .code
+        .context("Browser Use Cloud authorization code was missing")?;
+
+    let response = client
+        .post(format!("{base_url}/cloud/cli-auth/token"))
+        .json(&BrowserUseCloudAuthorizationCodeTokenRequest {
+            grant_type: BROWSER_USE_CLOUD_AUTHORIZATION_CODE_GRANT_TYPE,
+            code: &code,
+            redirect_uri: &redirect_uri,
+            code_verifier: &code_verifier,
+            client_id: BROWSER_USE_CLOUD_CLIENT_ID,
+        })
+        .send()
+        .context("exchange Browser Use Cloud authorization code")?;
+    if response.status().is_success() {
+        return response
+            .json::<BrowserUseCloudTokenResponse>()
+            .context("parse Browser Use Cloud browser token");
+    }
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+        BrowserUseCloudTokenError {
+            error: "server_error".to_string(),
+            error_description: Some(format!(
+                "Browser Use Cloud returned {status} during authorization code exchange"
+            )),
+            interval: None,
+        },
+    );
+    bail!(
+        "{}",
+        error
+            .error_description
+            .unwrap_or_else(|| format!("Browser Use Cloud sign-in failed: {}", error.error))
+    )
+}
+
+fn browser_use_cloud_device_login(open_browser: bool) -> Result<BrowserUseCloudTokenResponse> {
+    let base_url = browser_use_cloud_api_base_url();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?;
+    let start = client
+        .post(format!("{base_url}/cloud/cli-auth/device"))
+        .json(&BrowserUseCloudDeviceStartRequest {
+            device_name: browser_use_cloud_device_name(),
+        })
+        .send()
+        .context("start Browser Use Cloud device authorization")?
+        .error_for_status()
+        .context("start Browser Use Cloud device authorization")?
+        .json::<BrowserUseCloudDeviceStartResponse>()
+        .context("parse Browser Use Cloud device authorization")?;
+
+    println!("{}", cli_heading("Browser Use Cloud sign-in"));
+    println!();
+    println!(
+        "{} {}",
+        cli_muted("Open:"),
+        cli_link(&start.verification_uri)
+    );
+    println!("{} {}", cli_muted("Code:"), cli_code(&start.user_code));
+    println!();
+    println!(
+        "{}",
+        cli_muted(format!(
+            "If the browser does not open, go to {} and enter the code.",
+            start.verification_uri
+        ))
+    );
+    if open_browser {
+        if let Err(error) = open::that(&start.verification_uri) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
+    let mut interval = Duration::from_secs(start.interval.max(1));
+    while Instant::now() < deadline {
+        thread::sleep(interval);
+        let response = match client
+            .post(format!("{base_url}/cloud/cli-auth/token"))
+            .json(&BrowserUseCloudDeviceTokenRequest {
+                grant_type: BROWSER_USE_CLOUD_DEVICE_GRANT_TYPE,
+                device_code: &start.device_code,
+            })
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status().is_success() {
+            return response
+                .json::<BrowserUseCloudTokenResponse>()
+                .context("parse Browser Use Cloud device token");
+        }
+
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        let error = serde_json::from_str::<BrowserUseCloudTokenError>(&text).unwrap_or(
+            BrowserUseCloudTokenError {
+                error: "server_error".to_string(),
+                error_description: Some(format!(
+                    "Browser Use Cloud returned {status} during device authorization"
+                )),
+                interval: None,
+            },
+        );
+        match error.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => {
+                interval = Duration::from_secs(error.interval.unwrap_or(10).max(1));
+            }
+            "access_denied" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in was denied".to_string())
+            ),
+            "expired_token" => bail!(
+                "{}",
+                error
+                    .error_description
+                    .unwrap_or_else(|| "Browser Use Cloud sign-in expired".to_string())
+            ),
+            _ => bail!(
+                "{}",
+                error.error_description.unwrap_or_else(|| format!(
+                    "Browser Use Cloud sign-in failed: {}",
+                    error.error
+                ))
+            ),
+        }
+    }
+    bail!("Browser Use Cloud sign-in expired")
+}
+
+fn store_browser_use_cloud_api_key(
+    store: &Store,
+    api_key: &str,
+    credential: Option<&BrowserUseCloudTokenResponse>,
+) -> Result<()> {
+    store.set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, api_key.trim())?;
+    store.set_setting("browser", "Browser Use Cloud")?;
+    if let Some(credential) = credential {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "cli_login")?;
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING, &credential.api_key_id)?;
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING,
+            &credential.project_id,
+        )?;
+        if let Some(expires_at) = credential.expires_at.as_deref() {
+            store.set_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING, expires_at)?;
+        } else {
+            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        }
+        store.set_setting(
+            BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING,
+            &serde_json::to_string(&credential.scopes)?,
+        )?;
+    } else {
+        store.set_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING, "manual")?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+        store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    }
+    Ok(())
+}
+
+fn revoke_browser_use_cloud_api_key(api_key: &str) -> Result<()> {
+    let base_url = browser_use_cloud_api_base_url();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Browser Use Cloud auth client")?
+        .delete(format!("{base_url}/cloud/cli-auth/current-key"))
+        .header("X-Browser-Use-API-Key", api_key.trim())
+        .send()
+        .context("revoke Browser Use Cloud API key")?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    bail!("Browser Use Cloud key revocation failed with {status}: {body}")
+}
+
+fn clear_browser_use_cloud_api_key(store: &Store) -> Result<()> {
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_ID_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_PROJECT_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_EXPIRES_SETTING)?;
+    store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SCOPES_SETTING)?;
+    Ok(())
+}
+
+fn auth_logout(store: &Store, account: AuthAccount, local_only: bool) -> Result<()> {
     match account {
         AuthAccount::Codex => {
             store.delete_setting("auth.codex.access_token")?;
@@ -3677,7 +4154,16 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             }
         }
         AuthAccount::BrowserUseCloud => {
-            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            let source = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SOURCE_SETTING)?;
+            let api_key = store.get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
+            if !local_only && source.as_deref() == Some("cli_login") {
+                if let Some(api_key) = api_key.as_deref().filter(|value| !value.trim().is_empty()) {
+                    revoke_browser_use_cloud_api_key(api_key).with_context(|| {
+                        "remote revocation failed; rerun with --local-only to remove only the local credential"
+                    })?;
+                }
+            }
+            clear_browser_use_cloud_api_key(store)?;
         }
         AuthAccount::ClaudeCode => {
             store.delete_setting("auth.claude_code.access_token")?;
@@ -3800,6 +4286,134 @@ impl Drop for CallbackServerHandle {
             let _ = thread.join();
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BrowserUseCloudAuthorization {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn start_browser_use_cloud_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<BrowserUseCloudAuthorization>>,
+) -> Result<(CallbackServerHandle, String)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("bind Browser Use Cloud OAuth callback on 127.0.0.1")?;
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        listener
+            .local_addr()
+            .context("read Browser Use Cloud OAuth callback address")?
+            .port(),
+        BROWSER_USE_CLOUD_CALLBACK_PATH
+    );
+    listener
+        .set_nonblocking(true)
+        .context("configure Browser Use Cloud OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_browser_use_cloud_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send(Err(error).context("accept Browser Use Cloud OAuth callback"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok((
+        CallbackServerHandle {
+            stop: stop_tx,
+            thread: Some(thread),
+        },
+        redirect_uri,
+    ))
+}
+
+fn handle_browser_use_cloud_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<BrowserUseCloudAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Browser Use Cloud OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Browser Use Cloud OAuth callback request")?;
+    let parsed = parse_browser_use_cloud_authorization_path(path)?;
+    let callback_path = Url::parse(&format!("http://127.0.0.1{path}"))
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+    let status = if callback_path != BROWSER_USE_CLOUD_CALLBACK_PATH {
+        404
+    } else if parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else if parsed.code.is_none() && parsed.error.is_none() {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 if parsed.error.is_some() => {
+            "Browser Use Cloud authorization was cancelled. You can close this window."
+        }
+        200 => "Browser Use Cloud authentication completed. You can close this window.",
+        400 => "Browser Use Cloud authentication failed: missing code or state mismatch.",
+        _ => "Browser Use Cloud callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
+    }
+}
+
+fn parse_browser_use_cloud_authorization_path(path: &str) -> Result<BrowserUseCloudAuthorization> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))
+        .context("parse Browser Use Cloud OAuth callback URL")?;
+    let mut authorization = BrowserUseCloudAuthorization::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => authorization.code = Some(value.into_owned()),
+            "state" => authorization.state = Some(value.into_owned()),
+            "error" => authorization.error = Some(value.into_owned()),
+            "error_description" => authorization.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(authorization)
 }
 
 fn start_codex_callback_server(
