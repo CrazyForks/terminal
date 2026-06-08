@@ -86,6 +86,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const SDK_PROTOCOL_VERSION: u64 = 1;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SDK_EVENT_STRING_LIMIT_BYTES: usize = 1_000_000;
@@ -4180,7 +4181,8 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
     }
     let id = request.id;
     let result = match request.method.as_str() {
-        "runtime.ping" => Ok(serde_json::json!({ "ok": true })),
+        "runtime.ping" => Ok(sdk_runtime_ping()),
+        "runtime.python_worker_ping" => sdk_runtime_python_worker_ping(context),
         "runtime.snapshot" => sdk_runtime_snapshot(&context.runtime),
         "browser.create" => sdk_browser_create(&context.runtime, &request.params),
         "browser.stop" | "browser.close" => sdk_browser_close(&context.runtime, &request.params),
@@ -4203,6 +4205,43 @@ fn handle_sdk_json_rpc_request(context: &SdkServerContext, request: JsonRpcReque
         }
         Err(error) => json_rpc_error(id, -32000, error.to_string()),
     }
+}
+
+fn sdk_runtime_ping() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "sdk_protocol_version": SDK_PROTOCOL_VERSION,
+        "terminal_version": env!("CARGO_PKG_VERSION"),
+        "capabilities": [
+            "browser.create",
+            "agent.run_task",
+            "agent.run",
+            "agent.stop",
+            "runtime.python_worker_ping",
+        ],
+    })
+}
+
+fn sdk_runtime_python_worker_ping(context: &SdkServerContext) -> Result<Value> {
+    let artifact_dir = context
+        ._ephemeral_state_dir
+        .path()
+        .join("python-worker-ping");
+    fs::create_dir_all(&artifact_dir)?;
+    let cwd = std::env::current_dir()?;
+    let mut worker =
+        PythonWorker::start_with_browser_mode_and_env(None, std::iter::empty::<(&str, &str)>())?;
+    let response = worker.run(
+        "sdk-python-worker-ping",
+        cwd,
+        artifact_dir,
+        "print('browser-use-python-worker-ok')",
+    )?;
+    Ok(serde_json::json!({
+        "ok": response.ok,
+        "text": response.text,
+        "error": response.error,
+    }))
 }
 
 fn sdk_runtime_snapshot(runtime: &RuntimeHandle) -> Result<Value> {
@@ -7909,6 +7948,11 @@ command = "test-mcp"
             r#"{"jsonrpc":"2.0","id":1,"method":"runtime.ping","params":{}}"#,
         );
         assert_eq!(ping["result"]["ok"], true);
+        assert_eq!(ping["result"]["sdk_protocol_version"], SDK_PROTOCOL_VERSION);
+        assert_eq!(
+            ping["result"]["terminal_version"],
+            env!("CARGO_PKG_VERSION")
+        );
         let snapshot = handle_sdk_json_rpc_line(
             &context,
             r#"{"jsonrpc":"2.0","id":10,"method":"runtime.snapshot","params":{}}"#,
