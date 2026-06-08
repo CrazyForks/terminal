@@ -1463,7 +1463,6 @@ struct App {
     feedback: FeedbackState,
     feedback_rx: Option<tokio::sync::mpsc::Receiver<FeedbackSubmitResult>>,
     feedback_thanks_started: Option<Instant>,
-    setup_cloud_success_started: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -2518,7 +2517,6 @@ impl App {
             feedback: FeedbackState::default(),
             feedback_rx: None,
             feedback_thanks_started: None,
-            setup_cloud_success_started: None,
         };
         if let Some(session_id) = app.selected_session_id.clone() {
             app.apply_session_settings_to_app(&session_id)?;
@@ -5343,10 +5341,6 @@ impl App {
             self.feedback_thanks_started = None;
             return Ok(false);
         }
-        if self.surface == Surface::SetupCloudSuccess {
-            self.continue_after_setup_cloud_success()?;
-            return Ok(false);
-        }
         if self.prompt_history.search.is_some() {
             self.handle_prompt_history_search_key(key)?;
             self.drain_store_notifications()?;
@@ -6188,7 +6182,7 @@ impl App {
             Surface::SetupConfirm => self.execute_setup_confirm_selection()?,
             Surface::SetupResult => self.execute_setup_result_selection()?,
             Surface::SetupCloud => self.execute_setup_cloud_selection()?,
-            Surface::SetupCloudSuccess => self.continue_after_setup_cloud_success()?,
+            Surface::SetupCloudSuccess => self.execute_setup_cloud_connected_selection()?,
             Surface::Account => {
                 let account = AUTH_CHOICES
                     .get(self.selected_row.min(AUTH_CHOICES.len().saturating_sub(1)))
@@ -6421,13 +6415,30 @@ impl App {
         self.setup_result = None;
         self.setup_pending_account = None;
         self.status_notice = None;
-        self.setup_cloud_success_started = Some(Instant::now());
         self.open_surface(Surface::SetupCloudSuccess);
     }
 
     fn continue_after_setup_cloud_success(&mut self) -> Result<()> {
-        self.setup_cloud_success_started = None;
         self.open_cookie_sync()
+    }
+
+    fn execute_setup_cloud_connected_selection(&mut self) -> Result<()> {
+        match self.selected_row.min(1) {
+            0 => self.continue_after_setup_cloud_success(),
+            _ => self.skip_setup_cookie_sync_after_cloud_auth(),
+        }
+    }
+
+    fn skip_setup_cookie_sync_after_cloud_auth(&mut self) -> Result<()> {
+        self.pending_cookie_sync_after_auth = false;
+        if self.pending_setup_after_cookie_sync {
+            self.pending_setup_after_cookie_sync = false;
+            self.status_notice = None;
+            return self.open_setup_model_selection();
+        }
+        self.status_notice = None;
+        self.close_surface();
+        Ok(())
     }
 
     fn continue_after_setup_success(&mut self, account: String) -> Result<()> {
@@ -9198,7 +9209,7 @@ impl App {
             Surface::SetupConfirm => 2,
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::SetupCloud => 2,
-            Surface::SetupCloudSuccess => 0,
+            Surface::SetupCloudSuccess => 2,
             Surface::Account => AUTH_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Email => 2,
@@ -9359,10 +9370,7 @@ impl App {
     }
 
     fn should_animate_feedback_thanks(&self) -> bool {
-        matches!(
-            self.surface,
-            Surface::FeedbackThanks | Surface::SetupCloudSuccess
-        )
+        self.surface == Surface::FeedbackThanks
     }
 
     #[cfg(test)]
@@ -15386,7 +15394,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn browser_use_cloud_onboarding_shows_success_before_cookie_sync() -> Result<()> {
+    fn browser_use_cloud_onboarding_confirms_before_cookie_sync() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
         unsafe {
             std::env::remove_var("BROWSER_USE_API_KEY");
@@ -15419,11 +15427,66 @@ mod redesign_tests {
 
             let screen = render_dump(&mut app)?;
             assert!(screen.contains("Browser Use Cloud is connected"));
-            assert!(screen.contains("press any key to sync cookies"));
+            assert!(screen.contains("Continue to cookie sync?"));
+            assert!(screen.contains("> Yes"));
+            assert!(screen.contains("  Skip"));
             assert!(!screen.contains("Import local browser cookies to Browser Use Cloud"));
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::CookieSync);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_onboarding_skip_cookie_sync_opens_model_selection() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = App::new(args(&temp))?;
+            app.account = settings::ACCOUNT_OPENAI.to_string();
+            app.store
+                .set_setting("auth.openai.api_key", "sk-test-key")?;
+            app.pending_cookie_sync_after_auth = true;
+            app.pending_setup_after_cookie_sync = true;
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            let tx = app
+                .browser_use_cloud_login
+                .as_ref()
+                .and_then(|flow| flow.event_tx_guard.as_ref())
+                .context("test cloud login event sender")?
+                .clone();
+
+            tx.send(BrowserUseCloudLoginEvent::Finished(Ok(
+                BrowserUseCloudCredential {
+                    api_key: "bu-device-key".to_string(),
+                    api_key_id: "key_123".to_string(),
+                    project_id: "project_123".to_string(),
+                    expires_at: None,
+                    scopes: vec!["v3:browsers:create".to_string()],
+                },
+            )))?;
+            assert!(app.drain_browser_use_cloud_login_notifications()?);
+            assert_eq!(app.surface, Surface::SetupCloudSuccess);
+
+            app.selected_row = 1;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            assert_eq!(app.surface, Surface::ModelSearch);
+            assert!(!app.setup_complete);
+            assert!(!app.pending_setup_after_cookie_sync);
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENAI));
             Ok(())
         })();
         if let Some(value) = saved {

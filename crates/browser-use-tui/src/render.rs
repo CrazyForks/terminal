@@ -261,10 +261,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             app.modal_background = None;
             render_feedback_thanks(frame, area, app);
         }
-        Surface::SetupCloudSuccess => {
-            app.modal_background = None;
-            render_setup_cloud_success(frame, area, app);
-        }
         surface => {
             app.modal_background = None;
             let state = app
@@ -1456,7 +1452,7 @@ fn surface_heading(app: &App, surface: Surface) -> (String, &'static str) {
         Surface::SetupConfirm => ("Setup".to_string(), "Confirm provider"),
         Surface::SetupResult => ("Setup".to_string(), "Connection result"),
         Surface::SetupCloud => ("Setup".to_string(), "Choose your browser backend"),
-        Surface::SetupCloudSuccess => ("Setup".to_string(), ""),
+        Surface::SetupCloudSuccess => ("Setup".to_string(), "Browser Use Cloud connected"),
         Surface::Account => ("Authenticate".to_string(), "Sign in to a model provider"),
         Surface::ApiKey => ("API key".to_string(), "Enter your provider API key"),
         Surface::Telemetry => ("Laminar".to_string(), "Configure Laminar telemetry"),
@@ -1547,7 +1543,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::History => "Type to filter | Enter:open | Esc:close",
         Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm | Surface::SetupCloud => "Enter:continue | Esc:back",
-        Surface::SetupCloudSuccess => "",
+        Surface::SetupCloudSuccess => "Enter:select | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
@@ -1603,6 +1599,7 @@ fn surface_lines(
         Surface::SetupConfirm => setup_confirm_lines(app),
         Surface::SetupResult => setup_result_lines(app, width),
         Surface::SetupCloud => setup_cloud_lines(app),
+        Surface::SetupCloudSuccess => setup_cloud_connected_lines(app),
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
@@ -1625,7 +1622,6 @@ fn surface_lines(
         Surface::Email => email_lines(app),
         Surface::Feedback => feedback_lines(app),
         Surface::FeedbackThanks => Vec::new(),
-        Surface::SetupCloudSuccess => Vec::new(),
         Surface::Main => Vec::new(),
     }
 }
@@ -2482,6 +2478,17 @@ fn setup_cloud_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn setup_cloud_connected_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled("Browser Use Cloud is connected", done())),
+        Line::from(""),
+        Line::from(Span::styled("Continue to cookie sync?", bold())),
+        Line::from(""),
+        selected("Yes", 0, app.selected_row),
+        selected("Skip", 1, app.selected_row),
+    ]
+}
+
 fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let Some(result) = app.setup_result.as_ref() else {
         return vec![
@@ -2665,8 +2672,6 @@ const FEEDBACK_THANKS_FACE_FRAME_0: &str = r"\(•◡•)/";
 const FEEDBACK_THANKS_FACE_FRAME_1: &str = r"/(•◡•)\";
 const FEEDBACK_THANKS_MESSAGE: &str = "Thanks for the feedback!";
 const FEEDBACK_THANKS_HINT: &str = "press any key to continue";
-const SETUP_CLOUD_SUCCESS_MESSAGE: &str = "Browser Use Cloud is connected";
-const SETUP_CLOUD_SUCCESS_HINT: &str = "press any key to sync cookies";
 
 fn render_success_character(
     frame: &mut Frame<'_>,
@@ -2713,16 +2718,6 @@ fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.feedback_thanks_started,
         FEEDBACK_THANKS_MESSAGE,
         FEEDBACK_THANKS_HINT,
-    );
-}
-
-fn render_setup_cloud_success(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    render_success_character(
-        frame,
-        area,
-        app.setup_cloud_success_started,
-        SETUP_CLOUD_SUCCESS_MESSAGE,
-        SETUP_CLOUD_SUCCESS_HINT,
     );
 }
 
