@@ -5882,6 +5882,7 @@ fn sdk_agent_run(context: &SdkServerContext, params: &Value) -> Result<Value> {
     let browser_snapshot = browser_id
         .as_ref()
         .and_then(|browser_id| context.runtime.browsers().snapshot(browser_id).ok());
+    sdk_require_cloud_browser_credentials(context, params, browser_snapshot.as_ref())?;
     let config = sdk_provider_run_config(params, Some(&task), browser_snapshot.as_ref())?;
     let browser_id_value = browser_id
         .as_ref()
@@ -6282,6 +6283,7 @@ fn sdk_floor_char_boundary(text: &str, mut index: usize) -> usize {
 }
 
 fn sdk_agent_run_task(context: &SdkServerContext, params: &Value) -> Result<Value> {
+    sdk_require_cloud_browser_credentials(context, params, None)?;
     let mut run_params = params.clone();
     if let Value::Object(map) = &mut run_params {
         if !map.contains_key("browser_id") {
@@ -6616,6 +6618,25 @@ fn sdk_provider_run_config(
         config = config.with_fake_result(fake_agent_result_text(task.unwrap_or("task"), None));
     }
     Ok(config)
+}
+
+fn sdk_require_cloud_browser_credentials(
+    context: &SdkServerContext,
+    params: &Value,
+    browser_snapshot: Option<&browser_use_runtime::BrowserSnapshot>,
+) -> Result<()> {
+    let browser = params.get("browser").unwrap_or(&Value::Null);
+    let browser_mode = sdk_browser_mode_from_params(params, browser, browser_snapshot);
+    if browser_mode != "cloud" {
+        return Ok(());
+    }
+    let store = context.store.lock().expect("sdk store mutex poisoned");
+    if browser_use_api_key_from_store_or_env(&store)?.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "cloud browser mode requires BROWSER_USE_API_KEY or `browser-use-terminal auth login browser-use-cloud`"
+    )
 }
 
 fn sdk_config_overrides_from_params(params: &Value) -> Result<ConfigOverrides> {
@@ -6965,7 +6986,9 @@ fn sdk_provider_backend(provider: &str, model: &str) -> Result<ProviderBackend> 
     }
     let normalized = provider.trim().to_ascii_lowercase();
     if normalized == "browser-use" || normalized == "browser_use" {
-        return Ok(ProviderBackend::Openai);
+        bail!(
+            "Browser Use LLM gateway models are not supported by the Rust terminal SDK yet; use ChatOpenAI, ChatAnthropic, ChatOpenRouter, or ChatDeepSeek"
+        );
     }
     ProviderBackend::from_provider_id(&normalized)
         .filter(|backend| *backend != ProviderBackend::None)
@@ -9506,6 +9529,35 @@ command = "test-mcp"
     }
 
     #[test]
+    fn sdk_json_rpc_cloud_browser_requires_cloud_credentials_before_run() -> Result<()> {
+        let previous = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok();
+        std::env::remove_var(BROWSER_USE_CLOUD_API_KEY_ENV);
+        let context = SdkServerContext::memory()?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "agent.run_task",
+            "params": {
+                "task": "inspect",
+                "llm": {"provider": "fake", "model": "fake"},
+                "browser_mode": "cloud"
+            }
+        });
+
+        let response = handle_sdk_json_rpc_line(&context, &serde_json::to_string(&request)?);
+
+        if let Some(value) = previous {
+            std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, value);
+        }
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cloud browser mode requires")));
+        assert!(context.runtime.snapshot().agents.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn sdk_json_rpc_browser_create_preserves_browser_use_settings() -> Result<()> {
         let context = SdkServerContext::memory()?;
         let request = serde_json::json!({
@@ -9681,6 +9733,21 @@ command = "test-mcp"
             .iter()
             .any(|(key, value)| key == "CUSTOM_ENV" && value == "custom-value"));
         Ok(())
+    }
+
+    #[test]
+    fn sdk_provider_run_config_rejects_browser_use_gateway_provider() {
+        let params = serde_json::json!({
+            "task": "inspect",
+            "llm": {"provider": "browser-use", "model": "bu-2-0"}
+        });
+
+        let error = sdk_provider_run_config(&params, Some("inspect"), None)
+            .expect_err("browser-use gateway provider should not be misrouted to OpenAI");
+
+        assert!(error
+            .to_string()
+            .contains("Browser Use LLM gateway models are not supported"));
     }
 
     #[test]
