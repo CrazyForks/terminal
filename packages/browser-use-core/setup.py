@@ -15,6 +15,10 @@ class PlatformWheel(bdist_wheel):
             self.plat_name = plat_name
 
     def get_tag(self) -> tuple[str, str, str]:
+        plat_name = os.environ.get("BROWSER_USE_CORE_PLAT_NAME")
+        if plat_name:
+            return "py3", "none", plat_name
+
         _python, _abi, platform = super().get_tag()
         return "py3", "none", platform
 
