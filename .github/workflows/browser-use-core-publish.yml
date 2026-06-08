@@ -23,16 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -123,11 +117,8 @@ jobs:
 
           wheels = sorted(Path("dist").glob("browser_use_core-*.whl"))
           expected_platforms = {
-              "macosx_11_0_arm64",
-              "macosx_10_13_x86_64",
               "manylinux_2_17_x86_64",
               "manylinux_2_17_aarch64",
-              "win_amd64",
           }
           actual_platforms = {wheel.name.rsplit("-", 1)[1].removesuffix(".whl") for wheel in wheels}
           if actual_platforms != expected_platforms:
