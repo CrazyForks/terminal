@@ -2745,6 +2745,12 @@ impl App {
                     authorization,
                     browser_open_error,
                 } => {
+                    self.track_onboarding_event(
+                        "bu:tui onboarding cloud auth browser opened",
+                        serde_json::json!({
+                            "browser_open_error": browser_open_error.is_some(),
+                        }),
+                    );
                     if let Some(flow) = self.browser_use_cloud_login.as_mut() {
                         flow.authorization = Some(authorization);
                         flow.browser_open_error = browser_open_error;
@@ -2762,6 +2768,12 @@ impl App {
                             self.complete_browser_use_cloud_device_auth(&credential)?;
                         }
                         Err(error) => {
+                            self.track_onboarding_event(
+                                "bu:tui onboarding cloud auth failed",
+                                serde_json::json!({
+                                    "failure_kind": "authorization_failed",
+                                }),
+                            );
                             self.show_setup_result(
                                 SetupResultKind::Failure,
                                 account,
@@ -2889,6 +2901,12 @@ impl App {
                             self.cookie_sync.status = CookieSyncStatus::Failed(format!(
                                 "Cookie sync completed, but the Cloud profile could not be saved: {error:#}"
                             ));
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "profile_save_failed",
+                                }),
+                            );
                             return;
                         }
                     }
@@ -2896,9 +2914,47 @@ impl App {
                         cookie_sync_result_status(&value).unwrap_or_else(|| {
                             CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string())
                         });
+                    match &self.cookie_sync.status {
+                        CookieSyncStatus::Completed(_) => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync completed",
+                                cookie_sync_result_analytics(&value),
+                            );
+                        }
+                        CookieSyncStatus::NeedsAuth => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "needs_auth",
+                                    "reported_status": "needs-auth",
+                                }),
+                            );
+                        }
+                        CookieSyncStatus::Failed(_) => {
+                            self.track_onboarding_event(
+                                "bu:tui cookie sync failed",
+                                serde_json::json!({
+                                    "failure_kind": "failed_status",
+                                    "reported_status": value
+                                        .get("status")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("unknown"),
+                                }),
+                            );
+                        }
+                        CookieSyncStatus::LoadingProfiles
+                        | CookieSyncStatus::Ready
+                        | CookieSyncStatus::Syncing => {}
+                    }
                 }
             },
             Err(error) => {
+                self.track_onboarding_event(
+                    "bu:tui cookie sync failed",
+                    serde_json::json!({
+                        "failure_kind": cookie_sync_error_kind(&error),
+                    }),
+                );
                 self.cookie_sync.status = CookieSyncStatus::Failed(error);
             }
         }
@@ -2909,10 +2965,27 @@ impl App {
             Some("needs-auth") => {
                 self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
                 self.cookie_sync.profiles.clear();
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "needs_auth",
+                        "reported_status": "needs-auth",
+                    }),
+                );
             }
             Some("needs-user-action") | Some("ok") => {
                 self.cookie_sync.profiles = cookie_sync_profiles_from_value(&value);
                 self.cookie_sync.status = CookieSyncStatus::Ready;
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load completed",
+                    serde_json::json!({
+                        "profiles_count": self.cookie_sync.profiles.len(),
+                        "reported_status": value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("ok"),
+                    }),
+                );
             }
             Some("failed") => {
                 let error = value
@@ -2921,10 +2994,27 @@ impl App {
                     .unwrap_or("Cookie sync profile scan failed")
                     .to_string();
                 self.cookie_sync.status = CookieSyncStatus::Failed(error);
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "failed_status",
+                        "reported_status": "failed",
+                    }),
+                );
             }
             _ => {
                 self.cookie_sync.status =
                     CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string());
+                self.track_onboarding_event(
+                    "bu:tui cookie sync profile load failed",
+                    serde_json::json!({
+                        "failure_kind": "unexpected_response",
+                        "reported_status": value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("missing"),
+                    }),
+                );
             }
         }
     }
@@ -4576,7 +4666,8 @@ impl App {
         // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
-        self.append_session_model_selection(&session.id, &self.current_model_selection())?;
+        let selection = self.current_model_selection();
+        self.append_session_model_selection(&session.id, &selection)?;
         self.append_current_session_runtime_settings(&session.id)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
@@ -4594,6 +4685,7 @@ impl App {
             input_record.seq,
             &submission.text,
             product_analytics::BLOCKED_REASON_NO_AUTH,
+            analytics_model_for_selection(&selection),
         );
         // Inject the nudge as a non-terminal assistant-style message so the
         // transcript renders it without marking the session completed/done.
@@ -4758,6 +4850,7 @@ impl App {
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
             AppCommand::OpenFeedback => {
+                self.track_feedback_opened();
                 self.feedback = FeedbackState::default();
                 self.open_surface(Surface::Feedback);
             }
@@ -4795,6 +4888,7 @@ impl App {
             product_analytics::MESSAGE_KIND_INITIAL,
             input_record.seq,
             &submission.text,
+            analytics_model_for_selection(&selection),
         );
         self.prompt_history.record_submission(&submission.text);
         self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
@@ -4838,6 +4932,8 @@ impl App {
             .store
             .load_session(&session_id)?
             .with_context(|| format!("unknown session id: {session_id}"))?;
+        let analytics_selection = self.session_model_selection_or_current(&session_id)?;
+        let analytics_model = analytics_model_for_selection(&analytics_selection);
         let options = self.configured_agent_options().ok();
         if let Some(options) = options.as_ref() {
             let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
@@ -4884,6 +4980,7 @@ impl App {
                         product_analytics::MESSAGE_KIND_FOLLOWUP,
                         followup_record.seq,
                         &submission.text,
+                        analytics_model,
                     );
                     self.prompt_history.record_submission(&submission.text);
                     if let Some(options) = options.as_ref() {
@@ -4922,6 +5019,7 @@ impl App {
                         product_analytics::MESSAGE_KIND_FOLLOWUP,
                         fallback_record.seq,
                         &submission.text,
+                        analytics_model,
                     );
                     self.prompt_history.record_submission(&submission.text);
                     if let Some(options) = options.as_ref() {
@@ -4955,6 +5053,7 @@ impl App {
             product_analytics::MESSAGE_KIND_FOLLOWUP,
             followup_record.seq,
             &submission.text,
+            analytics_model,
         );
         self.prompt_history.record_submission(&submission.text);
         if let Some(options) = options.as_ref() {
@@ -4997,6 +5096,7 @@ impl App {
             product_analytics::MESSAGE_KIND_FOLLOWUP,
             followup_record.seq,
             &submission.text,
+            analytics_model_for_selection(&self.session_model_selection_or_current(&session_id)?),
         );
         self.prompt_history.record_submission(&submission.text);
         if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
@@ -6315,6 +6415,12 @@ impl App {
         if !self.setup_started {
             self.setup_started = true;
             self.selected_row = 0;
+            self.track_onboarding_event(
+                "bu:tui onboarding provider list opened",
+                serde_json::json!({
+                    "source": "welcome_cta",
+                }),
+            );
             return Ok(());
         }
         let choices = self.setup_account_choices()?;
@@ -6325,6 +6431,13 @@ impl App {
             return Ok(());
         };
         let account = account.to_string();
+        self.track_onboarding_event(
+            "bu:tui onboarding provider selected",
+            serde_json::json!({
+                "selected_provider": account_kind(&account),
+                "selected_provider_kind": analytics_provider_kind_for_account(&account),
+            }),
+        );
         self.setup_pending_account = Some(account);
         self.setup_result = None;
         self.open_surface(Surface::SetupConfirm);
@@ -6440,10 +6553,24 @@ impl App {
     }
 
     fn start_setup_cloud_onboarding(&mut self) -> Result<()> {
+        let has_existing_cloud_key = self.browser_use_cloud_key_ready()?;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud selected",
+            serde_json::json!({
+                "has_existing_cloud_key": has_existing_cloud_key,
+            }),
+        );
         self.pending_setup_after_cookie_sync = true;
         self.pending_cookie_sync_after_auth = true;
-        if self.browser_use_cloud_key_ready()? {
+        if has_existing_cloud_key {
             self.select_browser_use_cloud()?;
+            self.track_onboarding_event(
+                "bu:tui onboarding cloud auth succeeded",
+                serde_json::json!({
+                    "method": "existing_key",
+                    "return_to_cookie_sync": true,
+                }),
+            );
             self.show_setup_cloud_success();
             return Ok(());
         }
@@ -6451,6 +6578,12 @@ impl App {
     }
 
     fn decline_setup_cloud_onboarding(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud skipped",
+            serde_json::json!({
+                "reason": "user_selected_local_chrome",
+            }),
+        );
         self.pending_setup_after_cookie_sync = false;
         self.pending_cookie_sync_after_auth = false;
         self.select_local_chrome()?;
@@ -6474,6 +6607,12 @@ impl App {
     }
 
     fn show_setup_cloud_success(&mut self) {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync offered",
+            serde_json::json!({
+                "has_cloud_key": true,
+            }),
+        );
         self.setup_result = None;
         self.setup_pending_account = None;
         self.status_notice = None;
@@ -6481,6 +6620,10 @@ impl App {
     }
 
     fn continue_after_setup_cloud_success(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync selected",
+            serde_json::json!({}),
+        );
         self.open_cookie_sync()
     }
 
@@ -6492,6 +6635,12 @@ impl App {
     }
 
     fn skip_setup_cookie_sync_after_cloud_auth(&mut self) -> Result<()> {
+        self.track_onboarding_event(
+            "bu:tui onboarding cookie sync skipped",
+            serde_json::json!({
+                "reason": "user_selected_skip",
+            }),
+        );
         self.pending_cookie_sync_after_auth = false;
         if self.pending_setup_after_cookie_sync {
             self.pending_setup_after_cookie_sync = false;
@@ -6521,7 +6670,7 @@ impl App {
         }
         if !self.setup_complete {
             self.status_notice = None;
-            self.open_surface(Surface::SetupCloud);
+            self.open_setup_cloud_offer("after_provider_auth");
             return Ok(());
         }
         self.advance_after_auth()
@@ -7428,7 +7577,10 @@ impl App {
         // Home-screen feedback has no run context, so leave it null instead of
         // recording the default selection.
         let model = if session_id.is_some() {
-            let sel = self.current_model_selection();
+            let sel = session_id
+                .as_deref()
+                .and_then(|id| self.session_model_selection_or_current(id).ok())
+                .unwrap_or_else(|| self.current_model_selection());
             if sel.provider_model.is_empty() {
                 None
             } else {
@@ -7454,6 +7606,12 @@ impl App {
             "model": model,
             "install_id": install_id,
         });
+        self.track_feedback_submitted(
+            category,
+            include_logs,
+            description.is_some(),
+            session_id.as_deref(),
+        );
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         self.feedback_rx = Some(rx);
@@ -7582,7 +7740,7 @@ impl App {
         // front.
         if !self.setup_complete {
             self.status_notice = None;
-            self.open_surface(Surface::SetupCloud);
+            self.open_setup_cloud_offer("after_provider_auth");
             return Ok(());
         }
         if self.pending_model_search_after_auth {
@@ -8538,9 +8696,21 @@ impl App {
         self.api_key_account = None;
         self.composer.clear();
         self.browser_use_cloud_login = None;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud auth started",
+            serde_json::json!({
+                "return_to_cookie_sync": self.pending_cookie_sync_after_auth,
+            }),
+        );
         let flow = match start_browser_use_cloud_login_flow(account.clone()) {
             Ok(flow) => flow,
             Err(error) => {
+                self.track_onboarding_event(
+                    "bu:tui onboarding cloud auth failed",
+                    serde_json::json!({
+                        "failure_kind": "start_failed",
+                    }),
+                );
                 self.show_setup_result(
                     SetupResultKind::Failure,
                     account,
@@ -8807,6 +8977,20 @@ impl App {
         self.select_browser_use_cloud()?;
         self.api_key_account = None;
         self.pending_cookie_sync_after_auth = false;
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud auth succeeded",
+            serde_json::json!({
+                "method": "device_login",
+                "return_to_cookie_sync": return_to_cookie_sync,
+                "project_present": !credential.project_id.trim().is_empty(),
+                "project_name_present": credential
+                    .project_name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()),
+                "scopes_count": credential.scopes.len(),
+            }),
+        );
         if return_to_cookie_sync {
             self.show_setup_cloud_success();
             return Ok(());
@@ -8907,6 +9091,7 @@ impl App {
     fn open_cookie_sync(&mut self) -> Result<()> {
         self.open_surface(Surface::CookieSync);
         self.status_notice = None;
+        self.track_onboarding_event("bu:tui cookie sync opened", serde_json::json!({}));
         self.start_cookie_sync_profile_load()
     }
 
@@ -9110,8 +9295,19 @@ impl App {
             self.cookie_sync.profiles.clear();
             self.cookie_sync.selected_profile_label = None;
             self.cookie_sync.rx = None;
+            self.track_onboarding_event(
+                "bu:tui cookie sync profile load failed",
+                serde_json::json!({
+                    "failure_kind": "needs_auth",
+                    "reported_status": "missing_api_key",
+                }),
+            );
             return Ok(());
         };
+        self.track_onboarding_event(
+            "bu:tui cookie sync profile load started",
+            serde_json::json!({}),
+        );
         self.cookie_sync.status = CookieSyncStatus::LoadingProfiles;
         self.cookie_sync.profiles.clear();
         self.cookie_sync.selected_profile_label = None;
@@ -9168,14 +9364,33 @@ impl App {
         else {
             self.cookie_sync.status =
                 CookieSyncStatus::Failed("No local Chromium profiles found.".to_string());
+            self.track_onboarding_event(
+                "bu:tui cookie sync failed",
+                serde_json::json!({
+                    "failure_kind": "no_profiles",
+                }),
+            );
             return Ok(());
         };
         let Some(api_key) = self.browser_use_cloud_api_key_value()? else {
             self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
+            self.track_onboarding_event(
+                "bu:tui cookie sync failed",
+                serde_json::json!({
+                    "failure_kind": "needs_auth",
+                }),
+            );
             return Ok(());
         };
         self.cookie_sync.status = CookieSyncStatus::Syncing;
         self.cookie_sync.selected_profile_label = Some(profile.display_name.clone());
+        self.track_onboarding_event(
+            "bu:tui cookie sync started",
+            serde_json::json!({
+                "selected_profile_browser": profile_browser_kind(&profile.browser_name),
+                "profiles_count": self.cookie_sync.profiles.len(),
+            }),
+        );
         let command = format!(
             "browser profile sync --profile {} --all-cookies",
             browser_shell_quote_arg(&profile.id)
@@ -9211,6 +9426,39 @@ impl App {
         Ok(())
     }
 
+    fn open_setup_cloud_offer(&mut self, source: &'static str) {
+        let has_existing_cloud_key = self.browser_use_cloud_key_ready().unwrap_or(false);
+        self.track_onboarding_event(
+            "bu:tui onboarding cloud offered",
+            serde_json::json!({
+                "source": source,
+                "has_existing_cloud_key": has_existing_cloud_key,
+            }),
+        );
+        self.open_surface(Surface::SetupCloud);
+    }
+
+    fn track_onboarding_event(&self, event: &'static str, extra: serde_json::Value) {
+        if cfg!(test) {
+            return;
+        }
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "setup_flow": !self.setup_complete || self.pending_setup_after_cookie_sync,
+            "setup_complete": self.setup_complete,
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
+        );
+        merge_json_object(&mut properties, extra);
+        product_analytics::capture_async(&self.store, event, properties);
+    }
+
     fn complete_setup(&mut self) -> Result<()> {
         self.setup_complete = true;
         self.setup_started = false;
@@ -9219,15 +9467,18 @@ impl App {
         if cfg!(test) {
             return Ok(());
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui setup completed",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "browser_kind": browser_choice_kind(&self.browser),
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui setup completed", properties);
         Ok(())
     }
 
@@ -9235,31 +9486,48 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui app opened",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "browser_kind": browser_choice_kind(&self.browser),
-                "setup_complete": self.setup_complete,
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+            "browser_kind": browser_choice_kind(&self.browser),
+            "setup_complete": self.setup_complete,
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui app opened", properties);
+        if !self.setup_complete {
+            product_analytics::capture_async(
+                &self.store,
+                "bu:tui onboarding started",
+                serde_json::json!({
+                    "surface": "tui",
+                    "provider_kind": analytics_provider_kind_for_account(&self.account),
+                    "provider": account_kind(&self.account),
+                    "browser_kind": browser_choice_kind(&self.browser),
+                }),
+            );
+        }
     }
 
     fn track_model_selected(&self) {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
-            &self.store,
-            "bu:tui model selected",
-            serde_json::json!({
-                "surface": "tui",
-                "provider_kind": account_kind(&self.account),
-                "model": self.provider_model,
-            }),
+        let selection = self.current_model_selection();
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "provider_kind": analytics_provider_kind_for_account(&self.account),
+            "provider": account_kind(&self.account),
+        });
+        product_analytics::append_model_analytics(
+            &mut properties,
+            analytics_model_for_selection(&selection),
         );
+        product_analytics::capture_async(&self.store, "bu:tui model selected", properties);
     }
 
     fn track_browser_selected(&self) {
@@ -9285,9 +9553,53 @@ impl App {
             "bu:tui auth provider selected",
             serde_json::json!({
                 "surface": "tui",
-                "provider_kind": account_kind(account),
+                "provider_kind": analytics_provider_kind_for_account(account),
+                "provider": account_kind(account),
             }),
         );
+    }
+
+    fn track_feedback_opened(&self) {
+        if cfg!(test) {
+            return;
+        }
+        product_analytics::capture_async(
+            &self.store,
+            "bu:tui feedback opened",
+            serde_json::json!({
+                "surface": "tui",
+                "has_session": self.selected_session_id.is_some(),
+            }),
+        );
+    }
+
+    fn track_feedback_submitted(
+        &self,
+        category: FeedbackCategory,
+        include_logs: bool,
+        has_description: bool,
+        session_id: Option<&str>,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let mut properties = serde_json::json!({
+            "surface": "tui",
+            "category": category.api_value(),
+            "include_logs": include_logs,
+            "has_description": has_description,
+            "has_session": session_id.is_some(),
+        });
+        if let Some(selection) = session_id
+            .and_then(|id| self.session_model_selection_or_current(id).ok())
+            .or_else(|| session_id.map(|_| self.current_model_selection()))
+        {
+            product_analytics::append_model_analytics(
+                &mut properties,
+                analytics_model_for_selection(&selection),
+            );
+        }
+        product_analytics::capture_async(&self.store, "bu:tui feedback submitted", properties);
     }
 
     fn persist_runtime_settings(&self) -> Result<()> {
@@ -10084,6 +10396,41 @@ fn cookie_sync_result_status(value: &serde_json::Value) -> Option<CookieSyncStat
     }
 }
 
+fn cookie_sync_result_analytics(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "reported_status": value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        "synced": value
+            .get("synced")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "synced_cookie_count": value
+            .get("synced_cookie_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        "cloud_profile_present": value.get("cloud_profile").is_some(),
+        "local_profile_present": value.get("profile").is_some(),
+    })
+}
+
+fn cookie_sync_error_kind(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("api key")
+        || normalized.contains("auth")
+        || normalized.contains("unauthorized")
+    {
+        "needs_auth"
+    } else if normalized.contains("profile") && normalized.contains("found") {
+        "no_profiles"
+    } else if normalized.contains("unexpected") || normalized.contains("json") {
+        "unexpected_response"
+    } else {
+        "command_failed"
+    }
+}
+
 fn cookie_sync_success_message(value: &serde_json::Value) -> String {
     let profile = value
         .get("profile")
@@ -10199,12 +10546,57 @@ fn account_kind(account: &str) -> &'static str {
     }
 }
 
+fn analytics_provider_kind_for_account(account: &str) -> &'static str {
+    match account {
+        ACCOUNT_CODEX => "subscription",
+        ACCOUNT_OPENAI | ACCOUNT_OPENROUTER | ACCOUNT_DEEPSEEK | ACCOUNT_ANTHROPIC
+        | BROWSER_USE_CLOUD => "api_key",
+        account if is_claude_code_account(account) => "oauth",
+        _ => "other",
+    }
+}
+
+fn analytics_model_for_selection(
+    selection: &SessionModelSelection,
+) -> product_analytics::ModelAnalytics<'_> {
+    product_analytics::ModelAnalytics {
+        provider_kind: Some(analytics_provider_kind_for_account(&selection.account)),
+        provider: Some(account_kind(&selection.account)),
+        model: Some(&selection.provider_model),
+    }
+}
+
+fn merge_json_object(target: &mut serde_json::Value, extra: serde_json::Value) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let Some(extra) = extra.as_object() else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 fn browser_choice_kind(browser: &str) -> &'static str {
     match browser {
         BROWSER_LOCAL_CHROME => "local",
         "Headless Chromium" => "headless",
         "Managed Chromium" => "managed",
         BROWSER_USE_CLOUD => "cloud",
+        _ => "other",
+    }
+}
+
+fn profile_browser_kind(browser: &str) -> &'static str {
+    match browser.trim().to_ascii_lowercase().as_str() {
+        "google chrome" => "google_chrome",
+        "chromium" => "chromium",
+        "microsoft edge"
+        | "microsoft edge beta"
+        | "microsoft edge dev"
+        | "microsoft edge canary" => "microsoft_edge",
+        "brave" => "brave",
         _ => "other",
     }
 }
@@ -18356,7 +18748,8 @@ wire_api = "responses"
         assert_eq!(app.surface, Surface::SetupConfirm);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Use OpenAI API key?"));
-        assert!(screen.contains("API key modal"));
+        assert!(screen.contains("Enter your provider API key."));
+        assert!(screen.contains("Browser Use saves it locally."));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
