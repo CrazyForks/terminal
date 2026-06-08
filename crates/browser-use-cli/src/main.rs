@@ -76,8 +76,8 @@ use browser_use_runtime::{
     CompleteAgentRequest, CreateRootAgentRequest, Durability as RuntimeDurability,
     FailAgentRequest, LiveThreadPersistence, LocalRuntimeRequest, LocalRuntimeWaitTarget,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItemKind as RuntimeMailboxItemKind,
-    RunAgentRequest, RunId as RuntimeRunId, RuntimeHandle, RuntimeProjectionState, SessionId,
-    SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
+    RunAgentRequest, RunId as RuntimeRunId, RuntimeEvent, RuntimeHandle, RuntimeProjectionState,
+    SessionId, SpawnChildRequest, SqliteJournal, StateIndex, SubmitInputRequest,
 };
 #[cfg(test)]
 use browser_use_runtime::{AttachChildAgentRequest, AttachRootAgentRequest};
@@ -85,7 +85,7 @@ use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const APPROX_CHARS_PER_TOKEN: usize = 4;
@@ -4882,6 +4882,560 @@ fn sdk_server(transport: SdkTransportArg) -> Result<()> {
     }
 }
 
+#[derive(Default)]
+struct BrowserUseSdkPresentationProjection {
+    sessions: HashMap<String, BrowserUseSdkPresentationSession>,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkPresentationSession {
+    current_step: usize,
+    active_step_started_ms: Option<i64>,
+    active_actions: HashMap<String, BrowserUseSdkAction>,
+    assistant_text: String,
+}
+
+struct BrowserUseSdkAction {
+    name: String,
+    started_ms: i64,
+}
+
+#[derive(Default)]
+struct BrowserUseSdkTerminalFrameRenderer {
+    current_step: Option<usize>,
+    action_count: usize,
+    pending_model_text: Option<String>,
+    final_text: Option<String>,
+}
+
+impl BrowserUseSdkPresentationProjection {
+    fn apply(&mut self, event: &RuntimeEvent) -> Vec<Value> {
+        let Some(session_id) = event.session_id.as_ref().map(|id| id.as_str().to_string()) else {
+            return Vec::new();
+        };
+        let session = self.sessions.entry(session_id.clone()).or_default();
+        let (event_type, payload) = sdk_presentation_event_parts(event);
+        let mut out = Vec::new();
+
+        match event_type {
+            "model.turn.request" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                session.current_step = session.current_step.saturating_add(1);
+                session.active_step_started_ms = Some(event.ts_ms);
+                session.assistant_text.clear();
+                out.push(json!({
+                    "type": "step.started",
+                    "step": session.current_step,
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "model.stream_delta" => {
+                if let Some(text) = payload
+                    .get("text")
+                    .or_else(|| payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
+                    session.assistant_text.push_str(text);
+                }
+            }
+            "tool.started" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                session.active_actions.insert(
+                    key.clone(),
+                    BrowserUseSdkAction {
+                        name: action.to_string(),
+                        started_ms: event.ts_ms,
+                    },
+                );
+                out.push(json!({
+                    "type": "action.started",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": action,
+                    "params_preview": sdk_presentation_params_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": action,
+                        "params_preview": sdk_presentation_params_preview(payload),
+                    },
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "tool.output" | "tool.completed" | "tool.failed" | "tool.aborted" => {
+                let action = sdk_presentation_action_name(payload).unwrap_or("tool");
+                let key = sdk_presentation_tool_key(event, payload, action);
+                let active = session.active_actions.remove(&key);
+                let name = active
+                    .as_ref()
+                    .map(|action| action.name.as_str())
+                    .unwrap_or(action);
+                let started_ms = active.as_ref().map(|action| action.started_ms);
+                out.push(json!({
+                    "type": "action.completed",
+                    "step": session.current_step.max(1),
+                    "id": key,
+                    "name": name,
+                    "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                    "output_preview": sdk_presentation_output_preview(payload),
+                    "action": {
+                        "id": key,
+                        "name": name,
+                        "success": !matches!(event_type, "tool.failed" | "tool.aborted"),
+                        "output_preview": sdk_presentation_output_preview(payload),
+                    },
+                    "duration_ms": started_ms.map(|started| event.ts_ms.saturating_sub(started)),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.done" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": true,
+                    "text": payload
+                        .get("result")
+                        .or_else(|| payload.get("text"))
+                        .and_then(Value::as_str),
+                    "result_file": payload.get("result_file").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "session.failed" => {
+                if let Some(message) = session.drain_assistant_message(event.ts_ms) {
+                    out.push(message);
+                }
+                out.push(json!({
+                    "type": "final_result",
+                    "step": session.current_step.max(1),
+                    "success": false,
+                    "text": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.completed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": true,
+                    "result": payload.get("result").and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.failed" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+                out.push(json!({
+                    "type": "agent.completed",
+                    "success": false,
+                    "error": payload
+                        .get("error")
+                        .or_else(|| payload.get("message"))
+                        .and_then(Value::as_str),
+                    "ts_ms": event.ts_ms,
+                }));
+            }
+            "agent.turn.completed" | "agent.turn.aborted" => {
+                if let Some(completed) = session.complete_step(event.ts_ms) {
+                    out.push(completed);
+                }
+            }
+            _ => {}
+        }
+
+        out
+    }
+}
+
+impl BrowserUseSdkTerminalFrameRenderer {
+    fn apply(&mut self, event: &Value) -> Option<String> {
+        let event_type = event.get("type").and_then(Value::as_str)?;
+        match event_type {
+            "step.started" => {
+                self.flush_pending_model_text();
+                self.current_step = event
+                    .get("step")
+                    .and_then(Value::as_u64)
+                    .and_then(|step| usize::try_from(step).ok());
+                self.action_count = 0;
+                self.final_text = None;
+                let step = self.current_step.unwrap_or(0);
+                Some(format!("\x1b[36m┌─ Step {}\x1b[0m", step.max(1)))
+            }
+            "action.started" => {
+                self.flush_pending_model_text();
+                self.action_count = self.action_count.saturating_add(1);
+                let name = event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("action");
+                let detail = event
+                    .get("params_preview")
+                    .and_then(Value::as_str)
+                    .map(|preview| sdk_terminal_format_action_detail(name, preview))
+                    .unwrap_or_default();
+                Some(sdk_terminal_row("▶", name, &detail, "\x1b[34m"))
+            }
+            "action.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let name = event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("action");
+                    let detail = event
+                        .get("output_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    return Some(sdk_terminal_row("✖", name, detail, "\x1b[31m"));
+                }
+                None
+            }
+            "model.message" => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    self.pending_model_text = Some(text.to_string());
+                }
+                None
+            }
+            "final_result" => {
+                let text = event
+                    .get("text")
+                    .or_else(|| event.get("result"))
+                    .and_then(Value::as_str)?;
+                let mut lines = Vec::new();
+                if let Some(pending) = self.pending_model_text.take() {
+                    if sdk_terminal_normalize(&pending) != sdk_terminal_normalize(text) {
+                        lines.push(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"));
+                    }
+                }
+                self.final_text = Some(text.to_string());
+                let success = event.get("success").and_then(Value::as_bool) != Some(false);
+                let title = if success {
+                    "📄 Final Result"
+                } else {
+                    "📄 Final Result (failed)"
+                };
+                let color = if success { "\x1b[32m" } else { "\x1b[31m" };
+                lines.push(sdk_terminal_text_block(title, text, color));
+                Some(lines.join("\n"))
+            }
+            "step.completed" => {
+                if let Some(preview) = event.get("assistant_preview").and_then(Value::as_str) {
+                    if sdk_terminal_normalize(preview)
+                        != sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+                    {
+                        self.pending_model_text = Some(preview.to_string());
+                    }
+                }
+                let mut lines = Vec::new();
+                if let Some(pending) = self.flush_pending_model_text() {
+                    lines.push(pending);
+                }
+                let duration = event
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .map(|ms| format!("{:.2}s", (ms as f64) / 1000.0))
+                    .unwrap_or_else(|| "complete".to_string());
+                let summary = if self.action_count > 0 {
+                    format!(
+                        "{} action{} · {}",
+                        self.action_count,
+                        if self.action_count == 1 { "" } else { "s" },
+                        duration
+                    )
+                } else {
+                    duration
+                };
+                lines.push(format!("\x1b[36m└─ {}\x1b[0m", summary));
+                Some(lines.join("\n"))
+            }
+            "agent.completed" => {
+                if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    let error = event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Task failed");
+                    return Some(sdk_terminal_text_block("Task failed", error, "\x1b[31m"));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn flush_pending_model_text(&mut self) -> Option<String> {
+        let pending = self.pending_model_text.take()?;
+        if sdk_terminal_normalize(&pending)
+            == sdk_terminal_normalize(self.final_text.as_deref().unwrap_or_default())
+        {
+            return None;
+        }
+        Some(sdk_terminal_text_block("💬 Response", &pending, "\x1b[35m"))
+    }
+}
+
+fn sdk_terminal_row(icon: &str, label: &str, detail: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let label = format!("{icon} {label}");
+    if detail.trim().is_empty() {
+        return format!("│  {color}{label}{reset}");
+    }
+    let line = format!("│  {color}{label:<18}{reset} {}", detail.trim());
+    sdk_terminal_wrap(&line, 96, "│                      ")
+}
+
+fn sdk_terminal_text_block(title: &str, text: &str, color: &str) -> String {
+    let reset = "\x1b[0m";
+    let mut lines = vec![format!("│  {color}{title}{reset}")];
+    for paragraph in text.lines() {
+        let wrapped = sdk_terminal_wrap_plain(paragraph, 92);
+        if wrapped.is_empty() {
+            lines.push("│".to_string());
+        } else {
+            for line in wrapped {
+                lines.push(format!("│     {line}"));
+            }
+        }
+    }
+    if text.is_empty() {
+        lines.push("│".to_string());
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_format_action_detail(_name: &str, preview: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(preview) else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    let Some(object) = value.as_object() else {
+        return sdk_terminal_compact_preview(preview, 180);
+    };
+    if let Some(command) = object.get("command").or_else(|| object.get("cmd")) {
+        if let Some(command) = command.as_str() {
+            return format!("command: {}", sdk_terminal_compact_preview(command, 180));
+        }
+        if let Some(parts) = command.as_array() {
+            let text = parts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sdk_terminal_shell_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return format!("command: {}", sdk_terminal_compact_preview(&text, 180));
+            }
+        }
+    }
+    if let Some(url) = object.get("url").and_then(Value::as_str) {
+        return format!("url: {url}");
+    }
+    if let Some(code) = object.get("code").and_then(Value::as_str) {
+        return format!("code: {}", sdk_terminal_compact_preview(code, 180));
+    }
+    let mut parts = Vec::new();
+    for (key, value) in object {
+        if value.is_null() {
+            continue;
+        }
+        let text = value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+        if text.trim().is_empty() || text == "[]" || text == "{}" {
+            continue;
+        }
+        parts.push(format!(
+            "{key}: {}",
+            sdk_terminal_compact_preview(&text, 80)
+        ));
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        sdk_terminal_compact_preview(preview, 180)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn sdk_terminal_compact_preview(text: &str, limit: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.len() <= limit {
+        return text;
+    }
+    let end = sdk_floor_char_boundary(&text, limit.saturating_sub(16));
+    format!(
+        "{} ... +{} chars",
+        &text[..end],
+        text.len().saturating_sub(end)
+    )
+}
+
+fn sdk_terminal_shell_quote(text: &str) -> String {
+    if text.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '=' | ',')
+    }) {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn sdk_terminal_wrap(text: &str, width: usize, subsequent_indent: &str) -> String {
+    let mut lines = Vec::new();
+    for (index, line) in sdk_terminal_wrap_plain(text, width).into_iter().enumerate() {
+        if index == 0 {
+            lines.push(line);
+        } else {
+            lines.push(format!("{subsequent_indent}{}", line.trim_start()));
+        }
+    }
+    lines.join("\n")
+}
+
+fn sdk_terminal_wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let separator = if current.is_empty() { 0 } else { 1 };
+        if !current.is_empty() && current.len() + separator + word.len() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn sdk_terminal_normalize(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl BrowserUseSdkPresentationSession {
+    fn drain_assistant_message(&mut self, ts_ms: i64) -> Option<Value> {
+        let assistant_text = self.assistant_text.trim();
+        if assistant_text.is_empty() {
+            return None;
+        }
+        let text = assistant_text.to_string();
+        self.assistant_text.clear();
+        Some(json!({
+            "type": "model.message",
+            "step": self.current_step.max(1),
+            "text": sdk_presentation_preview(&Value::String(text)),
+            "ts_ms": ts_ms,
+        }))
+    }
+
+    fn complete_step(&mut self, ts_ms: i64) -> Option<Value> {
+        let started_ms = self.active_step_started_ms.take()?;
+        self.active_actions.clear();
+        let assistant_preview = self.drain_assistant_message(ts_ms).and_then(|event| {
+            event
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        Some(json!({
+            "type": "step.completed",
+            "step": self.current_step.max(1),
+            "duration_ms": ts_ms.saturating_sub(started_ms),
+            "assistant_preview": assistant_preview,
+            "ts_ms": ts_ms,
+        }))
+    }
+}
+
+fn sdk_presentation_event_parts(event: &RuntimeEvent) -> (&str, &Value) {
+    let wrapped_type = event.payload.get("event_type").and_then(Value::as_str);
+    let wrapped_payload = event.payload.get("payload");
+    match (wrapped_type, wrapped_payload) {
+        (Some(event_type), Some(payload)) => (event_type, payload),
+        _ => (event.event_type(), &event.payload),
+    }
+}
+
+fn sdk_presentation_action_name(payload: &Value) -> Option<&str> {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool_name"))
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str)
+}
+
+fn sdk_presentation_tool_key(event: &RuntimeEvent, payload: &Value, fallback_name: &str) -> String {
+    payload
+        .get("tool_call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| event.tool_call_id.as_ref().map(|id| id.as_str()))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback_name.to_string())
+}
+
+fn sdk_presentation_params_preview(payload: &Value) -> Option<String> {
+    for key in [
+        "arguments",
+        "args",
+        "input",
+        "command",
+        "cmd",
+        "code",
+        "url",
+    ] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_output_preview(payload: &Value) -> Option<String> {
+    for key in ["result", "text", "output", "error", "message", "content"] {
+        if let Some(value) = payload.get(key) {
+            return sdk_presentation_preview(value);
+        }
+    }
+    None
+}
+
+fn sdk_presentation_preview(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 180;
+    if text.len() <= LIMIT {
+        return Some(text);
+    }
+    let end = sdk_floor_char_boundary(&text, LIMIT);
+    Some(format!(
+        "{}...[{} more chars]",
+        &text[..end],
+        text.len() - end
+    ))
+}
+
 fn sdk_server_stdio() -> Result<()> {
     let context = SdkServerContext::memory()?;
     let (response_tx, response_rx) = mpsc::channel::<Value>();
@@ -4913,6 +5467,8 @@ fn sdk_server_stdio() -> Result<()> {
                     .build()
                     .context("build sdk event runtime")?;
                 rt.block_on(async move {
+                    let mut sdk_projection = BrowserUseSdkPresentationProjection::default();
+                    let mut terminal_renderer = BrowserUseSdkTerminalFrameRenderer::default();
                     while !stop.load(Ordering::Relaxed) {
                         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                             Ok(Ok(event)) => {
@@ -4965,6 +5521,36 @@ fn sdk_server_stdio() -> Result<()> {
                                 });
                                 if response_tx.send(notification).is_err() {
                                     break;
+                                }
+                                for sdk_event in sdk_projection.apply(&event) {
+                                    let notification = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "agent.step",
+                                        "params": {
+                                            "run_id": run_id.clone(),
+                                            "session_id": session_id.clone(),
+                                            "agent_id": agent_id.clone(),
+                                            "event": sdk_transport_value(&sdk_event),
+                                        },
+                                    });
+                                    if response_tx.send(notification).is_err() {
+                                        break;
+                                    }
+                                    if let Some(text) = terminal_renderer.apply(&sdk_event) {
+                                        let notification = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "agent.terminal_frame",
+                                            "params": {
+                                                "run_id": run_id.clone(),
+                                                "session_id": session_id.clone(),
+                                                "agent_id": agent_id.clone(),
+                                                "text": text,
+                                            },
+                                        });
+                                        if response_tx.send(notification).is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
@@ -9278,6 +9864,121 @@ command = "test-mcp"
                 && event["event_type"] == "token_count"
         }));
         assert_eq!(result["result"]["history"]["usage"]["total_tokens"], 6);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_browser_use_projection_maps_runtime_events_to_step_events() -> Result<()> {
+        fn observed(
+            session_id: &SessionId,
+            event_type: &str,
+            payload: Value,
+            ts_ms: i64,
+        ) -> RuntimeEvent {
+            let mut event = RuntimeEvent::new(
+                browser_use_runtime::RuntimeEventKind::StoreEventAppended,
+                RuntimeDurability::Barrier,
+            )
+            .with_session_id(session_id.clone())
+            .with_payload(json!({
+                "event_type": event_type,
+                "payload": payload,
+            }));
+            event.ts_ms = ts_ms;
+            event
+        }
+
+        let session_id = SessionId::from_string("session-1".to_string())?;
+        let mut projection = BrowserUseSdkPresentationProjection::default();
+
+        let first = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            100,
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], "step.started");
+        assert_eq!(first[0]["step"], 1);
+
+        let started = projection.apply(&observed(
+            &session_id,
+            "tool.started",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "arguments": {"command": "browser connect managed --headed"}
+            }),
+            125,
+        ));
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["type"], "action.started");
+        assert_eq!(started[0]["action"]["name"], "browser");
+        assert!(started[0]["action"]["params_preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("managed")));
+
+        let completed = projection.apply(&observed(
+            &session_id,
+            "tool.output",
+            json!({
+                "name": "browser",
+                "tool_call_id": "call-1",
+                "text": "{\"status\":\"connected\"}"
+            }),
+            175,
+        ));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["type"], "action.completed");
+        assert_eq!(completed[0]["action"]["success"], true);
+        assert_eq!(completed[0]["duration_ms"], 50);
+
+        let second = projection.apply(&observed(
+            &session_id,
+            "model.turn.request",
+            json!({"model": "fake"}),
+            200,
+        ));
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0]["type"], "step.completed");
+        assert_eq!(second[0]["step"], 1);
+        assert_eq!(second[1]["type"], "step.started");
+        assert_eq!(second[1]["step"], 2);
+
+        let stream = projection.apply(&observed(
+            &session_id,
+            "model.stream_delta",
+            json!({"text": "final answer"}),
+            225,
+        ));
+        assert!(stream.is_empty());
+
+        let done = projection.apply(&observed(
+            &session_id,
+            "session.done",
+            json!({"result": "final answer"}),
+            250,
+        ));
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["type"], "model.message");
+        assert_eq!(done[0]["text"], "final answer");
+        assert_eq!(done[1]["type"], "final_result");
+        assert_eq!(done[1]["text"], "final answer");
+
+        let mut agent_completed = RuntimeEvent::new(
+            browser_use_runtime::RuntimeEventKind::AgentCompleted,
+            RuntimeDurability::Barrier,
+        )
+        .with_session_id(session_id)
+        .with_payload(json!({"result": "final answer"}));
+        agent_completed.ts_ms = 300;
+        let completed = projection.apply(&agent_completed);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["type"], "step.completed");
+        assert_eq!(completed[0]["step"], 2);
+        assert_eq!(completed[1]["type"], "agent.completed");
+        assert_eq!(completed[1]["success"], true);
+
         Ok(())
     }
 
