@@ -587,8 +587,8 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     )
     .len()
     .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES) as u16;
-    // top border + input rows + bottom border + status row beneath.
-    preview_lines + visual_input_lines + 3
+    // top border + input rows + bottom border + spacer + status row beneath.
+    preview_lines + visual_input_lines + 4
 }
 
 /// Visual rows the input area inside the fused composer should occupy.
@@ -1688,7 +1688,16 @@ fn render_composer(
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
     let box_h = input_h.saturating_add(2).min(area.height);
-    let status_h: u16 = if area.height > box_h { 1 } else { 0 };
+    let status_gap_h: u16 = if area.height > box_h.saturating_add(1) {
+        1
+    } else {
+        0
+    };
+    let status_h: u16 = if area.height > box_h.saturating_add(status_gap_h) {
+        1
+    } else {
+        0
+    };
 
     let box_area = Rect {
         x: area.x,
@@ -1752,7 +1761,7 @@ fn render_composer(
     if status_h > 0 {
         let status_area = Rect {
             x: area.x,
-            y: box_area.y + box_area.height,
+            y: box_area.y + box_area.height + status_gap_h,
             width: area.width,
             height: status_h,
         };

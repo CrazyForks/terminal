@@ -8941,21 +8941,15 @@ impl App {
         if self.browser != settings::BROWSER_LOCAL_CHROME {
             return self.browser.clone();
         }
-        match (
-            self.browser_local_label.as_deref(),
-            self.browser_profile_label.as_deref(),
-        ) {
-            (Some(browser), Some(profile)) => format!(
-                "{} · {} · {}",
-                self.browser,
-                browser,
-                concise_profile_label(profile)
-            ),
-            (Some(browser), None) => format!("{} · {}", self.browser, browser),
-            (None, Some(profile)) => {
-                format!("{} · {}", self.browser, concise_profile_label(profile))
-            }
-            (None, None) => self.browser.clone(),
+        let profile = self
+            .browser_profile_label
+            .as_deref()
+            .map(concise_profile_label)
+            .filter(|label| !label.is_empty());
+        if let Some(profile) = profile {
+            format!("{} · {}", self.browser, profile)
+        } else {
+            self.browser.clone()
         }
     }
 
@@ -9804,11 +9798,10 @@ fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncP
 
 fn concise_profile_label(label: &str) -> String {
     let trimmed = label.trim();
-    let without_browser = trimmed.strip_prefix("Google Chrome - ").unwrap_or(trimmed);
-    without_browser
+    trimmed
         .rsplit_once(':')
         .map(|(_, profile)| profile)
-        .unwrap_or(without_browser)
+        .unwrap_or(trimmed)
         .trim()
         .to_string()
 }
