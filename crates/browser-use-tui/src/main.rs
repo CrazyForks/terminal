@@ -4278,8 +4278,8 @@ impl App {
         if let Some(dir) = browser_use_terminal_home_dir() {
             if let Some((mut models, fresh)) = load_cached_provider_models(&dir, source) {
                 let appended = append_local_provider_models(source, &mut models);
-                if fresh && !models.is_empty() {
-                    if appended {
+                if !models.is_empty() {
+                    if fresh && appended {
                         let _ = save_cached_provider_models(&dir, source, &models);
                     }
                     self.provider_models = models;
