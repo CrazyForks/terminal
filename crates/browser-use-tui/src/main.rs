@@ -2197,6 +2197,27 @@ fn model_source_for_account(account: &str) -> Option<ModelSource> {
     })
 }
 
+const ANTHROPIC_FABLE_MODEL_ID: &str = "claude-fable-5";
+
+fn append_local_provider_models(source: ModelSource, models: &mut Vec<ProviderModel>) -> bool {
+    if source != ModelSource::Anthropic
+        || models
+            .iter()
+            .any(|model| model.id == ANTHROPIC_FABLE_MODEL_ID)
+    {
+        return false;
+    }
+
+    models.push(ProviderModel {
+        id: ANTHROPIC_FABLE_MODEL_ID.to_string(),
+        name: Some("Claude Fable 5".to_string()),
+        vision: false,
+        supports_tools: None,
+    });
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    true
+}
+
 fn default_provider_model_for_backend(
     backend: AgentBackend,
     current_dir: &Path,
@@ -4255,8 +4276,12 @@ impl App {
             return;
         }
         if let Some(dir) = browser_use_terminal_home_dir() {
-            if let Some((models, _fresh)) = load_cached_provider_models(&dir, source) {
-                if !models.is_empty() {
+            if let Some((mut models, fresh)) = load_cached_provider_models(&dir, source) {
+                let appended = append_local_provider_models(source, &mut models);
+                if fresh && !models.is_empty() {
+                    if appended {
+                        let _ = save_cached_provider_models(&dir, source, &models);
+                    }
                     self.provider_models = models;
                     return;
                 }
@@ -4293,7 +4318,8 @@ impl App {
         let credential = self.get_provider_credential(account);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(models) = fetch_provider_models(source, credential) {
+            if let Ok(mut models) = fetch_provider_models(source, credential) {
+                append_local_provider_models(source, &mut models);
                 let _ = tx.send((source, models));
             }
         });
