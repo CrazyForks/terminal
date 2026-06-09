@@ -99,6 +99,11 @@ pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
         provider_model: "claude-opus-4-8",
     },
     RecommendedModel {
+        display: "Claude Fable 5",
+        account: ACCOUNT_ANTHROPIC,
+        provider_model: "claude-fable-5",
+    },
+    RecommendedModel {
         display: "Gemini 3.1 Pro",
         account: ACCOUNT_OPENROUTER,
         provider_model: "google/gemini-3.1-pro-preview",
@@ -346,6 +351,14 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             account: ACCOUNT_ANTHROPIC,
             backend: AgentBackend::Anthropic,
             provider_model: "claude-opus-4-8".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::BringYourOwnKey,
+        },
+        ModelChoice {
+            display: "Claude Fable 5".to_string(),
+            account: ACCOUNT_ANTHROPIC,
+            backend: AgentBackend::Anthropic,
+            provider_model: "claude-fable-5".to_string(),
             descriptor: "needs key".to_string(),
             group: ModelChoiceGroup::BringYourOwnKey,
         },
