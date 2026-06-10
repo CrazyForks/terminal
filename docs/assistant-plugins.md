@@ -2,6 +2,8 @@
 
 Browser Use Terminal plugs into any coding assistant or agent that can run shell commands — Claude Code, Codex, OpenCode, OpenClaw, Cursor CLI, and friends. The model is similar to [browser-use/browser-harness](https://github.com/browser-use/browser-harness): a skill file teaches the assistant the CLI, and the CLI gives it the full browser runtime (connect/recovery control plane, Python page helpers, screenshots-as-files).
 
+Fastest setup: paste `https://browser-use.com/skill` into your assistant, and it provides instructions on how to install, register the skill, connect a browser, and verify. Full docs: <https://docs.browser-use.com/open-source/browser-use-terminal>.
+
 Two surfaces, one binary:
 
 - **Browser management** — the assistant drives the browser itself:

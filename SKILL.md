@@ -5,6 +5,8 @@ description: Direct browser control via the Browser Use Terminal CLI. Use when t
 
 # Browser Use Terminal
 
+For setup, install, or connection problems, read https://browser-use.com/skill (agent setup instructions) or https://docs.browser-use.com/open-source/browser-use-terminal (full docs).
+
 One CLI (`browser-use-terminal`, on $PATH), two surfaces:
 
 - **Browser management** — drive the browser yourself. `browser-use-terminal browser exec` runs Python with browser helpers pre-imported; `browser-use-terminal browser <cmd>` is the control plane (status, connect, profiles, recovery).
