@@ -56,13 +56,15 @@ Two surfaces, one binary:
 
 ## How it stays stateful across bash calls
 
-Each CLI invocation is a one-shot process, but the browser is not:
+Each CLI invocation is a thin client over a long-lived daemon. The first `browser` command auto-spawns one daemon per state dir. It hosts the browser session registries — and therefore the live CDP websocket — across invocations. This is what keeps Chrome's per-connection debugging-permission popup to a single Allow in local mode, exactly like the TUI. The CLI and daemon speak line-delimited JSON over a unix socket (`$TMPDIR/but-browser-<statehash>.sock`, mode 0600); a version handshake restarts stale daemons after CLI updates, and if the daemon can't start the CLI falls back to in-process execution with a warning. Operate it with `browser-use-terminal browser daemon status|stop|logs`.
 
-- **local** — your Chrome keeps running; each call rediscovers it via `DevToolsActivePort`.
-- **managed** — the CLI launches Chromium with a stable per-session profile and a marker file (`<state-dir>/external-browser/managed/<session>/`), leaves it running on exit, and reattaches on the next call. Stop it with `browser-use-terminal browser recover stop-owned-browser`.
+The browsers themselves also survive daemon restarts:
+
+- **local** — your Chrome keeps running; the daemon holds one authorized CDP connection to it.
+- **managed** — Chromium launches with a stable per-session profile and a marker file (`<state-dir>/external-browser/managed/<session>/`), outlives the daemon, and is reattached. Stop it with `browser-use-terminal browser recover stop-owned-browser`.
 - **cloud** — the created browser's id/CDP URL is recorded (`<state-dir>/external-browser/cloud/<session>.json`) and reattached until it stops or times out. Stop it (and billing) with `browser-use-terminal browser recover stop-owned-remote`.
 
-Page/tab state therefore persists between `browser exec` calls; Python variables do not (each exec is a fresh interpreter). `--session <name>` gives parallel workstreams isolated artifact dirs, event logs, and managed browsers.
+Page/tab state therefore persists between `browser exec` calls; Python variables do not (each exec is a fresh interpreter). `--session <name>` gives parallel workstreams isolated artifact dirs, event logs, and managed browsers (requests share one daemon and run serially).
 
 Everything an assistant does is recorded in the same SQLite event log the TUI uses — inspect with `browser-use-terminal events browser-cli-<session>` or `browser-use-terminal sessions list`.
 

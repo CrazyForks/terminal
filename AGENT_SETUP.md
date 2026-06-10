@@ -144,6 +144,9 @@ The essentials:
   the user exactly, wait, then retry.
 - Diagnostics: `browser-use-terminal browser doctor` and
   `browser-use-terminal browser status --json`.
+- A background daemon holds the browser connection between your commands
+  (auto-started). If it misbehaves: `browser-use-terminal browser daemon status`,
+  `... daemon logs`, `... daemon stop` (next command restarts it and reattaches).
 - Slow first command in each shell: the launcher checks for updates; set
   `BUT_AUTO_UPDATE=0` to skip.
 

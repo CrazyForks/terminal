@@ -581,6 +581,19 @@ pub(crate) fn browser_command_is_passive(words: &[&str]) -> bool {
         words,
         ["browser", "status", ..]
             | ["status", ..]
+            // Read-only / informational commands must never trigger an
+            // auto-connect: `help`/`doctor`/`domain` are the first things an
+            // external assistant runs to orient itself.
+            | ["browser", "help", ..]
+            | ["help", ..]
+            | ["browser", "--help", ..]
+            | ["--help", ..]
+            | ["browser", "-h", ..]
+            | ["-h", ..]
+            | ["browser", "doctor", ..]
+            | ["doctor", ..]
+            | ["browser", "domain", ..]
+            | ["domain", ..]
             | ["browser", "connect", ..]
             | ["connect", ..]
             | ["browser", "local", "list", ..]

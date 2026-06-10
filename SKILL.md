@@ -81,9 +81,10 @@ browser-use-terminal browser doctor
 browser-use-terminal browser recover reconnect-websocket
 browser-use-terminal browser recover stop-owned-browser  # stop the persistent managed browser
 browser-use-terminal browser recover stop-owned-remote   # stop the cloud browser (stops billing)
+browser-use-terminal browser daemon status|stop|logs     # the background daemon holding the connection
 ```
 
-Managed and cloud browsers persist across invocations — later calls reattach instead of relaunching. Stop them with the recover commands above when the user is done (cloud browsers bill until stopped or timed out).
+A background daemon (auto-started, one per state dir) holds the CDP connection across your commands, so the browser — and in local mode, Chrome's granted debugging permission — persists between invocations. Managed and cloud browsers also survive daemon restarts; later calls reattach instead of relaunching. Stop browsers with the recover commands above when the user is done (cloud browsers bill until stopped or timed out).
 
 - `exec` auto-connects, so you rarely need these. Reach for them when `status` shows a problem or the user asks for a specific browser.
 - If output JSON says `status: "needs-user-action"` (e.g. pick a Chrome profile, click Allow in Chrome's permission popup, enable the remote-debugging checkbox), show the `user_prompt` to the user verbatim and wait — do not guess.
