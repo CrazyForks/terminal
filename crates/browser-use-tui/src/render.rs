@@ -1202,29 +1202,53 @@ fn render_command_palette_box(
     let footer_chunk = chunks[3];
     let items = app.slash_palette_items();
 
+    let mut hidden_above = 0usize;
+    let mut hidden_below = 0usize;
     if items.is_empty() {
         Paragraph::new(Line::from(Span::styled("  No commands match.", muted())))
             .render(body_chunk, buffer);
     } else {
         let rows = slash_palette_rows(app, body_chunk.width as usize);
-        let mut visible = rows;
         let body_h = body_chunk.height as usize;
-        if body_h > 0 && app.selected_row >= body_h {
-            let skip = app.selected_row + 1 - body_h;
-            visible = visible.into_iter().skip(skip).collect();
-        }
+        let skip = if body_h > 0 && app.selected_row >= body_h {
+            app.selected_row + 1 - body_h
+        } else {
+            0
+        };
+        hidden_above = skip;
+        hidden_below = rows.len().saturating_sub(skip + body_h);
+        let visible: Vec<Line<'static>> = rows.into_iter().skip(skip).collect();
+        // No wrap: each item must stay on one line so the skip-based
+        // scrolling above keeps the selected row visible on short screens.
         Paragraph::new(visible)
             .style(Style::default().fg(text()))
-            .wrap(Wrap { trim: false })
             .render(body_chunk, buffer);
     }
 
-    Paragraph::new(Line::from(Span::styled(
-        " ↑↓ navigate · ⏎ select · esc close",
-        muted(),
-    )))
-    .alignment(Alignment::Right)
-    .render(footer_chunk, buffer);
+    // Footer: nav hints flush right; when rows are scrolled out of view,
+    // a "↑ N · ↓ N more" count sits on the left so the overflow is visible.
+    let nav_hint = "↑↓ navigate · ⏎ select · esc close";
+    let mut more_parts = Vec::new();
+    if hidden_above > 0 {
+        more_parts.push(format!("↑ {hidden_above}"));
+    }
+    if hidden_below > 0 {
+        more_parts.push(format!("↓ {hidden_below}"));
+    }
+    let footer = if more_parts.is_empty() {
+        Paragraph::new(Line::from(Span::styled(format!(" {nav_hint}"), muted())))
+            .alignment(Alignment::Right)
+    } else {
+        let more_hint = format!(" {} more", more_parts.join(" · "));
+        let pad = (footer_chunk.width as usize)
+            .saturating_sub(more_hint.chars().count() + nav_hint.chars().count());
+        Paragraph::new(Line::from(vec![
+            Span::styled(more_hint, muted()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(nav_hint, muted()),
+        ]))
+    };
+    footer.render(footer_chunk, buffer);
     cursor
 }
 
@@ -1971,7 +1995,9 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
             let marker = if is_selected { "› " } else { "  " };
             let cmd_style = if is_selected { accent() } else { text_style() };
             let desc_style = if is_selected { text_style() } else { muted() };
-            let desc_max = width.saturating_sub(cmd_col + 4).max(4);
+            // Budget: 2 (highlight_selectable_row indent) + 2 (marker) +
+            // cmd_col + 2 (gap) must leave room for the description.
+            let desc_max = width.saturating_sub(cmd_col + 6).max(4);
             let description = truncate(slash_palette_item_description(app, item), desc_max);
             highlight_selectable_row(
                 vec![

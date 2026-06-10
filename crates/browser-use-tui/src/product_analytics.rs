@@ -41,24 +41,14 @@ pub fn capture_user_message(
     text: &str,
     model: ModelAnalytics<'_>,
 ) {
-    let trimmed = text.trim();
-    let char_count = trimmed.chars().count();
-    let word_count = if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.split_whitespace().count()
-    };
-    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
     let mut properties = serde_json::json!({
         "surface": surface,
         "session_id": session_id,
         "is_subagent": is_subagent,
         "kind": kind,
         "seq": seq,
-        "char_count": char_count,
-        "word_count": word_count,
-        "approx_tokens": approx_tokens,
     });
+    append_user_text_analytics(&mut properties, text);
     append_model_analytics(&mut properties, model);
     capture_async(store, "bu:tui user_message", properties);
 }
@@ -74,6 +64,22 @@ pub fn capture_user_message_blocked(
     blocked_reason: &str,
     model: ModelAnalytics<'_>,
 ) {
+    let mut properties = serde_json::json!({
+        "surface": surface,
+        "session_id": session_id,
+        "is_subagent": is_subagent,
+        "seq": seq,
+        "blocked_reason": blocked_reason,
+    });
+    append_user_text_analytics(&mut properties, text);
+    append_model_analytics(&mut properties, model);
+    capture_async(store, "bu:tui user_message_blocked", properties);
+}
+
+fn append_user_text_analytics(properties: &mut serde_json::Value, text: &str) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
     let trimmed = text.trim();
     let char_count = trimmed.chars().count();
     let word_count = if trimmed.is_empty() {
@@ -82,18 +88,20 @@ pub fn capture_user_message_blocked(
         trimmed.split_whitespace().count()
     };
     let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
-    let mut properties = serde_json::json!({
-        "surface": surface,
-        "session_id": session_id,
-        "is_subagent": is_subagent,
-        "seq": seq,
-        "char_count": char_count,
-        "word_count": word_count,
-        "approx_tokens": approx_tokens,
-        "blocked_reason": blocked_reason,
-    });
-    append_model_analytics(&mut properties, model);
-    capture_async(store, "bu:tui user_message_blocked", properties);
+    object.insert(
+        "text".to_string(),
+        serde_json::Value::String(text.to_string()),
+    );
+    object.insert(
+        "text_chars".to_string(),
+        serde_json::json!(text.chars().count()),
+    );
+    object.insert("char_count".to_string(), serde_json::json!(char_count));
+    object.insert("word_count".to_string(), serde_json::json!(word_count));
+    object.insert(
+        "approx_tokens".to_string(),
+        serde_json::json!(approx_tokens),
+    );
 }
 
 pub fn append_model_analytics(properties: &mut serde_json::Value, model: ModelAnalytics<'_>) {
@@ -142,7 +150,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn appends_model_analytics_without_payload_content() {
+    fn appends_user_text_analytics_with_raw_text() {
+        let mut properties = serde_json::json!({"surface": "tui"});
+        append_user_text_analytics(&mut properties, "  open example.com  ");
+
+        assert_eq!(properties["text"], "  open example.com  ");
+        assert_eq!(properties["text_chars"], 20);
+        assert_eq!(properties["char_count"], 16);
+        assert_eq!(properties["word_count"], 2);
+        assert_eq!(properties["approx_tokens"], 4);
+    }
+
+    #[test]
+    fn appends_model_analytics() {
         let mut properties = serde_json::json!({"surface": "tui"});
         append_model_analytics(
             &mut properties,
@@ -157,7 +177,6 @@ mod tests {
         assert_eq!(properties["provider"], "codex");
         assert_eq!(properties["model"], "gpt-5.5");
         assert_eq!(properties["provider_model"], "openai/gpt-5.5");
-        assert!(properties.get("text").is_none());
     }
 
     #[test]

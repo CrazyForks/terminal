@@ -2785,6 +2785,34 @@ fn append_message_analytics(properties: &mut serde_json::Value, analytics: Messa
     }
 }
 
+fn append_user_text_analytics(properties: &mut serde_json::Value, text: &str) {
+    let Some(object) = properties.as_object_mut() else {
+        return;
+    };
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    let word_count = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split_whitespace().count()
+    };
+    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
+    object.insert(
+        "text".to_string(),
+        serde_json::Value::String(text.to_string()),
+    );
+    object.insert(
+        "text_chars".to_string(),
+        serde_json::json!(text.chars().count()),
+    );
+    object.insert("char_count".to_string(), serde_json::json!(char_count));
+    object.insert("word_count".to_string(), serde_json::json!(word_count));
+    object.insert(
+        "approx_tokens".to_string(),
+        serde_json::json!(approx_tokens),
+    );
+}
+
 fn simple_model_id(model: &str) -> String {
     model
         .trim()
@@ -2807,24 +2835,14 @@ fn capture_user_message(
     text: &str,
     analytics: MessageAnalytics,
 ) {
-    let trimmed = text.trim();
-    let char_count = trimmed.chars().count();
-    let word_count = if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.split_whitespace().count()
-    };
-    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
     let mut properties = serde_json::json!({
         "surface": surface,
         "session_id": session_id,
         "is_subagent": is_subagent,
         "kind": kind,
         "seq": seq,
-        "char_count": char_count,
-        "word_count": word_count,
-        "approx_tokens": approx_tokens,
     });
+    append_user_text_analytics(&mut properties, text);
     append_message_analytics(&mut properties, analytics);
     capture_async(store, "bu:tui user_message", properties);
 }
@@ -9362,6 +9380,18 @@ command = "test-mcp"
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn appends_user_text_analytics_with_raw_text() {
+        let mut properties = serde_json::json!({"surface": "cli"});
+        append_user_text_analytics(&mut properties, "  open example.com  ");
+
+        assert_eq!(properties["text"], "  open example.com  ");
+        assert_eq!(properties["text_chars"], 20);
+        assert_eq!(properties["char_count"], 16);
+        assert_eq!(properties["word_count"], 2);
+        assert_eq!(properties["approx_tokens"], 4);
     }
 
     #[test]
