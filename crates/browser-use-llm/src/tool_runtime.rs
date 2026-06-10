@@ -115,11 +115,10 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    provider_metadata: provider_metadata.clone().or_else(|| {
-                        namespace
-                            .clone()
-                            .map(|namespace| serde_json::json!({ "namespace": namespace }))
-                    }),
+                    provider_metadata: tool_call_provider_metadata(
+                        namespace.clone(),
+                        provider_metadata,
+                    ),
                 });
                 tool_calls.push(ToolCall {
                     id,
@@ -165,6 +164,23 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
         tool_calls,
         usage,
         finish_reason,
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 

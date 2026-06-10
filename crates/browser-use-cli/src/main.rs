@@ -238,6 +238,11 @@ enum Command {
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
     },
+    RunGoogle {
+        text: String,
+        #[arg(long, default_value = "gemini-3.5-flash")]
+        model: String,
+    },
     RunOpenrouter {
         text: String,
         #[arg(long, default_value = "openai/gpt-5.5")]
@@ -276,6 +281,11 @@ enum Command {
     RunAnthropicSession {
         task_id: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+    },
+    RunGoogleSession {
+        task_id: String,
+        #[arg(long, default_value = "gemini-3.5-flash")]
         model: String,
     },
     RunOpenrouterSession {
@@ -743,6 +753,7 @@ enum AuthAccount {
     BrowserUseCloud,
     Openai,
     Anthropic,
+    Google,
     Openrouter,
     Deepseek,
 }
@@ -881,6 +892,15 @@ fn main() -> Result<()> {
             collaboration_mode,
             &runtime_options,
         ),
+        Command::RunGoogle { text, model } => run_google(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunOpenrouter { text, model } => run_openrouter(
             &store,
             text,
@@ -936,6 +956,15 @@ fn main() -> Result<()> {
             &runtime_options,
         ),
         Command::RunAnthropicSession { task_id, model } => run_anthropic_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
+        Command::RunGoogleSession { task_id, model } => run_google_session(
             &store,
             &task_id,
             model,
@@ -1242,6 +1271,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunOpenai { .. } => "run_openai",
         Command::RunBrowserUse { .. } => "run_browser_use",
         Command::RunAnthropic { .. } => "run_anthropic",
+        Command::RunGoogle { .. } => "run_google",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunCodex { .. } => "run_codex",
@@ -1249,6 +1279,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunBrowserUseSession { .. } => "run_browser_use_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
+        Command::RunGoogleSession { .. } => "run_google_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
         Command::Followup { .. } => "followup",
@@ -2215,6 +2246,7 @@ fn default_cli_model_for_backend_with_overrides(
         }
         ProviderBackend::BrowserUse => Ok("bu-3-max".to_string()),
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
+        ProviderBackend::Google => Ok("gemini-3.5-flash".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
         ProviderBackend::Codex | ProviderBackend::Fake | ProviderBackend::None => {
@@ -2228,6 +2260,7 @@ fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Openai => "openai",
         ProviderBackend::BrowserUse => "browser-use",
         ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Google => "google",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::Fake => "fake",
@@ -2344,6 +2377,25 @@ fn run_browser_use(
         )?
         .with_default_model_provider_id("browser-use"),
     );
+    run_new_session_from_config(store, text, config)
+}
+
+fn run_google(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Google, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -2503,6 +2555,28 @@ fn run_browser_use_session(
         )?
         .with_default_model_provider_id("browser-use"),
     );
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_google_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Google, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
@@ -2810,6 +2884,7 @@ fn analytics_provider_kind_for_backend(backend: ProviderBackend) -> &'static str
         ProviderBackend::Codex => "subscription",
         ProviderBackend::Openai
         | ProviderBackend::Anthropic
+        | ProviderBackend::Google
         | ProviderBackend::Openrouter
         | ProviderBackend::Deepseek
         | ProviderBackend::BrowserUse => "api_key",
@@ -2822,6 +2897,7 @@ fn provider_id_for_backend(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Codex => "codex",
         ProviderBackend::Openai => "openai",
         ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Google => "google",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::BrowserUse => "browser-use",
@@ -3788,6 +3864,16 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             )?;
             print_api_key_status(
                 store,
+                "Google API key",
+                "auth.google.api_key",
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+            )?;
+            print_api_key_status(
+                store,
                 "OpenRouter API key",
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
@@ -3979,6 +4065,7 @@ fn auth_login(
         }
         AuthAccount::Openai
         | AuthAccount::Anthropic
+        | AuthAccount::Google
         | AuthAccount::Openrouter
         | AuthAccount::Deepseek => {
             let api_key =
@@ -4363,6 +4450,7 @@ fn auth_logout(store: &Store, account: AuthAccount, local_only: bool) -> Result<
         }
         AuthAccount::Openai
         | AuthAccount::Anthropic
+        | AuthAccount::Google
         | AuthAccount::Openrouter
         | AuthAccount::Deepseek => {
             if let Some(key) = api_key_setting(account) {
@@ -4992,6 +5080,7 @@ fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
     match account {
         AuthAccount::Openai => Some("auth.openai.api_key"),
         AuthAccount::Anthropic => Some("auth.anthropic.api_key"),
+        AuthAccount::Google => Some("auth.google.api_key"),
         AuthAccount::Openrouter => Some("auth.openrouter.api_key"),
         AuthAccount::Deepseek => Some("auth.deepseek.api_key"),
         AuthAccount::BrowserUseCloud => Some(BROWSER_USE_CLOUD_API_KEY_SETTING),
@@ -5006,6 +5095,7 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
         AuthAccount::BrowserUseCloud => "Browser Use Cloud",
         AuthAccount::Openai => "OpenAI API key",
         AuthAccount::Anthropic => "Anthropic API key",
+        AuthAccount::Google => "Google API key",
         AuthAccount::Openrouter => "OpenRouter API key",
         AuthAccount::Deepseek => "DeepSeek API key",
     }

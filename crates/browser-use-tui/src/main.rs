@@ -126,13 +126,13 @@ use runtime::{
 #[cfg(test)]
 use settings::RECOMMENDED_MODELS;
 use settings::{
-    browser_use_cloud_env_key_present, bundled_codex_login_model_ids, bundled_openai_model_ids,
-    bundled_openrouter_model_ids, display_and_provider_model_for_input,
+    browser_use_cloud_env_key_present, bundled_codex_login_model_ids, bundled_google_model_ids,
+    bundled_openai_model_ids, bundled_openrouter_model_ids, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_config, provider_model_choices, provider_model_for_display,
     recommended_models_for_codex_availability, AgentBackend, ModelChoice, ProviderDefaultModel,
-    RecommendedModel, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    RecommendedModel, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_GOOGLE,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
@@ -2173,6 +2173,7 @@ fn account_static(account: &str) -> Option<&'static str> {
         ACCOUNT_CODEX,
         ACCOUNT_OPENAI,
         ACCOUNT_ANTHROPIC,
+        ACCOUNT_GOOGLE,
         ACCOUNT_OPENROUTER,
         ACCOUNT_DEEPSEEK,
     ]
@@ -2188,6 +2189,8 @@ fn model_source_for_account(account: &str) -> Option<ModelSource> {
         ModelSource::OpenAi
     } else if account == ACCOUNT_ANTHROPIC {
         ModelSource::Anthropic
+    } else if account == ACCOUNT_GOOGLE {
+        ModelSource::Google
     } else if account == ACCOUNT_OPENROUTER {
         ModelSource::OpenRouter
     } else if account == ACCOUNT_DEEPSEEK {
@@ -3920,6 +3923,12 @@ impl App {
                     .expect("Anthropic provider default model"),
             },
             ProviderRow {
+                label: "Google".to_string(),
+                account: ACCOUNT_GOOGLE,
+                default_model: settings::provider_default_model(ACCOUNT_GOOGLE)
+                    .expect("Google provider default model"),
+            },
+            ProviderRow {
                 label: "OpenRouter".to_string(),
                 account: ACCOUNT_OPENROUTER,
                 default_model: settings::provider_default_model(ACCOUNT_OPENROUTER)
@@ -4035,6 +4044,7 @@ impl App {
         match self.provider_auth_account() {
             ACCOUNT_OPENAI => "OpenAI",
             ACCOUNT_ANTHROPIC => "Anthropic",
+            ACCOUNT_GOOGLE => "Google",
             ACCOUNT_OPENROUTER => "OpenRouter",
             ACCOUNT_DEEPSEEK => "DeepSeek",
             _ => "Provider",
@@ -4053,6 +4063,16 @@ impl App {
                 .has_stored_or_env(
                     "auth.openrouter.api_key",
                     &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
+                )
+                .unwrap_or(false),
+            ACCOUNT_GOOGLE => self
+                .has_stored_or_env(
+                    "auth.google.api_key",
+                    &[
+                        "LLM_BROWSER_GOOGLE_API_KEY",
+                        "GEMINI_API_KEY",
+                        "GOOGLE_API_KEY",
+                    ],
                 )
                 .unwrap_or(false),
             ACCOUNT_DEEPSEEK => self
@@ -4264,6 +4284,18 @@ impl App {
                 .collect();
             return;
         }
+        if account == ACCOUNT_GOOGLE {
+            self.provider_models = bundled_google_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+            return;
+        }
         let Some(source) = model_source_for_account(account) else {
             return;
         };
@@ -4309,7 +4341,7 @@ impl App {
         if self.provider_fetch.is_some() {
             return;
         }
-        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI {
+        if account == ACCOUNT_CODEX || account == ACCOUNT_OPENAI || account == ACCOUNT_GOOGLE {
             return;
         }
         let Some(source) = model_source_for_account(account) else {
@@ -4349,6 +4381,15 @@ impl App {
             (
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+            )
+        } else if account == ACCOUNT_GOOGLE {
+            (
+                "auth.google.api_key",
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
             )
         } else if account == ACCOUNT_DEEPSEEK {
             (
@@ -9887,6 +9928,14 @@ impl App {
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
             )?,
+            ACCOUNT_GOOGLE => self.has_stored_or_env(
+                "auth.google.api_key",
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+            )?,
             ACCOUNT_DEEPSEEK => self.has_stored_or_env(
                 "auth.deepseek.api_key",
                 &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
@@ -10532,6 +10581,7 @@ fn auth_setting_key(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "auth.openai.api_key",
         ACCOUNT_OPENROUTER => "auth.openrouter.api_key",
+        ACCOUNT_GOOGLE => "auth.google.api_key",
         ACCOUNT_DEEPSEEK => "auth.deepseek.api_key",
         ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
         BROWSER_USE_CLOUD => BROWSER_USE_CLOUD_API_KEY_SETTING,
@@ -10544,6 +10594,7 @@ fn auth_secret_label(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
+        ACCOUNT_GOOGLE => "Google API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use Cloud key",
@@ -10557,6 +10608,7 @@ fn account_kind(account: &str) -> &'static str {
         ACCOUNT_CODEX => "codex",
         ACCOUNT_OPENAI => "openai",
         ACCOUNT_OPENROUTER => "openrouter",
+        ACCOUNT_GOOGLE => "google",
         ACCOUNT_DEEPSEEK => "deepseek",
         ACCOUNT_ANTHROPIC => "anthropic",
         BROWSER_USE_CLOUD => "browser_use_cloud",
@@ -16345,7 +16397,10 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         app.open_surface(Surface::Account);
-        app.selected_row = 3;
+        app.selected_row = settings::AUTH_CHOICES
+            .iter()
+            .position(|account| *account == settings::ACCOUNT_OPENROUTER)
+            .context("OpenRouter auth row")?;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         for ch in "sk-or-v1-test".chars() {
@@ -17415,9 +17470,9 @@ mod redesign_tests {
     fn slash_palette_layers_over_running_content() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
-        // The command palette grew an item; give the fixture a couple more rows
+        // The command palette grew provider rows; give the fixture enough rows
         // (real terminals have them) so the running transcript still shows under it.
-        app.args.height = 32;
+        app.args.height = 37;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
             &session.id,
@@ -17434,7 +17489,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("/task"));
-        assert!(screen.contains("Reading the repository layout"));
+        assert!(screen.contains("Reading th"));
         assert!(screen.contains("Type to steer the agent"));
         Ok(())
     }
@@ -18143,7 +18198,7 @@ wire_api = "responses"
         let temp = tempfile::tempdir()?;
         let app = ready_app(&temp)?;
         let rows = app.provider_rows();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert!(rows
             .iter()
             .any(|row| { row.label == "OpenAI" && row.account == settings::ACCOUNT_OPENAI }));
@@ -18153,6 +18208,9 @@ wire_api = "responses"
         assert!(rows
             .iter()
             .any(|row| { row.label == "Anthropic" && row.account == settings::ACCOUNT_ANTHROPIC }));
+        assert!(rows
+            .iter()
+            .any(|row| { row.label == "Google" && row.account == settings::ACCOUNT_GOOGLE }));
         assert!(rows.iter().any(|row| {
             row.account == settings::ACCOUNT_ANTHROPIC
                 && row.default_model.provider_model == "claude-opus-4-8"

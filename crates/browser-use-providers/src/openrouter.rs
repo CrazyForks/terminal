@@ -18,6 +18,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum ModelSource {
     OpenAi,
     Anthropic,
+    Google,
     DeepSeek,
     OpenRouter,
     Codex,
@@ -29,6 +30,7 @@ impl ModelSource {
         match self {
             ModelSource::OpenAi => "openai",
             ModelSource::Anthropic => "anthropic",
+            ModelSource::Google => "google",
             ModelSource::DeepSeek => "deepseek",
             ModelSource::OpenRouter => "openrouter",
             ModelSource::Codex => "codex",
@@ -111,6 +113,24 @@ struct CodexModelEntry {
     visibility: Option<String>,
 }
 
+// --- Google `{ "models": [{ "name", "baseModelId", "displayName", "supportedGenerationMethods" }] }` shape ---
+#[derive(Deserialize)]
+struct GoogleModelsResponse {
+    #[serde(default)]
+    models: Vec<GoogleModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct GoogleModelEntry {
+    name: String,
+    #[serde(default, rename = "baseModelId")]
+    base_model_id: Option<String>,
+    #[serde(default, rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(default, rename = "supportedGenerationMethods")]
+    supported_generation_methods: Vec<String>,
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -178,10 +198,47 @@ pub fn parse_codex_models(body: &str) -> Result<Vec<ProviderModel>> {
     ))
 }
 
+/// Parse the Gemini `models.list` body, keeping models that can generate content.
+pub fn parse_google_models(body: &str) -> Result<Vec<ProviderModel>> {
+    let parsed: GoogleModelsResponse =
+        serde_json::from_str(body).context("parse Google /models response")?;
+    Ok(sort_dedup(
+        parsed
+            .models
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .supported_generation_methods
+                    .iter()
+                    .any(|method| method == "generateContent" || method == "streamGenerateContent")
+            })
+            .map(|entry| {
+                let id = entry
+                    .base_model_id
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        entry
+                            .name
+                            .strip_prefix("models/")
+                            .unwrap_or(&entry.name)
+                            .to_string()
+                    });
+                ProviderModel {
+                    id,
+                    name: entry.display_name,
+                    vision: false,
+                    supports_tools: None,
+                }
+            })
+            .collect(),
+    ))
+}
+
 fn models_url(source: ModelSource) -> &'static str {
     match source {
         ModelSource::OpenAi => "https://api.openai.com/v1/models",
         ModelSource::Anthropic => "https://api.anthropic.com/v1/models",
+        ModelSource::Google => "https://generativelanguage.googleapis.com/v1beta/models",
         ModelSource::DeepSeek => "https://api.deepseek.com/v1/models",
         ModelSource::OpenRouter => "https://openrouter.ai/api/v1/models",
         ModelSource::Codex => "https://chatgpt.com/backend-api/codex/models?client_version=0.1.0",
@@ -208,6 +265,9 @@ pub fn fetch_provider_models(
         ProviderCredential::ApiKey(key) if source == ModelSource::Anthropic => {
             request.header("x-api-key", key.trim())
         }
+        ProviderCredential::ApiKey(key) if source == ModelSource::Google => {
+            request.header("x-goog-api-key", key.trim())
+        }
         ProviderCredential::ApiKey(key) => {
             request.header("authorization", format!("Bearer {}", key.trim()))
         }
@@ -227,6 +287,7 @@ pub fn fetch_provider_models(
         .with_context(|| format!("read {} /models body", source.as_str()))?;
     match source {
         ModelSource::Codex => parse_codex_models(&body),
+        ModelSource::Google => parse_google_models(&body),
         _ => parse_openai_compatible_models(&body),
     }
 }
@@ -312,6 +373,34 @@ mod tests {
         let models = parse_codex_models(body).expect("parse");
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5.5"]);
+    }
+
+    #[test]
+    fn parses_google_models() {
+        let body = r#"{
+            "models": [
+                {
+                    "name": "models/gemini-3.5-flash-001",
+                    "baseModelId": "gemini-3.5-flash",
+                    "displayName": "Gemini 3.5 Flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "displayName": "Text Embedding 004",
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                    "name": "models/gemini-3.1-pro",
+                    "displayName": "Gemini 3.1 Pro",
+                    "supportedGenerationMethods": ["streamGenerateContent"]
+                }
+            ]
+        }"#;
+        let models = parse_google_models(body).expect("parse");
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["gemini-3.1-pro", "gemini-3.5-flash"]);
+        assert_eq!(models[1].name.as_deref(), Some("Gemini 3.5 Flash"));
     }
 
     #[test]

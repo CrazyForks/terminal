@@ -490,9 +490,7 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
                     id,
                     name,
                     input,
-                    provider_metadata: provider_metadata.or_else(|| {
-                        namespace.map(|namespace| serde_json::json!({ "namespace": namespace }))
-                    }),
+                    provider_metadata: tool_call_provider_metadata(namespace, provider_metadata),
                 });
             }
             LlmEvent::Finish {
@@ -533,6 +531,23 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
         content,
         usage,
         finish_reason,
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 

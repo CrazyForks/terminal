@@ -2298,13 +2298,20 @@ fn message_to_provider_item(message: &Message) -> Item {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
-                tool_calls.push(json!({
+                let mut call = json!({
                     "id": id,
                     "name": name,
                     "arguments": input,
-                }));
+                });
+                if let Some(metadata) = provider_metadata {
+                    call["provider_metadata"] = metadata.clone();
+                }
+                tool_calls.push(call);
             }
             ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
         }
@@ -2424,14 +2431,13 @@ impl TurnObserver for StoreObserver {
         // store events yet (the legacy stack had richer turn-lifecycle telemetry).
         // We persist the terminal session result, which is what readers need today.
         if let TurnLifecycleEvent::TurnComplete {
-            last_agent_message: Some(text),
-            ..
+            last_agent_message, ..
         } = ev
         {
             self.sink.emit(PendingEvent::new(
                 self.session_id.clone(),
                 names::SESSION_DONE,
-                session_done_payload(Some(&text), None),
+                session_done_payload(last_agent_message.as_deref(), None),
             ));
         }
     }
@@ -3205,6 +3211,28 @@ mod tests {
     use tempfile::TempDir;
 
     static ENTRYPOINT_ENV_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    #[test]
+    fn message_to_provider_item_preserves_tool_call_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_browser".to_string(),
+                name: "browser".to_string(),
+                input: serde_json::json!({ "action": "status" }),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-model-call"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["tool_calls"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-model-call")
+        );
+    }
 
     struct EnvRestore {
         _guard: StdMutexGuard<'static, ()>,
@@ -4399,6 +4427,50 @@ mod tests {
         assert!(
             saw_session_done,
             "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_turn_observer_publishes_empty_session_done() {
+        let (dir, store, session_id) = store_with_session();
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        let mut projected = runtime.subscribe_projected();
+        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
+            runtime,
+            store: Arc::clone(&store),
+            model_context_window: None,
+        });
+        let observer = StoreObserver::new(sink, session_id.clone());
+
+        observer.on_lifecycle(TurnLifecycleEvent::TurnComplete {
+            turn_id: session_id,
+            last_agent_message: None,
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(250), projected.recv())
+            .await
+            .expect("runtime projected event")
+            .expect("runtime event");
+        assert_eq!(
+            event.payload.get("event_type").and_then(Value::as_str),
+            Some(names::SESSION_DONE)
+        );
+        assert_eq!(
+            event.payload.get("payload").cloned(),
+            Some(serde_json::json!({}))
         );
     }
 
