@@ -328,6 +328,36 @@ enum Command {
         task_id: String,
         code: String,
     },
+    /// Browser management for external assistants
+    ///
+    /// `browser exec [CODE]` runs Python with browser helpers pre-imported
+    /// (reads stdin when CODE is omitted — heredoc-friendly) and prints the
+    /// script output plus `Screenshot saved to <path>` lines. Any other
+    /// arguments are forwarded to the browser control plane
+    /// (`status --json`, `connect local`, `doctor`, ...); run
+    /// `browser help` for the full command list. The browser auto-connects
+    /// using the remembered preference, and the browser itself persists across
+    /// invocations.
+    Browser {
+        /// Named workstream; isolates artifact dirs and event logs.
+        #[arg(long, default_value = "default")]
+        session: String,
+        /// Per-exec script timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Print the full structured response as JSON.
+        #[arg(long)]
+        json: bool,
+        /// `exec [CODE]` or control-plane command words.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Print or install the assistant-facing skill (SKILL.md) that teaches
+    /// coding assistants how to use the `browser` subcommand.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     SyncCookies {
         #[arg(value_name = "LOCAL_PROFILE")]
         profile: Option<String>,
@@ -736,6 +766,32 @@ enum SessionsCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Print the skill markdown to stdout.
+    Show,
+    /// Print the canonical install location for each assistant.
+    Paths,
+    /// Install the skill for coding assistants. With no argument, installs for
+    /// every assistant whose home directory exists.
+    Install {
+        #[arg(value_enum)]
+        assistant: Option<SkillAssistant>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SkillAssistant {
+    /// Claude Code (~/.claude/skills). OpenCode also discovers this location.
+    Claude,
+    /// Codex CLI ($CODEX_HOME or ~/.codex, under skills/).
+    Codex,
+    /// OpenCode (~/.config/opencode/skills).
+    Opencode,
+    /// The cross-assistant agents dir (~/.agents/skills).
+    Agents,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum AuthAccount {
     Codex,
@@ -972,6 +1028,13 @@ fn main() -> Result<()> {
         Command::Events { task_id } => events(&store, &task_id),
         Command::Python { task_id, code } => python(&store, &task_id, code),
         Command::BrowserScript { task_id, code } => browser_script(&store, &task_id, code),
+        Command::Browser {
+            session,
+            timeout,
+            json,
+            args: browser_args,
+        } => browser_cli(store, &session, timeout, json, browser_args),
+        Command::Skill { command } => skill(command),
         Command::SyncCookies {
             profile,
             local_profile,
@@ -1261,6 +1324,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Events { .. } => "events",
         Command::Python { .. } => "python",
         Command::BrowserScript { .. } => "browser_script",
+        Command::Browser { .. } => "browser",
+        Command::Skill { .. } => "skill",
         Command::SyncCookies { .. } => "sync_cookies",
         Command::UserShell { .. } => "user_shell",
         Command::Review { .. } => "review",
@@ -3238,6 +3303,304 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             .error
             .unwrap_or_else(|| "browser_script failed".to_string())
     )
+}
+
+/// Assistant-facing skill document, embedded so installed binaries can write
+/// it without a repo checkout. Source of truth: `SKILL.md` at the repo root.
+const SKILL_MD: &str = include_str!("../../../SKILL.md");
+const SKILL_DIR_NAME: &str = "browser-use-terminal";
+const EXTERNAL_BROWSER_SESSION_PREFIX: &str = "browser-cli-";
+/// Screenshot downscale ceiling for the external CLI surface. Assistants view
+/// screenshots through their file-read tools, several of which resize or
+/// reject images above ~2000 px per side (Codex `view_image` caps at 2048).
+const EXTERNAL_SCREENSHOT_MAX_DIM: &str = "1800";
+
+/// `browser-use-terminal browser ...`: browser management for external coding
+/// assistants. One-shot invocations run against a durable named session; the
+/// browser itself (user Chrome / managed / cloud) persists between calls.
+fn browser_cli(
+    store: Store,
+    session: &str,
+    timeout: u64,
+    json: bool,
+    args: Vec<String>,
+) -> Result<()> {
+    let session_name = sanitize_external_session_name(session)?;
+    let session_id = format!("{EXTERNAL_BROWSER_SESSION_PREFIX}{session_name}");
+    let cwd = std::env::current_dir().context("resolve current dir")?;
+    let task = match store.load_session(&session_id)? {
+        Some(task) => task,
+        None => {
+            let artifact_root = store.state_dir().join("artifacts").join(&session_id);
+            store.create_session_with_id_and_artifact_root(
+                None,
+                &cwd,
+                artifact_root,
+                session_id.clone(),
+            )?
+        }
+    };
+    let artifact_dir = PathBuf::from(&task.artifact_root);
+    // One-shot invocations must not tear down Rust-owned browsers on exit:
+    // managed Chromium / cloud browsers persist and later calls reattach
+    // (browser-harness daemon semantics, minus the daemon).
+    unsafe {
+        std::env::set_var("BROWSER_USE_TERMINAL_PERSIST_BROWSERS", "1");
+        if std::env::var_os("BU_EXTERNAL_BROWSER_STATE_DIR").is_none() {
+            std::env::set_var(
+                "BU_EXTERNAL_BROWSER_STATE_DIR",
+                store.state_dir().join("external-browser"),
+            );
+        }
+    }
+    let shared: SharedStore = Arc::new(Mutex::new(store));
+
+    let mut argv = args;
+    if argv.first().map(String::as_str) == Some("browser") {
+        argv.remove(0);
+    }
+    if argv.is_empty() {
+        argv.push("help".to_string());
+    }
+
+    if argv.first().map(String::as_str) == Some("exec") {
+        let code = if argv.len() == 1 || (argv.len() == 2 && argv[1] == "-") {
+            let mut buffer = String::new();
+            io::stdin()
+                .read_to_string(&mut buffer)
+                .context("read Python code from stdin")?;
+            buffer
+        } else {
+            argv[1..].join(" ")
+        };
+        if code.trim().is_empty() {
+            bail!("no Python code provided: pass it as an argument or on stdin (heredoc)");
+        }
+        if std::env::var_os("BU_BROWSER_SCREENSHOT_MAX_DIM").is_none()
+            && std::env::var_os("BROWSER_USE_SCREENSHOT_MAX_DIM").is_none()
+        {
+            unsafe {
+                std::env::set_var("BU_BROWSER_SCREENSHOT_MAX_DIM", EXTERNAL_SCREENSHOT_MAX_DIM);
+            }
+        }
+        let outcome = browser_use_agent::tools::handlers::browser::run_external_browser_script(
+            &shared,
+            &session_id,
+            &cwd,
+            &artifact_dir,
+            &code,
+            timeout,
+        )?;
+        match outcome {
+            browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Blocked(
+                content,
+            ) => {
+                println!("{}", serde_json::to_string_pretty(&content)?);
+                bail!("browser needs user action before scripts can run (see JSON above)");
+            }
+            browser_use_agent::tools::handlers::browser::ExternalBrowserScriptOutcome::Ran(out) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::to_value(&out)?)?
+                    );
+                } else {
+                    print_external_script_output(&out);
+                }
+                if !out.ok {
+                    bail!(
+                        "{}",
+                        out.error
+                            .unwrap_or_else(|| "browser_script failed".to_string())
+                    );
+                }
+                Ok(())
+            }
+        }
+    } else {
+        let command = join_browser_command_words(&argv);
+        let out = browser_use_agent::tools::handlers::browser::run_external_browser_command(
+            &shared,
+            &session_id,
+            &cwd,
+            &artifact_dir,
+            &command,
+        )?;
+        match &out.content {
+            Value::String(text) => println!("{text}"),
+            other => println!("{}", serde_json::to_string_pretty(other)?),
+        }
+        Ok(())
+    }
+}
+
+fn print_external_script_output(out: &browser_use_browser::BrowserScriptOutput) {
+    let text = out.text.trim_end();
+    if !text.is_empty() {
+        println!("{text}");
+    }
+    let mut printed_paths = HashSet::new();
+    for image in &out.images {
+        if let Some(path) = image.get("path").and_then(Value::as_str) {
+            if printed_paths.insert(path.to_string()) {
+                println!("Screenshot saved to {path}");
+            }
+        }
+    }
+    for artifact in &out.artifacts {
+        if let Some(path) = artifact.get("path").and_then(Value::as_str) {
+            if printed_paths.insert(path.to_string()) {
+                println!("Artifact saved to {path}");
+            }
+        }
+    }
+}
+
+fn sanitize_external_session_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("invalid --session name {name:?}: use 1-64 ASCII letters, digits, '-', '_' or '.'");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Re-quote command words for the browser control plane's shell-words parser
+/// so arguments containing spaces (e.g. profile ids like
+/// `google-chrome:Profile 2`) survive the join.
+fn join_browser_command_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if !word.is_empty()
+                && !word
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+            {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn skill(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::Show => {
+            print!("{SKILL_MD}");
+            Ok(())
+        }
+        SkillCommand::Paths => {
+            let home = user_home_dir()?;
+            for assistant in [
+                SkillAssistant::Claude,
+                SkillAssistant::Codex,
+                SkillAssistant::Opencode,
+                SkillAssistant::Agents,
+            ] {
+                println!(
+                    "{}: {}",
+                    skill_assistant_label(assistant),
+                    skill_install_dir(&home, assistant)
+                        .join("SKILL.md")
+                        .display()
+                );
+            }
+            Ok(())
+        }
+        SkillCommand::Install { assistant } => skill_install(assistant),
+    }
+}
+
+fn skill_install(assistant: Option<SkillAssistant>) -> Result<()> {
+    let home = user_home_dir()?;
+    let targets = match assistant {
+        Some(assistant) => vec![assistant],
+        None => {
+            let detected = detect_skill_assistants(&home);
+            if detected.is_empty() {
+                bail!(
+                    "no assistant homes found (~/.claude, ~/.codex, ~/.config/opencode, ~/.agents). \
+                     Pass one explicitly: `browser-use-terminal skill install <claude|codex|opencode|agents>`"
+                );
+            }
+            detected
+        }
+    };
+    for target in targets {
+        let dir = skill_install_dir(&home, target);
+        fs::create_dir_all(&dir).with_context(|| format!("create skill dir {}", dir.display()))?;
+        let path = dir.join("SKILL.md");
+        fs::write(&path, SKILL_MD).with_context(|| format!("write {}", path.display()))?;
+        println!(
+            "Installed {} skill: {}",
+            skill_assistant_label(target),
+            path.display()
+        );
+    }
+    println!(
+        "\nNew sessions of those assistants will discover the skill automatically. \
+         Browser setup (one-time): open chrome://inspect/#remote-debugging in Chrome and tick \
+         \"Allow remote debugging\", or let the CLI use a managed/cloud browser \
+         (`browser-use-terminal browser preference use managed-headless|cloud`)."
+    );
+    Ok(())
+}
+
+fn skill_assistant_label(assistant: SkillAssistant) -> &'static str {
+    match assistant {
+        SkillAssistant::Claude => "Claude Code",
+        SkillAssistant::Codex => "Codex",
+        SkillAssistant::Opencode => "OpenCode",
+        SkillAssistant::Agents => "agents dir",
+    }
+}
+
+fn skill_install_dir(home: &Path, assistant: SkillAssistant) -> PathBuf {
+    let base = match assistant {
+        SkillAssistant::Claude => home.join(".claude"),
+        SkillAssistant::Codex => std::env::var_os("CODEX_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex")),
+        SkillAssistant::Opencode => home.join(".config").join("opencode"),
+        SkillAssistant::Agents => home.join(".agents"),
+    };
+    base.join("skills").join(SKILL_DIR_NAME)
+}
+
+fn detect_skill_assistants(home: &Path) -> Vec<SkillAssistant> {
+    // OpenCode also discovers Claude-compatible skill paths (~/.claude/skills),
+    // so a Claude install covers OpenCode users unless they only have
+    // ~/.config/opencode.
+    [
+        SkillAssistant::Claude,
+        SkillAssistant::Codex,
+        SkillAssistant::Opencode,
+        SkillAssistant::Agents,
+    ]
+    .into_iter()
+    .filter(|assistant| {
+        skill_install_dir(home, *assistant)
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(Path::is_dir)
+    })
+    .collect()
+}
+
+fn user_home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .context("could not resolve the home directory (HOME/USERPROFILE unset)")
 }
 
 fn remote_cdp_connect_command_from_env() -> Option<String> {

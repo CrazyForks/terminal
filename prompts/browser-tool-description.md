@@ -93,6 +93,7 @@ Recovery:
 - `browser recover reattach-same-target`: attaches a fresh CDP session to the same target id. If the target is gone, it reports available targets and does not silently switch.
 - `browser recover restart-runtime`: resets the Rust connection holder and reconnects to the same endpoint. It does not kill Chrome.
 - `browser recover restart-owned-browser`: restarts only Rust-owned managed browsers.
+- `browser recover stop-owned-browser`: stops only Rust-owned managed browsers (including persistent managed browsers reattached across CLI invocations).
 - `browser recover stop-owned-remote`: stops only Rust-owned Browser Use cloud browsers.
 
 Commands:
@@ -134,6 +135,7 @@ browser recover reconnect-websocket
 browser recover reattach-same-target
 browser recover restart-runtime
 browser recover restart-owned-browser
+browser recover stop-owned-browser
 browser recover stop-owned-remote
 
 browser script runs --json
