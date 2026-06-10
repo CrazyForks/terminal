@@ -271,6 +271,7 @@ struct GeminiStream {
     tools: ToolStream,
     finish_reason: Option<FinishReason>,
     usage: Usage,
+    saw_model_output: bool,
     next_tool_id: u64,
     tool_part_ids: Vec<String>,
 }
@@ -282,12 +283,22 @@ impl GeminiStream {
             tools: ToolStream::new(),
             finish_reason: None,
             usage: Usage::default(),
+            saw_model_output: false,
             next_tool_id: 0,
             tool_part_ids: Vec::new(),
         }
     }
 
-    fn tool_part_id(&mut self, index: usize) -> (String, bool) {
+    fn tool_part_id(&mut self, index: usize, provider_id: Option<&str>) -> (String, bool) {
+        if let Some(provider_id) = provider_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let id = provider_id.to_string();
+            let first_seen = !self.tool_part_ids.iter().any(|seen| seen == provider_id);
+            if first_seen {
+                self.tool_part_ids.push(id.clone());
+            }
+            return (id, first_seen);
+        }
+
         let first_seen = self.tool_part_ids.len() <= index;
         while self.tool_part_ids.len() <= index {
             let id = format!("gemini_call_{}", self.next_tool_id);
@@ -334,6 +345,7 @@ impl ProtocolStream for GeminiStream {
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     if !text.is_empty() {
+                        self.saw_model_output = true;
                         events.extend(self.lifecycle.text_delta(TEXT_ID, text));
                     }
                 }
@@ -341,8 +353,10 @@ impl ProtocolStream for GeminiStream {
                     let Some(name) = call.get("name").and_then(Value::as_str) else {
                         continue;
                     };
+                    self.saw_model_output = true;
                     let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                    let (id, first_seen) = self.tool_part_id(function_call_index);
+                    let provider_id = call.get("id").and_then(Value::as_str);
+                    let (id, first_seen) = self.tool_part_id(function_call_index, provider_id);
                     function_call_index += 1;
                     if first_seen {
                         events.extend(self.tools.delta(&id, Some(name), &args.to_string()));
@@ -363,6 +377,12 @@ impl ProtocolStream for GeminiStream {
     fn finish(&mut self) -> Result<Vec<LlmEvent>, LlmError> {
         if self.lifecycle.is_finished() {
             return Ok(Vec::new());
+        }
+        if !self.saw_model_output {
+            return Err(LlmError::new(
+                LlmErrorReason::ProviderInternal,
+                "Gemini stream ended without text, tool calls, or a usable finish reason",
+            ));
         }
         let mut events = Vec::new();
         events.extend(self.lifecycle.text_end(TEXT_ID));
@@ -584,6 +604,41 @@ mod tests {
     }
 
     #[test]
+    fn build_body_replays_provider_function_call_id() {
+        let mut req = LlmRequest::new("gemini-3.5-flash", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_abc123".into(),
+                name: "browser".into(),
+                input: json!({ "cmd": "status --json" }),
+                provider_metadata: None,
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "call_abc123".into(),
+                content: vec![ContentPart::text("connected")],
+                is_error: false,
+            }],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            json!("browser")
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["id"],
+            json!("call_abc123")
+        );
+    }
+
+    #[test]
     fn build_body_pairs_reused_synthetic_call_ids_in_order() {
         let mut req = LlmRequest::new("gemini-3.1-pro-preview", "google");
         req.messages.push(Message::new(
@@ -686,6 +741,22 @@ mod tests {
     }
 
     #[test]
+    fn decodes_provider_function_call_id_for_replay() {
+        let mut stream = GeminiStream::new();
+        let mut events = stream
+            .on_frame(&frame(
+                r#"{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_abc123","name":"browser","args":{"action":"status"}}}]},"finishReason":"STOP"}]}"#,
+            ))
+            .unwrap();
+        events.extend(stream.finish().unwrap());
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::ToolCall { id, name, .. } if id == "call_abc123" && name == "browser"
+        )));
+    }
+
+    #[test]
     fn decodes_function_call_signature_from_later_stream_chunk() {
         let mut stream = GeminiStream::new();
         let mut events = stream
@@ -716,5 +787,22 @@ mod tests {
             } if id == "gemini_call_0"
                 && meta["google"]["thought_signature"] == "sig-model-call"
         ));
+    }
+
+    #[test]
+    fn empty_gemini_stream_is_provider_error() {
+        let mut stream = GeminiStream::new();
+        assert!(stream
+            .on_frame(&frame(
+                r#"{"usageMetadata":{"promptTokenCount":19464,"totalTokenCount":19464}}"#
+            ))
+            .unwrap()
+            .is_empty());
+
+        let err = stream.finish().expect_err("empty response should fail");
+
+        assert_eq!(err.reason, LlmErrorReason::ProviderInternal);
+        assert!(err.retryable);
+        assert!(err.message.contains("ended without text"));
     }
 }
