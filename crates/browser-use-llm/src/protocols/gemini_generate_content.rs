@@ -1,5 +1,7 @@
 //! Gemini `streamGenerateContent` protocol.
 
+use std::collections::{HashMap, VecDeque};
+
 use serde_json::{json, Map, Value};
 
 use crate::protocols::utils::{Lifecycle, ToolStream};
@@ -40,7 +42,9 @@ impl Protocol for GeminiGenerateContentProtocol {
             Value::Array(
                 req.messages
                     .iter()
-                    .map(build_content)
+                    .scan(FunctionNameTracker::default(), |tracker, message| {
+                        Some(build_content(message, tracker))
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         );
@@ -114,7 +118,30 @@ fn build_generation_config(req: &LlmRequest) -> Map<String, Value> {
     config
 }
 
-fn build_content(message: &Message) -> Result<Value, LlmError> {
+#[derive(Default)]
+struct FunctionNameTracker {
+    pending_by_call_id: HashMap<String, VecDeque<String>>,
+}
+
+impl FunctionNameTracker {
+    fn record_call(&mut self, id: &str, name: &str) {
+        self.pending_by_call_id
+            .entry(id.to_string())
+            .or_default()
+            .push_back(name.to_string());
+    }
+
+    fn take_name(&mut self, id: &str) -> Option<String> {
+        let queue = self.pending_by_call_id.get_mut(id)?;
+        let name = queue.pop_front();
+        if queue.is_empty() {
+            self.pending_by_call_id.remove(id);
+        }
+        name
+    }
+}
+
+fn build_content(message: &Message, tracker: &mut FunctionNameTracker) -> Result<Value, LlmError> {
     let role = match message.role {
         MessageRole::Assistant => "model",
         MessageRole::User | MessageRole::Tool | MessageRole::System | MessageRole::Developer => {
@@ -123,11 +150,11 @@ fn build_content(message: &Message) -> Result<Value, LlmError> {
     };
     Ok(json!({
         "role": role,
-        "parts": message.content.iter().map(build_part).collect::<Result<Vec<_>, _>>()?,
+        "parts": message.content.iter().map(|part| build_part(part, tracker)).collect::<Result<Vec<_>, _>>()?,
     }))
 }
 
-fn build_part(part: &ContentPart) -> Result<Value, LlmError> {
+fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<Value, LlmError> {
     match part {
         ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
             Ok(json!({ "text": text }))
@@ -150,11 +177,12 @@ fn build_part(part: &ContentPart) -> Result<Value, LlmError> {
             }
         }
         ContentPart::ToolCall {
+            id,
             name,
             input,
             provider_metadata,
-            ..
         } => {
+            tracker.record_call(id, name);
             let mut part = Map::new();
             part.insert(
                 "functionCall".to_string(),
@@ -170,12 +198,16 @@ fn build_part(part: &ContentPart) -> Result<Value, LlmError> {
             content,
             is_error,
         } => {
+            let name = tracker
+                .take_name(tool_call_id)
+                .unwrap_or_else(|| tool_call_id.clone());
             let response = json!({
-                "id": tool_call_id,
                 "content": flatten_tool_result_content(content),
                 "is_error": is_error,
             });
-            Ok(json!({ "functionResponse": { "name": tool_call_id, "response": response } }))
+            Ok(
+                json!({ "functionResponse": { "name": name, "id": tool_call_id, "response": response } }),
+            )
         }
     }
 }
@@ -512,6 +544,106 @@ mod tests {
     }
 
     #[test]
+    fn build_body_uses_function_name_for_function_response() {
+        let mut req = LlmRequest::new("gemini-3.1-pro-preview", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "gemini_call_0".into(),
+                name: "browser".into(),
+                input: json!({ "cmd": "connect local" }),
+                provider_metadata: Some(json!({
+                    "google": {
+                        "thought_signature": "sig-browser"
+                    }
+                })),
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "gemini_call_0".into(),
+                content: vec![ContentPart::text("connected")],
+                is_error: false,
+            }],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            json!("browser")
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["id"],
+            json!("gemini_call_0")
+        );
+        assert!(body["contents"][1]["parts"][0]["functionResponse"]["response"]["id"].is_null());
+    }
+
+    #[test]
+    fn build_body_pairs_reused_synthetic_call_ids_in_order() {
+        let mut req = LlmRequest::new("gemini-3.1-pro-preview", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "gemini_call_0".into(),
+                name: "browser".into(),
+                input: json!({ "cmd": "connect local" }),
+                provider_metadata: Some(json!({
+                    "google": {
+                        "thought_signature": "sig-browser"
+                    }
+                })),
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "gemini_call_0".into(),
+                content: vec![ContentPart::text("connected")],
+                is_error: false,
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "gemini_call_0".into(),
+                name: "browser_script".into(),
+                input: json!({ "code": "page_info()" }),
+                provider_metadata: Some(json!({
+                    "google": {
+                        "thought_signature": "sig-script"
+                    }
+                })),
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "gemini_call_0".into(),
+                content: vec![ContentPart::text("page loaded")],
+                is_error: false,
+            }],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            json!("browser")
+        );
+        assert_eq!(
+            body["contents"][3]["parts"][0]["functionResponse"]["name"],
+            json!("browser_script")
+        );
+    }
+
+    #[test]
     fn decodes_text_usage_and_function_call() {
         let mut stream = GeminiStream::new();
         let mut events = stream
@@ -549,9 +681,7 @@ mod tests {
                 input,
                 provider_metadata: Some(meta),
                 ..
-            } if name == "browser"
-                && input["action"] == "status"
-                && meta["google"]["thought_signature"] == "sig-model-call"
+            } if name == "browser" && input["action"] == "status" && meta["google"]["thought_signature"] == "sig-model-call"
         )));
     }
 

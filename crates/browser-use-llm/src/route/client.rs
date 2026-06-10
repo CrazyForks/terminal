@@ -387,7 +387,7 @@ impl RateLimitInfo {
 }
 
 /// Header keys whose values must never appear in logs, errors, or `Debug`.
-const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key"];
+const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
 
 /// Redact secret header values for safe display.
 ///
@@ -1281,6 +1281,7 @@ mod tests {
                 "Bearer sk-secret-123".to_string(),
             ),
             ("x-api-key".to_string(), "sk-ant-secret".to_string()),
+            ("x-goog-api-key".to_string(), "google-secret".to_string()),
             ("content-type".to_string(), "application/json".to_string()),
         ];
         let red = redact_headers(&headers);
@@ -1291,11 +1292,13 @@ mod tests {
         };
         assert_eq!(get("Authorization"), Some("<redacted>"));
         assert_eq!(get("x-api-key"), Some("<redacted>"));
+        assert_eq!(get("x-goog-api-key"), Some("<redacted>"));
         assert_eq!(get("content-type"), Some("application/json"));
         // The secret value must not appear anywhere in the redacted view.
         let dump = format!("{red:?}");
         assert!(!dump.contains("sk-secret-123"), "leaked bearer token");
         assert!(!dump.contains("sk-ant-secret"), "leaked api key");
+        assert!(!dump.contains("google-secret"), "leaked Google api key");
     }
 
     #[test]

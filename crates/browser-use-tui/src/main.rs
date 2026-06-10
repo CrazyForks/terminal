@@ -10620,8 +10620,8 @@ fn account_kind(account: &str) -> &'static str {
 fn analytics_provider_kind_for_account(account: &str) -> &'static str {
     match account {
         ACCOUNT_CODEX => "subscription",
-        ACCOUNT_OPENAI | ACCOUNT_OPENROUTER | ACCOUNT_DEEPSEEK | ACCOUNT_ANTHROPIC
-        | BROWSER_USE_CLOUD => "api_key",
+        ACCOUNT_OPENAI | ACCOUNT_OPENROUTER | ACCOUNT_GOOGLE | ACCOUNT_DEEPSEEK
+        | ACCOUNT_ANTHROPIC | BROWSER_USE_CLOUD => "api_key",
         account if is_claude_code_account(account) => "oauth",
         _ => "other",
     }
@@ -18231,6 +18231,15 @@ wire_api = "responses"
         }));
         assert!(!rows.iter().any(|row| row.label.contains("API key")));
         Ok(())
+    }
+
+    #[test]
+    fn google_account_analytics_kind_is_api_key() {
+        assert_eq!(
+            analytics_provider_kind_for_account(settings::ACCOUNT_GOOGLE),
+            "api_key"
+        );
+        assert_eq!(account_kind(settings::ACCOUNT_GOOGLE), "google");
     }
 
     #[test]
