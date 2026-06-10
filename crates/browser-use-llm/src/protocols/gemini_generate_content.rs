@@ -378,7 +378,7 @@ impl ProtocolStream for GeminiStream {
         if self.lifecycle.is_finished() {
             return Ok(Vec::new());
         }
-        if !self.saw_model_output {
+        if !self.saw_model_output && self.finish_reason.is_none() {
             return Err(LlmError::new(
                 LlmErrorReason::ProviderInternal,
                 "Gemini stream ended without text, tool calls, or a usable finish reason",
@@ -804,5 +804,26 @@ mod tests {
         assert_eq!(err.reason, LlmErrorReason::ProviderInternal);
         assert!(err.retryable);
         assert!(err.message.contains("ended without text"));
+    }
+
+    #[test]
+    fn empty_safety_blocked_stream_finishes_as_content_filter() {
+        let mut stream = GeminiStream::new();
+        assert!(stream
+            .on_frame(&frame(
+                r#"{"candidates":[{"finishReason":"SAFETY"}],"usageMetadata":{"promptTokenCount":2,"totalTokenCount":2}}"#
+            ))
+            .unwrap()
+            .is_empty());
+
+        let events = stream.finish().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::Finish {
+                finish_reason: Some(FinishReason::ContentFilter),
+                usage,
+            } if usage.total_tokens == 2
+        )));
     }
 }
