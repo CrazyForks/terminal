@@ -8,6 +8,7 @@ pub(crate) enum AgentBackend {
     Codex,
     Openai,
     Anthropic,
+    Google,
     Openrouter,
     Deepseek,
     Fake,
@@ -20,6 +21,7 @@ impl AgentBackend {
             Self::Codex => "codex",
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
+            Self::Google => "google",
             Self::Openrouter => "openrouter",
             Self::Deepseek => "deepseek",
             Self::Fake => "fake",
@@ -32,6 +34,7 @@ impl AgentBackend {
             "codex" => Some(Self::Codex),
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
+            "google" | "gemini" => Some(Self::Google),
             "openrouter" => Some(Self::Openrouter),
             "deepseek" => Some(Self::Deepseek),
             "fake" => Some(Self::Fake),
@@ -47,6 +50,7 @@ impl From<AgentBackend> for ProviderBackend {
             AgentBackend::Codex => Self::Codex,
             AgentBackend::Openai => Self::Openai,
             AgentBackend::Anthropic => Self::Anthropic,
+            AgentBackend::Google => Self::Google,
             AgentBackend::Openrouter => Self::Openrouter,
             AgentBackend::Deepseek => Self::Deepseek,
             AgentBackend::Fake => Self::Fake,
@@ -59,6 +63,7 @@ impl From<AgentBackend> for ProviderBackend {
 pub(crate) enum ModelChoiceGroup {
     Recommended,
     BringYourOwnKey,
+    Google,
     OpenRouter,
     Deepseek,
 }
@@ -134,6 +139,10 @@ pub(crate) fn provider_default_model(account: &str) -> Option<ProviderDefaultMod
             display: "Claude Opus 4.8",
             provider_model: "claude-opus-4-8",
         },
+        ACCOUNT_GOOGLE => ProviderDefaultModel {
+            display: "Gemini 3.5 Flash",
+            provider_model: "gemini-3.5-flash",
+        },
         ACCOUNT_OPENROUTER => ProviderDefaultModel {
             display: "Gemini 3.1 Pro",
             provider_model: "google/gemini-3.1-pro-preview",
@@ -160,16 +169,18 @@ pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
 pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
 pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
 pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
+pub(crate) const ACCOUNT_GOOGLE: &str = "Google API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
 pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
 pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
-pub(crate) const AUTH_CHOICES: [&str; 6] = [
+pub(crate) const AUTH_CHOICES: [&str; 7] = [
     ACCOUNT_CODEX,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
+    ACCOUNT_GOOGLE,
     ACCOUNT_OPENROUTER,
     ACCOUNT_DEEPSEEK,
     BROWSER_USE_CLOUD,
@@ -229,7 +240,7 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
         return model_choices_for_catalog(&bundled_model_catalog());
     }
     // Keep the stored order identical to the grouped render order
-    // (Recommended → BringYourOwnKey → OpenRouter → Deepseek). The picker treats
+    // (Recommended → BringYourOwnKey → Google → OpenRouter → Deepseek). The picker treats
     // `selected_row` as an index into this vec (navigation clamp, Enter/save),
     // while `render::model_lines` highlights rows by a grouped row counter.
     // Without this stable regroup the two index spaces diverge for interleaved
@@ -245,8 +256,9 @@ fn group_render_rank(group: &ModelChoiceGroup) -> u8 {
     match group {
         ModelChoiceGroup::Recommended => 0,
         ModelChoiceGroup::BringYourOwnKey => 1,
-        ModelChoiceGroup::OpenRouter => 2,
-        ModelChoiceGroup::Deepseek => 3,
+        ModelChoiceGroup::Google => 2,
+        ModelChoiceGroup::OpenRouter => 3,
+        ModelChoiceGroup::Deepseek => 4,
     }
 }
 
@@ -371,6 +383,38 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             group: ModelChoiceGroup::BringYourOwnKey,
         },
         ModelChoice {
+            display: "Gemini 3.1 Pro Preview".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.1-pro-preview".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3.5 Flash".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.5-flash".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3 Flash Preview".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3-flash-preview".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
+            display: "Gemini 3.1 Flash-Lite".to_string(),
+            account: ACCOUNT_GOOGLE,
+            backend: AgentBackend::Google,
+            provider_model: "gemini-3.1-flash-lite".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Google,
+        },
+        ModelChoice {
             display: "Qwen3.6 Plus".to_string(),
             account: ACCOUNT_OPENROUTER,
             backend: AgentBackend::Openrouter,
@@ -457,6 +501,8 @@ pub(crate) fn provider_backend_for_account(account: &str) -> AgentBackend {
         AgentBackend::Openai
     } else if account == ACCOUNT_ANTHROPIC {
         AgentBackend::Anthropic
+    } else if account == ACCOUNT_GOOGLE {
+        AgentBackend::Google
     } else if account == ACCOUNT_DEEPSEEK {
         AgentBackend::Deepseek
     } else {
@@ -564,6 +610,18 @@ pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
     .collect()
 }
 
+pub(crate) fn bundled_google_model_ids() -> Vec<String> {
+    [
+        "gemini-3.1-pro-preview",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite",
+    ]
+    .iter()
+    .map(|id| id.to_string())
+    .collect()
+}
+
 pub(crate) fn provider_model_for_display(display: &str, choices: &[ModelChoice]) -> String {
     choices
         .iter()
@@ -634,6 +692,19 @@ mod tests {
         }
         // Every curated id carries a vendor prefix (vendor/model).
         assert!(ids.iter().all(|id| id.contains('/')));
+    }
+
+    #[test]
+    fn bundled_google_ids_are_the_curated_provider_set() {
+        assert_eq!(
+            bundled_google_model_ids(),
+            vec![
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-flash",
+                "gemini-3-flash-preview",
+                "gemini-3.1-flash-lite",
+            ]
+        );
     }
 
     #[test]

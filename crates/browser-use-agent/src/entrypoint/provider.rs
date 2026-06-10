@@ -24,6 +24,8 @@
 //!     `LLM_BROWSER_BROWSER_USE_BASE_URL`),
 //!   * [`ProviderBackend::Anthropic`]   → [`ProviderChoice::Anthropic`]
 //!     (key from `ANTHROPIC_API_KEY` / `LLM_BROWSER_ANTHROPIC_API_KEY`),
+//!   * [`ProviderBackend::Google`]      → [`ProviderChoice::Google`]
+//!     (key from `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `LLM_BROWSER_GOOGLE_API_KEY`),
 //!   * [`ProviderBackend::Openrouter`]  → [`ProviderChoice::OpenAiCompatibleProvider`]
 //!     id `"openrouter"` (key from `OPENROUTER_API_KEY`),
 //!   * [`ProviderBackend::Deepseek`]    → [`ProviderChoice::OpenAiCompatibleProvider`]
@@ -834,6 +836,24 @@ pub fn provider_choice_for_backend(
             Ok(Some(ProviderChoice::Anthropic {
                 api_key,
                 base_url: env_first(&["LLM_BROWSER_ANTHROPIC_BASE_URL"]),
+            }))
+        }
+        ProviderBackend::Google => {
+            let api_key = key_env_then_store(
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+                store,
+                "google",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set GEMINI_API_KEY (or run `auth login google`) for the google backend",
+            ))?;
+            Ok(Some(ProviderChoice::Google {
+                api_key,
+                base_url: env_first(&["LLM_BROWSER_GOOGLE_BASE_URL"]),
             }))
         }
         ProviderBackend::Openrouter => {
