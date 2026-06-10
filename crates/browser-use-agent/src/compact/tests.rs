@@ -84,7 +84,7 @@ impl CompactionSampler for ScriptedSampler {
                 .iter()
                 .flat_map(|message| message.content.iter())
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.clone()),
+                    ContentPart::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .collect(),

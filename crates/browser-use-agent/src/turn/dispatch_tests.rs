@@ -162,7 +162,7 @@ fn output_text_and_error(msg: &Message) -> (String, bool) {
             let text = content
                 .iter()
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -512,7 +512,7 @@ mod registry_e2e {
                 let text = content
                     .iter()
                     .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.clone()),
+                        ContentPart::Text { text, .. } => Some(text.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

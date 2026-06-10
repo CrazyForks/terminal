@@ -243,6 +243,7 @@ fn text_delta(s: &str) -> LlmEvent {
     LlmEvent::TextDelta {
         id: "t0".to_string(),
         delta: s.to_string(),
+        provider_metadata: None,
     }
 }
 
@@ -274,7 +275,7 @@ fn tool_result_texts(conv: &SharedConversation) -> Vec<String> {
                 content
                     .into_iter()
                     .filter_map(|c| match c {
-                        ContentPart::Text { text } => Some(text),
+                        ContentPart::Text { text, .. } => Some(text),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

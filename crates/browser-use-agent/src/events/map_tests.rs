@@ -32,6 +32,7 @@ fn text_delta_maps_to_stream_delta() {
         &LlmEvent::TextDelta {
             id: "t0".to_string(),
             delta: "hello".to_string(),
+            provider_metadata: None,
         },
     );
     assert_eq!(

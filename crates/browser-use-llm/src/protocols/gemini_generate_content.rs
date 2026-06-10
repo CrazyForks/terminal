@@ -156,9 +156,15 @@ fn build_content(message: &Message, tracker: &mut FunctionNameTracker) -> Result
 
 fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<Value, LlmError> {
     match part {
-        ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
-            Ok(json!({ "text": text }))
+        ContentPart::Text {
+            text,
+            provider_metadata,
         }
+        | ContentPart::Reasoning {
+            text,
+            provider_metadata,
+            ..
+        } => Ok(build_text_part(text, provider_metadata)),
         ContentPart::Media {
             mime_type,
             data,
@@ -188,9 +194,15 @@ fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<V
                 "functionCall".to_string(),
                 json!({ "name": name, "args": input }),
             );
-            let signature = gemini_thought_signature(provider_metadata)
-                .unwrap_or_else(|| GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string());
-            part.insert("thoughtSignature".to_string(), Value::String(signature));
+            if let Some(signature) = gemini_thought_signature(provider_metadata).or_else(|| {
+                if should_add_dummy_thought_signature(id, provider_metadata) {
+                    Some(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string())
+                } else {
+                    None
+                }
+            }) {
+                part.insert("thoughtSignature".to_string(), Value::String(signature));
+            }
             Ok(Value::Object(part))
         }
         ContentPart::ToolResult {
@@ -210,6 +222,19 @@ fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<V
             )
         }
     }
+}
+
+fn build_text_part(text: &str, provider_metadata: &Option<Value>) -> Value {
+    let mut part = Map::new();
+    part.insert("text".to_string(), Value::String(text.to_string()));
+    if let Some(signature) = gemini_thought_signature(provider_metadata) {
+        part.insert("thoughtSignature".to_string(), Value::String(signature));
+    }
+    Value::Object(part)
+}
+
+fn should_add_dummy_thought_signature(id: &str, provider_metadata: &Option<Value>) -> bool {
+    provider_metadata.is_none() && id.starts_with("gemini_call_")
 }
 
 fn gemini_thought_signature(provider_metadata: &Option<Value>) -> Option<String> {
@@ -235,7 +260,7 @@ fn flatten_tool_result_content(content: &[ContentPart]) -> String {
     let mut text = String::new();
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
             }
@@ -344,9 +369,17 @@ impl ProtocolStream for GeminiStream {
             let mut function_call_index = 0;
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                    let provider_metadata = part
+                        .get("thoughtSignature")
+                        .and_then(Value::as_str)
+                        .map(|signature| json!({ "google": { "thought_signature": signature } }));
+                    if !text.is_empty() || provider_metadata.is_some() {
                         self.saw_model_output = true;
-                        events.extend(self.lifecycle.text_delta(TEXT_ID, text));
+                        events.extend(self.lifecycle.text_delta_with_provider_metadata(
+                            TEXT_ID,
+                            text,
+                            provider_metadata,
+                        ));
                     }
                 }
                 if let Some(call) = part.get("functionCall") {
@@ -560,6 +593,52 @@ mod tests {
         assert_eq!(
             body["contents"][0]["parts"][0]["thoughtSignature"],
             json!("skip_thought_signature_validator")
+        );
+    }
+
+    #[test]
+    fn build_body_does_not_add_dummy_signature_to_provider_call_without_one() {
+        let mut req = LlmRequest::new("gemini-3.5-flash", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_parallel_2".into(),
+                name: "browser".into(),
+                input: json!({ "cmd": "status --json" }),
+                provider_metadata: None,
+            }],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert!(body["contents"][0]["parts"][0]["thoughtSignature"].is_null());
+    }
+
+    #[test]
+    fn build_body_preserves_text_part_thought_signature() {
+        let mut req = LlmRequest::new("gemini-3.5-flash", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::Text {
+                text: String::new(),
+                provider_metadata: Some(json!({
+                    "google": {
+                        "thought_signature": "sig-final-text"
+                    }
+                })),
+            }],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert_eq!(body["contents"][0]["parts"][0]["text"], json!(""));
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("sig-final-text")
         );
     }
 
@@ -787,6 +866,26 @@ mod tests {
             } if id == "gemini_call_0"
                 && meta["google"]["thought_signature"] == "sig-model-call"
         ));
+    }
+
+    #[test]
+    fn decodes_text_part_thought_signature() {
+        let mut stream = GeminiStream::new();
+        let mut events = stream
+            .on_frame(&frame(
+                r#"{"candidates":[{"content":{"parts":[{"text":"","thoughtSignature":"sig-final-text"}]},"finishReason":"STOP"}]}"#,
+            ))
+            .unwrap();
+        events.extend(stream.finish().unwrap());
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::TextDelta {
+                delta,
+                provider_metadata: Some(meta),
+                ..
+            } if delta.is_empty() && meta["google"]["thought_signature"] == "sig-final-text"
+        )));
     }
 
     #[test]

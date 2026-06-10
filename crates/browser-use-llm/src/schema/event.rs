@@ -55,6 +55,8 @@ pub enum LlmEvent {
     TextDelta {
         id: String,
         delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_metadata: Option<Value>,
     },
     TextEnd {
         id: String,

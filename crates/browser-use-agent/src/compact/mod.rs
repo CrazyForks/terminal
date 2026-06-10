@@ -563,7 +563,7 @@ fn message_to_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text } => {
+            ContentPart::Text { text, .. } => {
                 content_parts.push(json!({ "type": "text", "text": text }));
             }
             ContentPart::Media {
@@ -608,7 +608,7 @@ fn tool_result_content_to_item_content(content: &[ContentPart]) -> Value {
     let mut has_non_text = false;
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {

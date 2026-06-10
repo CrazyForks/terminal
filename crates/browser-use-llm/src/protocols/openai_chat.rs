@@ -288,7 +288,7 @@ fn build_user_content(message: &Message, include_image_content: bool) -> Value {
     let mut has_media = false;
     for part in &message.content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {
@@ -394,7 +394,7 @@ fn append_chat_content_parts(
 ) {
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {
@@ -442,7 +442,7 @@ fn collect_tool_result_text_and_images(
 ) {
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
             }
@@ -516,7 +516,7 @@ fn collect_text(message: &Message) -> String {
 fn collect_text_parts(parts: &[ContentPart]) -> String {
     let mut text = String::new();
     for part in parts {
-        if let ContentPart::Text { text: fragment } = part {
+        if let ContentPart::Text { text: fragment, .. } = part {
             text.push_str(fragment);
         }
     }
@@ -1048,10 +1048,12 @@ mod tests {
             LlmEvent::TextDelta {
                 id: TEXT_ID.into(),
                 delta: "Hel".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: TEXT_ID.into(),
                 delta: "lo".into(),
+                provider_metadata: None,
             },
             LlmEvent::ToolInputStart {
                 id: "call_42".into(),
@@ -1157,6 +1159,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: TEXT_ID.into(),
                     delta: "hi".into(),
+                    provider_metadata: None,
                 },
                 LlmEvent::TextEnd {
                     id: TEXT_ID.into(),

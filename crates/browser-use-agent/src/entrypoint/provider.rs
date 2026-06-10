@@ -4326,7 +4326,7 @@ mod tests {
                     } => {
                         assert!(!*is_error, "tool call must succeed: {content:?}");
                         content.iter().find_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                     }
@@ -4450,7 +4450,7 @@ mod tests {
                     let text = content
                         .iter()
                         .find_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -4541,7 +4541,7 @@ mod tests {
                         let text = content
                             .iter()
                             .find_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
+                                ContentPart::Text { text, .. } => Some(text.clone()),
                                 _ => None,
                             })
                             .unwrap_or_default();
