@@ -744,7 +744,7 @@ async fn bounded_loop_aborts_after_max_turns() {
         panic!("last bounded request should include final-step developer nudge");
     };
     assert!(
-        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("final allowed step")),
+        matches!(content.first(), Some(ContentPart::Text { text, .. }) if text.contains("final allowed step")),
         "final nudge should tell the agent to finish"
     );
     assert_eq!(observer.kinds(), vec!["started", "aborted"]);
@@ -789,7 +789,7 @@ async fn bounded_loop_adds_progress_nudge_for_long_runs() {
         panic!("turn 50 should include the progress developer nudge");
     };
     assert!(
-        matches!(content.first(), Some(ContentPart::Text { text }) if text.contains("Progress checkpoint")),
+        matches!(content.first(), Some(ContentPart::Text { text, .. }) if text.contains("Progress checkpoint")),
         "progress nudge should tell the agent to finalize once enough evidence exists"
     );
     assert_eq!(observer.kinds(), vec!["started", "complete"]);

@@ -49,6 +49,7 @@
 
 pub mod provider;
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,7 +84,7 @@ use crate::context::{
     ContextManager, Item,
 };
 use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
-use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
+use crate::events::{names, session_done_payload, EventSink, PendingEvent, ResultFilePtr, TurnCtx};
 use crate::live_executor::ensure_agent_attached as ensure_runtime_agent_attached;
 use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
@@ -1393,6 +1394,123 @@ fn runtime_or_store_events(
         .unwrap_or_default()
 }
 
+/// Fallback final result discovered from the session cwd when the model ends
+/// without a `done()` call (ported from exp/real-v8-restore-88 2bd479d).
+struct FallbackResultFile {
+    text: String,
+    file: ResultFilePtr,
+}
+
+fn fallback_result_file_for_session(
+    store: &SharedStore,
+    session_id: &str,
+) -> Option<FallbackResultFile> {
+    let session = store
+        .lock()
+        .expect("store mutex poisoned")
+        .load_session(session_id)
+        .ok()
+        .flatten()?;
+    let cwd = std::path::PathBuf::from(session.cwd);
+    let files = discover_result_files(&cwd);
+    let first = files.first()?;
+    let text = if files.len() == 1 {
+        format!("Result file: {}", first.path.display())
+    } else {
+        let rendered = files
+            .iter()
+            .map(|file| format!("- {}", file.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Result files:\n{rendered}")
+    };
+    Some(FallbackResultFile {
+        text,
+        file: ResultFilePtr {
+            url: None,
+            path: Some(first.path.display().to_string()),
+            bytes: Some(first.bytes),
+        },
+    })
+}
+
+struct DiscoveredResultFile {
+    path: std::path::PathBuf,
+    bytes: u64,
+}
+
+fn discover_result_files(cwd: &std::path::Path) -> Vec<DiscoveredResultFile> {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            // Match any result-shaped artifact, not just `result.*`: the model
+            // routinely saves the deliverable under other names (result_probe.json,
+            // feb17_selected.json, *.csv) and then ends without a clean done(), so a
+            // narrow `result.` filter silently discarded completed work (real_v8
+            // task 52). Priority below still prefers canonical names; we only ever
+            // use this when there is no inline answer at all.
+            let lower = name.to_ascii_lowercase();
+            let result_shaped = lower.starts_with("result")
+                || lower.ends_with(".json")
+                || lower.ends_with(".csv")
+                || lower.ends_with(".md")
+                || lower.ends_with(".txt");
+            if !result_shaped {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            // Require a minimally substantive file so we never finalize on an
+            // empty stub or tiny scratch file.
+            if !metadata.is_file() || metadata.len() < 16 {
+                return None;
+            }
+            Some(DiscoveredResultFile {
+                path,
+                bytes: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        let left_name = left
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let right_name = right
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        // Canonical names first; within the same priority prefer the file with
+        // more content (more likely the real deliverable than a scratch file).
+        result_file_priority(left_name)
+            .cmp(&result_file_priority(right_name))
+            .then_with(|| right.bytes.cmp(&left.bytes))
+            .then_with(|| left_name.cmp(right_name))
+    });
+    files
+}
+
+fn result_file_priority(name: &str) -> usize {
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        "result.json" => 0,
+        "result.csv" => 1,
+        "result.md" => 2,
+        "result.txt" => 3,
+        _ if n.starts_with("result") => 4,
+        _ if n.ends_with(".json") => 5,
+        _ if n.ends_with(".csv") => 6,
+        _ if n.ends_with(".md") => 7,
+        _ => 8,
+    }
+}
+
 fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
     if !fallback_capture_recording_enabled() {
         return;
@@ -2280,8 +2398,15 @@ fn message_to_provider_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text } => {
-                content_parts.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_metadata,
+            } => {
+                let mut item = json!({ "type": "text", "text": text });
+                if let Some(metadata) = provider_metadata {
+                    item["provider_metadata"] = metadata.clone();
+                }
+                content_parts.push(item);
             }
             ContentPart::Media {
                 mime_type,
@@ -2298,13 +2423,20 @@ fn message_to_provider_item(message: &Message) -> Item {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
-                tool_calls.push(json!({
+                let mut call = json!({
                     "id": id,
                     "name": name,
                     "arguments": input,
-                }));
+                });
+                if let Some(metadata) = provider_metadata {
+                    call["provider_metadata"] = metadata.clone();
+                }
+                tool_calls.push(call);
             }
             ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
         }
@@ -2327,7 +2459,7 @@ fn tool_result_content_to_provider_content(content: &[ContentPart]) -> serde_jso
     let mut has_non_text = false;
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {
@@ -2401,40 +2533,15 @@ fn media_content_part_for_provider(
     }
 }
 
-/// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.
+/// A [`TurnObserver`] for lifecycle hooks that must not decide terminal status.
 ///
-/// On turn completion it emits the final agent message as a `session.done`
-/// event through the durable UI sink, so the run's result is visible to the TUI
-/// and protocol reducers. The streaming text deltas are emitted by the sampling
-/// driver through the same durable sink.
-struct StoreObserver {
-    sink: Arc<dyn EventSink>,
-    session_id: String,
-}
-
-impl StoreObserver {
-    fn new(sink: Arc<dyn EventSink>, session_id: String) -> Self {
-        Self { sink, session_id }
-    }
-}
+/// Runtime-owned runs accept `session.done` only after the turn loop has returned
+/// and runtime resources have been quiesced. Streaming model/tool events are
+/// still persisted by the sampling driver through [`RuntimeStoreSink`].
+struct StoreObserver;
 
 impl TurnObserver for StoreObserver {
-    fn on_lifecycle(&self, ev: TurnLifecycleEvent) {
-        // Phase-E seam: started/aborted lifecycle markers are not surfaced as
-        // store events yet (the legacy stack had richer turn-lifecycle telemetry).
-        // We persist the terminal session result, which is what readers need today.
-        if let TurnLifecycleEvent::TurnComplete {
-            last_agent_message: Some(text),
-            ..
-        } = ev
-        {
-            self.sink.emit(PendingEvent::new(
-                self.session_id.clone(),
-                names::SESSION_DONE,
-                session_done_payload(Some(&text), None),
-            ));
-        }
-    }
+    fn on_lifecycle(&self, _ev: TurnLifecycleEvent) {}
 }
 
 /// A network-free scripted driver for the `Fake` backend.
@@ -2588,15 +2695,7 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
         }
         *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
-        // The observer persists the terminal agent message through the runtime so
-        // `session.done` is journaled and projected by the same live authority as
-        // model/tool events.
-        let sink: Arc<dyn EventSink> = Arc::new(RuntimeStoreSink {
-            runtime: runtime_handle,
-            store: Arc::clone(&store),
-            model_context_window: None,
-        });
-        let observer = StoreObserver::new(sink, session_id.as_str().to_string());
+        let observer = StoreObserver;
 
         let turn_loop = TurnLoop::new(state, driver, observer);
         let result = match max_turns {
@@ -2611,10 +2710,100 @@ impl<Sd: SamplingDriver> RuntimeTurnLoopDriver<Sd> {
                     .await
             }
         };
-        if result.is_ok() {
-            ensure_fallback_capture_recording(&store, session_id.as_str());
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.as_str().to_string())?;
+        match result {
+            Ok(last_agent_message) => {
+                ensure_fallback_capture_recording(&store, session_id.as_str());
+                cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id.clone(),
+                )
+                .await?;
+                // Never lose finished work: if the model ended without a final
+                // message (no done() call — e.g. ended on leaked planning text
+                // or an empty turn), fall back to the best result.* artifact in
+                // the session cwd so session.done still carries the deliverable.
+                let mut final_message = last_agent_message;
+                let mut result_file: Option<ResultFilePtr> = None;
+                if final_message.is_none() && !cancel.is_cancelled() {
+                    if let Some(fallback) =
+                        fallback_result_file_for_session(&store, session_id.as_str())
+                    {
+                        final_message = Some(fallback.text);
+                        result_file = Some(fallback.file);
+                    }
+                }
+                if let Some(text) = final_message.as_deref() {
+                    runtime_handle.append_observed_session_event(
+                        runtime_session_id,
+                        names::SESSION_DONE,
+                        session_done_payload(Some(text), result_file.as_ref()),
+                        RuntimeDurability::Barrier,
+                    )?;
+                }
+                Ok(final_message)
+            }
+            Err(error) => {
+                let _ = cleanup_session_resources_for_terminal(
+                    runtime_handle.clone(),
+                    runtime_session_id.clone(),
+                )
+                .await;
+                // Never lose finished work on a crash: if a substantive result
+                // artifact already exists on disk, capture it as session.done
+                // instead of failing with nothing (real_v8 task 99: provider
+                // error mid-run, but result.json was already written).
+                if !cancel.is_cancelled() {
+                    if let Some(fallback) =
+                        fallback_result_file_for_session(&store, session_id.as_str())
+                    {
+                        runtime_handle.append_observed_session_event(
+                            runtime_session_id,
+                            names::SESSION_DONE,
+                            session_done_payload(Some(&fallback.text), Some(&fallback.file)),
+                            RuntimeDurability::Barrier,
+                        )?;
+                        return Ok(Some(fallback.text));
+                    }
+                }
+                Err(error)
+            }
         }
-        result
+    }
+}
+
+async fn cleanup_session_resources_for_terminal(
+    runtime_handle: RuntimeHandle,
+    runtime_session_id: RuntimeSessionId,
+) -> Result<usize, AgentError> {
+    let session_for_error = runtime_session_id.as_str().to_string();
+    tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime_handle.cleanup_session_resources(&runtime_session_id)
+        }))
+    })
+    .await
+    .map_err(|error| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup task failed to join for session {session_for_error}: {error}"
+        ))
+    })?
+    .map_err(|panic| {
+        AgentError::Other(anyhow::anyhow!(
+            "terminal cleanup panicked for session {session_for_error}: {}",
+            panic_payload_message(panic)
+        ))
+    })?
+    .map_err(AgentError::Other)
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -3205,6 +3394,48 @@ mod tests {
     use tempfile::TempDir;
 
     static ENTRYPOINT_ENV_LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+
+    #[test]
+    fn message_to_provider_item_preserves_tool_call_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_browser".to_string(),
+                name: "browser".to_string(),
+                input: serde_json::json!({ "action": "status" }),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-model-call"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["tool_calls"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-model-call")
+        );
+    }
+
+    #[test]
+    fn message_to_provider_item_preserves_text_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::Text {
+                text: String::new(),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-text-part"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["content"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-text-part")
+        );
+    }
 
     struct EnvRestore {
         _guard: StdMutexGuard<'static, ()>,
@@ -4047,7 +4278,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -4086,7 +4317,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -4173,7 +4404,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -4399,6 +4630,105 @@ mod tests {
         assert!(
             saw_session_done,
             "runtime-backed terminal observer must publish session.done through runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_done_is_journaled_after_resource_cleanup() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        let runtime_session_id =
+            RuntimeSessionId::from_string(session_id.clone()).expect("runtime session id");
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: runtime_session_id.clone(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+
+        let cleanup_store = Arc::clone(&store);
+        let cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let store = cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &cleanup_session_id,
+                            "test.cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append cleanup marker");
+                    1
+                },
+            )
+            .expect("register cleanup marker");
+        let blocking_cleanup_store = Arc::clone(&store);
+        let blocking_cleanup_session_id = session_id.clone();
+        runtime
+            .get_or_insert_session_resource(
+                &runtime_session_id,
+                "test.blocking_cleanup_before_done",
+                || 1usize,
+                move |_resource: Arc<usize>| {
+                    let _client = reqwest::blocking::Client::new();
+                    let store = blocking_cleanup_store.lock().expect("store mutex poisoned");
+                    store
+                        .append_event(
+                            &blocking_cleanup_session_id,
+                            "test.blocking_cleanup",
+                            json!({ "phase": "terminal_barrier" }),
+                        )
+                        .expect("append blocking cleanup marker");
+                    1
+                },
+            )
+            .expect("register blocking cleanup marker");
+
+        run_session_with_config_with_cancel_and_runtime(
+            Arc::clone(&store),
+            &session_id,
+            fake_config(),
+            CancellationToken::new(),
+            Some(runtime),
+        )
+        .await
+        .expect("runtime-backed run");
+
+        let log = events(&store, &session_id);
+        let cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.cleanup")
+            .map(|event| event.seq)
+            .expect("cleanup marker");
+        let blocking_cleanup_seq = log
+            .iter()
+            .find(|event| event.event_type == "test.blocking_cleanup")
+            .map(|event| event.seq)
+            .expect("blocking cleanup marker");
+        let done_seq = log
+            .iter()
+            .find(|event| event.event_type == names::SESSION_DONE)
+            .map(|event| event.seq)
+            .expect("session.done");
+        assert!(
+            cleanup_seq < done_seq,
+            "terminal cleanup must be durable before session.done: cleanup={cleanup_seq}, done={done_seq}"
+        );
+        assert!(
+            blocking_cleanup_seq < done_seq,
+            "blocking terminal cleanup must be durable before session.done: cleanup={blocking_cleanup_seq}, done={done_seq}"
         );
     }
 
@@ -5215,7 +5545,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5351,7 +5681,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert!(!state.has_pending_input().await);
 
-        let ContentPart::Text { text } = &drained[0].content[0] else {
+        let ContentPart::Text { text, .. } = &drained[0].content[0] else {
             panic!("mailbox input should be direct task text");
         };
         assert_eq!(
@@ -5860,6 +6190,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "t0".to_string(),
                     delta: "running shell".to_string(),
+                    provider_metadata: None,
                 },
                 LlmEvent::ToolCall {
                     id: "call-1".to_string(),
@@ -5877,6 +6208,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "t1".to_string(),
                     delta: "all done".to_string(),
+                    provider_metadata: None,
                 },
                 LlmEvent::Finish {
                     usage: Usage::default(),
@@ -5919,7 +6251,7 @@ mod tests {
                     content
                         .iter()
                         .filter_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()

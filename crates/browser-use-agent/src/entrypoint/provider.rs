@@ -24,6 +24,8 @@
 //!     `LLM_BROWSER_BROWSER_USE_BASE_URL`),
 //!   * [`ProviderBackend::Anthropic`]   → [`ProviderChoice::Anthropic`]
 //!     (key from `ANTHROPIC_API_KEY` / `LLM_BROWSER_ANTHROPIC_API_KEY`),
+//!   * [`ProviderBackend::Google`]      → [`ProviderChoice::Google`]
+//!     (key from `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `LLM_BROWSER_GOOGLE_API_KEY`),
 //!   * [`ProviderBackend::Openrouter`]  → [`ProviderChoice::OpenAiCompatibleProvider`]
 //!     id `"openrouter"` (key from `OPENROUTER_API_KEY`),
 //!   * [`ProviderBackend::Deepseek`]    → [`ProviderChoice::OpenAiCompatibleProvider`]
@@ -122,6 +124,8 @@ pub type RealSamplingDriver = ModelSamplingDriver<
     ModelClientTransport,
     RegistryRunner<NoneSandboxProvider, GuardianApprover>,
 >;
+
+const DISABLE_LOCAL_SEARCH_ENV: &str = "BROWSER_USE_DISABLE_LOCAL_SEARCH";
 
 /// The production tool dispatcher type: a [`RegistryRunner`] whose approver is the
 /// REAL [`GuardianApprover`] (permissive sandbox seam). Named so the builder + the
@@ -836,6 +840,24 @@ pub fn provider_choice_for_backend(
                 base_url: env_first(&["LLM_BROWSER_ANTHROPIC_BASE_URL"]),
             }))
         }
+        ProviderBackend::Google => {
+            let api_key = key_env_then_store(
+                &[
+                    "LLM_BROWSER_GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+                store,
+                "google",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set GEMINI_API_KEY (or run `auth login google`) for the google backend",
+            ))?;
+            Ok(Some(ProviderChoice::Google {
+                api_key,
+                base_url: env_first(&["LLM_BROWSER_GOOGLE_BASE_URL"]),
+            }))
+        }
         ProviderBackend::Openrouter => {
             let api_key = key_env_then_store(
                 &["OPENROUTER_API_KEY", "LLM_BROWSER_OPENAI_COMPAT_API_KEY"],
@@ -1348,8 +1370,11 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     );
     // `search`: locally-executed DuckDuckGo (Lite) web search — the client runs
     // the HTTP request and parses the results itself (distinct from the hosted
-    // `web_search` above). Read-only, so parallel_safe = true.
-    reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    // `web_search` above). Eval runs can disable it to avoid captcha-heavy
+    // detours while keeping hosted `web_search` available.
+    if local_search_enabled_for_run(config) {
+        reg.register::<_, SearchRequest>("search", definitions::search(), true, SearchTool::new());
+    }
     let browser_backend = browser_backend_for_runtime_or_config(
         config,
         runtime_handle.as_ref(),
@@ -1559,6 +1584,43 @@ fn legacy_subagent_tools_enabled_for_run(config: &ProviderRunConfig) -> bool {
     !config.options.multi_agent_v2.enabled
         && config.options.collab_enabled
         && config.options.child_agent_runner.is_some()
+}
+
+fn local_search_enabled_for_run(config: &ProviderRunConfig) -> bool {
+    if config_override_bool_any(
+        &config.options.config_overrides,
+        &[
+            "disable_local_search",
+            "tools.disable_local_search",
+            "search.disabled",
+        ],
+    ) == Some(true)
+    {
+        return false;
+    }
+    if config_override_bool_any(
+        &config.options.config_overrides,
+        &[
+            "local_search_enabled",
+            "tools.local_search_enabled",
+            "search.enabled",
+        ],
+    ) == Some(false)
+    {
+        return false;
+    }
+    !std::env::var(DISABLE_LOCAL_SEARCH_ENV)
+        .ok()
+        .is_some_and(|value| env_flag_enabled(&value))
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "0" | "false" | "off" | "no" | "disabled"
+        )
 }
 
 fn apply_role_tool_policy<S, A>(
@@ -3350,6 +3412,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disable_local_search_override_hides_duckduckgo_search_only() {
+        let options = crate::config_overrides::AgentRunOptions {
+            config_overrides: vec![(
+                "disable_local_search".to_string(),
+                toml::Value::Boolean(true),
+            )],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(names.contains(&"web_search"));
+        assert!(!names.contains(&"search"));
+        assert!(names.contains(&"browser_script"));
+        assert!(names.contains(&"done"));
+    }
+
     /// A non-empty `mcp_servers` map registers the `mcp` tool. The stdio server
     /// command (`true`) connects to nothing useful, but `connect_all`'s per-server
     /// failure isolation still yields a manager and the registration wiring
@@ -4306,7 +4392,7 @@ mod tests {
                     } => {
                         assert!(!*is_error, "tool call must succeed: {content:?}");
                         content.iter().find_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                     }
@@ -4430,7 +4516,7 @@ mod tests {
                     let text = content
                         .iter()
                         .find_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -4521,7 +4607,7 @@ mod tests {
                         let text = content
                             .iter()
                             .find_map(|part| match part {
-                                ContentPart::Text { text } => Some(text.clone()),
+                                ContentPart::Text { text, .. } => Some(text.clone()),
                                 _ => None,
                             })
                             .unwrap_or_default();

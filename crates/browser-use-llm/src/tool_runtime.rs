@@ -95,6 +95,7 @@ struct ToolCall {
 fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
     let mut reasoning = String::new();
     let mut text = String::new();
+    let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
     let mut assistant_tool_parts: Vec<ContentPart> = Vec::new();
     let mut usage = Usage::default();
@@ -102,7 +103,11 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
 
     for ev in events {
         match ev {
-            LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            LlmEvent::TextDelta {
+                delta,
+                provider_metadata,
+                ..
+            } => push_text_part(&mut text, &mut text_parts, delta, provider_metadata),
             LlmEvent::ReasoningDelta { delta, .. } => reasoning.push_str(&delta),
             LlmEvent::ToolCall {
                 id,
@@ -115,11 +120,10 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    provider_metadata: provider_metadata.clone().or_else(|| {
-                        namespace
-                            .clone()
-                            .map(|namespace| serde_json::json!({ "namespace": namespace }))
-                    }),
+                    provider_metadata: tool_call_provider_metadata(
+                        namespace.clone(),
+                        provider_metadata,
+                    ),
                 });
                 tool_calls.push(ToolCall {
                     id,
@@ -155,9 +159,8 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
             provider_metadata: None,
         });
     }
-    if !text.is_empty() {
-        assistant_content.push(ContentPart::text(text));
-    }
+    flush_text_buffer(&mut text, &mut text_parts);
+    assistant_content.extend(text_parts);
     assistant_content.extend(assistant_tool_parts);
 
     TurnOutcome {
@@ -165,6 +168,46 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
         tool_calls,
         usage,
         finish_reason,
+    }
+}
+
+fn push_text_part(
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    delta: String,
+    provider_metadata: Option<serde_json::Value>,
+) {
+    if let Some(provider_metadata) = provider_metadata {
+        flush_text_buffer(text_buffer, text_parts);
+        text_parts.push(ContentPart::Text {
+            text: delta,
+            provider_metadata: Some(provider_metadata),
+        });
+    } else {
+        text_buffer.push_str(&delta);
+    }
+}
+
+fn flush_text_buffer(text_buffer: &mut String, text_parts: &mut Vec<ContentPart>) {
+    if !text_buffer.is_empty() {
+        text_parts.push(ContentPart::text(std::mem::take(text_buffer)));
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 
@@ -409,6 +452,7 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "m".into(),
                 delta: text.into(),
+                provider_metadata: None,
             },
             LlmEvent::TextEnd {
                 id: "m".into(),

@@ -17,6 +17,8 @@ use super::options::GenerationOptions;
 pub enum ContentPart {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_metadata: Option<Value>,
     },
     /// Inline media. Exactly one of `data` (base64) or `url` is expected.
     Media {
@@ -53,7 +55,10 @@ pub enum ContentPart {
 
 impl ContentPart {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentPart::Text { text: s.into() }
+        ContentPart::Text {
+            text: s.into(),
+            provider_metadata: None,
+        }
     }
 }
 

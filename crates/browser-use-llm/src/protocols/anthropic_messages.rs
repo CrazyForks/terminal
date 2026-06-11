@@ -161,7 +161,7 @@ fn apply_cache_control_to_last_content_block(content: &mut [Value], cache: Optio
 /// Translate a canonical [`ContentPart`] into an Anthropic content block.
 fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
     match part {
-        ContentPart::Text { text } => Ok(json!({ "type": "text", "text": text })),
+        ContentPart::Text { text, .. } => Ok(json!({ "type": "text", "text": text })),
         ContentPart::Media {
             mime_type,
             data,
@@ -295,7 +295,7 @@ fn flatten_error_tool_result_content(content: &[ContentPart]) -> String {
 fn collect_error_tool_result_text(content: &[ContentPart], chunks: &mut Vec<String>) {
     for part in content {
         match part {
-            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => {
                 if !text.trim().is_empty() {
                     chunks.push(text.clone());
                 }
@@ -1174,14 +1174,17 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "block-0".into(),
                 delta: "".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: "block-0".into(),
                 delta: "Hello".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: "block-0".into(),
                 delta: " there".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextEnd {
                 id: "block-0".into(),

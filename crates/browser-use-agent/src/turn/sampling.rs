@@ -579,9 +579,19 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         // Emit UI events first (map is pure; emit is the only side effect).
         self.emit_event(&ev, turn_idx);
         match ev {
-            LlmEvent::TextDelta { id, delta } => {
+            LlmEvent::TextDelta {
+                id,
+                delta,
+                provider_metadata,
+            } => {
                 let has_content = !delta.trim().is_empty();
                 acc.full_text.push_str(&delta);
+                push_text_part(
+                    &mut acc.text_buffer,
+                    &mut acc.text_parts,
+                    delta,
+                    provider_metadata,
+                );
                 if has_content {
                     acc.text_items_with_content.insert(id, true);
                 }
@@ -612,9 +622,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                     id,
                     name,
                     input,
-                    provider_metadata: provider_metadata.or_else(|| {
-                        namespace.map(|namespace| serde_json::json!({ "namespace": namespace }))
-                    }),
+                    provider_metadata: tool_call_provider_metadata(namespace, provider_metadata),
                 });
                 Ok(StreamProgress::Continue)
             }
@@ -635,6 +643,23 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     }
 }
 
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
+    }
+}
+
 fn checks_mailbox_preemption_after_event(ev: &LlmEvent) -> bool {
     matches!(
         ev,
@@ -650,6 +675,8 @@ fn checks_mailbox_preemption_after_event(ev: &LlmEvent) -> bool {
 #[derive(Default)]
 struct TurnAccumulator {
     full_text: String,
+    text_parts: Vec<ContentPart>,
+    text_buffer: String,
     text_items_with_content: HashMap<String, bool>,
     defers_mailbox_delivery_to_next_turn: bool,
     /// The tool calls the model emitted, in model order. The length doubles as
@@ -723,6 +750,19 @@ fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
         .any(|p| matches!(p, ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME))
 }
 
+fn done_tool_succeeded(tool_calls: &[ContentPart], outputs: &[Message]) -> bool {
+    tool_calls
+        .iter()
+        .zip(outputs.iter())
+        .any(|(call, output)| match call {
+            ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME => {
+                let (_, is_error) = tool_result_text_and_status(output);
+                !is_error
+            }
+            _ => false,
+        })
+}
+
 /// The final summary carried by the model's `done` call, if any.
 ///
 /// Reads the `result` field from the first `done` tool call's JSON arguments,
@@ -757,13 +797,44 @@ fn done_summary(tool_calls: &[ContentPart]) -> Option<String> {
 /// Assemble the assistant `Message` recorded for this turn: its streamed text
 /// (if any) followed by the tool calls it emitted, in model order. Mirrors codex
 /// recording the assistant function-call item before its outputs.
-fn assistant_message(full_text: &str, tool_calls: &[ContentPart]) -> Message {
+fn assistant_message(
+    full_text: &str,
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    tool_calls: &[ContentPart],
+) -> Message {
     let mut content: Vec<ContentPart> = Vec::new();
-    if !full_text.is_empty() {
+    flush_text_buffer(text_buffer, text_parts);
+    if !text_parts.is_empty() {
+        content.extend(text_parts.iter().cloned());
+    } else if !full_text.is_empty() {
         content.push(ContentPart::text(full_text));
     }
     content.extend(tool_calls.iter().cloned());
     Message::new(MessageRole::Assistant, content)
+}
+
+fn push_text_part(
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    delta: String,
+    provider_metadata: Option<serde_json::Value>,
+) {
+    if let Some(provider_metadata) = provider_metadata {
+        flush_text_buffer(text_buffer, text_parts);
+        text_parts.push(ContentPart::Text {
+            text: delta,
+            provider_metadata: Some(provider_metadata),
+        });
+    } else {
+        text_buffer.push_str(&delta);
+    }
+}
+
+fn flush_text_buffer(text_buffer: &mut String, text_parts: &mut Vec<ContentPart>) {
+    if !text_buffer.is_empty() {
+        text_parts.push(ContentPart::text(std::mem::take(text_buffer)));
+    }
 }
 
 fn tool_call_identity(call: &ContentPart) -> (String, String) {
@@ -804,7 +875,7 @@ fn event_content_parts_if_media(parts: &[ContentPart]) -> Option<Vec<Value>> {
 fn append_event_content_parts(parts: &[ContentPart], out: &mut Vec<Value>, has_media: &mut bool) {
     for part in parts {
         match part {
-            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => {
                 if !text.is_empty() {
                     out.push(serde_json::json!({ "type": "input_text", "text": text }));
                 }
@@ -871,7 +942,7 @@ fn flatten_content_text(parts: &[ContentPart]) -> String {
 fn collect_content_text(parts: &[ContentPart], chunks: &mut Vec<String>) {
     for part in parts {
         match part {
-            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => {
                 if !text.is_empty() {
                     chunks.push(text.clone());
                 }
@@ -991,23 +1062,20 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match (&self.dispatcher, &self.recorder, tool_calls.is_empty()) {
                     // Fused path with at least one tool call.
                     (Some(dispatcher), Some(recorder), false) => {
-                        // A `done` call declares the turn finished: dispatch it (so the
-                        // summary is recorded) but report NO follow-up, terminating the
-                        // loop. Detect it BEFORE the calls vec is consumed by dispatch.
-                        let is_terminal = calls_done_tool(&tool_calls);
-                        // Surface the `done` summary as the turn result when the model
-                        // declared completion via `done` and streamed no other text, so
-                        // the loop returns the summary (codex keeps the final message).
-                        if is_terminal && last_agent_message.is_none() {
-                            last_agent_message = done_summary(&tool_calls);
-                            if last_agent_message.is_some() {
-                                acc.defers_mailbox_delivery_to_next_turn = true;
-                            }
-                        }
+                        // A successful `done` call declares the turn finished. Detect
+                        // the call before dispatch, but decide terminality only after
+                        // the handler output has been recorded; eval-mode done audit
+                        // can reject weak completions and should get a repair turn.
+                        let has_done_call = calls_done_tool(&tool_calls);
 
                         // 1. Record the assistant message (text + tool calls), so the
                         //    recorded transcript carries the call before its output.
-                        let assistant = assistant_message(&acc.full_text, &tool_calls);
+                        let assistant = assistant_message(
+                            &acc.full_text,
+                            &mut acc.text_buffer,
+                            &mut acc.text_parts,
+                            &tool_calls,
+                        );
                         recorder.record(std::slice::from_ref(&assistant)).await;
 
                         // 2. Dispatch in model order through the parallel/serial gate.
@@ -1027,14 +1095,29 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                             recorder.record(&result.outputs_in_order).await;
                         }
 
-                        // A `done` call is TERMINAL: the model declared completion, so
-                        // the loop must stop even though a tool ran. Otherwise, follow-up
-                        // iff a tool actually ran (codex re-samples after feeding tool
-                        // outputs back into history).
-                        if is_terminal {
+                        let done_succeeded = has_done_call
+                            && done_tool_succeeded(&tool_calls, &result.outputs_in_order);
+
+                        // Surface the successful `done` summary as the turn result
+                        // when the model declared completion and streamed no other
+                        // text, so the loop returns the summary (codex keeps the final
+                        // message). Rejected done calls keep following up.
+                        if done_succeeded && last_agent_message.is_none() {
+                            last_agent_message = done_summary(&tool_calls);
+                            if last_agent_message.is_some() {
+                                acc.defers_mailbox_delivery_to_next_turn = true;
+                            }
+                        }
+
+                        // A successful `done` call is TERMINAL. A rejected `done` call
+                        // needs follow-up so the model can repair the final answer.
+                        if done_succeeded {
                             false
                         } else {
-                            decision::needs_follow_up(result.needs_follow_up, false)
+                            decision::needs_follow_up(
+                                result.needs_follow_up || has_done_call,
+                                false,
+                            )
                         }
                     }
                     // Text-only sampler, OR fusion configured but no tool call: the

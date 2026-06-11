@@ -302,7 +302,16 @@ pub fn compacted_history_from_summary(
     summary_suffix: CompactionSummary,
     token_limit: usize,
 ) -> CompactedHistory {
-    let summary_text = format!("{SUMMARY_PREFIX}\n{}", summary_suffix.text);
+    // Apply the empty-summary fallback to the SUFFIX before prepending the
+    // prefix — otherwise the prefix makes the string non-empty and the fallback
+    // in build_compacted_history is dead code, shipping PREFIX + "" (total
+    // post-compaction amnesia; real_v8 task 24).
+    let suffix_text = if summary_suffix.text.trim().is_empty() {
+        "(no summary available)".to_string()
+    } else {
+        summary_suffix.text.clone()
+    };
+    let summary_text = format!("{SUMMARY_PREFIX}\n{suffix_text}");
     let user_messages: Vec<String> = history.iter().filter_map(real_user_message_text).collect();
     let items = build_compacted_history(&user_messages, &summary_text, token_limit);
 
@@ -563,8 +572,15 @@ fn message_to_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text } => {
-                content_parts.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_metadata,
+            } => {
+                let mut item = json!({ "type": "text", "text": text });
+                if let Some(metadata) = provider_metadata {
+                    item["provider_metadata"] = metadata.clone();
+                }
+                content_parts.push(item);
             }
             ContentPart::Media {
                 mime_type,
@@ -581,13 +597,20 @@ fn message_to_item(message: &Message) -> Item {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
-                tool_calls.push(json!({
+                let mut call = json!({
                     "id": id,
                     "name": name,
                     "arguments": input,
-                }));
+                });
+                if let Some(metadata) = provider_metadata {
+                    call["provider_metadata"] = metadata.clone();
+                }
+                tool_calls.push(call);
             }
             ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
         }
@@ -608,7 +631,7 @@ fn tool_result_content_to_item_content(content: &[ContentPart]) -> Value {
     let mut has_non_text = false;
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {

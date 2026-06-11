@@ -135,7 +135,7 @@ fn lower_message(message: &Message, out: &mut Vec<Value>) {
 
     for part in &message.content {
         match part {
-            ContentPart::Text { text } => {
+            ContentPart::Text { text, .. } => {
                 content_parts.push(json!({
                     "type": text_part_type(message.role),
                     "text": text,
@@ -278,7 +278,7 @@ fn append_tool_result_output(
 ) {
     for part in content {
         match part {
-            ContentPart::Text { text: t } | ContentPart::Reasoning { text: t, .. } => {
+            ContentPart::Text { text: t, .. } | ContentPart::Reasoning { text: t, .. } => {
                 text.push_str(t);
                 if !t.is_empty() {
                     parts.push(json!({ "type": "input_text", "text": t }));
@@ -937,10 +937,12 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "Let me ".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "check.".into(),
+                provider_metadata: None,
             },
             // output_item.added (function_call) closes the open text block.
             LlmEvent::TextEnd {
@@ -1028,6 +1030,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "msg_1".into(),
                     delta: "still working".into(),
+                    provider_metadata: None,
                 },
                 LlmEvent::TextEnd {
                     id: "msg_1".into(),
@@ -1076,7 +1079,8 @@ mod tests {
                 LlmEvent::TextStart { id: "t1".into() },
                 LlmEvent::TextDelta {
                     id: "t1".into(),
-                    delta: "hi".into()
+                    delta: "hi".into(),
+                    provider_metadata: None,
                 },
                 LlmEvent::TextEnd {
                     id: "t1".into(),

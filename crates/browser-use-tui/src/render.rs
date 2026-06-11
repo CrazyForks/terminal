@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    ACCOUNT_GOOGLE, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, AUTH_CHOICES, BROWSER_LOCAL_CHROME,
+    BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -2491,6 +2492,7 @@ fn setup_account_lines(app: &App) -> Vec<Line<'static>> {
             vec![
                 ACCOUNT_OPENAI,
                 ACCOUNT_ANTHROPIC,
+                ACCOUNT_GOOGLE,
                 ACCOUNT_OPENROUTER,
                 ACCOUNT_DEEPSEEK,
             ]
@@ -5195,6 +5197,7 @@ fn auth_secret_label(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
+        ACCOUNT_GOOGLE => "Google API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use Cloud key",

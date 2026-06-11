@@ -39,6 +39,38 @@ fn assistant_with_tool_call(id: &str, name: &str) -> serde_json::Value {
     })
 }
 
+fn assistant_with_provider_metadata(id: &str, name: &str) -> serde_json::Value {
+    json!({
+        "role": "assistant",
+        "content": "calling a tool",
+        "tool_calls": [{
+            "id": id,
+            "name": name,
+            "arguments": { "x": 1 },
+            "provider_metadata": {
+                "google": {
+                    "thought_signature": "sig-model-call"
+                }
+            }
+        }],
+    })
+}
+
+fn assistant_with_text_provider_metadata() -> serde_json::Value {
+    json!({
+        "role": "assistant",
+        "content": [{
+            "type": "text",
+            "text": "",
+            "provider_metadata": {
+                "google": {
+                    "thought_signature": "sig-text-part"
+                }
+            }
+        }]
+    })
+}
+
 fn function_call(id: &str, name: &str) -> serde_json::Value {
     json!({ "type": "function_call", "call_id": id, "name": name, "arguments": "{}" })
 }
@@ -225,6 +257,46 @@ fn lower_to_messages_user_assistant_tool_roundtrip() {
             assert_eq!(content, &vec![ContentPart::text("result text")]);
         }
         other => panic!("expected ToolResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn lower_to_messages_preserves_tool_call_provider_metadata() {
+    let cm = ContextManager::new();
+    let messages = cm.lower_to_messages(&[assistant_with_provider_metadata("call-1", "search")]);
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].content[1] {
+        ContentPart::ToolCall {
+            provider_metadata: Some(metadata),
+            ..
+        } => {
+            assert_eq!(
+                metadata["google"]["thought_signature"],
+                json!("sig-model-call")
+            );
+        }
+        other => panic!("expected ToolCall with provider metadata, got {other:?}"),
+    }
+}
+
+#[test]
+fn lower_to_messages_preserves_text_provider_metadata() {
+    let cm = ContextManager::new();
+    let messages = cm.lower_to_messages(&[assistant_with_text_provider_metadata()]);
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0].content[0] {
+        ContentPart::Text {
+            provider_metadata: Some(metadata),
+            ..
+        } => {
+            assert_eq!(
+                metadata["google"]["thought_signature"],
+                json!("sig-text-part")
+            );
+        }
+        other => panic!("expected Text with provider metadata, got {other:?}"),
     }
 }
 

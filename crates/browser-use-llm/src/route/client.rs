@@ -387,7 +387,7 @@ impl RateLimitInfo {
 }
 
 /// Header keys whose values must never appear in logs, errors, or `Debug`.
-const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key"];
+const SECRET_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
 
 /// Redact secret header values for safe display.
 ///
@@ -470,6 +470,7 @@ pub fn decode_chunks(
 /// usage and the finish reason.
 fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
     let mut text = String::new();
+    let mut text_parts: Vec<ContentPart> = Vec::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<ContentPart> = Vec::new();
     let mut usage = Usage::default();
@@ -477,7 +478,11 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
 
     for ev in events {
         match ev {
-            LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            LlmEvent::TextDelta {
+                delta,
+                provider_metadata,
+                ..
+            } => push_text_part(&mut text, &mut text_parts, delta, provider_metadata),
             LlmEvent::ReasoningDelta { delta, .. } => reasoning.push_str(&delta),
             LlmEvent::ToolCall {
                 id,
@@ -490,9 +495,7 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
                     id,
                     name,
                     input,
-                    provider_metadata: provider_metadata.or_else(|| {
-                        namespace.map(|namespace| serde_json::json!({ "namespace": namespace }))
-                    }),
+                    provider_metadata: tool_call_provider_metadata(namespace, provider_metadata),
                 });
             }
             LlmEvent::Finish {
@@ -524,15 +527,54 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
             provider_metadata: None,
         });
     }
-    if !text.is_empty() {
-        content.push(ContentPart::text(text));
-    }
+    flush_text_buffer(&mut text, &mut text_parts);
+    content.extend(text_parts);
     content.extend(tool_calls);
 
     LlmResponse {
         content,
         usage,
         finish_reason,
+    }
+}
+
+fn push_text_part(
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    delta: String,
+    provider_metadata: Option<serde_json::Value>,
+) {
+    if let Some(provider_metadata) = provider_metadata {
+        flush_text_buffer(text_buffer, text_parts);
+        text_parts.push(ContentPart::Text {
+            text: delta,
+            provider_metadata: Some(provider_metadata),
+        });
+    } else {
+        text_buffer.push_str(&delta);
+    }
+}
+
+fn flush_text_buffer(text_buffer: &mut String, text_parts: &mut Vec<ContentPart>) {
+    if !text_buffer.is_empty() {
+        text_parts.push(ContentPart::text(std::mem::take(text_buffer)));
+    }
+}
+
+fn tool_call_provider_metadata(
+    namespace: Option<String>,
+    provider_metadata: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (namespace, provider_metadata) {
+        (Some(namespace), Some(serde_json::Value::Object(mut meta))) => {
+            meta.insert("namespace".to_string(), serde_json::json!(namespace));
+            Some(serde_json::Value::Object(meta))
+        }
+        (Some(namespace), Some(meta)) => {
+            Some(serde_json::json!({ "namespace": namespace, "provider": meta }))
+        }
+        (Some(namespace), None) => Some(serde_json::json!({ "namespace": namespace })),
+        (None, metadata) => metadata,
     }
 }
 
@@ -953,10 +995,12 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "Let me ".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "check.".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextEnd {
                 id: "msg_1".into(),
@@ -1041,7 +1085,7 @@ mod tests {
         assert!(resp
             .content
             .iter()
-            .any(|p| matches!(p, ContentPart::Text { text } if text == "Let me check.")));
+            .any(|p| matches!(p, ContentPart::Text { text, .. } if text == "Let me check.")));
         // The tool call survives aggregation with parsed input.
         let tc = resp
             .content
@@ -1266,6 +1310,7 @@ mod tests {
                 "Bearer sk-secret-123".to_string(),
             ),
             ("x-api-key".to_string(), "sk-ant-secret".to_string()),
+            ("x-goog-api-key".to_string(), "google-secret".to_string()),
             ("content-type".to_string(), "application/json".to_string()),
         ];
         let red = redact_headers(&headers);
@@ -1276,11 +1321,13 @@ mod tests {
         };
         assert_eq!(get("Authorization"), Some("<redacted>"));
         assert_eq!(get("x-api-key"), Some("<redacted>"));
+        assert_eq!(get("x-goog-api-key"), Some("<redacted>"));
         assert_eq!(get("content-type"), Some("application/json"));
         // The secret value must not appear anywhere in the redacted view.
         let dump = format!("{red:?}");
         assert!(!dump.contains("sk-secret-123"), "leaked bearer token");
         assert!(!dump.contains("sk-ant-secret"), "leaked api key");
+        assert!(!dump.contains("google-secret"), "leaked Google api key");
     }
 
     #[test]

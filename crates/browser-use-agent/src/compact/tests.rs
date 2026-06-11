@@ -84,7 +84,7 @@ impl CompactionSampler for ScriptedSampler {
                 .iter()
                 .flat_map(|message| message.content.iter())
                 .filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.clone()),
+                    ContentPart::Text { text, .. } => Some(text.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -370,7 +370,7 @@ async fn context_window_exceeded_with_only_prompt_left_propagates() {
 }
 
 #[tokio::test]
-async fn empty_model_summary_yields_prefix_only_summary() {
+async fn empty_model_summary_yields_no_summary_available_fallback() {
     // The model returns an empty summary => summary_text = PREFIX + "\n" + "".
     // (The "(no summary available)" placeholder only applies when the WHOLE
     // summary_text is empty, which it never is here because the prefix is present;
@@ -390,7 +390,10 @@ async fn empty_model_summary_yields_prefix_only_summary() {
 
     let last = item_text(compacted.items.last().unwrap());
     assert_eq!(last, compacted.summary_text);
-    assert_eq!(compacted.summary_text, format!("{SUMMARY_PREFIX}\n"));
+    assert_eq!(
+        compacted.summary_text,
+        format!("{SUMMARY_PREFIX}\n(no summary available)")
+    );
 }
 
 // ---- (5) end-to-end through the real TurnLoop -----------------------------
@@ -606,7 +609,29 @@ async fn record_items_roundtrips_through_context_manager() {
     use crate::turn::TurnState as _;
     let msgs = vec![
         Message::new(MessageRole::User, vec![ContentPart::text("hello")]),
-        Message::new(MessageRole::Assistant, vec![ContentPart::text("hi there")]),
+        Message::new(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::Text {
+                    text: "hi there".to_string(),
+                    provider_metadata: Some(json!({
+                        "google": {
+                            "thought_signature": "sig-text"
+                        }
+                    })),
+                },
+                ContentPart::ToolCall {
+                    id: "call_browser".to_string(),
+                    name: "default_api:browser".to_string(),
+                    input: json!({ "cmd": "status --json" }),
+                    provider_metadata: Some(json!({
+                        "google": {
+                            "thought_signature": "sig-tool"
+                        }
+                    })),
+                },
+            ],
+        ),
     ];
     state.record_items(&msgs).await;
 
@@ -614,4 +639,18 @@ async fn record_items_roundtrips_through_context_manager() {
     assert_eq!(read_back.len(), 2, "both recorded messages lower back");
     assert_eq!(read_back[0].role, MessageRole::User);
     assert_eq!(read_back[1].role, MessageRole::Assistant);
+    assert!(matches!(
+        &read_back[1].content[0],
+        ContentPart::Text {
+            provider_metadata: Some(metadata),
+            ..
+        } if metadata["google"]["thought_signature"] == json!("sig-text")
+    ));
+    assert!(matches!(
+        &read_back[1].content[1],
+        ContentPart::ToolCall {
+            provider_metadata: Some(metadata),
+            ..
+        } if metadata["google"]["thought_signature"] == json!("sig-tool")
+    ));
 }
