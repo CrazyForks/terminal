@@ -218,6 +218,14 @@ enum Command {
     Start {
         text: String,
     },
+    /// Run a browser task to completion with the configured default
+    /// provider/model (resolved like the TUI). Streams progress and exits when
+    /// the task finishes — the delegation entry point for external assistants.
+    Run {
+        text: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     RunFake {
         text: String,
         #[arg(long)]
@@ -914,6 +922,15 @@ fn main() -> Result<()> {
     };
     match args.command {
         Command::Start { text } => start(&store, text),
+        Command::Run { text, model } => run_default(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+            &runtime_options,
+        ),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
         Command::RunOpenai { text, model } => run_openai(
             &store,
@@ -1307,6 +1324,7 @@ fn main() -> Result<()> {
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Start { .. } => "start",
+        Command::Run { .. } => "run",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
         Command::RunBrowserUse { .. } => "run_browser_use",
@@ -2353,6 +2371,149 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
         .replace(['_', ' '], "-")
 }
 
+/// Map a configured `model_provider` id to its CLI backend.
+fn provider_backend_for_provider_id(provider_id: &str) -> Option<ProviderBackend> {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some(ProviderBackend::Openai),
+        "anthropic" | "claude" => Some(ProviderBackend::Anthropic),
+        "openrouter" => Some(ProviderBackend::Openrouter),
+        "deepseek" => Some(ProviderBackend::Deepseek),
+        "browser-use" | "browser_use" | "browseruse" => Some(ProviderBackend::BrowserUse),
+        "codex" | "chatgpt" => Some(ProviderBackend::Codex),
+        _ => None,
+    }
+}
+
+fn provider_backend_from_env_keys() -> Option<ProviderBackend> {
+    let has = |key: &str| std::env::var(key).is_ok_and(|value| !value.trim().is_empty());
+    if has("ANTHROPIC_API_KEY") {
+        Some(ProviderBackend::Anthropic)
+    } else if has("OPENAI_API_KEY") {
+        Some(ProviderBackend::Openai)
+    } else if has("BROWSER_USE_API_KEY") {
+        Some(ProviderBackend::BrowserUse)
+    } else if has("OPENROUTER_API_KEY") {
+        Some(ProviderBackend::Openrouter)
+    } else if has("DEEPSEEK_API_KEY") {
+        Some(ProviderBackend::Deepseek)
+    } else {
+        None
+    }
+}
+
+/// `browser-use-terminal run "<task>"`: provider-agnostic task run.
+///
+/// Resolves the provider from the user's config (what `/model` in the TUI
+/// persists), falling back to whichever provider API key is set in the
+/// environment, then dispatches to the matching `run-*` path. Unlike `start`
+/// (which only queues a session), this drives the task to completion.
+fn run_default(
+    store: &Store,
+    text: String,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    let cwd = std::env::current_dir()?;
+    let configured =
+        configured_model_provider_id_for_cwd_with_options(&cwd, config_profile, &overrides)?;
+    let backend = match configured.as_deref().map(str::trim) {
+        Some(provider_id) if !provider_id.is_empty() => {
+            provider_backend_for_provider_id(provider_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured model provider {provider_id:?} is not runnable from the CLI; \
+                     use an explicit command like `browser-use-terminal run-anthropic \"<task>\"`"
+                )
+            })?
+        }
+        _ => provider_backend_from_env_keys().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model provider is configured. Configure one in the TUI (`browser`, then \
+                 /auth and /model), set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, \
+                 OPENROUTER_API_KEY, DEEPSEEK_API_KEY, or BROWSER_USE_API_KEY), or use an \
+                 explicit command such as `browser-use-terminal run-anthropic \"<task>\"`."
+            )
+        })?,
+    };
+    match backend {
+        ProviderBackend::Openai => run_openai(
+            store,
+            text,
+            model,
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        ),
+        ProviderBackend::Anthropic
+        | ProviderBackend::Openrouter
+        | ProviderBackend::Deepseek
+        | ProviderBackend::BrowserUse
+        | ProviderBackend::Codex => {
+            let (model, _source) = resolve_cli_model_with_source(
+                backend,
+                model,
+                config_profile,
+                raw_config_overrides,
+            )?;
+            match backend {
+                ProviderBackend::Anthropic => run_anthropic(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Openrouter => run_openrouter(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Deepseek => run_deepseek(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::BrowserUse => run_browser_use(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Codex => run_codex(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                _ => unreachable!(),
+            }
+        }
+        ProviderBackend::Fake | ProviderBackend::None => {
+            bail!("no runnable model provider configured")
+        }
+    }
+}
+
 fn run_openai(
     store: &Store,
     text: String,
@@ -3171,7 +3332,21 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     let title = task_from_events(&events).unwrap_or_else(|| "untitled task".to_string());
     let browser = browser_summary_from_events(&events, "local chrome");
     println!("Task: {title}");
-    println!("Status: {}", task.status.as_str());
+    // A session created by `start` (or an SDK queue) has no agent attached yet;
+    // reporting it as plain "running" sends pollers into infinite loops.
+    let agent_started = events.iter().any(|event| {
+        !matches!(
+            event.event_type.as_str(),
+            "session.created" | "session.input"
+        )
+    });
+    if task.status.is_active() && !agent_started {
+        println!(
+            "Status: queued (no agent attached — drive it with `browser-use-terminal run \"<task>\"` next time, or `run-anthropic-session {task_id}` to run this one)"
+        );
+    } else {
+        println!("Status: {}", task.status.as_str());
+    }
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
@@ -3345,6 +3520,21 @@ fn browser_cli(
     let session_id = format!("{EXTERNAL_BROWSER_SESSION_PREFIX}{session_name}");
     let cwd = std::env::current_dir().context("resolve current dir")?;
     let state_dir = store.state_dir().to_path_buf();
+
+    let mut argv = args;
+    if argv.first().map(String::as_str) == Some("browser") {
+        argv.remove(0);
+    }
+    if argv.is_empty() {
+        argv.push("help".to_string());
+    }
+
+    // Daemon control operates on the daemon itself and must not side-effect a
+    // browser session row / artifact dir; intercept before the session ensure.
+    if argv.first().map(String::as_str) == Some("daemon") {
+        return browser_external_daemon_control(&state_dir, &argv);
+    }
+
     let task = match store.load_session(&session_id)? {
         Some(task) => task,
         None => {
@@ -3358,18 +3548,6 @@ fn browser_cli(
         }
     };
     let artifact_dir = PathBuf::from(&task.artifact_root);
-
-    let mut argv = args;
-    if argv.first().map(String::as_str) == Some("browser") {
-        argv.remove(0);
-    }
-    if argv.is_empty() {
-        argv.push("help".to_string());
-    }
-
-    if argv.first().map(String::as_str) == Some("daemon") {
-        return browser_external_daemon_control(&state_dir, &argv);
-    }
 
     let action = if argv.first().map(String::as_str) == Some("exec") {
         let code = if argv.len() == 1 || (argv.len() == 2 && argv[1] == "-") {

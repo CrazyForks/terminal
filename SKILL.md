@@ -1,16 +1,13 @@
 ---
 name: browser-use-terminal
-description: Direct browser control via the Browser Use Terminal CLI. Use when the user wants to automate, scrape, test, or interact with web pages — drive the browser yourself with Python helpers, or delegate a whole browsing task to the built-in browser agent.
+description: Direct browser control via the Browser Use Terminal CLI. Use when the user wants to automate, scrape, test, or interact with web pages — you drive the browser yourself with Python helpers.
 ---
 
 # Browser Use Terminal
 
-For setup, install, or connection problems, read https://browser-use.com/skill (agent setup instructions) or https://docs.browser-use.com/open-source/browser-use-terminal (full docs).
+Direct browser control via CDP — you are the agent; you drive the browser. For setup, install, or connection problems, read https://browser-use.com/skill (agent setup instructions) or https://docs.browser-use.com/open-source/browser-use-terminal (full docs).
 
-One CLI (`browser-use-terminal`, on $PATH), two surfaces:
-
-- **Browser management** — drive the browser yourself. `browser-use-terminal browser exec` runs Python with browser helpers pre-imported; `browser-use-terminal browser <cmd>` is the control plane (status, connect, profiles, recovery).
-- **Core agent** — delegate an entire browsing task: `browser-use-terminal start "<task>"`.
+`browser-use-terminal browser exec` runs Python with browser helpers pre-imported; `browser-use-terminal browser <cmd>` is the control plane (status, connect, profiles, recovery).
 
 ## Usage
 
@@ -90,16 +87,6 @@ A background daemon (auto-started, one per state dir) holds the CDP connection a
 - If output JSON says `status: "needs-user-action"` (e.g. pick a Chrome profile, click Allow in Chrome's permission popup, enable the remote-debugging checkbox), show the `user_prompt` to the user verbatim and wait — do not guess.
 - Auth wall mid-task: stop and ask the user. Don't type credentials from screenshots; use stored secrets if available.
 - Connecting to the user's real Chrome requires a one-time setup: `chrome://inspect/#remote-debugging` → tick "Allow remote debugging". `browser local setup` walks the user through it.
-
-## Delegating to the built-in agent
-
-For a self-contained browsing task (research, multi-step form filling, comparison shopping), the built-in agent is often faster than driving the browser yourself:
-
-```bash
-browser-use-terminal start "Find the three cheapest direct LAX→SFO flights next Friday and list airline, time, price"
-```
-
-It runs with the user's configured model, prints progress events, and ends with a result. Inspect afterwards with `browser-use-terminal history`, `show <task_id>`, `events <task_id>`.
 
 ## What actually works
 

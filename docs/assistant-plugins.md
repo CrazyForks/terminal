@@ -4,20 +4,17 @@ Browser Use Terminal plugs into any coding assistant or agent that can run shell
 
 Fastest setup: paste `https://browser-use.com/skill` into your assistant, and it provides instructions on how to install, register the skill, connect a browser, and verify. Full docs: <https://docs.browser-use.com/open-source/browser-use-terminal>.
 
-Two surfaces, one binary:
+The assistant is the agent. The skill teaches it to drive the browser directly:
 
-- **Browser management** — the assistant drives the browser itself:
-  ```bash
-  browser-use-terminal browser exec <<'PY'
-  new_tab("https://example.com")
-  wait_for_load()
-  print(capture_screenshot())
-  PY
-  ```
-- **Core agent** — the assistant delegates a whole task to the built-in browser agent:
-  ```bash
-  browser-use-terminal start "Compare M4 MacBook Air prices across three retailers"
-  ```
+```bash
+browser-use-terminal browser exec <<'PY'
+new_tab("https://example.com")
+wait_for_load()
+print(capture_screenshot())
+PY
+```
+
+(The built-in agent — the TUI and `browser-use-terminal run` — remains a human-facing surface and is not part of the skill.)
 
 ## Install
 

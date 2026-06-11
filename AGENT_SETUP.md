@@ -8,8 +8,8 @@ Every step is idempotent; re-run safely. Tell the user what you're doing as
 you go, and stop to ask only where this page says to.
 
 What you get: a `browser-use-terminal` CLI you drive from shell commands —
-run Python against a real browser (navigate, click, type, screenshot, extract),
-or delegate whole browsing tasks to its built-in agent.
+run Python against a real browser (navigate, click, type, screenshot, extract).
+You are the agent; you drive the browser.
 
 ## 1. Preflight
 
@@ -128,9 +128,6 @@ The essentials:
 - In the user's real Chrome, open work in `new_tab(...)`, never `goto_url` over
   their active tab.
 - Auth walls: stop and ask the user. Never type credentials read off a screenshot.
-- Delegate a whole task to the built-in browser agent (needs model auth —
-  `browser-use-terminal auth` or provider API keys):
-  `browser-use-terminal start "find the 3 cheapest direct LAX->SFO flights Friday"`.
 - Parallel workstreams: add `--session <name>` to `browser` commands.
 - Done for the day: `browser-use-terminal browser recover stop-owned-browser`
   (managed) or `... stop-owned-remote` (cloud).
