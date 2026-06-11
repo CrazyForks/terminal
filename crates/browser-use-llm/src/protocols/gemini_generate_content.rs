@@ -148,13 +148,25 @@ fn build_content(message: &Message, tracker: &mut FunctionNameTracker) -> Result
             "user"
         }
     };
+    let mut tool_call_index = 0;
     Ok(json!({
         "role": role,
-        "parts": message.content.iter().map(|part| build_part(part, tracker)).collect::<Result<Vec<_>, _>>()?,
+        "parts": message.content.iter().map(|part| {
+            let current_tool_call_index = matches!(part, ContentPart::ToolCall { .. }).then(|| {
+                let index = tool_call_index;
+                tool_call_index += 1;
+                index
+            });
+            build_part(part, tracker, current_tool_call_index)
+        }).collect::<Result<Vec<_>, _>>()?,
     }))
 }
 
-fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<Value, LlmError> {
+fn build_part(
+    part: &ContentPart,
+    tracker: &mut FunctionNameTracker,
+    tool_call_index: Option<usize>,
+) -> Result<Value, LlmError> {
     match part {
         ContentPart::Text {
             text,
@@ -195,7 +207,7 @@ fn build_part(part: &ContentPart, tracker: &mut FunctionNameTracker) -> Result<V
                 json!({ "name": name, "args": input }),
             );
             if let Some(signature) = gemini_thought_signature(provider_metadata).or_else(|| {
-                if should_add_dummy_thought_signature(id, provider_metadata) {
+                if should_add_dummy_thought_signature(tool_call_index, provider_metadata) {
                     Some(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string())
                 } else {
                     None
@@ -233,8 +245,11 @@ fn build_text_part(text: &str, provider_metadata: &Option<Value>) -> Value {
     Value::Object(part)
 }
 
-fn should_add_dummy_thought_signature(id: &str, provider_metadata: &Option<Value>) -> bool {
-    provider_metadata.is_none() && id.starts_with("gemini_call_")
+fn should_add_dummy_thought_signature(
+    tool_call_index: Option<usize>,
+    provider_metadata: &Option<Value>,
+) -> bool {
+    gemini_thought_signature(provider_metadata).is_none() && tool_call_index == Some(0)
 }
 
 fn gemini_thought_signature(provider_metadata: &Option<Value>) -> Option<String> {
@@ -597,13 +612,13 @@ mod tests {
     }
 
     #[test]
-    fn build_body_does_not_add_dummy_signature_to_provider_call_without_one() {
+    fn build_body_adds_dummy_signature_to_first_provider_call_without_one() {
         let mut req = LlmRequest::new("gemini-3.5-flash", "google");
         req.messages.push(Message::new(
             MessageRole::Assistant,
             vec![ContentPart::ToolCall {
-                id: "call_parallel_2".into(),
-                name: "browser".into(),
+                id: "call_browser".into(),
+                name: "default_api:browser".into(),
                 input: json!({ "cmd": "status --json" }),
                 provider_metadata: None,
             }],
@@ -613,7 +628,46 @@ mod tests {
             .build_body(&req)
             .unwrap();
 
-        assert!(body["contents"][0]["parts"][0]["thoughtSignature"].is_null());
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("skip_thought_signature_validator")
+        );
+    }
+
+    #[test]
+    fn build_body_does_not_add_dummy_signature_to_later_parallel_call_without_one() {
+        let mut req = LlmRequest::new("gemini-3.5-flash", "google");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![
+                ContentPart::ToolCall {
+                    id: "call_parallel_1".into(),
+                    name: "browser".into(),
+                    input: json!({ "cmd": "status --json" }),
+                    provider_metadata: Some(json!({
+                        "google": {
+                            "thought_signature": "sig-parallel-first"
+                        }
+                    })),
+                },
+                ContentPart::ToolCall {
+                    id: "call_parallel_2".into(),
+                    name: "browser".into(),
+                    input: json!({ "cmd": "status --json" }),
+                    provider_metadata: None,
+                },
+            ],
+        ));
+
+        let body = GeminiGenerateContentProtocol::new()
+            .build_body(&req)
+            .unwrap();
+
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            json!("sig-parallel-first")
+        );
+        assert!(body["contents"][0]["parts"][1]["thoughtSignature"].is_null());
     }
 
     #[test]

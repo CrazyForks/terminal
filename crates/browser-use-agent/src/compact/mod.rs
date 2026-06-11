@@ -563,8 +563,15 @@ fn message_to_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text, .. } => {
-                content_parts.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_metadata,
+            } => {
+                let mut item = json!({ "type": "text", "text": text });
+                if let Some(metadata) = provider_metadata {
+                    item["provider_metadata"] = metadata.clone();
+                }
+                content_parts.push(item);
             }
             ContentPart::Media {
                 mime_type,
@@ -581,13 +588,20 @@ fn message_to_item(message: &Message) -> Item {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
-                tool_calls.push(json!({
+                let mut call = json!({
                     "id": id,
                     "name": name,
                     "arguments": input,
-                }));
+                });
+                if let Some(metadata) = provider_metadata {
+                    call["provider_metadata"] = metadata.clone();
+                }
+                tool_calls.push(call);
             }
             ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
         }

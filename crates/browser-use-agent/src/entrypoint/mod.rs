@@ -2280,8 +2280,15 @@ fn message_to_provider_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text, .. } => {
-                content_parts.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_metadata,
+            } => {
+                let mut item = json!({ "type": "text", "text": text });
+                if let Some(metadata) = provider_metadata {
+                    item["provider_metadata"] = metadata.clone();
+                }
+                content_parts.push(item);
             }
             ContentPart::Media {
                 mime_type,
@@ -3231,6 +3238,26 @@ mod tests {
         assert_eq!(
             item["tool_calls"][0]["provider_metadata"]["google"]["thought_signature"],
             serde_json::json!("sig-model-call")
+        );
+    }
+
+    #[test]
+    fn message_to_provider_item_preserves_text_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::Text {
+                text: String::new(),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-text-part"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["content"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-text-part")
         );
     }
 
