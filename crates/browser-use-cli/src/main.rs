@@ -2371,19 +2371,6 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
         .replace(['_', ' '], "-")
 }
 
-/// Map a configured `model_provider` id to its CLI backend.
-fn provider_backend_for_provider_id(provider_id: &str) -> Option<ProviderBackend> {
-    match provider_id.trim().to_ascii_lowercase().as_str() {
-        "openai" => Some(ProviderBackend::Openai),
-        "anthropic" | "claude" => Some(ProviderBackend::Anthropic),
-        "openrouter" => Some(ProviderBackend::Openrouter),
-        "deepseek" => Some(ProviderBackend::Deepseek),
-        "browser-use" | "browser_use" | "browseruse" => Some(ProviderBackend::BrowserUse),
-        "codex" | "chatgpt" => Some(ProviderBackend::Codex),
-        _ => None,
-    }
-}
-
 fn provider_backend_from_env_keys() -> Option<ProviderBackend> {
     let has = |key: &str| std::env::var(key).is_ok_and(|value| !value.trim().is_empty());
     if has("ANTHROPIC_API_KEY") {
@@ -2422,12 +2409,7 @@ fn run_default(
         configured_model_provider_id_for_cwd_with_options(&cwd, config_profile, &overrides)?;
     let backend = match configured.as_deref().map(str::trim) {
         Some(provider_id) if !provider_id.is_empty() => {
-            provider_backend_for_provider_id(provider_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "configured model provider {provider_id:?} is not runnable from the CLI; \
-                     use an explicit command like `browser-use-terminal run-anthropic \"<task>\"`"
-                )
-            })?
+            ProviderBackend::from_provider_id(provider_id).unwrap_or(ProviderBackend::Openai)
         }
         _ => provider_backend_from_env_keys().ok_or_else(|| {
             anyhow::anyhow!(
