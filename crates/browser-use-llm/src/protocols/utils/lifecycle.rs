@@ -5,6 +5,8 @@
 
 use std::collections::BTreeSet;
 
+use serde_json::Value;
+
 use crate::schema::{FinishReason, LlmEvent, TextPhase, Usage};
 
 #[derive(Debug, Default)]
@@ -30,6 +32,15 @@ impl Lifecycle {
     /// Record a text delta. Emits `StepStart` (once) and `TextStart` (the first
     /// time this id is seen) before the `TextDelta`.
     pub fn text_delta(&mut self, id: impl Into<String>, delta: impl Into<String>) -> Vec<LlmEvent> {
+        self.text_delta_with_provider_metadata(id, delta, None)
+    }
+
+    pub fn text_delta_with_provider_metadata(
+        &mut self,
+        id: impl Into<String>,
+        delta: impl Into<String>,
+        provider_metadata: Option<Value>,
+    ) -> Vec<LlmEvent> {
         let id = id.into();
         let mut out = Vec::new();
         self.ensure_step(&mut out);
@@ -39,6 +50,7 @@ impl Lifecycle {
         out.push(LlmEvent::TextDelta {
             id,
             delta: delta.into(),
+            provider_metadata,
         });
         out
     }
@@ -141,7 +153,8 @@ mod tests {
                 LlmEvent::TextStart { id: "t0".into() },
                 LlmEvent::TextDelta {
                     id: "t0".into(),
-                    delta: "he".into()
+                    delta: "he".into(),
+                    provider_metadata: None,
                 },
             ]
         );
@@ -150,7 +163,8 @@ mod tests {
             lc.text_delta("t0", "llo"),
             vec![LlmEvent::TextDelta {
                 id: "t0".into(),
-                delta: "llo".into()
+                delta: "llo".into(),
+                provider_metadata: None,
             }]
         );
     }

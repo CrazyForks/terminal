@@ -470,6 +470,7 @@ pub fn decode_chunks(
 /// usage and the finish reason.
 fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
     let mut text = String::new();
+    let mut text_parts: Vec<ContentPart> = Vec::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<ContentPart> = Vec::new();
     let mut usage = Usage::default();
@@ -477,7 +478,11 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
 
     for ev in events {
         match ev {
-            LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            LlmEvent::TextDelta {
+                delta,
+                provider_metadata,
+                ..
+            } => push_text_part(&mut text, &mut text_parts, delta, provider_metadata),
             LlmEvent::ReasoningDelta { delta, .. } => reasoning.push_str(&delta),
             LlmEvent::ToolCall {
                 id,
@@ -522,15 +527,37 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
             provider_metadata: None,
         });
     }
-    if !text.is_empty() {
-        content.push(ContentPart::text(text));
-    }
+    flush_text_buffer(&mut text, &mut text_parts);
+    content.extend(text_parts);
     content.extend(tool_calls);
 
     LlmResponse {
         content,
         usage,
         finish_reason,
+    }
+}
+
+fn push_text_part(
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    delta: String,
+    provider_metadata: Option<serde_json::Value>,
+) {
+    if let Some(provider_metadata) = provider_metadata {
+        flush_text_buffer(text_buffer, text_parts);
+        text_parts.push(ContentPart::Text {
+            text: delta,
+            provider_metadata: Some(provider_metadata),
+        });
+    } else {
+        text_buffer.push_str(&delta);
+    }
+}
+
+fn flush_text_buffer(text_buffer: &mut String, text_parts: &mut Vec<ContentPart>) {
+    if !text_buffer.is_empty() {
+        text_parts.push(ContentPart::text(std::mem::take(text_buffer)));
     }
 }
 
@@ -968,10 +995,12 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "Let me ".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextDelta {
                 id: "msg_1".into(),
                 delta: "check.".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextEnd {
                 id: "msg_1".into(),
@@ -1056,7 +1085,7 @@ mod tests {
         assert!(resp
             .content
             .iter()
-            .any(|p| matches!(p, ContentPart::Text { text } if text == "Let me check.")));
+            .any(|p| matches!(p, ContentPart::Text { text, .. } if text == "Let me check.")));
         // The tool call survives aggregation with parsed input.
         let tc = resp
             .content

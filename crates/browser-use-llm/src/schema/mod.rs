@@ -88,6 +88,7 @@ mod tests {
             LlmEvent::TextDelta {
                 id: "t0".into(),
                 delta: "he".into(),
+                provider_metadata: None,
             },
             LlmEvent::TextEnd {
                 id: "t0".into(),

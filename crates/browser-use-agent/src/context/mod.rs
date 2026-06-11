@@ -298,7 +298,10 @@ fn part_to_content_part(part: &Value) -> Option<ContentPart> {
     match part_type {
         "text" | "input_text" | "output_text" => {
             let text = part.get("text").and_then(Value::as_str)?;
-            Some(ContentPart::text(text))
+            Some(ContentPart::Text {
+                text: text.to_string(),
+                provider_metadata: part.get("provider_metadata").cloned(),
+            })
         }
         "input_image" | "image" | "image_url" | "output_image" => {
             let url = part

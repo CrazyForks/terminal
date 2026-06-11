@@ -2398,8 +2398,15 @@ fn message_to_provider_item(message: &Message) -> Item {
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
         match part {
-            ContentPart::Text { text } => {
-                content_parts.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_metadata,
+            } => {
+                let mut item = json!({ "type": "text", "text": text });
+                if let Some(metadata) = provider_metadata {
+                    item["provider_metadata"] = metadata.clone();
+                }
+                content_parts.push(item);
             }
             ContentPart::Media {
                 mime_type,
@@ -2452,7 +2459,7 @@ fn tool_result_content_to_provider_content(content: &[ContentPart]) -> serde_jso
     let mut has_non_text = false;
     for part in content {
         match part {
-            ContentPart::Text { text: fragment }
+            ContentPart::Text { text: fragment, .. }
             | ContentPart::Reasoning { text: fragment, .. } => {
                 text.push_str(fragment);
                 if !fragment.is_empty() {
@@ -3410,6 +3417,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn message_to_provider_item_preserves_text_provider_metadata() {
+        let item = message_to_provider_item(&Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::Text {
+                text: String::new(),
+                provider_metadata: Some(serde_json::json!({
+                    "google": {
+                        "thought_signature": "sig-text-part"
+                    }
+                })),
+            }],
+        ));
+
+        assert_eq!(
+            item["content"][0]["provider_metadata"]["google"]["thought_signature"],
+            serde_json::json!("sig-text-part")
+        );
+    }
+
     struct EnvRestore {
         _guard: StdMutexGuard<'static, ()>,
         values: Vec<(&'static str, Option<String>)>,
@@ -4251,7 +4278,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -4290,7 +4317,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -4377,7 +4404,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -5518,7 +5545,7 @@ mod tests {
             .iter()
             .flat_map(|message| message.content.iter())
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -5654,7 +5681,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert!(!state.has_pending_input().await);
 
-        let ContentPart::Text { text } = &drained[0].content[0] else {
+        let ContentPart::Text { text, .. } = &drained[0].content[0] else {
             panic!("mailbox input should be direct task text");
         };
         assert_eq!(
@@ -6163,6 +6190,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "t0".to_string(),
                     delta: "running shell".to_string(),
+                    provider_metadata: None,
                 },
                 LlmEvent::ToolCall {
                     id: "call-1".to_string(),
@@ -6180,6 +6208,7 @@ mod tests {
                 LlmEvent::TextDelta {
                     id: "t1".to_string(),
                     delta: "all done".to_string(),
+                    provider_metadata: None,
                 },
                 LlmEvent::Finish {
                     usage: Usage::default(),
@@ -6222,7 +6251,7 @@ mod tests {
                     content
                         .iter()
                         .filter_map(|c| match c {
-                            ContentPart::Text { text } => Some(text.clone()),
+                            ContentPart::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()

@@ -579,9 +579,19 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         // Emit UI events first (map is pure; emit is the only side effect).
         self.emit_event(&ev, turn_idx);
         match ev {
-            LlmEvent::TextDelta { id, delta } => {
+            LlmEvent::TextDelta {
+                id,
+                delta,
+                provider_metadata,
+            } => {
                 let has_content = !delta.trim().is_empty();
                 acc.full_text.push_str(&delta);
+                push_text_part(
+                    &mut acc.text_buffer,
+                    &mut acc.text_parts,
+                    delta,
+                    provider_metadata,
+                );
                 if has_content {
                     acc.text_items_with_content.insert(id, true);
                 }
@@ -665,6 +675,8 @@ fn checks_mailbox_preemption_after_event(ev: &LlmEvent) -> bool {
 #[derive(Default)]
 struct TurnAccumulator {
     full_text: String,
+    text_parts: Vec<ContentPart>,
+    text_buffer: String,
     text_items_with_content: HashMap<String, bool>,
     defers_mailbox_delivery_to_next_turn: bool,
     /// The tool calls the model emitted, in model order. The length doubles as
@@ -785,13 +797,44 @@ fn done_summary(tool_calls: &[ContentPart]) -> Option<String> {
 /// Assemble the assistant `Message` recorded for this turn: its streamed text
 /// (if any) followed by the tool calls it emitted, in model order. Mirrors codex
 /// recording the assistant function-call item before its outputs.
-fn assistant_message(full_text: &str, tool_calls: &[ContentPart]) -> Message {
+fn assistant_message(
+    full_text: &str,
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    tool_calls: &[ContentPart],
+) -> Message {
     let mut content: Vec<ContentPart> = Vec::new();
-    if !full_text.is_empty() {
+    flush_text_buffer(text_buffer, text_parts);
+    if !text_parts.is_empty() {
+        content.extend(text_parts.iter().cloned());
+    } else if !full_text.is_empty() {
         content.push(ContentPart::text(full_text));
     }
     content.extend(tool_calls.iter().cloned());
     Message::new(MessageRole::Assistant, content)
+}
+
+fn push_text_part(
+    text_buffer: &mut String,
+    text_parts: &mut Vec<ContentPart>,
+    delta: String,
+    provider_metadata: Option<serde_json::Value>,
+) {
+    if let Some(provider_metadata) = provider_metadata {
+        flush_text_buffer(text_buffer, text_parts);
+        text_parts.push(ContentPart::Text {
+            text: delta,
+            provider_metadata: Some(provider_metadata),
+        });
+    } else {
+        text_buffer.push_str(&delta);
+    }
+}
+
+fn flush_text_buffer(text_buffer: &mut String, text_parts: &mut Vec<ContentPart>) {
+    if !text_buffer.is_empty() {
+        text_parts.push(ContentPart::text(std::mem::take(text_buffer)));
+    }
 }
 
 fn tool_call_identity(call: &ContentPart) -> (String, String) {
@@ -832,7 +875,7 @@ fn event_content_parts_if_media(parts: &[ContentPart]) -> Option<Vec<Value>> {
 fn append_event_content_parts(parts: &[ContentPart], out: &mut Vec<Value>, has_media: &mut bool) {
     for part in parts {
         match part {
-            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => {
                 if !text.is_empty() {
                     out.push(serde_json::json!({ "type": "input_text", "text": text }));
                 }
@@ -899,7 +942,7 @@ fn flatten_content_text(parts: &[ContentPart]) -> String {
 fn collect_content_text(parts: &[ContentPart], chunks: &mut Vec<String>) {
     for part in parts {
         match part {
-            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => {
                 if !text.is_empty() {
                     chunks.push(text.clone());
                 }
@@ -1027,7 +1070,12 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 
                         // 1. Record the assistant message (text + tool calls), so the
                         //    recorded transcript carries the call before its output.
-                        let assistant = assistant_message(&acc.full_text, &tool_calls);
+                        let assistant = assistant_message(
+                            &acc.full_text,
+                            &mut acc.text_buffer,
+                            &mut acc.text_parts,
+                            &tool_calls,
+                        );
                         recorder.record(std::slice::from_ref(&assistant)).await;
 
                         // 2. Dispatch in model order through the parallel/serial gate.

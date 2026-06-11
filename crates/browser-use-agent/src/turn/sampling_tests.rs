@@ -180,6 +180,7 @@ fn text_delta(s: &str) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::TextDelta {
         id: "t0".to_string(),
         delta: s.to_string(),
+        provider_metadata: None,
     })
 }
 
@@ -382,7 +383,7 @@ async fn active_goal_context_is_injected_with_codex_envelope() {
     let captured = seen.lock().unwrap();
     let req = captured.first().expect("request captured");
     assert_eq!(req.messages.len(), 2);
-    let ContentPart::Text { text } = &req.messages[0].content[0] else {
+    let ContentPart::Text { text, .. } = &req.messages[0].content[0] else {
         panic!("goal context should be text");
     };
     assert!(text.starts_with("<goal_context>\n"));
@@ -919,7 +920,7 @@ async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
     assert!(
         matches!(
             req.messages[0].content.first(),
-            Some(ContentPart::Text { text }) if text.contains("Use `browser connect local` before page work")
+            Some(ContentPart::Text { text, .. }) if text.contains("Use `browser connect local` before page work")
         ),
         "mode instruction message was not prepended: {:?}",
         req.messages[0]
