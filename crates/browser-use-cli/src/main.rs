@@ -2416,6 +2416,8 @@ fn provider_backend_from_env_keys() -> Option<ProviderBackend> {
         Some(ProviderBackend::Openrouter)
     } else if has("DEEPSEEK_API_KEY") {
         Some(ProviderBackend::Deepseek)
+    } else if has("GEMINI_API_KEY") || has("GOOGLE_API_KEY") {
+        Some(ProviderBackend::Google)
     } else {
         None
     }
@@ -2448,7 +2450,7 @@ fn run_default(
             anyhow::anyhow!(
                 "no model provider is configured. Configure one in the TUI (`browser`, then \
                  /auth and /model), set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, \
-                 OPENROUTER_API_KEY, DEEPSEEK_API_KEY, or BROWSER_USE_API_KEY), or use an \
+                 OPENROUTER_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, or BROWSER_USE_API_KEY), or use an \
                  explicit command such as `browser-use-terminal run-anthropic \"<task>\"`."
             )
         })?,
@@ -2466,6 +2468,7 @@ fn run_default(
         ProviderBackend::Anthropic
         | ProviderBackend::Openrouter
         | ProviderBackend::Deepseek
+        | ProviderBackend::Google
         | ProviderBackend::BrowserUse
         | ProviderBackend::Codex => {
             let (model, _source) = resolve_cli_model_with_source(
@@ -2494,6 +2497,15 @@ fn run_default(
                     runtime_options,
                 ),
                 ProviderBackend::Deepseek => run_deepseek(
+                    store,
+                    text,
+                    model,
+                    config_profile,
+                    raw_config_overrides,
+                    collaboration_mode,
+                    runtime_options,
+                ),
+                ProviderBackend::Google => run_google(
                     store,
                     text,
                     model,
