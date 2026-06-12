@@ -28,8 +28,20 @@ use tungstenite::{connect, Message, WebSocket};
 const BU_API: &str = "https://api.browser-use.com/api/v3";
 const LOG_LIMIT: usize = 250;
 const SCRIPT_MAX_OUTPUT_CHARS: usize = 120_000;
-const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 15_000;
-const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 1_000;
+// Cost optimization (eval-everything): a script that finishes within the start
+// call returns its result in ONE tool call — no separate `observe` model turns.
+// Raised 15s->30s so the common scrape script (which finishes well under 30s)
+// no longer forces a poll round-trip. This is a single, non-stacking block that
+// still hands control back at 30s, so a stuck script can be cancelled/finalized
+// (unlike the reverted "observe30", which STACKED 30s observe blocks and starved
+// the run timebox — see DEFAULT_OBSERVE_TIMEOUT_MS doc in browser.rs).
+const BROWSER_SCRIPT_DEFAULT_INITIAL_WAIT_MS: u64 = 30_000;
+// The `next_observe_ms` HINT surfaced to the model ("call observe with
+// observe_timeout_ms=N"). Raised 1s->15s to nudge the model to long-poll instead
+// of issuing 1s "still running?" peeks (the dominant observe-churn cost). This is
+// only a hint — the observe floor stays at 1s, so the model keeps full agency to
+// bail early; we stay under the 30s window that previously regressed.
+const BROWSER_SCRIPT_DEFAULT_OBSERVE_MS: u64 = 15_000;
 const BROWSER_SCRIPT_HELPERS: &str = include_str!("browser_script_helpers.py");
 const BROWSER_CONNECT_LOCAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const BROWSER_CONNECT_ATTACH_DEADLINE: Duration = Duration::from_secs(8);
@@ -13089,6 +13101,127 @@ print("http_get_many parity ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("http_get_many parity ok"));
+    }
+
+    #[test]
+    fn browser_script_http_get_vendored_proxy_private_bypass_and_error_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-http-get-vendored-proxy",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+import http.server
+import json
+import os
+import socketserver
+import sys
+import threading
+
+assert _is_private_or_local_host("localhost")
+assert _is_private_or_local_host("127.0.0.1")
+assert _is_private_or_local_host("10.1.2.3")
+assert _is_private_or_local_host("192.168.0.5")
+assert _is_private_or_local_host("169.254.1.1")
+assert _is_private_or_local_host("printer.local")
+assert _is_private_or_local_host("wiki.internal")
+assert _is_private_or_local_host("intranet-host")
+assert not _is_private_or_local_host("example.com")
+assert not _is_private_or_local_host("8.8.8.8")
+
+proxy_calls = []
+proxy_mode = {"fail": False}
+
+class FakeFetchProxy(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        assert self.path == "/fetch"
+        assert self.headers.get("X-Browser-Use-API-Key") == "test-key"
+        req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        proxy_calls.append(req["url"])
+        if proxy_mode["fail"]:
+            self.send_response(500)
+            self.end_headers()
+            return
+        body = json.dumps({
+            "status_code": 200,
+            "status": "200 OK",
+            "headers": {"x-proxy": "yes"},
+            "body": "proxied:" + req["url"],
+            "body_base64": "",
+            "is_binary": False,
+            "final_url": req["url"],
+            "redirect_count": 0,
+            "protocol": "HTTP/2.0",
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+class DirectTarget(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        body = b"direct"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+proxy_server = socketserver.TCPServer(("127.0.0.1", 0), FakeFetchProxy)
+target_server = socketserver.TCPServer(("127.0.0.1", 0), DirectTarget)
+for server in (proxy_server, target_server):
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+target_base = f"http://127.0.0.1:{target_server.server_address[1]}"
+
+sys.modules.pop("fetch_use", None)  # force the VENDORED client path
+os.environ["BROWSER_USE_API_KEY"] = "test-key"
+os.environ["FETCH_USE_URL"] = f"http://127.0.0.1:{proxy_server.server_address[1]}"
+
+try:
+    # 1) public URL goes through the vendored proxy client
+    proxied = http_get("https://public.example/data")
+    assert proxied == "proxied:https://public.example/data", proxied
+    assert proxied.status_code == 200 and proxied.headers["x-proxy"] == "yes"
+
+    # 2) loopback/private host bypasses the proxy entirely
+    before = len(proxy_calls)
+    direct = http_get(target_base + "/anything")
+    assert direct == "direct", direct
+    assert len(proxy_calls) == before, "private host must never reach the proxy"
+
+    # 3) use_proxy=True forces even a private host through the proxy
+    forced = http_get(target_base + "/anything", use_proxy=True)
+    assert forced == "proxied:" + target_base + "/anything", forced
+
+    # 4) proxy failure falls back to direct; both errors surfaced when direct also fails
+    proxy_mode["fail"] = True
+    fallback = http_get(target_base + "/anything", use_proxy=True, timeout=3)
+    assert fallback == "direct", fallback
+    try:
+        http_get("https://no-such-host.invalid/x", timeout=3)
+    except RuntimeError as exc:
+        assert "fetch proxy also failed" in str(exc), exc
+    else:
+        raise AssertionError("expected both proxy and direct to fail")
+finally:
+    for server in (proxy_server, target_server):
+        server.shutdown()
+        server.server_close()
+print("http_get vendored proxy ok")
+"#,
+            20,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("http_get vendored proxy ok"));
     }
 
     #[test]

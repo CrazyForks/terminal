@@ -7,6 +7,7 @@ browser-harness semantics so the model sees one coherent browser API.
 
 import base64
 import gzip
+import ipaddress
 import json
 import math
 import os
@@ -1694,16 +1695,114 @@ class _HttpErrorRecord(dict):
         raise ValueError(f"request failed for {self.url}: {self.error}")
 
 
-def http_get(url, headers=None, timeout=20.0, binary=None):
+def _is_private_or_local_host(host):
+    """True for hosts the fetch proxy must never see: loopback, RFC1918/link-local
+    ranges, .local/.internal-style suffixes, and dotless intranet shortnames.
+    Routing these through the remote proxy would leak the URL/headers off-box and
+    fetch the WRONG target (the proxy's localhost, not the caller's)."""
+    host = str(host or "").strip().lower().rstrip(".").strip("[]")
+    if not host:
+        return True
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if host.endswith((".local", ".internal", ".lan", ".intranet", ".corp", ".home.arpa")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "." not in host
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified
+
+
+class _ProxyFetchResponse:
+    """Response shim mirroring fetch-use's FetchResponse attribute surface."""
+
+    __slots__ = ("status_code", "status", "headers", "url", "text", "content")
+
+    def __init__(self, status_code, headers, url, body, body_b64, is_binary):
+        self.status_code = status_code
+        self.status = status_code
+        self.headers = headers or {}
+        self.url = url
+        self.text = body or ""
+        if is_binary and body_b64:
+            self.content = base64.b64decode(body_b64)
+        else:
+            self.content = (body or "").encode("utf-8", errors="replace")
+
+
+def _fetch_use_sync(url, headers=None, timeout_ms=30000, method="GET", body=None):
+    """Vendored minimal Browser-Use Fetch client (mirrors the `fetch-use` pkg).
+
+    POSTs through fetch.browser-use.com so requests carry Chrome TLS
+    fingerprinting + rotating proxy IPs — the same un-blockable path browser-use
+    uses — instead of a bare urllib request that bot-protection blocks. Vendored
+    so it works even when the `fetch_use` package isn't installed in the sandbox.
+    """
+    import uuid as _uuid
+
+    api_key = os.environ.get("BROWSER_USE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("BROWSER_USE_API_KEY not set")
+    service = (os.environ.get("FETCH_USE_URL") or "https://fetch.browser-use.com").rstrip("/")
+    session_id = (os.environ.get("SESSION_ID") or str(_uuid.uuid4()))[:36]
+    payload = {
+        "url": url,
+        "method": str(method or "GET").upper(),
+        "timeout_ms": min(int(timeout_ms), 120000),
+        "follow_redirects": True,
+        "max_redirects": 10,
+        "proxy_country": os.environ.get("FETCH_USE_PROXY_COUNTRY", "US"),
+        "session_id": session_id,
+    }
+    if headers:
+        payload["headers"] = dict(headers)
+    if body is not None:
+        payload["body"] = body
+    req_headers = {"Content-Type": "application/json", "X-Browser-Use-API-Key": api_key}
+    token = os.environ.get("FETCH_USE_AUTH_TOKEN")
+    if token:
+        req_headers["X-Fetch-Token"] = token
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(service + "/fetch", data=data, headers=req_headers, method="POST")
+    with urllib.request.urlopen(request, timeout=(int(timeout_ms) / 1000) + 10) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    if result.get("error"):
+        raise RuntimeError(f"fetch proxy error: {result['error']}")
+    return _ProxyFetchResponse(
+        result.get("status_code", 0),
+        result.get("headers", {}),
+        result.get("final_url", url),
+        result.get("body", ""),
+        result.get("body_base64", ""),
+        result.get("is_binary", False),
+    )
+
+
+def http_get(url, headers=None, timeout=20.0, binary=None, use_proxy=None):
     """Pure HTTP fetch for static pages and APIs.
 
-    When BROWSER_USE_API_KEY is set and fetch_use is installed, route through
-    fetch-use like browser-harness. Otherwise fall back to local urllib with a
-    browser-like UA and gzip handling. Pass binary=True for bytes.
+    Public URLs route through the Browser-Use Fetch proxy (Chrome TLS
+    fingerprint + rotating IPs) when BROWSER_USE_API_KEY is set, so
+    bot-protected sites don't block us — preferring the installed `fetch_use`
+    package, else the vendored client above. Loopback/private/intranet hosts
+    are ALWAYS fetched directly (never sent to the proxy). On proxy failure the
+    request falls back to direct urllib and the proxy error is surfaced.
+    Pass binary=True for bytes. use_proxy: None=auto (public hosts only),
+    True=force the proxy, False=force direct.
     """
-    if os.environ.get("BROWSER_USE_API_KEY"):
+    proxy_error = None
+    want_proxy = (
+        use_proxy
+        if use_proxy is not None
+        else not _is_private_or_local_host(urlparse(url).hostname)
+    )
+    if want_proxy and os.environ.get("BROWSER_USE_API_KEY"):
         try:
-            from fetch_use import fetch_sync
+            try:
+                from fetch_use import fetch_sync
+            except ImportError:
+                fetch_sync = _fetch_use_sync
 
             response = fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000))
             status_code = getattr(response, "status_code", getattr(response, "status", None))
@@ -1726,8 +1825,16 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
                 response_headers,
                 response_url,
             )
-        except ImportError:
-            pass
+        except Exception as exc:
+            # Proxy unavailable / auth / schema / network error — fall back to a
+            # direct urllib request below, but keep the proxy error visible so a
+            # bot-blocked direct response isn't mistaken for proxy success.
+            proxy_error = exc
+            print(
+                f"http_get: fetch proxy failed ({exc}); retrying direct",
+                file=sys.stderr,
+                flush=True,
+            )
     request_headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     if headers:
         request_headers.update(headers)
@@ -1751,11 +1858,16 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
             f"{exc.code} for {url}. If this is bot/login protection, retry from the browser with js(fetch(...)), "
             "pass site-specific headers/cookies, or configure the Browser Use fetch proxy with BROWSER_USE_API_KEY."
         )
+        if proxy_error is not None:
+            guidance += f" (fetch proxy also failed: {proxy_error})"
         raise RuntimeError(guidance) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(
+        message = (
             f"http_get failed for {url}: {exc}. Try a shorter timeout, browser js(fetch(...)), or a configured proxy if the site blocks direct HTTP."
-        ) from exc
+        )
+        if proxy_error is not None:
+            message += f" (fetch proxy also failed: {proxy_error})"
+        raise RuntimeError(message) from exc
 
 
 def http_get_many(urls, headers=None, timeout=20.0, binary=None, max_workers=8, return_errors=True):
